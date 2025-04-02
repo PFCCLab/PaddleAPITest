@@ -279,7 +279,7 @@ class APITestBase:
                 tmp.append(item)
         return tuple(tmp) if is_tuple else tmp
         
-    def _handle_axis_param(self, config_items, is_tuple=False):
+    def _handle_axis_arg(self, config_items, is_tuple=False):
         """处理 axis 参数"""
         tmp = []
         input_tensor = self.paddle_args[0]
@@ -350,12 +350,12 @@ class APITestBase:
                 self.paddle_args.append(self.paddle_args_config[i].get_paddle_tensor(self.api_config))
             elif isinstance(self.paddle_args_config[i], list):
                 if need_axis_handling and i == 1:
-                    self.paddle_args.append(self._handle_axis_param(self.paddle_args_config[i]))
+                    self.paddle_args.append(self._handle_axis_arg(self.paddle_args_config[i]))
                 else:
                     self.paddle_args.append(self._handle_list_or_tuple(self.paddle_args_config[i]))
             elif isinstance(self.paddle_args_config[i], tuple):
                 if need_axis_handling and i == 1:
-                    self.paddle_args.append(self._handle_axis_param(self.paddle_args_config[i], is_tuple=True))
+                    self.paddle_args.append(self._handle_axis_arg(self.paddle_args_config[i], is_tuple=True))
                 else:
                     self.paddle_args.append(self._handle_list_or_tuple(self.paddle_args_config[i], is_tuple=True))
             else:
@@ -366,12 +366,12 @@ class APITestBase:
                 self.paddle_kwargs[key] = arg_config.get_paddle_tensor(self.api_config)
             elif isinstance(arg_config, list):
                 if need_axis_handling and key == "axis":
-                    self.paddle_kwargs[key] = self._handle_axis_param(arg_config)
+                    self.paddle_kwargs[key] = self._handle_axis_arg(arg_config)
                 else:
                     self.paddle_kwargs[key] = self._handle_list_or_tuple(arg_config)
             elif isinstance(arg_config, tuple):
                 if need_axis_handling and key == "axis":
-                    self.paddle_kwargs[key] = self._handle_axis_param(arg_config, is_tuple=True)
+                    self.paddle_kwargs[key] = self._handle_axis_arg(arg_config, is_tuple=True)
                 else:
                     self.paddle_kwargs[key] = self._handle_list_or_tuple(arg_config, is_tuple=True)
             else:
