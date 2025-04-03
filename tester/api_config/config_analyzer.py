@@ -148,19 +148,31 @@ class TensorConfig:
                     self.numpy_tensor = (numpy.random.random(self.shape) + 0.5).astype(dtype)
             # a
             elif api_config.api_name in ["paddle.arange"]:
-                if "int" in self.dtype:
-                    x = numpy.random.random()
-                    if x > 0.5:
-                        self.numpy_tensor = (numpy.random.randint(1, 65535, size=self.shape)).astype(self.dtype)
-                    else:
-                        self.numpy_tensor = (numpy.random.randint(-65536, -1, size=self.shape)).astype(self.dtype)
+                tensor_num = 0
+                for arg in api_config.args:
+                    if "Tensor" in arg:
+                        tensor_num += 1
+                if tensor_num == 3 or "step" in api_config.kwargs:
+                    if self.check_arg(api_config,2,"step"):
+                        if "int" in self.dtype:
+                            x = numpy.random.random()
+                            if x > 0.5:
+                                self.numpy_tensor = (numpy.random.randint(1, 65535, size=self.shape)).astype(self.dtype)
+                            else:
+                                self.numpy_tensor = (numpy.random.randint(-65536, -1, size=self.shape)).astype(self.dtype)
+                        else:
+                            dtype = "float32" if self.dtype == "bfloat16" else self.dtype
+                            x = numpy.random.random()
+                            if x > 0.5:
+                                self.numpy_tensor = (numpy.random.random(self.shape) + 1.0).astype(dtype)
+                            else:
+                                self.numpy_tensor = (numpy.random.random(self.shape) - 2.0).astype(dtype)
                 else:
-                    dtype = "float32" if self.dtype == "bfloat16" else self.dtype
-                    x = numpy.random.random()
-                    if x > 0.5:
-                        self.numpy_tensor = (numpy.random.random(self.shape) + 1.0).astype(dtype)
+                    if "int" in self.dtype:
+                        self.numpy_tensor = (numpy.random.randint(-65535, 65535, size=self.shape)).astype(self.dtype)
                     else:
-                        self.numpy_tensor = (numpy.random.random(self.shape) - 2.0).astype(dtype)            
+                        dtype = "float32" if self.dtype == "bfloat16" else self.dtype
+                        self.numpy_tensor = (numpy.random.random(self.shape) - 0.5).astype(dtype)                                
             # b
             # c
             # d
@@ -380,10 +392,11 @@ class TensorConfig:
     
     def get_arg(self, api_config, arg_pos=None, arg_name=None):
         """Get the argument value from the api_config"""
-        if arg_pos and len(api_config.args) > arg_pos:
-            return api_config.args[arg_pos]
         if arg_name and arg_name in api_config.kwargs:
             return api_config.kwargs[arg_name]
+        elif arg_pos and len(api_config.args) > arg_pos:
+            return api_config.args[arg_pos]
+
         return None
 
 class APIConfig:
