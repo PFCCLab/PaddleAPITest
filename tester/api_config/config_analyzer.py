@@ -150,7 +150,7 @@ class TensorConfig:
             elif api_config.api_name in ["paddle.arange"]:
                 tensor_num = 0
                 for arg in api_config.args:
-                    if "Tensor" in arg:
+                    if "Tensor" in str(arg):
                         tensor_num += 1
                 if tensor_num == 3 or "step" in api_config.kwargs:
                     if self.check_arg(api_config,2,"step"):
@@ -384,10 +384,10 @@ class TensorConfig:
 
     def check_arg(self, api_config, arg_pos=None, arg_name=None):
         """Checks if the argument in api_config matches this instance"""
-        if arg_pos and len(api_config.args) > arg_pos:
+        if arg_name and arg_name in api_config.kwargs:
+            return str(api_config.kwargs[arg_name]) == str(self)        
+        elif arg_pos and len(api_config.args) > arg_pos:
             return str(api_config.args[arg_pos]) == str(self)
-        elif arg_name and arg_name in api_config.kwargs:
-            return str(api_config.kwargs[arg_name]) == str(self)
         return False
     
     def get_arg(self, api_config, arg_pos=None, arg_name=None):
