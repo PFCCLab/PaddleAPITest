@@ -166,13 +166,7 @@ class TensorConfig:
                             if x > 0.5:
                                 self.numpy_tensor = (numpy.random.random(self.shape) + 1.0).astype(dtype)
                             else:
-                                self.numpy_tensor = (numpy.random.random(self.shape) - 2.0).astype(dtype)
-                else:
-                    if "int" in self.dtype:
-                        self.numpy_tensor = (numpy.random.randint(-65535, 65535, size=self.shape)).astype(self.dtype)
-                    else:
-                        dtype = "float32" if self.dtype == "bfloat16" else self.dtype
-                        self.numpy_tensor = (numpy.random.random(self.shape) - 0.5).astype(dtype)                                
+                                self.numpy_tensor = (numpy.random.random(self.shape) - 2.0).astype(dtype)                               
             # b
             # c
             # d
