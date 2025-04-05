@@ -348,7 +348,6 @@ class TensorConfig:
                             else:
                                 self.numpy_tensor = [self.maxvalue]
                         else:
-                            print("111111")
                             self.numpy_tensor = (numpy.random.randint(1, self.maxvalue+1, size=self.shape)).astype(self.dtype)
                             if self.shape == []:
                                 while self.maxvalue % self.numpy_tensor:
