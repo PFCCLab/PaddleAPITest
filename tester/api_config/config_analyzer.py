@@ -43,6 +43,8 @@ class TensorConfig:
         self.torch_tensor = None
         self.maxvalue = None
         self.fix = None
+        self.index = -2
+        self.key = "null"
     def __deepcopy__(self, memo):
         cls = self.__class__
         result = cls.__new__(cls)
@@ -330,10 +332,10 @@ class TensorConfig:
             # q
             # r
             elif api_config.api_name in ["paddle.Tensor.reshape","paddle.reshape"]:
-                if not self.check_arg(api_config, 0, "x"):
+                if self.index == 1 or "shape" == self.key:
                     flag = True
-                    if "shape" in api_config.kwargs:
-                        if "Tensor" in str((api_config.kwargs["shape"])):
+                    if "shape" == self.key:
+                        if "Tensor" in str(type((api_config.kwargs["shape"]))):
                             flag = False
                     else:
                         if "Tensor" in str(type(api_config.args[1])):
@@ -346,6 +348,7 @@ class TensorConfig:
                             else:
                                 self.numpy_tensor = [self.maxvalue]
                         else:
+                            print("111111")
                             self.numpy_tensor = (numpy.random.randint(1, self.maxvalue+1, size=self.shape)).astype(self.dtype)
                             if self.shape == []:
                                 while self.maxvalue % self.numpy_tensor:
@@ -485,6 +488,12 @@ class TensorConfig:
 
     def set_fix(self, fix):
         self.fix = fix
+    
+    def set_index(self,index):
+        self.index = index
+    
+    def set_key(self,key):
+        self.key = key
         
     def get_paddle_tensor(self, api_config):
         if self.dtype in ["float8_e5m2", "float8_e4m3fn"]:
