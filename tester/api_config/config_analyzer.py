@@ -41,6 +41,8 @@ class TensorConfig:
         self.numpy_tensor = None
         self.paddle_tensor = None
         self.torch_tensor = None
+        self.maxvalue = None
+        self.fix = None
     def __deepcopy__(self, memo):
         cls = self.__class__
         result = cls.__new__(cls)
@@ -204,6 +206,44 @@ class TensorConfig:
                     self.numpy_tensor = self.generate_random_axes(api_config)
             # q
             # r
+            elif api_config.api_name in ["paddle.Tensor.reshape","paddle.reshape"]:
+                if not self.check_arg(api_config, 0, "x"):
+                    flag = True
+                    if "shape" in api_config.kwargs:
+                        if "Tensor" in str((api_config.kwargs["shape"])):
+                            flag = False
+                    else:
+                        if "Tensor" in str(type(api_config.args[1])):
+                            flag = False
+                    self.dtype = "int32"
+                    if flag:
+                        if self.fix is not None and self.fix:
+                            if self.shape == []:
+                                self.numpy_tensor = self.maxvalue
+                            else:
+                                self.numpy_tensor = [self.maxvalue]
+                        else:
+                            self.numpy_tensor = (numpy.random.randint(1, self.maxvalue+1, size=self.shape)).astype(self.dtype)
+                            if self.shape == []:
+                                while self.maxvalue % self.numpy_tensor:
+                                    self.numpy_tensor = (numpy.random.randint(1, self.maxvalue+1, size=self.shape)).astype(self.dtype)
+                                self.maxvalue = self.maxvalue // self.numpy_tensor
+                            else:
+                                while self.maxvalue % self.numpy_tensor[0]:
+                                    self.numpy_tensor = (numpy.random.randint(1, self.maxvalue+1, size=self.shape)).astype(self.dtype)
+                                self.maxvalue = self.maxvalue // self.numpy_tensor[0]
+                    else:
+                        self.numpy_tensor= numpy.empty(self.shape)
+                        num = self.numel()
+                        for i in range(num - 1):
+                            temp = numpy.random.randint(1, self.maxvalue+1)
+                            while self.maxvalue % temp:
+                               temp = numpy.random.randint(1, self.maxvalue+1)
+                            self.maxvalue = self.maxvalue // temp
+                            self.numpy_tensor[i] = temp
+                        self.numpy_tensor[num-1]=self.maxvalue
+                        self.numpy_tensor = self.numpy_tensor.astype(self.dtype)
+
             # s
             elif api_config.api_name in ["paddle.sum", "paddle.squeeze"]:
                 if self.check_arg(api_config, 1, "axis"):
@@ -316,6 +356,12 @@ class TensorConfig:
                         self.numpy_tensor = (numpy.random.random(self.shape) - 0.5).astype(dtype)
         return self.numpy_tensor
 
+    def set_maxvalue(self, maxvalue):
+        self.maxvalue = maxvalue
+
+    def set_fix(self, fix):
+        self.fix = fix
+        
     def get_paddle_tensor(self, api_config):
         if self.dtype in ["float8_e5m2", "float8_e4m3fn"]:
             print("Warning ", self.dtype, "not supported")
@@ -376,19 +422,19 @@ class TensorConfig:
     def fill_numpy_tensor(self, full_value):
         self.numpy_tensor = numpy.full(shape=self.shape, fill_value=full_value, dtype=self.dtype)
 
-    def check_arg(self, api_config, arg_pos=None, arg_name=None):
+    def check_arg(self, api_config, arg_pos=-1, arg_name=None):
         """Checks if the argument in api_config matches this instance"""
         if arg_name and arg_name in api_config.kwargs:
             return str(api_config.kwargs[arg_name]) == str(self)        
-        elif arg_pos and len(api_config.args) > arg_pos:
+        elif arg_pos > -1 and len(api_config.args) > arg_pos:
             return str(api_config.args[arg_pos]) == str(self)
         return False
     
-    def get_arg(self, api_config, arg_pos=None, arg_name=None):
+    def get_arg(self, api_config, arg_pos=-1, arg_name=None):
         """Get the argument value from the api_config"""
         if arg_name and arg_name in api_config.kwargs:
             return api_config.kwargs[arg_name]
-        elif arg_pos and len(api_config.args) > arg_pos:
+        elif arg_pos > -1 and len(api_config.args) > arg_pos:
             return api_config.args[arg_pos]
 
         return None

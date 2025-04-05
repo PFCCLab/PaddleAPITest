@@ -151,6 +151,8 @@ class APITestBase:
     def __init__(self, api_config):
         self.api_config = api_config
         self.outputs_grad_numpy = []
+        self.maxvalue = 0
+        self.fix = False
 
     def need_skip(self):
         # not support
@@ -273,9 +275,19 @@ class APITestBase:
         """处理 list 或 tuple """
         tmp = []
         for item in config_items:
+            if "int" in str(type(item)):
+                self.maxvalue //= abs(item)
+            if isinstance(item,TensorConfig):
+                last = config_items.index(item)
+        for item in config_items:
             if isinstance(item, TensorConfig):
+                item.set_maxvalue(self.maxvalue)
+                if config_items.index(item) == last:
+                    item.set_fix(True)
                 tmp.append(item.get_paddle_tensor(self.api_config))
+                self.maxvalue = item.maxvalue
             else:
+                item = paddle.to_tensor(item)
                 tmp.append(item)
         return tuple(tmp) if is_tuple else tmp
         
@@ -347,7 +359,9 @@ class APITestBase:
 
         for i in range(len(self.paddle_args_config)):
             if isinstance(self.paddle_args_config[i], TensorConfig):
+                self.paddle_args_config[i].set_maxvalue(self.maxvalue)
                 self.paddle_args.append(self.paddle_args_config[i].get_paddle_tensor(self.api_config))
+                self.maxvalue = self.paddle_args_config[i].numel()
             elif isinstance(self.paddle_args_config[i], list):
                 if need_axis_handling and i == 1:
                     self.paddle_args.append(self._handle_axis_arg(self.paddle_args_config[i]))
@@ -363,7 +377,9 @@ class APITestBase:
 
         for key, arg_config in self.paddle_kwargs_config.items():
             if isinstance(arg_config, TensorConfig):
+                arg_config.set_maxvalue(self.maxvalue)
                 self.paddle_kwargs[key] = arg_config.get_paddle_tensor(self.api_config)
+                self.maxvalue = arg_config.numel()
             elif isinstance(arg_config, list):
                 if need_axis_handling and key == "axis":
                     self.paddle_kwargs[key] = self._handle_axis_arg(arg_config)

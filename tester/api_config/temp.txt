@@ -1,0 +1,5 @@
+paddle.Tensor.reshape(Tensor([],"int64"), tuple(Tensor([],"int64"),1,), )
+paddle.Tensor.reshape(Tensor([],"int64"), tuple(Tensor([],"int64"),1,), ) 
+paddle.reshape(Tensor([1, 1],"float32"), list[Tensor([],"int32"),Tensor([],"int32"),], )
+paddle.reshape(Tensor([4, 256, 7332],"float32"), tuple(0,256,Tensor([],"int64"),Tensor([],"int64"),), )
+paddle.reshape(Tensor([],"float32"), Tensor([0],"int64"), )
