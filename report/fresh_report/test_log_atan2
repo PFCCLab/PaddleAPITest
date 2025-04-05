@@ -1,0 +1,21 @@
+python engine.py --paddle_only=True --api_config='paddle.atan2(Tensor([0, 0, 0],"float64"), Tensor([0],"float64"), )'
+test begin: paddle.atan2(Tensor([0, 0, 0],"float64"), Tensor([0],"float64"), )
+
+
+--------------------------------------
+C++ Traceback (most recent call last):
+--------------------------------------
+0   egr::Grad(std::vector<paddle::Tensor, std::allocator<paddle::Tensor> > const&, std::vector<paddle::Tensor, std::allocator<paddle::Tensor> > const&, std::vector<paddle::Tensor, std::allocator<paddle::Tensor> > const&, bool, bool, bool, bool, std::vector<paddle::Tensor, std::allocator<paddle::Tensor> > const&)
+1   egr::RunBackward(std::vector<paddle::Tensor, std::allocator<paddle::Tensor> > const&, std::vector<paddle::Tensor, std::allocator<paddle::Tensor> > const&, bool, bool, std::vector<paddle::Tensor, std::allocator<paddle::Tensor> > const&, bool, std::vector<paddle::Tensor, std::allocator<paddle::Tensor> > const&)
+2   ExpandGradNode::operator()(paddle::small_vector<std::vector<paddle::Tensor, std::allocator<paddle::Tensor> >, 15u>&, bool, bool)
+3   paddle::experimental::expand_grad(paddle::Tensor const&, paddle::Tensor const&, paddle::experimental::IntArrayBase<paddle::Tensor> const&, paddle::Tensor*)
+4   void phi::ExpandGradKernel<double, phi::CPUContext>(phi::CPUContext const&, phi::DenseTensor const&, phi::DenseTensor const&, paddle::experimental::IntArrayBase<phi::DenseTensor> const&, phi::DenseTensor*)
+
+----------------------
+Error Message Summary:
+----------------------
+FatalError: `Erroneous arithmetic operation` is detected by the operating system.
+  [TimeInfo: *** Aborted at 1743649492 (unix time) try "date -d @1743649492" if you are using GNU date ***]
+  [SignalInfo: *** SIGFPE (@0x7f63a557e8d7) received by PID 616 (TID 0x7f6369503700) from PID 18446744072188586199 ***]
+
+Floating point exception (core dumped)

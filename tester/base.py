@@ -1,7 +1,6 @@
 import random
 from .paddle_to_torch.paddle_to_torch import paddle_to_torch
 from .api_config import TensorConfig, APIConfig, analyse_configs, USE_CACHED_NUMPY, cached_numpy
-
 import re
 import collections
 import paddle
@@ -204,7 +203,7 @@ class APITestBase:
 
         return False
     def need_check_grad(self):
-        if not self.is_forward_only() and not (self.api_config.api_name == "paddle.assign" and isinstance(self.paddle_args[0], list)) and not (self.api_config.api_name == "paddle.assign" and len(self.paddle_args) > 1 and self.paddle_args[1] is not None):
+        if not self.is_forward_only() and not (self.api_config.api_name == "paddle.assign" and len(self.paddle_args) and isinstance(self.paddle_args[0], list)) and not (self.api_config.api_name == "paddle.assign" and len(self.paddle_args) > 1 and self.paddle_args[1] is not None):
             if len(self.api_config.args) > 0 and isinstance(self.api_config.args[0], TensorConfig):
                 dtype = self.api_config.args[0].dtype
                 if dtype in ['float32', 'float64', 'float16', 'complex64', 'complex128', 'bfloat16']:
@@ -457,7 +456,7 @@ class APITestBase:
                 result = result + value
             elif isinstance(value, tuple) and len(value) > 0 and isinstance(value[0], paddle.Tensor):
                 result = result + list(value)
-
+        
         return result
 
     def get_torch_input_list(self):

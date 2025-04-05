@@ -1,5 +1,4 @@
 from .api_config import TensorConfig, APIConfig, analyse_configs
-
 import re
 import collections
 import paddle

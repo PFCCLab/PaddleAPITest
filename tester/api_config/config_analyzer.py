@@ -90,6 +90,7 @@ class TensorConfig:
             numel = numel * i
         return numel
     
+
     def get_cached_numpy(self, dtype, shape):
         numel = 1
         for i in shape:
@@ -169,8 +170,63 @@ class TensorConfig:
                                 self.numpy_tensor = (numpy.random.random(self.shape) + 1.0).astype(dtype)
                             else:
                                 self.numpy_tensor = (numpy.random.random(self.shape) - 2.0).astype(dtype)                               
+            
+            elif api_config.api_name in ["paddle.argmax","paddle.argmin"]:  
+                if  self.check_arg(api_config, 1, "axis"):
+                    arr=self.get_arg(api_config,0,'x')                
+                    min_dim = min(arr.shape)
+                    indices = (numpy.random.randint(0, min_dim-1, size=self.numel())).astype("int64")
+                    self.numpy_tensor = indices.reshape(self.shape)
+                    self.dtype = "int64"
+                
+
+            elif api_config.api_name in ["paddle.atan2"]:
+                s1=self.get_arg(api_config,0)
+                s2=self.get_arg(api_config,1)
+                s1=s1.shape
+                s2=s2.shape
+                if numpy.all(s1 == 0) and numpy.all(s2 == 0):
+                    while len(s1)>len(s2):
+                        s2.append(0)
+                    while len(s2)>len(s1):
+                        s1.append(0)
+                self.numpy_tensor=numpy.random.random(s1)
             # b
             # c
+            elif api_config.api_name in ["paddle.chunk"]:
+                if self.check_arg(api_config, 2, "axis"):
+                    x_tensor = None
+                    if "x" in api_config.kwargs:
+                        x_tensor = api_config.kwargs["x"]
+                    else:
+                        x_tensor = api_config.args[0]
+                    chunks = None
+                    if "chunks" in api_config.kwargs:
+                        chunks = api_config.kwargs["chunks"]
+                    else:
+                        chunks = api_config.args[1]
+                    valid_axes = []
+                    for i, dim_size in enumerate(x_tensor.shape):
+                        if dim_size % chunks == 0:
+                            valid_axes.append(i)
+                    if not valid_axes:
+                        valid_axes = [0]
+                    chosen_axis = random.choice(valid_axes)
+                    if len(self.shape) == 0:  
+                        self.numpy_tensor = numpy.array(chosen_axis, dtype=self.dtype)
+                    elif len(self.shape) == 1:  
+                        if self.shape[0] == 1:
+                            self.numpy_tensor = numpy.array([chosen_axis], dtype=self.dtype)
+                        else:
+                            raise ValueError(
+                                f"Invalid shape for 'axis' Tensor in paddle.chunk. "
+                                f"Expected a 0-D or 1-D Tensor with 1 element, but got shape {self.shape}."
+                            )
+                    else:
+                        raise ValueError(
+                            f"Invalid shape for 'axis' Tensor in paddle.chunk. "
+                            f"Expected a 0-D or 1-D Tensor, but got shape {self.shape}."
+                        )
             # d
             # e
             elif api_config.api_name in ["paddle.eye"]:
@@ -194,12 +250,79 @@ class TensorConfig:
             elif api_config.api_name in ["paddle.logspace"]:
                 if self.check_arg(api_config, 2, "num"):
                     self.numpy_tensor = numpy.random.randint(1, 65535, size=self.shape)
+            elif api_config.api_name in ["paddle.linalg.cholesky"]:
+                if self.check_arg(api_config, 0, "x"):
+                    if len(self.shape) < 2 or self.shape[-1] != self.shape[-2]:
+                        raise ValueError("Shape must have at least 2 dimensions and last two dimensions must be equal")
+                    batch_dims = self.shape[:-2]
+                    matrix_dim = self.shape[-1]
+                    A = numpy.random.random(batch_dims + [matrix_dim, matrix_dim]).astype(self.dtype)
+                    if len(batch_dims) > 0:
+                        tensor = numpy.einsum('...ij,...kj->...ik', A, A)
+                    else:
+                        tensor = numpy.dot(A, A.T)
+                    tensor += numpy.eye(matrix_dim, dtype=self.dtype) * 1e-6
+                    print("cholesky tensor", tensor)
+                    self.numpy_tensor = tensor
+            elif api_config.api_name in ["paddle.linalg.cov"]:
+                if self.check_arg(api_config, 0, "x"):
+                    if len(self.shape) < 1 or len(self.shape) > 2:
+                        raise ValueError("Shape must have 1 or 2 dimensions for covariance input")
+                    tensor = numpy.random.random(self.shape).astype(self.dtype)
+                    tensor += numpy.random.random(self.shape).astype(self.dtype) * 1e-6
+                    self.numpy_tensor = tensor
+                elif self.check_arg(api_config, 3, "fweights"):
+                    x_shape = self.get_arg(api_config, 0, "x").shape
+                    rowvar = self.get_arg(api_config, 1, "rowvar")
+                    if rowvar is None:
+                        rowvar = True
+                    n_observations = (x_shape[1] if rowvar else x_shape[0]) if len(x_shape) > 1 else x_shape[0]
+                    self.numpy_tensor = numpy.random.randint(1, 11, size=(n_observations,)).astype(self.dtype)
+                elif self.check_arg(api_config, 4, "aweights"):
+                    x_shape = self.get_arg(api_config, 0, "x").shape
+                    rowvar = self.get_arg(api_config, 1, "rowvar")
+                    if rowvar is None:
+                        rowvar = True
+                    n_observations = (x_shape[1] if rowvar else x_shape[0]) if len(x_shape) > 1 else x_shape[0]
+                    if self.dtype in ["float32", "float64"]:
+                        self.numpy_tensor = numpy.random.uniform(0.1, 1.0, size=(n_observations,)).astype(self.dtype)
+                    else:
+                        self.numpy_tensor = numpy.random.randint(1, 11, size=(n_observations,)).astype(self.dtype)
+            elif api_config.api_name in ["paddle.linalg.eigh"]:
+                if self.check_arg(api_config, 0, "x"):
+                    if len(self.shape) < 2 or self.shape[-1] != self.shape[-2]:
+                        raise ValueError("Shape must have at least 2 dimensions and last two dimensions must be equal")
+                    batch_dims = self.shape[:-2]
+                    matrix_dim = self.shape[-1]
+                    A = numpy.random.random(batch_dims + [matrix_dim, matrix_dim]).astype(self.dtype)
+                    if self.dtype in ['complex64', 'complex128']:
+                        A = A + 1j * numpy.random.random(batch_dims + [matrix_dim, matrix_dim]).astype(self.dtype)
+                        tensor = A + A.swapaxes(-1, -2).conj()  # A + A^H
+                    else:
+                        if len(batch_dims) > 0:
+                            tensor = numpy.einsum('...ij,...kj->...ik', A, A)
+                        else:
+                            tensor = numpy.dot(A, A.T)
+                    tensor += numpy.eye(matrix_dim, dtype=self.dtype) * 1e-6
+                    self.numpy_tensor = tensor
+            elif api_config.api_name in ["paddle.linalg.lstsq"]:
+                if self.check_arg(api_config, 0, "x") or self.check_arg(api_config, 1, "y"):
+                    if len(self.shape) < 2:
+                        raise ValueError("Shape must have at least 2 dimensions for lstsq x")
+                    batch_dims = self.shape[:-2]
+                    M, N = self.shape[-2], self.shape[-1]
+                    self.numpy_tensor = numpy.random.random(batch_dims + [M, N]).astype(self.dtype)
             # m
             elif api_config.api_name in ["paddle.mean", "paddle.max", "paddle.min"]:
                 if self.check_arg(api_config, 1, "axis"):
                     self.numpy_tensor = self.generate_random_axes(api_config)
             # n
             # o
+            elif api_config.api_name in ["paddle.ones"]:
+                if api_config.api_name == "paddle.ones" and len(self.shape) == 0:
+                    self.numpy_tensor = numpy.array(random.randint(1, 2048), dtype=self.dtype)
+                else:
+                    self.numpy_tensor = numpy.random.randint(1, 65535, size=self.shape).astype(self.dtype)
             # p
             elif api_config.api_name in ["paddle.prod"]:
                 if self.check_arg(api_config, 1, "axis"):
@@ -250,7 +373,7 @@ class TensorConfig:
                     self.numpy_tensor = self.generate_random_axes(api_config)
             elif api_config.api_name in ["paddle.split"]:
                 if self.check_arg(api_config, 2, "axis"):
-                    x_shape = self.get_arg(api_config, 0, "x")
+                    x_shape = self.get_arg(api_config, 0, "x").shape
                     num_or_sections = self.get_arg(api_config, 1, "num_or_sections")
                     if isinstance(num_or_sections, (list, tuple)):
                         neg_one_count = sum(1 for x in num_or_sections if x == -1)
@@ -354,6 +477,7 @@ class TensorConfig:
                     else:
                         dtype = "float32" if self.dtype == "bfloat16" else self.dtype
                         self.numpy_tensor = (numpy.random.random(self.shape) - 0.5).astype(dtype)
+
         return self.numpy_tensor
 
     def set_maxvalue(self, maxvalue):
@@ -377,6 +501,7 @@ class TensorConfig:
                 if self.dtype == "bfloat16":
                     self.paddle_tensor = paddle.cast(self.paddle_tensor, dtype="uint16")
                 self.paddle_tensor.stop_gradient = False
+        
         return self.paddle_tensor
     
     def get_torch_tensor(self, api_config):
@@ -596,20 +721,44 @@ class APIConfig:
         result = result + ")"
         return result
 
-    def get_tocken(self, config, offset):
-        def is_int(tocken):
+    # def get_tocken(self, config, offset):
+    #     def is_int(tocken):
+    #         try:
+    #             int(tocken)
+    #             return True
+    #         except Exception as err:
+    #             return False
+    #     pattern = r'\b[A-Za-z0-9._+-]+\b|-[A-Za-z0-9._+-]+\b'
+    #     match = re.search(pattern, config[offset:])
+    #     if match:
+    #         if is_int(match.group()) and config[offset + match.start() + len(match.group())] == ".":
+    #             return match.group()+".", offset + match.start() + len(match.group()) + 1
+    #         return match.group(), offset + match.start() + len(match.group())
+    #     return None, None
+
+    def get_tocken(self,config, offset):
+        def is_int(token):
             try:
-                int(tocken)
+                int(token)
                 return True
             except Exception as err:
                 return False
-        pattern = r'\b[A-Za-z0-9._+-]+\b|-[A-Za-z0-9._+-]+\b'
+
+        # Modified pattern to handle decimal numbers starting with dot
+        pattern = r'\b[A-Za-z0-9._+-]+\b|-[A-Za-z0-9._+-]+\b|\.[0-9]+'
         match = re.search(pattern, config[offset:])
         if match:
-            if is_int(match.group()) and config[offset + match.start() + len(match.group())] == ".":
-                return match.group()+".", offset + match.start() + len(match.group()) + 1
-            return match.group(), offset + match.start() + len(match.group())
+            token = match.group()
+            # Handle the case where token starts with dot followed by digits
+            if token.startswith('.') and token[1:].isdigit():
+                return token, offset + match.start() + len(token)
+
+            if is_int(token) and offset + match.start() + len(token) < len(config) and config[
+                offset + match.start() + len(token)] == ".":
+                return token + ".", offset + match.start() + len(token) + 1
+            return token, offset + match.start() + len(token)
         return None, None
+
 
     def get_api(self, config):
         return config[0:config.index("(")], len(config[0:config.index("(")])
@@ -706,6 +855,8 @@ class APIConfig:
     def get_numpy_type(self, config, offset):
         config = config[offset:]
         numpy_type_str = config[config.index("(")+1:config.index(")")]
+        if numpy_type_str == "numpy.bool":
+            return numpy.bool_, offset+len(numpy_type_str)+2
         return eval(numpy_type_str), offset+len(numpy_type_str)+2
 
     def get_one_arg(self, tocken, config, offset):
@@ -732,6 +883,8 @@ class APIConfig:
         elif tocken is None:
             return None, None
         else:
+            if tocken[0]=='.':
+                tocken='0'+tocken
             value = eval(tocken)
         return value, offset
 
