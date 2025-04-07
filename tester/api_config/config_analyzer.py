@@ -674,8 +674,6 @@ class TensorConfig:
 
     def check_arg(self, api_config, arg_pos=-1, arg_name=None):
         """Checks if the argument in api_config matches this instance"""
-        if arg_pos is not None and 0 <= arg_pos < len(api_config.args):
-            return str(api_config.args[arg_pos]) == str(self)
         if arg_name and arg_name in api_config.kwargs:
             return str(api_config.kwargs[arg_name]) == str(self)        
         elif arg_pos > -1 and len(api_config.args) > arg_pos:
