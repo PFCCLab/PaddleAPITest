@@ -1,0 +1,1 @@
+paddle.expand(x=Tensor([2, 2],"int64"), shape=Tensor([3],"int32"), )

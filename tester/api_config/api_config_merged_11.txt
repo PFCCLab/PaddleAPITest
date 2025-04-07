@@ -1,0 +1,6 @@
+paddle.diag(x=Tensor([2],"float64"), name="test name", )
+paddle.divide(x=Tensor([3, 1],"float64"), y=Tensor([3, 2],"float64"), name="", )
+paddle.floor_divide(x=Tensor([3, 1],"int32"), y=Tensor([3, 1],"int32"), name="", )
+paddle.tanh(x=Tensor([2, 3, 4],"float64"), name="test name", )
+paddle.cumsum(Tensor([5, 6],"float64"), axis=Tensor([1],"int32"), )
+paddle.cumsum(Tensor([9, 10, 11],"float32"), axis=Tensor([1],"int64"), )

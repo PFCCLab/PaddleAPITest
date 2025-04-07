@@ -18,16 +18,12 @@ api_config_paddle_to_torch_faild = open(DIR_PATH+"/tester/api_config/test_log/ap
 
 not_support_api = ["paddle.Tensor.coalesce",
  "paddle.Tensor.is_coalesced",
- "paddle.gather",
- "paddle.Tensor.gather",
  "paddle.index_select",
  "paddle.Tensor.index_select",
  "paddle.Tensor.index_put",
  "paddle.Tensor.index_sample",
  "paddle.index_put",
  "paddle.index_sample",
- "paddle.gather_nd",
- "paddle.Tensor.gather_nd",
  "paddle.incubate.segment_max",
  "paddle.incubate.segment_mean",
  "paddle.incubate.segment_min",
@@ -268,7 +264,7 @@ class APITestBase:
 
         return True
     
-    def _handle_list_or_tuple(self, config_items, is_tuple=False):
+    def _handle_list_or_tuple(self, config_items, is_tuple=False,index=0):
         """处理 list 或 tuple """
         tmp = []
         for item in config_items:
@@ -276,6 +272,8 @@ class APITestBase:
                 tensor, self.api_config = item.get_paddle_tensor(self.api_config)
                 tmp.append(tensor)
             else:
+                if self.api_config.api_name == 'paddle.Tensor.expand' or self.api_config.api_name == 'paddle.expand':
+                    item = paddle.to_tensor(item, dtype="int64",)
                 item = paddle.to_tensor(item)
                 tmp.append(item)
         return tuple(tmp) if is_tuple else tmp
@@ -346,21 +344,21 @@ class APITestBase:
 
         need_axis_handling = self.api_config.api_name in handle_axes_api
 
-        len_args = len(self.paddle_args_config)
         for i in range(len(self.paddle_args_config)):
             if isinstance(self.paddle_args_config[i], TensorConfig):
                 tensor, self.api_config = self.paddle_args_config[i].get_paddle_tensor(self.api_config)
                 self.paddle_args.append(tensor)
+
             elif isinstance(self.paddle_args_config[i], list):
                 if need_axis_handling and i == 1:
                     self.paddle_args.append(self._handle_axis_arg(self.paddle_args_config[i]))
                 else:
-                    self.paddle_args.append(self._handle_list_or_tuple(self.paddle_args_config[i]))
+                    self.paddle_args.append(self._handle_list_or_tuple(self.paddle_args_config[i],index=i))
             elif isinstance(self.paddle_args_config[i], tuple):
                 if need_axis_handling and i == 1:
                     self.paddle_args.append(self._handle_axis_arg(self.paddle_args_config[i], is_tuple=True))
                 else:
-                    self.paddle_args.append(self._handle_list_or_tuple(self.paddle_args_config[i], is_tuple=True))
+                    self.paddle_args.append(self._handle_list_or_tuple(self.paddle_args_config[i], is_tuple=True,index=i))
             else:
                 self.paddle_args.append(self.paddle_args_config[i])
 

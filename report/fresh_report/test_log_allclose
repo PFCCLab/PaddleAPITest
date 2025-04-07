@@ -1,0 +1,1 @@
+paddle.allclose(x=Tensor([0],"float64"), y=Tensor([0],"float64"), )

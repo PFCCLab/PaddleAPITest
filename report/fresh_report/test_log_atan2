@@ -1,6 +1,6 @@
+paddle.atan2(Tensor([0],"float64"), Tensor([0, 0],"float64"), )
 python engine.py --paddle_only=True --api_config='paddle.atan2(Tensor([0, 0, 0],"float64"), Tensor([0],"float64"), )'
 test begin: paddle.atan2(Tensor([0, 0, 0],"float64"), Tensor([0],"float64"), )
-
 
 --------------------------------------
 C++ Traceback (most recent call last):
