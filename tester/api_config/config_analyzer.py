@@ -90,7 +90,6 @@ class TensorConfig:
         for i in self.shape:
             numel = numel * i
         return numel
-    
 
     def get_cached_numpy(self, dtype, shape):
         numel = 1
@@ -107,16 +106,16 @@ class TensorConfig:
                 cached_numpy[dtype] = (numpy.random.random([4300000000]) - 0.5).astype(dtype)
                 tensor = cached_numpy[dtype][:numel].reshape(shape)
         return tensor
-    
+
     def generate_random_axes(self, api_config):
         if "x" in api_config.kwargs:
             max_dim = len(api_config.kwargs["x"].shape)
         else:
             max_dim = len(api_config.args[0].shape)
-        
+
         if max_dim == 0:
             max_dim = 1 # scalar
-            
+
         shape_len = len(self.shape)
         if shape_len == 0:
             dim = random.randint(0, max_dim - 1)
@@ -137,7 +136,6 @@ class TensorConfig:
                 f"Invalid shape for 'axis' Tensor in {api_config.api_name}. "
                 f"Expected a 0-D or 1-D Tensor, but got shape {self.shape}."
             )
-    
 
     def get_numpy_tensor(self, api_config):
         index = self.index
@@ -180,7 +178,6 @@ class TensorConfig:
                     indices = (numpy.random.randint(0, min_dim-1, size=self.numel())).astype("int64")
                     self.numpy_tensor = indices.reshape(self.shape)
                     self.dtype = "int64"
-                
 
             elif api_config.api_name in ["paddle.atan2"]:
                 s1=self.get_arg(api_config,0)
@@ -197,16 +194,8 @@ class TensorConfig:
             # c
             elif api_config.api_name in ["paddle.chunk"]:
                 if self.check_arg(api_config, 2, "axis"):
-                    x_tensor = None
-                    if "x" in api_config.kwargs:
-                        x_tensor = api_config.kwargs["x"]
-                    else:
-                        x_tensor = api_config.args[0]
-                    chunks = None
-                    if "chunks" in api_config.kwargs:
-                        chunks = api_config.kwargs["chunks"]
-                    else:
-                        chunks = api_config.args[1]
+                    x_tensor = self.get_arg(api_config, 0, "x")
+                    chunks = self.get_arg(api_config, 1, "chunks")
                     valid_axes = []
                     for i, dim_size in enumerate(x_tensor.shape):
                         if dim_size % chunks == 0:
@@ -237,6 +226,31 @@ class TensorConfig:
                 return self.numpy_tensor
             # d
             # e
+            elif api_config.api_name in ["paddle.empty"]:
+                is_shape_param = False
+                if len(api_config.args) > 0:
+                    if self.check_arg(api_config, 0, "shape"):
+                        is_shape_param = True
+                    elif isinstance(api_config.args[0], list):
+                        for item in api_config.args[0]:
+                            if str(item) == str(self):
+                                is_shape_param = True
+                                break
+                if "shape" in api_config.kwargs:
+                    if str(api_config.kwargs["shape"]) == str(self):
+                        is_shape_param = True
+                    elif isinstance(api_config.kwargs["shape"], list):
+                        for item in api_config.kwargs["shape"]:
+                            if str(item) == str(self):
+                                is_shape_param = True
+                                break
+                if is_shape_param:
+                    if "int" in self.dtype:
+                        self.numpy_tensor = numpy.random.randint(1, 10, size=self.shape).astype(self.dtype)
+                    else:
+                        dtype = "int32"
+                        self.numpy_tensor = numpy.random.randint(1, 10, size=self.shape).astype(dtype)
+                        self.dtype = dtype 
             elif api_config.api_name in ["paddle.eye"]:
                 self.numpy_tensor = numpy.random.randint(0, 2048, size = self.shape)
 
@@ -255,8 +269,6 @@ class TensorConfig:
             elif api_config.api_name in ["paddle.expand_as"]:
                 if self.dtype=='float16':
                     self.dtype='float32'
-                    
-
             # f
             elif api_config.api_name in ["paddle.full"]:
                 if self.check_arg(api_config, 1, "fill_value"):
@@ -268,6 +280,12 @@ class TensorConfig:
                 else:
                     self.numpy_tensor = (numpy.random.randint(0, 2048, size=self.shape)).astype(self.dtype)
             # g
+            elif api_config.api_name in ["paddle.gammainc", "paddle.gammaincc"]:
+                if "int" in self.dtype:
+                    self.numpy_tensor = numpy.random.randint(0, 65535, size=self.shape).astype(self.dtype)
+                else:
+                    dtype = "float32" if self.dtype == "bfloat16" else self.dtype
+                    self.numpy_tensor = numpy.abs(numpy.random.random(self.shape)).astype(dtype)
             # h
             # i
             # j
@@ -338,6 +356,20 @@ class TensorConfig:
                     batch_dims = self.shape[:-2]
                     M, N = self.shape[-2], self.shape[-1]
                     self.numpy_tensor = numpy.random.random(batch_dims + [M, N]).astype(self.dtype)
+            elif api_config.api_name in ["paddle.linalg.lu_unpack"]:
+                if self.check_arg(api_config, 0, "x"):
+                    if len(self.shape) < 2:
+                        raise ValueError("Shape must have at least 2 dimensions for LU matrix")
+                    batch_dims = self.shape[:-2]
+                    LU_tensor = numpy.random.random(self.shape).astype(self.dtype)
+                    K = min(self.shape[-2], self.shape[-1])
+                    LU_tensor[..., range(K), range(K)] += 1e-6
+                    self.numpy_tensor = LU_tensor
+                if self.check_arg(api_config, 1, "pivot"):
+                    M = self.get_arg(api_config, 0, "x").shape[-2]
+                    self.numpy_tensor = numpy.random.randint(1, M + 1, size=self.shape).astype(self.dtype)
+            elif api_config.api_name in ["paddle.linalg.pca_lowrank"]:
+                self.numpy_tensor = numpy.random.randn(*self.shape).astype(self.dtype)
             # m
             elif api_config.api_name in ["paddle.mean", "paddle.max", "paddle.min"]:
                 if self.check_arg(api_config, 1, "axis"):
@@ -427,7 +459,7 @@ class TensorConfig:
                         raise ValueError(
                             f"num_or_sections must be an int, list, or tuple, but got {type(num_or_sections)}"
                         )
-                    
+
                     target_dim = None
                     max_dim = len(x_shape)
                     if max_dim == 0:
@@ -446,7 +478,7 @@ class TensorConfig:
                         raise ValueError(
                             f"No valid axis found for paddle.split with x.shape={x_shape} and num_or_sections={num_or_sections}"
                         )
-                        
+
                     shape_len = len(self.shape)
                     if shape_len == 0:
                         self.numpy_tensor = numpy.array(target_dim, dtype=self.dtype)
@@ -520,9 +552,7 @@ class TensorConfig:
             # u
             elif api_config.api_name in ["paddle.unsqueeze"]:
                 if self.check_arg(api_config, 1, "axis"):
-                    max_dim = len(self.get_arg(api_config, 0, "x").shape)
-                    max_dim += 1
-
+                    max_dim = len(self.get_arg(api_config, 0, "x").shape) + 1
                     shape_len = len(self.shape)
                     if shape_len == 0:
                         dim = random.randint(0, max_dim - 1)
@@ -566,7 +596,6 @@ class TensorConfig:
                     else:
                         dtype = "float32" if self.dtype == "bfloat16" else self.dtype
                         self.numpy_tensor = (numpy.random.random(self.shape) - 0.5).astype(dtype)
-
         return self.numpy_tensor, api_config
     
     def set_index(self,index):
@@ -594,10 +623,10 @@ class TensorConfig:
             if self.dtype in ['float32', 'float64', 'float16', 'complex64', 'complex128', 'bfloat16']:
                 if self.dtype == "bfloat16":
                     self.paddle_tensor = paddle.cast(self.paddle_tensor, dtype="uint16")
-                self.paddle_tensor.stop_gradient = False
-        
+                self.paddle_tensor.stop_gradient = False 
+                
         return self.paddle_tensor, api_config
-    
+      
     def get_torch_tensor(self, api_config):
         if self.dtype in ["float8_e5m2", "float8_e4m3fn"]:
             print("Warning ", self.dtype, "not supported")
@@ -616,8 +645,9 @@ class TensorConfig:
             )
             if self.dtype == "bfloat16":
                 self.torch_tensor = self.torch_tensor.to(dtype=torch.bfloat16)
+
         return self.torch_tensor, api_config
-    
+      
     def clear_tensor(self):
         self.torch_tensor = None
         self.paddle_tensor = None
@@ -629,7 +659,7 @@ class TensorConfig:
         del self.paddle_tensor
         self.paddle_tensor = None
         paddle.device.cuda.empty_cache()
-    
+
     def clear_numpy_tensors(self):
         del self.numpy_tensor
         self.numpy_tensor = None
@@ -651,7 +681,7 @@ class TensorConfig:
         elif arg_pos > -1 and len(api_config.args) > arg_pos:
             return str(api_config.args[arg_pos]) == str(self)
         return False
-    
+
     def get_arg(self, api_config, arg_pos=-1, arg_name=None):
         """Get the argument value from the api_config"""
         if arg_name and arg_name in api_config.kwargs:

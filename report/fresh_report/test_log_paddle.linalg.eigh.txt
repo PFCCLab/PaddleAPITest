@@ -1,0 +1,16 @@
+paddle.linalg.eigh(Tensor([0, 0],"float32"), )
+paddle.linalg.eigh(Tensor([0, 5, 5],"float32"), )
+
+2025-04-03 18:56:22.373744 test begin: paddle.linalg.eigh(Tensor([0, 0],"float32"), )
+W0403 18:56:22.480055 33412 gpu_resources.cc:119] Please NOTE: device: 0, GPU Compute Capability: 8.9, Driver API Version: 12.6, Runtime API Version: 11.8
+W0403 18:56:22.481508 33412 gpu_resources.cc:164] device: 0, cuDNN Version: 8.9.
+W0403 18:56:22.489950 33412 backward.cc:437] While running Node (EighGradNode) raises an EnforceNotMet exception
+[paddle error] paddle.linalg.eigh(Tensor([0, 0],"float32"), )
+ (PreconditionNotMet) Tensor holds no memory. Call Tensor::mutable_data firstly.
+  [Hint: holder_ should not be null.] (at ..\paddle\phi\core\dense_tensor_impl.cc:46)
+
+2025-04-03 18:56:22.490968 test begin: paddle.linalg.eigh(Tensor([0, 5, 5],"float32"), )
+W0403 18:56:22.496976 16892 backward.cc:437] While running Node (EighGradNode) raises an EnforceNotMet exception
+[paddle error] paddle.linalg.eigh(Tensor([0, 5, 5],"float32"), )
+ (PreconditionNotMet) Tensor holds no memory. Call Tensor::mutable_data firstly.
+  [Hint: holder_ should not be null.] (at ..\paddle\phi\core\dense_tensor_impl.cc:46)

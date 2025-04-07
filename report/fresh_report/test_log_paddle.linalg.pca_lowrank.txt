@@ -1,0 +1,78 @@
+paddle.linalg.pca_lowrank(Tensor([1, 100, 4],"float64"), q=2, )
+paddle.linalg.pca_lowrank(Tensor([1, 100, 4],"float64"), q=4, )
+paddle.linalg.pca_lowrank(Tensor([1, 100, 40],"float64"), q=12, )
+paddle.linalg.pca_lowrank(Tensor([1, 100, 40],"float64"), q=6, )
+paddle.linalg.pca_lowrank(Tensor([1, 100, 40],"float64"), q=8, )
+paddle.linalg.pca_lowrank(Tensor([1, 17, 4],"float64"), q=2, )
+paddle.linalg.pca_lowrank(Tensor([1, 17, 4],"float64"), q=4, )
+paddle.linalg.pca_lowrank(Tensor([1, 4, 100],"float64"), q=2, )
+paddle.linalg.pca_lowrank(Tensor([1, 4, 100],"float64"), q=4, )
+paddle.linalg.pca_lowrank(Tensor([1, 4, 17],"float64"), q=2, )
+paddle.linalg.pca_lowrank(Tensor([1, 4, 17],"float64"), q=4, )
+paddle.linalg.pca_lowrank(Tensor([1, 40, 100],"float64"), q=12, )
+paddle.linalg.pca_lowrank(Tensor([1, 40, 100],"float64"), q=6, )
+paddle.linalg.pca_lowrank(Tensor([1, 40, 100],"float64"), q=8, )
+paddle.linalg.pca_lowrank(Tensor([100, 4],"float64"), q=2, )
+paddle.linalg.pca_lowrank(Tensor([100, 4],"float64"), q=4, )
+paddle.linalg.pca_lowrank(Tensor([100, 40],"float64"), q=12, )
+paddle.linalg.pca_lowrank(Tensor([100, 40],"float64"), q=6, )
+paddle.linalg.pca_lowrank(Tensor([100, 40],"float64"), q=8, )
+paddle.linalg.pca_lowrank(Tensor([17, 4],"float64"), q=2, )
+paddle.linalg.pca_lowrank(Tensor([17, 4],"float64"), q=4, )
+paddle.linalg.pca_lowrank(Tensor([2, 3, 100, 4],"float64"), q=2, )
+paddle.linalg.pca_lowrank(Tensor([2, 3, 100, 4],"float64"), q=4, )
+paddle.linalg.pca_lowrank(Tensor([2, 3, 100, 40],"float64"), q=12, )
+paddle.linalg.pca_lowrank(Tensor([2, 3, 100, 40],"float64"), q=6, )
+paddle.linalg.pca_lowrank(Tensor([2, 3, 100, 40],"float64"), q=8, )
+paddle.linalg.pca_lowrank(Tensor([2, 3, 17, 4],"float64"), q=2, )
+paddle.linalg.pca_lowrank(Tensor([2, 3, 17, 4],"float64"), q=4, )
+paddle.linalg.pca_lowrank(Tensor([2, 3, 4, 100],"float64"), q=2, )
+paddle.linalg.pca_lowrank(Tensor([2, 3, 4, 100],"float64"), q=4, )
+paddle.linalg.pca_lowrank(Tensor([2, 3, 4, 17],"float64"), q=2, )
+paddle.linalg.pca_lowrank(Tensor([2, 3, 4, 17],"float64"), q=4, )
+paddle.linalg.pca_lowrank(Tensor([2, 3, 40, 100],"float64"), q=12, )
+paddle.linalg.pca_lowrank(Tensor([2, 3, 40, 100],"float64"), q=6, )
+paddle.linalg.pca_lowrank(Tensor([2, 3, 40, 100],"float64"), q=8, )
+paddle.linalg.pca_lowrank(Tensor([3, 100, 4],"float64"), q=2, )
+paddle.linalg.pca_lowrank(Tensor([3, 100, 4],"float64"), q=4, )
+paddle.linalg.pca_lowrank(Tensor([3, 100, 40],"float64"), q=12, )
+paddle.linalg.pca_lowrank(Tensor([3, 100, 40],"float64"), q=6, )
+paddle.linalg.pca_lowrank(Tensor([3, 100, 40],"float64"), q=8, )
+paddle.linalg.pca_lowrank(Tensor([3, 17, 4],"float64"), q=2, )
+paddle.linalg.pca_lowrank(Tensor([3, 17, 4],"float64"), q=4, )
+paddle.linalg.pca_lowrank(Tensor([3, 4, 100],"float64"), q=2, )
+paddle.linalg.pca_lowrank(Tensor([3, 4, 100],"float64"), q=4, )
+paddle.linalg.pca_lowrank(Tensor([3, 4, 17],"float64"), q=2, )
+paddle.linalg.pca_lowrank(Tensor([3, 4, 17],"float64"), q=4, )
+paddle.linalg.pca_lowrank(Tensor([3, 40, 100],"float64"), q=12, )
+paddle.linalg.pca_lowrank(Tensor([3, 40, 100],"float64"), q=6, )
+paddle.linalg.pca_lowrank(Tensor([3, 40, 100],"float64"), q=8, )
+paddle.linalg.pca_lowrank(Tensor([4, 100],"float64"), q=2, )
+paddle.linalg.pca_lowrank(Tensor([4, 100],"float64"), q=4, )
+paddle.linalg.pca_lowrank(Tensor([4, 17],"float64"), q=2, )
+paddle.linalg.pca_lowrank(Tensor([4, 17],"float64"), q=4, )
+paddle.linalg.pca_lowrank(Tensor([40, 100],"float64"), q=12, )
+paddle.linalg.pca_lowrank(Tensor([40, 100],"float64"), q=6, )
+paddle.linalg.pca_lowrank(Tensor([40, 100],"float64"), q=8, )
+paddle.linalg.pca_lowrank(Tensor([5, 5],"float64"), None, center=False, )
+
+test begin: paddle.linalg.pca_lowrank(Tensor([1, 100, 4],"float64"), q=2, )
+W0407 05:27:42.897972 28584 gpu_resources.cc:119] Please NOTE: device: 0, GPU Compute Capability: 6.1, Driver API Version: 12.0, Runtime API Version: 11.8
+W0407 05:27:42.899061 28584 gpu_resources.cc:164] device: 0, cuDNN Version: 8.8.
+
+
+--------------------------------------
+C++ Traceback (most recent call last):
+--------------------------------------
+0   egr::Grad(std::vector<paddle::Tensor, std::allocator<paddle::Tensor> > const&, std::vector<paddle::Tensor, std::allocator<paddle::Tensor> > const&, std::vector<paddle::Tensor, std::allocator<paddle::Tensor> > const&, bool, bool, bool, bool, std::vector<paddle::Tensor, std::allocator<paddle::Tensor> > const&)
+1   egr::RunBackward(std::vector<paddle::Tensor, std::allocator<paddle::Tensor> > const&, std::vector<paddle::Tensor, std::allocator<paddle::Tensor> > const&, bool, bool, std::vector<paddle::Tensor, std::allocator<paddle::Tensor> > const&, bool, std::vector<paddle::Tensor, std::allocator<paddle::Tensor> > const&)
+2   QrGradNode::operator()(paddle::small_vector<std::vector<paddle::Tensor, std::allocator<paddle::Tensor> >, 15u>&, bool, bool)
+3   paddle::experimental::qr_grad(paddle::Tensor const&, paddle::Tensor const&, paddle::Tensor const&, paddle::Tensor const&, paddle::Tensor const&, std::string const&, paddle::Tensor*)
+4   void phi::QrGradKernel<double, phi::GPUContext>(phi::GPUContext const&, phi::DenseTensor const&, phi::DenseTensor const&, phi::DenseTensor const&, phi::DenseTensor const&, phi::DenseTensor const&, std::string const&, phi::DenseTensor*)
+
+----------------------
+Error Message Summary:
+----------------------
+FatalError: `Segmentation fault` is detected by the operating system.
+  [TimeInfo: *** Aborted at 1744003680 (unix time) try "date -d @1744003680" if you are using GNU date ***]
+  [SignalInfo: *** SIGSEGV (@0x0) received by PID 28472 (TID 0x7f2a0437d700) from PID 0 ***]

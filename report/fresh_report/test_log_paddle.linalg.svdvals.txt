@@ -1,0 +1,7 @@
+paddle.linalg.svdvals(Tensor([1, 12, 10],"float32"), )
+
+2025-04-07 05:55:26.734700 test begin: paddle.linalg.svdvals(Tensor([1, 12, 10],"float32"), )
+W0407 05:55:26.739182  4685 backward.cc:437] While running Node (SvdvalsGradNode) raises an EnforceNotMet exception
+[paddle error] paddle.linalg.svdvals(Tensor([1, 12, 10],"float32"), ) 
+ (InvalidArgument) Input(X) has error dim.X'dims[2] must be equal to 1But received X'dims[2] is 10
+  [Hint: Expected x_dims[x_ndim - 1] == N, but received x_dims[x_ndim - 1]:10 != N:1.] (at ../paddle/phi/kernels/impl/matmul_kernel_impl.h:252)

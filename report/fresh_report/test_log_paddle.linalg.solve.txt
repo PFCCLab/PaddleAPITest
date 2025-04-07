@@ -1,0 +1,9 @@
+paddle.linalg.solve(Tensor([10, 0, 0],"float32"), Tensor([10, 0, 0],"float32"), left=False, )
+
+2025-04-03 18:54:32.284660 test begin: paddle.linalg.solve(Tensor([10, 0, 0],"float32"), Tensor([10, 0, 0],"float32"), left=False, )
+W0403 18:54:32.457536  6860 gpu_resources.cc:119] Please NOTE: device: 0, GPU Compute Capability: 8.9, Driver API Version: 12.6, Runtime API Version: 11.8
+W0403 18:54:32.457536  6860 gpu_resources.cc:164] device: 0, cuDNN Version: 8.9.
+W0403 18:54:32.484033  6860 backward.cc:437] While running Node (SolveGradNode) raises an EnforceNotMet exception
+[paddle error] paddle.linalg.solve(Tensor([10, 0, 0],"float32"), Tensor([10, 0, 0],"float32"), left=False, )
+ (InvalidArgument) The value of target shape cannot be zero.
+  [Hint: Expected target_shape[i] != 0, but received target_shape[i]:0 == 0:0.] (at C:\home\workspace\Paddle\paddle\phi\kernels\gpu\expand_as_kernel.cu:49)

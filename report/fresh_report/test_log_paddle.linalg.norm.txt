@@ -1,0 +1,9 @@
+paddle.linalg.norm(Tensor([2, 3, 4, 5],"bfloat16"), 2.0, 1, False, )
+
+2025-04-03 18:51:47.631661 test begin: paddle.linalg.norm(Tensor([2, 3, 4, 5],"bfloat16"), 2.0, 1, False, )
+W0403 18:51:47.783756 31756 gpu_resources.cc:119] Please NOTE: device: 0, GPU Compute Capability: 8.9, Driver API Version: 12.6, Runtime API Version: 11.8
+W0403 18:51:47.783756 31756 gpu_resources.cc:164] device: 0, cuDNN Version: 8.9.
+W0403 18:51:47.795517 31756 backward.cc:437] While running Node (PNormGradNode) raises an EnforceNotMet exception
+[paddle error] paddle.linalg.norm(Tensor([2, 3, 4, 5],"bfloat16"), 2.0, 1, False, )
+ (InvalidArgument) The type of data we are trying to retrieve (float32) does not match the type of data (bfloat16) currently contained in the container.
+  [Hint: Expected dtype() == phi::CppTypeToDataType<T>::Type(), but received dtype():16 != phi::CppTypeToDataType<T>::Type():10.] (at ..\paddle\phi\core\dense_tensor.cc:160)

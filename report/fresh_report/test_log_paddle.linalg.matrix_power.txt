@@ -1,0 +1,11 @@
+paddle.linalg.matrix_power(Tensor([0, 0],"float32"), 2, )
+paddle.linalg.matrix_power(Tensor([2, 3, 0, 0],"float32"), 2, )
+
+2025-04-03 18:55:10.684461 test begin: paddle.linalg.matrix_power(Tensor([2, 3, 0, 0],"float32"), 2, )
+W0403 18:55:10.848007 14524 gpu_resources.cc:119] Please NOTE: device: 0, GPU Compute Capability: 8.9, Driver API Version: 12.6, Runtime API Version: 11.8
+W0403 18:55:10.849243 14524 gpu_resources.cc:164] device: 0, cuDNN Version: 8.9.
+ ** On entry to SgemmStridedBatched parameter number 8 had an illegal value
+W0403 18:55:10.944617 14524 backward.cc:437] While running Node (MatrixPowerGradNode) raises an EnforceNotMet exception
+[paddle error] paddle.linalg.matrix_power(Tensor([2, 3, 0, 0],"float32"), 2, )
+ (External) CUBLAS error(7).
+  [Hint: 'CUBLAS_STATUS_INVALID_VALUE'.  An unsupported value or parameter was passed to the function (a negative vector size, for example). To correct: ensure that all the parameters being passed have valid values. ] (at ../paddle/phi/kernels/funcs/blas/blas_impl.cu.h:77)

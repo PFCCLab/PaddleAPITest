@@ -16,6 +16,7 @@ DIR_PATH = os.path.dirname(os.path.realpath(__file__))[0:os.path.dirname(os.path
 
 api_config_paddle_to_torch_faild = open(DIR_PATH+"/tester/api_config/test_log/api_config_paddle_to_torch_faild.txt", "a")
 
+# Todo: check paddle.linalg.pca_lowrank @cangtianhuang
 not_support_api = ["paddle.Tensor.coalesce",
  "paddle.Tensor.is_coalesced",
  "paddle.index_select",
@@ -111,7 +112,6 @@ rand_apis = ["paddle.rand",
     "paddle.cauchy_",
     "paddle.geometric_",
     "paddle.empty_like",
-    "paddle.empty",
     "paddle.linalg.eigvals",
     "paddle.linalg.eigvalsh",
     "paddle.incubate.nn.functional.fused_bias_dropout_residual_layer_norm",
@@ -197,14 +197,18 @@ class APITestBase:
 
         return False
     def need_check_grad(self):
-        if not self.is_forward_only() and not (self.api_config.api_name == "paddle.assign" and len(self.paddle_args) and isinstance(self.paddle_args[0], list)) and not (self.api_config.api_name == "paddle.assign" and len(self.paddle_args) > 1 and self.paddle_args[1] is not None):
-            if len(self.api_config.args) > 0 and isinstance(self.api_config.args[0], TensorConfig):
-                dtype = self.api_config.args[0].dtype
-                if dtype in ['float32', 'float64', 'float16', 'complex64', 'complex128', 'bfloat16']:
-                    return True
+        if self.is_forward_only():
+            return False
+        if self.api_config.api_name == "paddle.assign":
+            if (len(self.paddle_args) and isinstance(self.paddle_args[0], list)) or \
+            (len(self.paddle_args) > 1 and self.paddle_args[1] is not None):
                 return False
-            return True
-        return False
+        if len(self.api_config.args) > 0 and isinstance(self.api_config.args[0], TensorConfig):
+            dtype = self.api_config.args[0].dtype
+            if dtype in ['float32', 'float64', 'float16', 'complex64', 'complex128', 'bfloat16']:
+                return True
+            return False
+        return True
 
     def ana_api_info(self):
         if not self.ana_paddle_api_info():
@@ -347,8 +351,7 @@ class APITestBase:
         for i in range(len(self.paddle_args_config)):
             if isinstance(self.paddle_args_config[i], TensorConfig):
                 tensor, self.api_config = self.paddle_args_config[i].get_paddle_tensor(self.api_config)
-                self.paddle_args.append(tensor)
-
+                self.paddle_args.append(tensor)  
             elif isinstance(self.paddle_args_config[i], list):
                 if need_axis_handling and i == 1:
                     self.paddle_args.append(self._handle_axis_arg(self.paddle_args_config[i]))
@@ -380,6 +383,12 @@ class APITestBase:
 
         if len(self.paddle_args) == 0 and "paddle.Tensor." in self.api_config.api_name:
             self.paddle_args.append(self.paddle_kwargs.popitem(last=False)[1])
+
+        if self.api_config.api_name == "paddle.linalg.lstsq" and 'gpu' in paddle.device.get_device():
+            if len(self.paddle_args) > 3:
+                self.paddle_args[3] = "gels"
+            elif "driver" in self.paddle_kwargs:
+                self.paddle_kwargs["driver"] = "gels"
 
         if self.need_check_grad():
             if (self.api_config.api_name[-1] == "_" and self.api_config.api_name[-2:] != "__") or self.api_config.api_name == "paddle.Tensor.__setitem__":
