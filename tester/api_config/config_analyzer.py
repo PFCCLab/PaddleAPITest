@@ -41,10 +41,9 @@ class TensorConfig:
         self.numpy_tensor = None
         self.paddle_tensor = None
         self.torch_tensor = None
-        self.maxvalue = None
-        self.fix = None
         self.index = -2
         self.key = "null"
+        self.fix = False
     def __deepcopy__(self, memo):
         cls = self.__class__
         result = cls.__new__(cls)
@@ -332,7 +331,9 @@ class TensorConfig:
             # q
             # r
             elif api_config.api_name in ["paddle.Tensor.reshape","paddle.reshape"]:
-                if self.index == 1 or "shape" == self.key:
+                if self.index == 0 or "x" == self.key:
+                    api_config.maxvalue = self.numel() // api_config.intnum
+                elif self.index == 1 or "shape" == self.key:
                     flag = True
                     if "shape" == self.key:
                         if "Tensor" in str(type((api_config.kwargs["shape"]))):
@@ -342,31 +343,31 @@ class TensorConfig:
                             flag = False
                     self.dtype = "int32"
                     if flag:
-                        if self.fix is not None and self.fix:
+                        if self.fix:
                             if self.shape == []:
-                                self.numpy_tensor = self.maxvalue
+                                self.numpy_tensor = api_config.maxvalue
                             else:
-                                self.numpy_tensor = [self.maxvalue]
+                                self.numpy_tensor = [api_config.maxvalue]
                         else:
-                            self.numpy_tensor = (numpy.random.randint(1, self.maxvalue+1, size=self.shape)).astype(self.dtype)
+                            self.numpy_tensor = (numpy.random.randint(1, api_config.maxvalue+1, size=self.shape)).astype(self.dtype)
                             if self.shape == []:
-                                while self.maxvalue % self.numpy_tensor:
-                                    self.numpy_tensor = (numpy.random.randint(1, self.maxvalue+1, size=self.shape)).astype(self.dtype)
-                                self.maxvalue = self.maxvalue // self.numpy_tensor
+                                while api_config.maxvalue % self.numpy_tensor:
+                                    self.numpy_tensor = (numpy.random.randint(1, api_config.maxvalue+1, size=self.shape)).astype(self.dtype)
+                                api_config.maxvalue = api_config.maxvalue // self.numpy_tensor
                             else:
-                                while self.maxvalue % self.numpy_tensor[0]:
-                                    self.numpy_tensor = (numpy.random.randint(1, self.maxvalue+1, size=self.shape)).astype(self.dtype)
-                                self.maxvalue = self.maxvalue // self.numpy_tensor[0]
+                                while api_config.maxvalue % self.numpy_tensor[0]:
+                                    self.numpy_tensor = (numpy.random.randint(1, api_config.maxvalue+1, size=self.shape)).astype(self.dtype)
+                                api_config.maxvalue = api_config.maxvalue // self.numpy_tensor[0]
                     else:
                         self.numpy_tensor= numpy.empty(self.shape)
                         num = self.numel()
                         for i in range(num - 1):
-                            temp = numpy.random.randint(1, self.maxvalue+1)
-                            while self.maxvalue % temp:
-                               temp = numpy.random.randint(1, self.maxvalue+1)
-                            self.maxvalue = self.maxvalue // temp
+                            temp = numpy.random.randint(1, api_config.maxvalue+1)
+                            while api_config.maxvalue % temp:
+                               temp = numpy.random.randint(1, api_config.maxvalue+1)
+                            api_config.maxvalue = api_config.maxvalue // temp
                             self.numpy_tensor[i] = temp
-                        self.numpy_tensor[num-1]=self.maxvalue
+                        self.numpy_tensor[num-1]=api_config.maxvalue
                         self.numpy_tensor = self.numpy_tensor.astype(self.dtype)
 
             # s
@@ -480,19 +481,16 @@ class TensorConfig:
                         dtype = "float32" if self.dtype == "bfloat16" else self.dtype
                         self.numpy_tensor = (numpy.random.random(self.shape) - 0.5).astype(dtype)
 
-        return self.numpy_tensor
-
-    def set_maxvalue(self, maxvalue):
-        self.maxvalue = maxvalue
-
-    def set_fix(self, fix):
-        self.fix = fix
+        return self.numpy_tensor, api_config
     
     def set_index(self,index):
         self.index = index
     
     def set_key(self,key):
         self.key = key
+
+    def set_fix(self, fix):
+        self.fix = fix
         
     def get_paddle_tensor(self, api_config):
         if self.dtype in ["float8_e5m2", "float8_e4m3fn"]:
@@ -500,8 +498,9 @@ class TensorConfig:
             return
 
         if self.paddle_tensor is None:
+            tensor, api_config = self.get_numpy_tensor(api_config)
             self.paddle_tensor = paddle.to_tensor(
-                self.get_numpy_tensor(api_config),
+                tensor,
                 dtype=self.dtype if self.dtype != 'bfloat16' else "float32",
             )
             self.paddle_tensor.stop_gradient = True
@@ -510,7 +509,7 @@ class TensorConfig:
                     self.paddle_tensor = paddle.cast(self.paddle_tensor, dtype="uint16")
                 self.paddle_tensor.stop_gradient = False
         
-        return self.paddle_tensor
+        return self.paddle_tensor, api_config
     
     def get_torch_tensor(self, api_config):
         if self.dtype in ["float8_e5m2", "float8_e4m3fn"]:
@@ -519,9 +518,10 @@ class TensorConfig:
 
         device = torch.device("cuda:0")
         torch.set_default_device(device)
+        tensor, api_config = self.get_numpy_tensor(api_config)
         if self.torch_tensor is None:
             self.torch_tensor = torch.tensor(
-                self.get_numpy_tensor(api_config),
+                tensor,
                 dtype=self.convert_dtype_to_torch_type(self.dtype)
                 if self.dtype != 'bfloat16'
                 else torch.float32,
@@ -529,7 +529,7 @@ class TensorConfig:
             )
             if self.dtype == "bfloat16":
                 self.torch_tensor = self.torch_tensor.to(dtype=torch.bfloat16)
-        return self.torch_tensor
+        return self.torch_tensor, api_config
     
     def clear_tensor(self):
         self.torch_tensor = None
@@ -587,6 +587,10 @@ class APIConfig:
         self.config = config
         self.args = []
         self.kwargs = collections.OrderedDict()
+        self.maxvalue = -1
+        self.fix = False
+        self.intnum = 1
+        self.firstshape = None
         config = config.replace("Tensor(", "TensorConfig(")
 
         self.api_name, offset = self.get_api(config)
@@ -600,17 +604,19 @@ class APIConfig:
             else:
                 self.append_args(value)
 
+        index = 0
         while(True):
             tocken, offset = self.get_tocken(config, offset)
             if offset is None:
                 return
 
+            key = "null"
             is_kwarg = config[offset] == '='
             if is_kwarg:
                 key = tocken
                 tocken, offset = self.get_tocken(config, offset+1)
 
-            value, offset = self.get_one_arg(tocken, config, offset)
+            value, offset = self.get_one_arg(tocken, config, offset, index ,key)
             
             if offset is None:
                 return
@@ -619,6 +625,7 @@ class APIConfig:
                 self.append_kwargs(key, value)
             else:
                 self.append_args(value)
+            index += 1
 
     def append_args(self, arg):
         self.args.append(arg)
@@ -771,10 +778,17 @@ class APIConfig:
     def get_api(self, config):
         return config[0:config.index("(")], len(config[0:config.index("(")])
 
-    def get_tensor(self, config, offset):
+    def get_tensor(self, config, offset, index, key):
         config = config[offset:]
         tensor_str = config[config.index("TensorConfig"):config.index(")")+1]
-        return eval(tensor_str), offset + len(tensor_str)
+        tensor = eval(tensor_str)
+        tensor.set_index(index)
+        tensor.set_key(key)
+        if not "Tensor" in config[1:]:
+            tensor.set_fix(True) 
+        if self.firstshape == None:
+            self.firstshape = tensor.shape
+        return tensor, offset + len(tensor_str)
 
     def get_dtype(self, config, offset):
         tocken, offset = self.get_tocken(config, offset)
@@ -784,7 +798,7 @@ class APIConfig:
         tocken, offset = self.get_tocken(config, offset)
         return paddle.base.framework.convert_np_dtype_to_proto_type(tocken), offset
 
-    def get_list(self, config, offset):
+    def get_list(self, config, offset, index, key):
         result = []
         tmp = 0
         last_index = offset
@@ -802,21 +816,23 @@ class APIConfig:
             list_str = list_str.replace(",", " ")
 
         offset = 1
+        indice = 0
         while(True):
             tocken, offset = self.get_tocken(list_str, offset)
             if offset is None:
                 break
 
-            value, offset = self.get_one_arg(tocken, list_str, offset)
+            value, offset = self.get_one_arg(tocken, list_str, offset, index, key, indice=indice)
 
             if offset is None:
                 break
 
             result.append(value)
+            indice += 1
 
         return result, last_index+1
 
-    def get_tuple(self, config, offset):
+    def get_tuple(self, config, offset, index, key):
         result = []
         tmp = 0
         last_index = offset
@@ -832,19 +848,20 @@ class APIConfig:
         tuple_str = config[offset: last_index+1]
 
         tuple_str = tuple_str.replace(",", " , ")
-
+        
+        indice = 0
         offset = 1
         while(True):
             tocken, offset = self.get_tocken(tuple_str, offset)
             if offset is None:
                 break
-
-            value, offset = self.get_one_arg(tocken, tuple_str, offset)
+            value, offset = self.get_one_arg(tocken, tuple_str, offset, index, key, indice=indice)
 
             if offset is None:
                 break
 
             result.append(value)
+            indice += 1
 
         return tuple(result), last_index+1
 
@@ -867,17 +884,17 @@ class APIConfig:
             return numpy.bool_, offset+len(numpy_type_str)+2
         return eval(numpy_type_str), offset+len(numpy_type_str)+2
 
-    def get_one_arg(self, tocken, config, offset):
+    def get_one_arg(self, tocken, config, offset, index, key, next = True, indice = None):
         if tocken == "TensorConfig":
-            value, offset = self.get_tensor(config, offset-len(tocken))
+            value, offset = self.get_tensor(config, offset-len(tocken), index, key)
         elif tocken == "Dtype":
             value, offset = self.get_dtype(config, offset)
         elif tocken == "VarType":
             value, offset = self.get_vartype(config, offset)
         elif tocken == "list":
-            value, offset = self.get_list(config, offset)
+            value, offset = self.get_list(config, offset, index, key)
         elif tocken == "tuple":
-            value, offset = self.get_tuple(config, offset)
+            value, offset = self.get_tuple(config, offset, index, key)
         elif tocken == "slice":
             value, offset = self.get_slice(config, offset)
         elif tocken == "complex":
@@ -894,6 +911,12 @@ class APIConfig:
             if tocken[0]=='.':
                 tocken='0'+tocken
             value = eval(tocken)
+            if self.api_name in ["paddle.Tensor.reshape","paddle.reshape"]:
+                if "int" in str(type(value)):
+                    if value == 0:
+                        self.intnum = self.intnum * self.firstshape[indice]
+                    elif not value == -1:
+                        self.intnum = self.intnum * value
         return value, offset
 
 

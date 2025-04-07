@@ -150,8 +150,6 @@ class APITestBase:
     def __init__(self, api_config):
         self.api_config = api_config
         self.outputs_grad_numpy = []
-        self.maxvalue = 0
-        self.fix = False
 
     def need_skip(self):
         # not support
@@ -270,23 +268,13 @@ class APITestBase:
 
         return True
     
-    def _handle_list_or_tuple(self, config_items, index=-2, key="null", is_tuple=False):
+    def _handle_list_or_tuple(self, config_items, is_tuple=False):
         """处理 list 或 tuple """
         tmp = []
         for item in config_items:
-            if "int" in str(type(item)):
-                self.maxvalue //= abs(item)
-            if isinstance(item,TensorConfig):
-                last = config_items.index(item)
-        for item in config_items:
             if isinstance(item, TensorConfig):
-                item.set_maxvalue(self.maxvalue)
-                item.set_index(index)
-                item.set_key(key)
-                if config_items.index(item) == last:
-                    item.set_fix(True)
-                tmp.append(item.get_paddle_tensor(self.api_config))
-                self.maxvalue = item.maxvalue
+                tensor, self.api_config = item.get_paddle_tensor(self.api_config)
+                tmp.append(tensor)
             else:
                 item = paddle.to_tensor(item)
                 tmp.append(item)
@@ -361,47 +349,34 @@ class APITestBase:
         len_args = len(self.paddle_args_config)
         for i in range(len(self.paddle_args_config)):
             if isinstance(self.paddle_args_config[i], TensorConfig):
-                self.paddle_args_config[i].set_index(i)
-                if i==0:
-                    self.maxvalue = self.paddle_args_config[i].numel()
-                self.paddle_args_config[i].set_maxvalue(self.maxvalue)
-                self.paddle_args.append(self.paddle_args_config[i].get_paddle_tensor(self.api_config))
-                self.maxvalue = self.paddle_args_config[i].maxvalue
+                tensor, self.api_config = self.paddle_args_config[i].get_paddle_tensor(self.api_config)
+                self.paddle_args.append(tensor)
             elif isinstance(self.paddle_args_config[i], list):
                 if need_axis_handling and i == 1:
                     self.paddle_args.append(self._handle_axis_arg(self.paddle_args_config[i]))
                 else:
-                    self.paddle_args.append(self._handle_list_or_tuple(self.paddle_args_config[i], index=i))
+                    self.paddle_args.append(self._handle_list_or_tuple(self.paddle_args_config[i]))
             elif isinstance(self.paddle_args_config[i], tuple):
                 if need_axis_handling and i == 1:
                     self.paddle_args.append(self._handle_axis_arg(self.paddle_args_config[i], is_tuple=True))
                 else:
-                    self.paddle_args.append(self._handle_list_or_tuple(self.paddle_args_config[i], index=i, is_tuple=True))
+                    self.paddle_args.append(self._handle_list_or_tuple(self.paddle_args_config[i], is_tuple=True))
             else:
                 self.paddle_args.append(self.paddle_args_config[i])
 
-        flag_args_zero = False
-        if len_args == 0:
-            flag_args_zero = True
         for key, arg_config in self.paddle_kwargs_config.items():
             if isinstance(arg_config, TensorConfig):
-                arg_config.set_key(key)
-                if flag_args_zero == True:
-                    flag_args_zero = False
-                    self.maxvalue = arg_config.numel()
-                arg_config.set_maxvalue(self.maxvalue)
-                self.paddle_kwargs[key] = arg_config.get_paddle_tensor(self.api_config)
-                self.maxvalue = arg_config.maxvalue
+                self.paddle_kwargs[key], self.api_config = arg_config.get_paddle_tensor(self.api_config)
             elif isinstance(arg_config, list):
                 if need_axis_handling and key == "axis":
                     self.paddle_kwargs[key] = self._handle_axis_arg(arg_config)
                 else:
-                    self.paddle_kwargs[key] = self._handle_list_or_tuple(arg_config, key=key)
+                    self.paddle_kwargs[key] = self._handle_list_or_tuple(arg_config)
             elif isinstance(arg_config, tuple):
                 if need_axis_handling and key == "axis":
                     self.paddle_kwargs[key] = self._handle_axis_arg(arg_config, is_tuple=True)
                 else:
-                    self.paddle_kwargs[key] = self._handle_list_or_tuple(arg_config, key=key, is_tuple=True)
+                    self.paddle_kwargs[key] = self._handle_list_or_tuple(arg_config, is_tuple=True)
             else:
                 self.paddle_kwargs[key] = arg_config
 
@@ -744,12 +719,14 @@ class APITestBase:
 
         for arg_config in self.torch_args_config:
             if isinstance(arg_config, TensorConfig):
-                self.torch_args.append(arg_config.get_torch_tensor(self.api_config))
+                tensor, self.api_config = arg_config.get_torch_tensor(self.api_config)
+                self.torch_args.append(tensor)
             elif isinstance(arg_config, list):
                 value = []
                 for i in range(len(arg_config)):
                     if isinstance(arg_config[i], TensorConfig):
-                        value.append(arg_config[i].get_torch_tensor(self.api_config))
+                        tensor, self.api_config = arg_config[i].get_torch_tensor(self.api_config)
+                        value.append(tensor)
                     else:
                         value.append(arg_config[i])
                 self.torch_args.append(value)
@@ -757,7 +734,8 @@ class APITestBase:
                 value = []
                 for i in range(len(arg_config)):
                     if isinstance(arg_config[i], TensorConfig):
-                        value.append(arg_config[i].get_torch_tensor(self.api_config))
+                        tensor, self.api_config = arg_config[i].get_torch_tensor(self.api_config)
+                        value.append(tensor)
                     else:
                         value.append(arg_config[i])
                 self.torch_args.append(tuple(value))
@@ -766,12 +744,13 @@ class APITestBase:
 
         for key, arg_config in self.torch_kwargs_config.items():
             if isinstance(arg_config, TensorConfig):
-                self.torch_kwargs[key] = arg_config.get_torch_tensor(self.api_config)
+                self.torch_kwargs[key], self.api_config = arg_config.get_torch_tensor(self.api_config)
             elif isinstance(arg_config, list):
                 value = []
                 for i in range(len(arg_config)):
                     if isinstance(arg_config[i], TensorConfig):
-                        value.append(arg_config[i].get_torch_tensor(self.api_config))
+                        tensor, self.api_config = arg_config[i].get_torch_tensor(self.api_config)
+                        value.append(tensor)
                     else:
                         value.append(arg_config[i])
                 self.torch_kwargs[key] = value
@@ -779,7 +758,8 @@ class APITestBase:
                 tmp = []
                 for i in range(len(arg_config)):
                     if isinstance(arg_config[i], TensorConfig):
-                        tmp.append(arg_config[i].get_torch_tensor(self.api_config))
+                        tensor, self.api_config = arg_config[i].get_torch_tensor(self.api_config)
+                        tmp.append(tensor)
                     else:
                         tmp.append(arg_config[i])
                 self.torch_kwargs[key] = tuple(tmp)
