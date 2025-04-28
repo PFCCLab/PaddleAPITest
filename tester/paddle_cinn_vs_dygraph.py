@@ -13,6 +13,7 @@ class APITestCINNVSDygraph(APITestBase):
         self.test_amp = test_amp
     @func_set_timeout(600)
     def test(self):
+        
         if self.need_skip():
             print("[Skip]", flush=True)
             return

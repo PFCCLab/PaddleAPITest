@@ -3,3 +3,4 @@ tester/__pycache__/
 tester/api_config/__pycache__/
 tester/paddle_to_torch/__pycache__/
 tester/api_config/test_log/
+.vscode/

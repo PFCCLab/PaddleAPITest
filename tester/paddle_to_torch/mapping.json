@@ -610,6 +610,122 @@
         },
         "description": "_tmp_tensor = arg[0], result = _tmp_tensor.__lt__(other=y)"
     },
+    "paddle.Tensor.__add__": {
+        "torch_api": "torch.Tensor.__add__",
+        "paddle_torch_args_map": {
+            "y": "other"
+        },
+        "description": "_tmp_tensor = arg[0], result = _tmp_tensor.__add__(other=y)"
+    },
+    "paddle.Tensor.__div__": {
+        "torch_api": "torch.Tensor.__div__",
+        "paddle_torch_args_map": {
+            "y": "other"
+        },
+        "description": "_tmp_tensor = arg[0], result = _tmp_tensor.__div__(other=y)"
+    },
+    "paddle.Tensor.__floordiv__": {
+        "torch_api": "torch.Tensor.__floordiv__",
+        "paddle_torch_args_map": {
+            "y": "other"
+        },
+        "description": "_tmp_tensor = arg[0], result = _tmp_tensor.__floordiv__(other=y)"
+    },
+    "paddle.Tensor.__matmul__": {
+        "torch_api": "torch.Tensor.__matmul__",
+        "paddle_torch_args_map": {
+            "y": "other"
+        },
+        "description": "_tmp_tensor = arg[0], result = _tmp_tensor.__matmul__(other=y)"
+    },
+    "paddle.Tensor.__mod__": {
+        "torch_api": "torch.Tensor.__mod__",
+        "paddle_torch_args_map": {
+            "y": "other"
+        },
+        "description": "_tmp_tensor = arg[0], result = _tmp_tensor.__mod__(other=y)"
+    },
+    "paddle.Tensor.__ne__": {
+        "torch_api": "torch.Tensor.__ne__",
+        "paddle_torch_args_map": {
+            "y": "other"
+        },
+        "description": "_tmp_tensor = arg[0], result = _tmp_tensor.__ne__(other=y)"
+    },
+    "paddle.Tensor.__pow__": {
+        "Rule": "__Pow__Rule",
+        "description": "use rule since torch.Tensor.__pow__(other=y) throws unimplemented error"
+    },
+    "paddle.Tensor.__radd__": {
+        "torch_api": "torch.Tensor.__radd__",
+        "paddle_torch_args_map": {
+            "y": "other"
+        },
+        "description": "_tmp_tensor = arg[0], result = _tmp_tensor.__radd__(other=y)"
+    },
+    "paddle.Tensor.__rmatmul__": {
+        "torch_api": "torch.Tensor.__rmatmul__",
+        "paddle_torch_args_map": {
+            "y": "other"
+        },
+        "description": "_tmp_tensor = arg[0], result = _tmp_tensor.__rmatmul__(other=y)"
+    },
+    "paddle.Tensor.__rmod__": {
+        "torch_api": "torch.Tensor.__rmod__",
+        "paddle_torch_args_map": {
+            "y": "other"
+        },
+        "description": "_tmp_tensor = arg[0], result = _tmp_tensor.__rmod__(other=y)"
+    },
+    "paddle.Tensor.__rmul__": {
+        "torch_api": "torch.Tensor.__rmul__",
+        "paddle_torch_args_map": {
+            "y": "other"
+        },
+        "description": "_tmp_tensor = arg[0], result = _tmp_tensor.__rmul__(other=y)"
+    },
+    "paddle.Tensor.__rpow__": {
+        "torch_api": "torch.Tensor.__rpow__",
+        "paddle_torch_args_map": {
+            "y": "other"
+        },
+        "description": "_tmp_tensor = arg[0], result = _tmp_tensor.__rpow__(other=y)"
+    },
+    "paddle.Tensor.__rsub__": {
+        "torch_api": "torch.Tensor.__rsub__",
+        "paddle_torch_args_map": {
+            "y": "other"
+        },
+        "description": "_tmp_tensor = arg[0], result = _tmp_tensor.__rsub__(other=y)"
+    },
+    "paddle.Tensor.__rtruediv__": {
+        "torch_api": "torch.Tensor.__rtruediv__",
+        "paddle_torch_args_map": {
+            "y": "other"
+        },
+        "description": "_tmp_tensor = arg[0], result = _tmp_tensor.__rtruediv__(other=y)"
+    },
+    "paddle.Tensor.__truediv__": {
+        "torch_api": "torch.Tensor.__truediv__",
+        "paddle_torch_args_map": {
+            "y": "other"
+        },
+        "description": "_tmp_tensor = arg[0], result = _tmp_tensor.__truediv__(other=y)"
+    },
+    "paddle.Tensor.__mul__": {
+        "torch_api": "torch.Tensor.__mul__",
+        "paddle_torch_args_map": {
+            "y": "other"
+        },
+        "description": "_tmp_tensor = arg[0], result = _tmp_tensor.__mul__(other=y)"
+    },
+    "paddle.Tensor.__sub__": {
+        "torch_api": "torch.Tensor.__sub__",
+        "paddle_torch_args_map": {
+            "y": "other"
+        },
+        "description": "_tmp_tensor = arg[0], result = _tmp_tensor.__sub__(other=y)"
+    },
     "migrated": "APIs migrated are placed here",
     "paddle.Tensor.addmm": {
         "torch_api": "torch.Tensor.addmm",

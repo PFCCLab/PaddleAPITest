@@ -2,8 +2,8 @@ import argparse
 from datetime import datetime
 
 from tester import (APIConfig, APITestAccuracy, APITestCINNVSDygraph,
-                    APITestPaddleOnly)
-from tester.api_config.log_writer import DIR_PATH, read_log, write_to_log
+                    APITestPaddleOnly, set_cfg)
+from tester.api_config.log_writer import read_log, write_to_log
 import torch
 import paddle
 
@@ -35,8 +35,14 @@ def main():
         '--test_amp',
         default=False,
     )
+    parser.add_argument(
+        '--id',
+        default="",
+        type=str,
+    )
     options = parser.parse_args()
-
+    set_cfg(options)  # Set the command line arguments in the config module
+    
     test_class = APITestAccuracy
     if options.paddle_only:
         test_class = APITestPaddleOnly

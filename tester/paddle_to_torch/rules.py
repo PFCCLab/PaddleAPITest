@@ -1317,7 +1317,17 @@ else:
 
 # z
 
-
+# __
+class __Pow__Rule(BaseRule):
+    def apply(self, paddle_api: str) -> ConvertResult:
+        impl = """
+tensor = locals().get('self')
+other = locals().get('y')
+result = tensor.__pow__(other)
+"""
+        code = impl.splitlines()
+        return ConvertResult.success(paddle_api, code)
+    
 __all__ = [  # type: ignore
     cls.__name__
     for cls in globals().values()

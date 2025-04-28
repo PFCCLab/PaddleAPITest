@@ -1,0 +1,12 @@
+paddle.Tensor.__truediv__(Tensor([4, 256, 256, 2],"float16"), Tensor([1, 1, 1, 2],"float16"), )
+
+[accuracy error] backward  paddle.Tensor.__truediv__(Tensor([4, 256, 256, 2],"float16"), Tensor([1, 1, 1, 2],"float16"), ) 
+ 
+Not equal to tolerance rtol=0.01, atol=0.01
+
+Mismatched elements: 1 / 2 (50%)
+Max absolute difference: 0.2969
+Max relative difference: 0.02242
+ x: array([[[[-12.945, -21.53 ]]]], dtype=float16)
+ y: array([[[[-13.24, -21.31]]]], dtype=float16)
+

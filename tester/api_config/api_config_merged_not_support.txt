@@ -1,0 +1,1 @@
+paddle.Tensor.__sub__(Tensor([0],"float32"), Tensor([0],"float32"), )

@@ -60,7 +60,7 @@ stochastic_behavior_apis =[
     "paddle.nn.functional.feature_alpha_dropout",
 ]
 
-single_op_no_signature_apis = ["__eq__", "__ge__", "__gt__", "__le__", "__lt__"]
+single_op_no_signature_apis = ["__eq__", "__ge__", "__gt__", "__le__", "__lt__", "__add__", "__div__", "__floordiv__", "__matmul__", "__mod__", "__ne__", "__pow__", "__radd__", "__rmatmul__", "__rmod__", "__rmul__", "__rpow__", "__rsub__", "__rtruediv__", "__truediv__", "__mul__", "__sub__"]
 
 no_signature_api_mappings = {
     f"paddle.Tensor.{method}": {

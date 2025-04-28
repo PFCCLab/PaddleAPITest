@@ -1704,6 +1704,23 @@ class TensorConfig:
                 min_dim = min(arr.shape)
                 indices = (numpy.random.randint(0, min_dim, size=self.numel())).astype("int64")
                 self.numpy_tensor = indices.reshape(self.shape)
+            
+            elif api_config.api_name in ["paddle.Tensor.__pow__"]:
+                # paddle.Tensor.__pow__(a, b) => a ^ b, where a is self and b is other
+                if self.check_arg(api_config, 0, "self"):
+                    self.numpy_tensor = self.get_random_numpy_tensor(self.shape, self.dtype, min=-10, max=10)
+                else:
+                    # self.check_arg(api_config, 1, "other"): 
+                    self.numpy_tensor = self.get_random_numpy_tensor(self.shape, self.dtype, min=-5, max=5)
+                    
+            elif api_config.api_name in ["paddle.Tensor.__rpow__"]:
+                # paddle.Tensor.__rpow__(a, b) => b ^ a, where a is self and b is other
+                if self.check_arg(api_config, 0, "self"):
+                    self.numpy_tensor = self.get_random_numpy_tensor(self.shape, self.dtype, min=-5, max=5)
+                else:
+                    # self.check_arg(api_config, 1, "other"): 
+                    self.numpy_tensor = self.get_random_numpy_tensor(self.shape, self.dtype, min=-10, max=10)
+                
             if self.numpy_tensor is None:
                 if USE_CACHED_NUMPY:
                     dtype = "float32" if self.dtype == "bfloat16" else self.dtype

@@ -1,0 +1,276 @@
+paddle.Tensor.__matmul__(Tensor([1, 1, 65536, 1024],"float32"), Tensor([1, 1, 1024, 32],"float32"), )
+
+W0425 07:08:38.308465 3757542 gpu_resources.cc:119] Please NOTE: device: 0, GPU Compute Capability: 8.9, Driver API Version: 12.2, Runtime API Version: 11.8
+W0425 07:08:38.309262 3757542 gpu_resources.cc:164] device: 0, cuDNN Version: 8.8.
+/usr/local/lib/python3.9/dist-packages/torch/autograd/graph.py:823: UserWarning: Attempting to run cuBLAS, but there was no current CUDA context! Attempting to set the primary context... (Triggered internally at /pytorch/aten/src/ATen/cuda/CublasHandlePool.cpp:180.)
+  return Variable._execution_engine.run_backward(  # Calls into the C++ engine to run the backward pass
+[accuracy error] backward  paddle.Tensor.__matmul__(Tensor([1, 1, 65536, 1024],"float32"), Tensor([1, 1, 1024, 32],"float32"), ) 
+ 
+Not equal to tolerance rtol=0.01, atol=0.01
+
+Mismatched elements: 22 / 32768 (0.0671%)
+Max absolute difference: 0.02316332
+Max relative difference: 15.170192
+ x: array([[[[  9.793615,  30.773022,  22.531193, ..., -34.302246,
+           -5.428729,  40.74084 ],
+         [ -3.547877,  -6.510621, -16.738092, ...,  -5.962055,...
+ y: array([[[[  9.801262,  30.77392 ,  22.537432, ..., -34.295544,
+           -5.429533,  40.745197],
+         [ -3.541831,  -6.509281, -16.737543, ...,  -5.958772,...
+
+paddle.Tensor.__matmul__(Tensor([1, 1, 65536, 32],"float32"), Tensor([1, 1, 32, 1024],"float32"), )
+
+[accuracy error] backward  paddle.Tensor.__matmul__(Tensor([1, 1, 65536, 32],"float32"), Tensor([1, 1, 32, 1024],"float32"), ) 
+ 
+Not equal to tolerance rtol=0.01, atol=0.01
+
+Mismatched elements: 22 / 32768 (0.0671%)
+Max absolute difference: 0.02227592
+Max relative difference: 65.53439
+ x: array([[[[-2.272654e+01,  2.302391e+01,  5.338843e-01, ...,
+           3.395246e+01, -4.407317e+00,  3.499095e+00],
+         [ 3.384471e-02, -1.316159e+01,  3.355618e+00, ...,...
+ y: array([[[[-22.726858,  23.024412,   0.531392, ...,  33.953735,
+           -4.40612 ,   3.508567],
+         [  0.03613 , -13.160051,   3.35535 , ..., -22.74018 ,...
+
+paddle.Tensor.__matmul__(Tensor([2, 1, 65536, 1024],"float32"), Tensor([2, 1, 1024, 64],"float32"), )
+
+[accuracy error] backward  paddle.Tensor.__matmul__(Tensor([2, 1, 65536, 1024],"float32"), Tensor([2, 1, 1024, 64],"float32"), ) 
+ 
+Not equal to tolerance rtol=0.01, atol=0.01
+
+Mismatched elements: 123 / 131072 (0.0938%)
+Max absolute difference: 0.03248596
+Max relative difference: 28.79684
+ x: array([[[[-2.967744e+00, -1.871120e+01, -6.173313e+00, ...,
+          -1.551398e+01,  3.453694e+01, -1.771651e+01],
+         [-5.196626e+01,  6.610651e+00, -1.577667e+00, ...,...
+ y: array([[[[-2.971813e+00, -1.871966e+01, -6.166810e+00, ...,
+          -1.552427e+01,  3.454149e+01, -1.772503e+01],
+         [-5.198147e+01,  6.611265e+00, -1.571947e+00, ...,...
+
+paddle.Tensor.__matmul__(Tensor([2, 1, 65536, 64],"float32"), Tensor([2, 1, 64, 1024],"float32"), )
+
+[accuracy error] backward  paddle.Tensor.__matmul__(Tensor([2, 1, 65536, 64],"float32"), Tensor([2, 1, 64, 1024],"float32"), ) 
+ 
+Not equal to tolerance rtol=0.01, atol=0.01
+
+Mismatched elements: 107 / 131072 (0.0816%)
+Max absolute difference: 0.0320816
+Max relative difference: 30.028067
+ x: array([[[[ 15.284692,   3.995877,  -8.957308, ...,  -5.283244,
+           34.76846 ,  -6.785715],
+         [ -2.965662, -11.438575, -19.811398, ...,  35.79987 ,...
+ y: array([[[[ 15.291573,   3.994946,  -8.949336, ...,  -5.278365,
+           34.772312,  -6.775231],
+         [ -2.978019, -11.45051 , -19.808964, ...,  35.80563 ,...
+
+paddle.Tensor.__matmul__(Tensor([4, 1, 65536, 1024],"float32"), Tensor([4, 1, 1024, 32],"float32"), )
+
+[accuracy error] backward  paddle.Tensor.__matmul__(Tensor([4, 1, 65536, 1024],"float32"), Tensor([4, 1, 1024, 32],"float32"), ) 
+ 
+Not equal to tolerance rtol=0.01, atol=0.01
+
+Mismatched elements: 104 / 131072 (0.0793%)
+Max absolute difference: 0.03388977
+Max relative difference: 43.899063
+ x: array([[[[-12.111767,   0.483306, -21.590694, ...,  11.885753,
+           20.352842,  12.377147],
+         [ 14.249086,  16.895586,  17.249243, ..., -38.09153 ,...
+ y: array([[[[-12.114971,   0.48872 , -21.59786 , ...,  11.881061,
+           20.365723,  12.385185],
+         [ 14.24958 ,  16.895231,  17.267162, ..., -38.10077 ,...
+
+paddle.Tensor.__matmul__(Tensor([4, 1, 65536, 32],"float32"), Tensor([4, 1, 32, 1024],"float32"), )
+
+[accuracy error] backward  paddle.Tensor.__matmul__(Tensor([4, 1, 65536, 32],"float32"), Tensor([4, 1, 32, 1024],"float32"), ) 
+ 
+Not equal to tolerance rtol=0.01, atol=0.01
+
+Mismatched elements: 94 / 131072 (0.0717%)
+Max absolute difference: 0.03149033
+Max relative difference: 16.39092
+ x: array([[[[ 19.988615, -30.272022, -29.0477  , ...,  14.291409,
+           11.124565, -14.524647],
+         [ 14.647811,   5.614227,  44.514576, ..., -50.43655 ,...
+ y: array([[[[ 19.987886, -30.276049, -29.061558, ...,  14.295076,
+           11.123872, -14.531388],
+         [ 14.650128,   5.609178,  44.52164 , ..., -50.44861 ,...
+
+paddle.Tensor.__matmul__(Tensor([4, 2, 16384, 1024],"float32"), Tensor([4, 2, 1024, 32],"float32"), )
+
+[accuracy error] backward  paddle.Tensor.__matmul__(Tensor([4, 2, 16384, 1024],"float32"), Tensor([4, 2, 1024, 32],"float32"), ) 
+ 
+Not equal to tolerance rtol=0.01, atol=0.01
+
+Mismatched elements: 1 / 262144 (0.000381%)
+Max absolute difference: 0.01310158
+Max relative difference: 3748.3374
+ x: array([[[[ 5.772367e+00,  1.640424e+01,  1.527752e+01, ...,
+           1.680916e+01,  4.247777e+00, -1.146146e+00],
+         [-5.934176e+00,  5.351166e+00, -1.520158e+00, ...,...
+ y: array([[[[ 5.774180e+00,  1.640984e+01,  1.528193e+01, ...,
+           1.680582e+01,  4.248947e+00, -1.145602e+00],
+         [-5.937066e+00,  5.356120e+00, -1.522068e+00, ...,...
+
+paddle.Tensor.__matmul__(Tensor([4, 2, 16384, 32],"float32"), Tensor([4, 2, 32, 1024],"float32"), )
+
+[accuracy error] backward  paddle.Tensor.__matmul__(Tensor([4, 2, 16384, 32],"float32"), Tensor([4, 2, 32, 1024],"float32"), ) 
+ 
+Not equal to tolerance rtol=0.01, atol=0.01
+
+Mismatched elements: 1 / 262144 (0.000381%)
+Max absolute difference: 0.01334953
+Max relative difference: 241.71397
+ x: array([[[[  7.392196,   6.378356,  -9.120307, ..., -20.33604 ,
+            4.068689,  13.142734],
+         [-11.977296,  -1.141441,  -7.183806, ..., -13.964497,...
+ y: array([[[[  7.392752,   6.375084,  -9.116975, ..., -20.337175,
+            4.068685,  13.142892],
+         [-11.978937,  -1.147583,  -7.186265, ..., -13.963494,...
+
+paddle.Tensor.__matmul__(Tensor([4, 304, 36, 306],"float16"), Tensor([306, 306],"float16"), )
+
+[accuracy error] backward  paddle.Tensor.__matmul__(Tensor([4, 304, 36, 306],"float16"), Tensor([306, 306],"float16"), ) 
+ 
+Not equal to tolerance rtol=0.01, atol=0.01
+
+Mismatched elements: 370 / 93636 (0.395%)
+Max absolute difference: 0.125
+Max relative difference: 11.99
+ x: array([[ 14.6    , -18.62   ,   7.375  , ..., -13.64   ,  -3.97   ,
+         25.47   ],
+       [ -2.902  , -11.164  ,  -7.87   , ...,  15.945  , -12.86   ,...
+ y: array([[ 14.6   , -18.62  ,   7.38  , ..., -13.65  ,  -3.986 ,  25.47  ],
+       [ -2.896 , -11.164 ,  -7.875 , ...,  15.94  , -12.86  , -44.97  ],
+       [ -5.383 ,  -0.212 ,   7.574 , ..., -35.47  ,  -7.246 , -19.36  ],...
+
+paddle.Tensor.__matmul__(Tensor([4, 346, 36, 306],"float16"), Tensor([306, 306],"float16"), )
+
+[accuracy error] backward  paddle.Tensor.__matmul__(Tensor([4, 346, 36, 306],"float16"), Tensor([306, 306],"float16"), ) 
+ 
+Not equal to tolerance rtol=0.01, atol=0.01
+
+Mismatched elements: 464 / 93636 (0.496%)
+Max absolute difference: 0.125
+Max relative difference: 9.26
+ x: array([[ -3.555 ,   3.38  ,  26.61  , ...,  -3.934 , -40.38  ,  -3.97  ],
+       [-11.82  , -15.81  ,  10.22  , ..., -12.445 ,  -5.363 ,  -5.36  ],
+       [ -7.89  ,  32.56  ,   7.504 , ..., -17.61  ,  30.77  ,  12.766 ],...
+ y: array([[ -3.57 ,   3.377,  26.6  , ...,  -3.932, -40.38 ,  -3.969],
+       [-11.805, -15.81 ,  10.23 , ..., -12.44 ,  -5.355,  -5.336],
+       [ -7.9  ,  32.56 ,   7.496, ..., -17.61 ,  30.81 ,  12.78 ],...
+
+paddle.Tensor.__matmul__(Tensor([4, 377, 36, 306],"float16"), Tensor([306, 306],"float16"), )
+
+[accuracy error] backward  paddle.Tensor.__matmul__(Tensor([4, 377, 36, 306],"float16"), Tensor([306, 306],"float16"), ) 
+ 
+Not equal to tolerance rtol=0.01, atol=0.01
+
+Mismatched elements: 504 / 93636 (0.538%)
+Max absolute difference: 0.125
+Max relative difference: 8.18
+ x: array([[ -1.105,  14.83 ,  -2.19 , ...,   3.693,  -1.773,  12.39 ],
+       [ -9.52 , -15.625,  -2.678, ...,   3.324,   3.957, -14.62 ],
+       [  8.24 ,  -1.433,  -5.5  , ...,  38.22 , -24.19 ,  18.12 ],...
+ y: array([[ -1.115,  14.82 ,  -2.18 , ...,   3.719,  -1.767,  12.41 ],
+       [ -9.516, -15.61 ,  -2.688, ...,   3.328,   3.977, -14.62 ],
+       [  8.25 ,  -1.43 ,  -5.504, ...,  38.25 , -24.19 ,  18.12 ],...
+
+paddle.Tensor.__matmul__(Tensor([4, 396, 36, 306],"float16"), Tensor([306, 306],"float16"), )
+
+[accuracy error] backward  paddle.Tensor.__matmul__(Tensor([4, 396, 36, 306],"float16"), Tensor([306, 306],"float16"), ) 
+ 
+Not equal to tolerance rtol=0.01, atol=0.01
+
+Mismatched elements: 521 / 93636 (0.556%)
+Max absolute difference: 0.125
+Max relative difference: 28.34
+ x: array([[  3.357,  16.   ,  -9.28 , ...,  14.984, -26.2  ,   1.922],
+       [ 44.   ,  -5.844,  -3.555, ...,   2.97 , -16.52 ,  11.25 ],
+       [ 18.34 ,   1.871, -39.3  , ..., -18.78 , -10.22 , -17.6  ],...
+ y: array([[  3.354,  16.   ,  -9.27 , ...,  14.984, -26.23 ,   1.927],
+       [ 44.   ,  -5.84 ,  -3.555, ...,   2.979, -16.52 ,  11.234],
+       [ 18.34 ,   1.851, -39.34 , ..., -18.78 , -10.22 , -17.6  ],...
+
+paddle.Tensor.__matmul__(Tensor([5, 1, 1024],"float32"), Tensor([1024, 51865],"float32"), )
+
+[accuracy error] backward  paddle.Tensor.__matmul__(Tensor([5, 1, 1024],"float32"), Tensor([1024, 51865],"float32"), ) 
+ 
+Not equal to tolerance rtol=0.01, atol=0.01
+
+Mismatched elements: 1 / 5120 (0.0195%)
+Max absolute difference: 0.01953506
+Max relative difference: 1.5034988
+ x: array([[[-41.601906,   3.324509,   4.779594, ..., -26.574282,
+         -17.6405  , -31.481562]],
+...
+ y: array([[[-41.606728,   3.323168,   4.777803, ..., -26.562511,
+         -17.629126, -31.476858]],
+...
+
+paddle.Tensor.__matmul__(Tensor([5, 1, 768],"float32"), Tensor([768, 51865],"float32"), )
+
+[accuracy error] backward  paddle.Tensor.__matmul__(Tensor([5, 1, 768],"float32"), Tensor([768, 51865],"float32"), ) 
+ 
+Not equal to tolerance rtol=0.01, atol=0.01
+
+Mismatched elements: 2 / 3840 (0.0521%)
+Max absolute difference: 0.01758575
+Max relative difference: 2.7823038
+ x: array([[[ -6.83152 ,  37.76357 , -30.1727  , ...,  -5.349769,
+          35.57148 ,  -4.052692]],
+...
+ y: array([[[ -6.839491,  37.762867, -30.174397, ...,  -5.346385,
+          35.578243,  -4.052563]],
+...
+
+paddle.Tensor.__matmul__(Tensor([5, 3, 1024],"float32"), Tensor([1024, 51865],"float32"), )
+
+[accuracy error] backward  paddle.Tensor.__matmul__(Tensor([5, 3, 1024],"float32"), Tensor([1024, 51865],"float32"), ) 
+ 
+Not equal to tolerance rtol=0.01, atol=0.01
+
+Mismatched elements: 6 / 15360 (0.0391%)
+Max absolute difference: 0.01948071
+Max relative difference: 41.978573
+ x: array([[[-20.12186 ,   3.598006, -25.952492, ..., -21.636675,
+         -12.722002, -19.453241],
+        [ 11.781637,  12.348924, -27.850826, ..., -10.925647,...
+ y: array([[[-20.126823,   3.60396 , -25.953083, ..., -21.639004,
+         -12.723951, -19.457052],
+        [ 11.770006,  12.353989, -27.855055, ..., -10.929886,...
+
+paddle.Tensor.__matmul__(Tensor([5, 3, 1280],"float32"), Tensor([1280, 51865],"float32"), )
+
+[accuracy error] backward  paddle.Tensor.__matmul__(Tensor([5, 3, 1280],"float32"), Tensor([1280, 51865],"float32"), ) 
+ 
+Not equal to tolerance rtol=0.01, atol=0.01
+
+Mismatched elements: 6 / 19200 (0.0312%)
+Max absolute difference: 0.01842356
+Max relative difference: 28.782755
+ x: array([[[  1.405688, -13.595794,  28.397121, ...,  -4.293926,
+           2.602141, -13.294753],
+        [ -5.119305,  15.75584 ,  26.53968 , ...,  -0.489257,...
+ y: array([[[  1.406803, -13.5945  ,  28.393143, ...,  -4.299234,
+           2.590125, -13.295961],
+        [ -5.121533,  15.764305,  26.534584, ...,  -0.496534,...
+
+paddle.Tensor.__matmul__(Tensor([5, 3, 768],"float32"), Tensor([768, 51865],"float32"), )
+
+[accuracy error] backward  paddle.Tensor.__matmul__(Tensor([5, 3, 768],"float32"), Tensor([768, 51865],"float32"), ) 
+ 
+Not equal to tolerance rtol=0.01, atol=0.01
+
+Mismatched elements: 4 / 11520 (0.0347%)
+Max absolute difference: 0.02059221
+Max relative difference: 2.0598662
+ x: array([[[ -4.870329, -40.76907 ,  13.131618, ...,  -0.22201 ,
+         -20.134659, -35.063465],
+        [ -0.355142, -23.687313, -21.846956, ...,  -8.50259 ,...
+ y: array([[[ -4.867914, -40.773346,  13.13145 , ...,  -0.223931,
+         -20.132446, -35.065945],
+        [ -0.349413, -23.68406 , -21.860077, ...,  -8.513475,...
+
