@@ -10,9 +10,6 @@ OUTPUT_PATH = TEST_LOG_PATH
 OUTPUT_PATH.mkdir(parents=True, exist_ok=True)
 
 # log_digester_lite
-pattern = re.compile(r"^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\.\d+")
-warning_pattern = re.compile(r"^W\d{4} \d{2}:\d{2}:\d{2}\.\d+\s+\d+ gpu_resources.cc")
-
 logs = []
 in_test_block = False
 current_content = []
@@ -26,18 +23,21 @@ except Exception as err:
     exit(1)
 
 for line in input_text.split("\n"):
-    if warning_pattern.match(line):
+    if "gpu_resources.cc" in line or "Waiting for available memory" in line:
         continue
 
-    if pattern.match(line):
-        if in_test_block:
-            if current_content:
-                logs.append("\n".join(current_content))
-            current_content = []
-            in_test_block = False
-        if "test begin:" in line:
-            in_test_block = True
-            current_content = [line]
+    if "test begin" in line:
+        if in_test_block and current_content:
+            logs.append("\n".join(current_content))
+        in_test_block = True
+        current_content = [line]
+        continue
+
+    if "Worker PID" in line:
+        if in_test_block and current_content:
+            logs.append("\n".join(current_content))
+        in_test_block = False
+        current_content = []
         continue
 
     if in_test_block:
@@ -45,7 +45,6 @@ for line in input_text.split("\n"):
 
 if current_content:
     logs.append("\n".join(current_content))
-    current_content = []
 
 
 def get_sort_key(content):
@@ -74,17 +73,22 @@ if pass_file.exists():
 print(f"Read {len(pass_names)} pass api(s)", flush=True)
 print(f"Read {len(pass_configs)} pass api config(s)", flush=True)
 
+notfound_logs = {}
 pass_logs = {}
-key_logs = {}
+error_logs = {}
 for content in logs:
     key = get_sort_key(content)
     if not key:
         continue
-    if key in pass_configs:
+    if "(NotFound)" in content:
+        notfound_logs[key] = content
+    elif key in pass_configs:
         pass_logs[key] = content
     else:
-        key_logs[key] = content
+        error_logs[key] = content
 
+if notfound_logs:
+    print(f"Read {len(notfound_logs)} notfound log(s)", flush=True)
 
 pass_log = OUTPUT_PATH / "pass_log.log"
 try:
@@ -100,13 +104,13 @@ print(f"Read and write {len(pass_logs)} pass log(s)", flush=True)
 error_log = OUTPUT_PATH / "error_log.log"
 try:
     with open(error_log, "w") as f:
-        for key in sorted(key_logs.keys()):
-            content = key_logs[key]
+        for key in sorted(error_logs.keys()):
+            content = error_logs[key]
             f.write(content + "\n\n")
 except Exception as err:
     print(f"Error writing {error_log}: {err}", flush=True)
     exit(0)
-print(f"Read and write {len(key_logs)} error log(s)", flush=True)
+print(f"Read and write {len(error_logs)} error log(s)", flush=True)
 
 # get_api_set + get_api_config_set
 # pass
@@ -149,7 +153,7 @@ for file_name in ERROR_FILES:
         with open(FILE_PATH, "r") as f:
             for line in f:
                 line = line.strip()
-                if line:
+                if line and line not in notfound_logs:
                     error_name = line.split("(", 1)[0]
                     error_names.add(error_name)
                     error_configs.add(line)
@@ -176,3 +180,12 @@ except Exception as err:
     print(f"Error writing {CONFIG_OUTPUT_PATH}: {err}", flush=True)
     exit(0)
 print(f"Write {len(error_configs)} error api config(s)", flush=True)
+
+if notfound_logs:
+    NOTFOUND_OUTPUT_PATH = OUTPUT_PATH / "notfound_config.txt"
+    try:
+        with open(NOTFOUND_OUTPUT_PATH, "w") as f:
+            f.writelines(f"{line}\n" for line in sorted(notfound_logs.keys()))
+    except Exception as err:
+        print(f"Error writing {NOTFOUND_OUTPUT_PATH}: {err}", flush=True)
+    print(f"Write {len(notfound_logs)} notfound api config(s)", flush=True)

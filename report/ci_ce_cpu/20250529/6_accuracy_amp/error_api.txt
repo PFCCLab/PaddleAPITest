@@ -1,0 +1,7 @@
+paddle.Tensor.__matmul__
+paddle.add_n
+paddle.concat
+paddle.einsum
+paddle.nn.functional.conv1d
+paddle.nn.functional.linear
+paddle.vision.ops.deform_conv2d

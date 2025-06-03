@@ -69,8 +69,8 @@ def to_0_size_config(api_config):
     else:
         apis_map[api_config.api_name][key] += 1
 
-    # if apis_map[api_config.api_name][key] > 2:
-    #     return []
+    if apis_map[api_config.api_name][key] > 5:
+        return []
 
     result = []
     tensor_configs = get_tensor_configs(api_config)

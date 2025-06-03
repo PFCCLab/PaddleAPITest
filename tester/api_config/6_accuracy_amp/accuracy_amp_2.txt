@@ -1,0 +1,1 @@
+paddle.incubate.nn.functional.fused_feedforward(Tensor([4, 32, 128],"float16"), Tensor([128, 256],"float16"), Tensor([256, 128],"float16"), Tensor([256],"float16"), Tensor([128],"float16"), Tensor([128],"float32"), Tensor([128],"float32"), Tensor([128],"float32"), Tensor([128],"float32"), 0.0, 0.0, activation="gelu", pre_layer_norm=False, )

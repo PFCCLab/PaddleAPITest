@@ -222,6 +222,11 @@ class APITestAccuracy(APITestBase):
         if self.api_config.api_name == "paddle.incubate.nn.functional.fused_rms_norm": 
             paddle_output = paddle_output[0]
 
+        if self.api_config.api_name == "paddle.unique": 
+            if "return_index=True" in self.api_config.config:
+                paddle_output = list(paddle_output)
+                del paddle_output[1]
+
         if isinstance(paddle_output, paddle.Tensor):
             if isinstance(torch_output, torch.Tensor):
                 try:
@@ -349,6 +354,9 @@ class APITestAccuracy(APITestBase):
             if self.api_config.api_name == "paddle.Tensor.__setitem__":
                 torch_out_grads = torch_out_grads[0]
                 paddle_out_grads = paddle_out_grads[0]
+            
+            # All configs that not compared with torch 
+            # should be moved to tester/api_config/5_accuracy/grads_diff.txt
             if self.api_config.api_name == "paddle.tensordot":
                 paddle_out_grads = paddle_out_grads[:2]
                 

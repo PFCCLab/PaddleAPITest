@@ -35,22 +35,22 @@
 
 ### 命令行参数
 
-| 参数                        | 类型  | 说明                                                                      |
-| --------------------------- | ----- | ------------------------------------------------------------------------- |
-| `--api_config`              | str   | API 配置字符串（单条测试）                                                |
-| `--api_config_file`         | str   | API 配置文件路径（如`tester/api_config/api_config_support2torch_1.txt`）  |
-| `--api_config_file_pattern` | str   | API 配置文件模式（如 `tester/api_config/api_config_support2torch_*.txt`） |
-| `--paddle_only`             | bool  | 仅运行 Paddle 测试（默认 False）                                          |
-| `--accuracy`                | bool  | 启用精度测试（默认 False）                                                |
-| `--paddle_cinn`             | bool  | 运行 CINN vs Dygraph 对比测试（默认 False）                               |
-| `--test_amp`                | bool  | 启用自动混合精度测试（默认 False）                                        |
-| `--num_gpus`                | int   | 使用的 GPU 数量（默认 0，-1 动态最大）                                    |
-| `--num_workers_per_gpu`     | int   | 每 GPU 的 worker 进程数（默认 1，-1 动态最大）                            |
-| `--gpu_ids`                 | str   | 使用的 GPU 序号，以逗号分隔（默认""，"-1" 动态最大）                      |
-| `--required_memory`         | float | 每 worker 进程预估使用显存（默认 10.0）                                   |
-| `--test_cpu`                | bool  | 启用 Paddle CPU 模式测试（默认 False）                                    |
-| `--use_cached_numpy`        | bool  | 启用 Numpy 缓存（默认 False）                                             |
-| `--log_dir`                 | str   | 日志输出路径（默认 "tester/api_config/test_log"）                         |
+| 参数                        | 类型  | 说明                                                                 |
+| --------------------------- | ----- | -------------------------------------------------------------------- |
+| `--api_config`              | str   | API 配置字符串（单条测试）                                           |
+| `--api_config_file`         | str   | API 配置文件路径（如`tester/api_config/5_accuracy/accuracy_1.txt`）  |
+| `--api_config_file_pattern` | str   | API 配置文件模式（如 `tester/api_config/5_accuracy/accuracy_*.txt`） |
+| `--paddle_only`             | bool  | 仅运行 Paddle 测试（默认 False）                                     |
+| `--accuracy`                | bool  | 启用精度测试（默认 False）                                           |
+| `--paddle_cinn`             | bool  | 运行 CINN vs Dygraph 对比测试（默认 False）                          |
+| `--num_gpus`                | int   | 使用的 GPU 数量（默认 0，-1 动态最大）                               |
+| `--num_workers_per_gpu`     | int   | 每 GPU 的 worker 进程数（默认 1，-1 动态最大）                       |
+| `--gpu_ids`                 | str   | 使用的 GPU 序号，以逗号分隔（默认 ""，"-1" 动态最大）                 |
+| `--required_memory`         | float | 每 worker 进程预估使用显存（默认 10.0）                              |
+| `--test_amp`                | bool  | 启用自动混合精度测试（默认 False）                                   |
+| `--test_cpu`                | bool  | 启用 Paddle CPU 模式测试（默认 False）                               |
+| `--use_cached_numpy`        | bool  | 启用 Numpy 缓存（默认 False）                                        |
+| `--log_dir`                 | str   | 日志输出路径（默认 "tester/api_config/test_log"）                    |
 
 ### 示例命令
 

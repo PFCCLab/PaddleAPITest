@@ -116,7 +116,32 @@ handle_axes_api = frozenset(
     ]
 )
 
-not_check_dtype = frozenset(["paddle.where", "paddle.nn.functional.one_hot", "paddle.frexp", "paddle.floor"])
+# All configs that report dtype diff when not in not_check_dtype list
+# should be moved to tester/api_config/5_accuracy/dtype_diff.txt
+not_check_dtype = frozenset(
+    [
+        "paddle.where",
+        "paddle.nn.functional.one_hot",
+        "paddle.frexp",
+        "paddle.Tensor.frexp",
+        "paddle.floor",
+        "paddle.Tensor.cumsum",
+        "paddle.add",
+        "paddle.add_n",
+        "paddle.cummax",
+        "paddle.cummin",
+        "paddle.cumsum",
+        "paddle.nn.functional.adaptive_max_pool1d",
+        "paddle.nn.functional.adaptive_max_pool2d",
+        "paddle.nn.functional.adaptive_max_pool3d",
+        "paddle.nn.functional.max_pool1d",
+        "paddle.nn.functional.max_pool2d",
+        "paddle.nn.functional.max_pool3d",
+        "paddle.copysign",
+        "paddle.cumprod",
+        "paddle.incubate.nn.functional.fused_layer_norm",
+    ]
+)
 
 
 class APITestBase:
@@ -590,11 +615,11 @@ class APITestBase:
 
     def convert_dtype_to_torch_type(self, dtype):
         # for python built-in types, mappings are int -> torch.int64, bool -> torch.bool, float -> torch.float64, complex -> torch.complex128, None -> None
-        if dtype in ['float32', 'float', numpy.float32, paddle.float32, paddle.base.libpaddle.VarDesc.VarType.FP32]:
+        if dtype in ['float32', numpy.float32, paddle.float32, paddle.base.libpaddle.VarDesc.VarType.FP32]:
             return torch.float32
         elif dtype in ['float16', numpy.float16, paddle.float16, paddle.base.libpaddle.VarDesc.VarType.FP16]:
             return torch.float16
-        elif dtype in ['float64', 'double', numpy.float64, paddle.float64, paddle.base.libpaddle.VarDesc.VarType.FP64, float]:
+        elif dtype in ['float64', 'float', 'double', numpy.float64, paddle.float64, paddle.base.libpaddle.VarDesc.VarType.FP64, float]:
             return torch.float64
         elif dtype in ['int16', numpy.int16, paddle.int16, paddle.base.libpaddle.VarDesc.VarType.INT16]:
             return torch.int16

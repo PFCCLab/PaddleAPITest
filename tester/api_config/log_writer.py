@@ -57,26 +57,28 @@ def set_engineV2():
 
 def get_log_file(log_type: str):
     """获取指定日志类型和PID对应的日志文件路径"""
-    global is_engineV2
-    prefix = LOG_PREFIXES.get(log_type)
+    if log_type not in LOG_PREFIXES:
+        raise ValueError(f"Invalid log type: {log_type}")
+        
+    prefix = LOG_PREFIXES[log_type]
+
     if not is_engineV2:
         cfg = get_cfg()
-        if cfg:
-            return TEST_LOG_PATH / f"{prefix + cfg.id}.txt"
-        else:
-            return TEST_LOG_PATH / f"{prefix}.txt"
+        filename = f"{prefix}{cfg.id}.txt" if cfg else f"{prefix}.txt"
+        return TEST_LOG_PATH / filename
+
     pid = os.getpid()
     return TMP_LOG_PATH / f"{prefix}_{pid}.txt"
 
 
 def write_to_log(log_type, line):
     """添加单条日志到当前进程的日志文件"""
-    if log_type not in LOG_PREFIXES:
-        raise ValueError(f"Invalid log type: {log_type}")
     line = line.strip()
     if not line:
         return
+
     file_path = get_log_file(log_type)
+
     try:
         with file_path.open("a") as f:
             f.write(line + "\n")
@@ -88,11 +90,12 @@ def read_log(log_type):
     """读取文件所有行，返回集合"""
     if log_type not in LOG_PREFIXES:
         raise ValueError(f"Invalid log type: {log_type}")
+
     cfg = get_cfg()
-    if cfg:
-        file_path = TEST_LOG_PATH / f"{LOG_PREFIXES[log_type] + cfg.id}.txt"
-    else:
-        file_path = TEST_LOG_PATH / f"{LOG_PREFIXES[log_type]}.txt"
+    prefix = LOG_PREFIXES[log_type]
+    filename = f"{prefix}{cfg.id}.txt" if cfg else f"{prefix}.txt"
+    file_path = TEST_LOG_PATH / filename
+
     try:
         with file_path.open("r") as f:
             return set(line.strip() for line in f if line.strip())
@@ -131,15 +134,22 @@ def aggregate_logs(end=False):
             print(f"Error writing to {aggregated_file}: {err}", flush=True)
 
     log_file = TEST_LOG_PATH / f"log_inorder.log"
+    tmp_files = sorted(TMP_LOG_PATH.glob(f"log_*.log"))
     try:
-        with log_file.open("a") as out_f:
-            files = list(TMP_LOG_PATH.glob(f"log_*.log"))
-            for file_path in files:
+        with log_file.open("ab") as out_f:
+            for file_path in tmp_files:
                 try:
-                    with file_path.open("r") as in_f:
-                        out_f.writelines(in_f.read())
-                    with file_path.open("w") as f:
-                        pass
+                    with file_path.open("rb") as in_f:
+                        for line in in_f:
+                            if len(line) > 10000:
+                                print(f"Truncating long line ({len(line)} bytes) in {file_path.name}")
+                                out_f.write(line[:10000] + b"\n")
+                            else:
+                                out_f.write(line)
+                    if end:
+                        file_path.unlink()
+                    else:
+                        file_path.open("wb").close()
                 except Exception as err:
                     print(f"Error reading {file_path}: {err}", flush=True)
     except Exception as err:

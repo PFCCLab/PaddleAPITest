@@ -6,7 +6,7 @@ from collections import defaultdict
 from pathlib import Path
 import re
 
-TEST_LOG_PATH = Path("tester/api_config/test_log")
+TEST_LOG_PATH = Path("tester/api_config/test_log_cpu")
 OUTPUT_PATH = TEST_LOG_PATH
 OUTPUT_PATH.mkdir(parents=True, exist_ok=True)
 
@@ -23,9 +23,6 @@ LOG_PREFIXES = {
 }
 
 # log_digester_lite
-pattern = re.compile(r"^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\.\d+")
-warning_pattern = re.compile(r"^W\d{4} \d{2}:\d{2}:\d{2}\.\d+\s+\d+ gpu_resources.cc")
-
 logs = []
 in_test_block = False
 current_content = []
@@ -39,18 +36,21 @@ except Exception as err:
     exit(1)
 
 for line in input_text.split("\n"):
-    if warning_pattern.match(line):
+    if "gpu_resources.cc" in line or "Waiting for available memory" in line:
         continue
 
-    if pattern.match(line):
-        if in_test_block:
-            if current_content:
-                logs.append("\n".join(current_content))
-            current_content = []
-            in_test_block = False
-        if "test begin:" in line:
-            in_test_block = True
-            current_content = [line]
+    if "test begin" in line:
+        if in_test_block and current_content:
+            logs.append("\n".join(current_content))
+        in_test_block = True
+        current_content = [line]
+        continue
+
+    if "Worker PID" in line:
+        if in_test_block and current_content:
+            logs.append("\n".join(current_content))
+        in_test_block = False
+        current_content = []
         continue
 
     if in_test_block:
@@ -58,7 +58,6 @@ for line in input_text.split("\n"):
 
 if current_content:
     logs.append("\n".join(current_content))
-    current_content = []
 
 log_counts = defaultdict(set)
 for prefix, file_name in LOG_PREFIXES.items():

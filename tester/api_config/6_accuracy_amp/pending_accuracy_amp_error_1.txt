@@ -1,1 +1,0 @@
-paddle.nn.functional.linear(x=Tensor([1, 1024, 768],"bfloat16"), weight=Tensor([768, 11008],"bfloat16"), bias=None, name=None, )

@@ -2596,3 +2596,5 @@ paddle.nn.quant.weight_quantize(Tensor([768, 22016],"float16"), algo="weight_onl
 paddle.nn.quant.weight_quantize(Tensor([768, 2304],"float16"), algo="weight_only_int8", )
 paddle.nn.quant.weight_quantize(Tensor([768, 768],"float16"), algo="weight_only_int8", )
 paddle.dot(Tensor([0, 0],"float32"), Tensor([0, 0],"float32"), )
+paddle.Tensor.set_(Tensor([0],"float16"), None, None, None, 0, )
+paddle.Tensor.set_(Tensor([0],"float32"), None, None, None, 0, )
