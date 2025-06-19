@@ -25618,3 +25618,6 @@ paddle.nn.functional.rrelu(Tensor([2, 3, 4, 5],"float32"), 0.3, 0.300000009, tra
 paddle.nn.functional.rrelu(Tensor([2, 3, 4, 5],"float64"), 0.3, 0.300000009, training=True, )
 paddle.nn.functional.rrelu(Tensor([2, 3, 4, 5],"float16"), 0.3, 0.300000009, training=True, )
 paddle.scatter(Tensor([183826, 256],"float32"), Tensor([10759233],"int64"), Tensor([10759233, 256],"float32"), )
+paddle.index_put(Tensor([100, 110],"float32"), tuple(Tensor([21],"int32"),Tensor([21],"int32"),), Tensor([21],"float32"), False, )
+paddle.index_put(Tensor([110, 42, 32, 56],"float64"), tuple(Tensor([16, 16],"int32"),Tensor([16, 16],"int32"),Tensor([32],"bool"),), Tensor([16, 16, 56],"float64"), False, )
+paddle.index_put(Tensor([110, 42, 56, 56],"float64"), tuple(Tensor([16, 16],"int32"),Tensor([16, 16],"int32"),Tensor([1, 16],"int32"),), Tensor([16, 16, 56],"float64"), False, )

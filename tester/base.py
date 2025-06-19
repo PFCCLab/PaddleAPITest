@@ -68,6 +68,7 @@ stochastic_behavior_apis = frozenset(
         # "paddle.nn.functional.feature_alpha_dropout",
         # "paddle.nn.functional.fused_feedforward",
         # "paddle.nn.functional.rrelu", # If parameter "training=True" is set, the result involves random calculation.
+        # "paddle.index_put", # If parameter "accumulate=False" and indices contain duplicate values, the behavior is undefined, the result involves random calculation.
         # "paddle.nn.functional.scaled_dot_product_attention", # If parameter "dropout_p=0.0" is not equal to 0.0 or 1.0, the result involves random calculation.
         # "paddle.scatter", # If overwrite is set to True and index contain duplicate values, the result involves random calculation.
         # "paddle.nn.functional.gumbel_softmax",
