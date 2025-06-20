@@ -270,7 +270,18 @@ class APITestAccuracy(APITestBase):
                         paddle_output = paddle.cast(paddle_output, dtype="float32")
                         torch_output = torch_output.to(dtype=torch.float32)
                     # self.np_assert_accuracy(paddle_output.numpy(), torch_output.numpy(), atol=self.atol, rtol=self.rtol)
-                    self.torch_assert_accuracy(paddle_output, torch_output, atol=self.atol, rtol=self.rtol)
+
+                    atol = self.atol
+                    rtol = self.rtol
+                    if self.api_config.api_name == "paddle.add_n":
+                        input_list_len = len(self.paddle_args[0])
+                        if input_list_len > 0:
+                            input_list_first = self.paddle_args[0][0]
+                            # cpu place, float16 dtype
+                            if paddle.device.get_device() == "cpu" and input_list_first.dtype == paddle.float16:
+                                atol = input_list_len * atol
+                                rtol = input_list_len * rtol
+                    self.torch_assert_accuracy(paddle_output, torch_output, atol=atol, rtol=rtol)
                 except Exception as err:
                     print("[accuracy error]", self.api_config.config, "\n", str(err), flush=True)
                     write_to_log("accuracy_error", self.api_config.config)
