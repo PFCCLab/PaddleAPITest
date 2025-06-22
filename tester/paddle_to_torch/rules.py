@@ -5822,7 +5822,8 @@ if data_format == "NCHW":
     x = x.view(n, seg_num, c, h, w)
 
     fold = int(c * shift_ratio)
-    x_padded = torch.nn.functional.pad(x, pad=(0, 0, 0, 0, 0, 0, 1, 1))  # Pad T-dim: (left=1, right=1)
+    zeros = x.new_zeros([n, 1, c, h, w])
+    x_padded = torch.cat([zeros, x, zeros], dim=1)
 
     slice1 = x_padded[:, 0:seg_num, :fold, :, :]
     slice2 = x_padded[:, 2:seg_num+2, fold:2*fold, :, :]
@@ -5837,7 +5838,8 @@ elif data_format == "NHWC":
     x = x.view(n, seg_num, h, w, c)
 
     fold = int(c * shift_ratio)
-    x_padded = torch.nn.functional.pad(x, pad=(0, 0, 0, 0, 0, 0, 1, 1)) 
+    zeros = x.new_zeros([n, 1, h, w, c])
+    x_padded = torch.cat([zeros, x, zeros], dim=1)
 
     slice1 = x_padded[:, 0:seg_num, :, :, :fold]
     slice2 = x_padded[:, 2:seg_num+2, :, :, fold:2*fold]
