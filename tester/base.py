@@ -487,6 +487,32 @@ class APITestBase:
             elif "driver" in self.paddle_kwargs:
                 self.paddle_kwargs["driver"] = "gels"
 
+        if self.api_config.api_name == "paddle.concat":
+            # handle type promotion here
+            input_list = self.paddle_kwargs.get("x", None)
+            is_x_kwargs = input_list is not None
+            input_list = self.paddle_args[0] if not is_x_kwargs else input_list
+            is_tuple = isinstance(input_list, tuple)
+            if is_tuple:
+                input_list = list(input_list)
+            promoted_type = numpy.promote_types(str(input_list[0].dtype).split('.')[-1], str(input_list[1].dtype).split('.')[-1])
+            num_inputs = len(input_list)
+            if num_inputs > 2:
+                for i in range(2, num_inputs):
+                    promoted_type = numpy.promote_types(str(input_list[i].dtype).split('.')[-1], promoted_type)
+            for i in range(num_inputs):
+                input_list[i] = input_list[i].astype(str(promoted_type))
+            if is_tuple:
+                if is_x_kwargs:
+                    self.paddle_kwargs["x"] = tuple(input_list)
+                else:
+                    self.paddle_args[0] = tuple(input_list)
+            else:
+                if is_x_kwargs:
+                    self.paddle_kwargs["x"] = input_list
+                else:
+                    self.paddle_args[0] = input_list
+
         if self.need_check_grad():
             if (self.api_config.api_name[-1] == "_" and self.api_config.api_name[-2:] != "__") or self.api_config.api_name == "paddle.Tensor.__setitem__":
                 self.paddle_args, self.paddle_kwargs = self.copy_paddle_input()
@@ -841,6 +867,25 @@ class APITestBase:
                 self.torch_kwargs[key] = self.convert_dtype_to_torch_type(arg_config)
             else:
                 self.torch_kwargs[key] = arg_config
+
+        if self.api_config.api_name == "paddle.concat":
+            # handle type promotion here
+            input_list = self.torch_kwargs["x"]
+            is_tuple = isinstance(input_list, tuple)
+            if is_tuple:
+                input_list = list(input_list)
+            input_list = list(input_list)
+            promoted_type = numpy.promote_types(str(input_list[0].dtype).split('.')[-1], str(input_list[1].dtype).split('.')[-1])
+            num_inputs = len(input_list)
+            if num_inputs > 2:
+                for i in range(2, num_inputs):
+                    promoted_type = numpy.promote_types(str(input_list[i].dtype).split('.')[-1], promoted_type)
+            for i in range(num_inputs):
+                input_list[i] = input_list[i].type(self.convert_dtype_to_torch_type(promoted_type))
+            if is_tuple:
+                self.torch_kwargs["x"] = tuple(input_list)
+            else:
+                self.torch_kwargs["x"] = input_list
 
         if self.need_check_grad():
             if (self.api_config.api_name[-1] == "_" and self.api_config.api_name[-2:] != "__") or self.api_config.api_name == "paddle.Tensor.__setitem__":
