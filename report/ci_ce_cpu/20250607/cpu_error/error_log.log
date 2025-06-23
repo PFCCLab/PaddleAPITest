@@ -9602,6 +9602,7 @@ FatalError: `Process abort signal` is detected by the operating system.
   [SignalInfo: *** SIGABRT (@0x1354d) received by PID 79181 (TID 0x7ffb53824740) from PID 79181 ***]
 
 
+
 2025-06-10 12:00:58.775979 GPU 3 79209 test begin: paddle.vander(Tensor([5],"float32"), 3, False, )
 terminate called after throwing an instance of 'c10::Error'
   what():  Storage size calculation overflowed with sizes=[5, 3] and strides=[3, -1]
