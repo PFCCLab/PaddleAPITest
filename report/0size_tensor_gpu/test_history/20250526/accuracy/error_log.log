@@ -19415,6 +19415,7 @@ ACTUAL: (shape=torch.Size([]), dtype=torch.float32)
 All elements: tensor([-0.])
 DESIRED: (shape=torch.Size([]), dtype=torch.float32)
 All elements: tensor([nan])
+
 [Worker 2] Completed Task 1415
 
 [Worker 2] Processing Task 1416: paddle.linalg.norm(x=Tensor([0, 3, 3],"float64"), axis=list[1,2,], p=1, )
