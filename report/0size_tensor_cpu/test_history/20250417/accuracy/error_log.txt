@@ -25450,7 +25450,6 @@ FatalError: `Segmentation fault` is detected by the operating system.
   [SignalInfo: *** SIGSEGV (@0x0) received by PID 32137 (TID 0x7f4480449700) from PID 0 ***]
 
 
-
 2025-04-17 10:04:11.945080 test begin: paddle.vstack(list[Tensor([0],"float64"),], name=None, )
 
 
