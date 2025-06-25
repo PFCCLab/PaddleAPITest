@@ -15242,7 +15242,6 @@ Max relative difference among violations: inf
   [Hint: Expected x.numel() > 0, but received x.numel():0 <= 0:0.] (at /paddle/paddle/phi/kernels/impl/lerp_kernel_impl.h:86)
 
 
-
 2025-04-17 09:15:51.583012 test begin: paddle.lerp(Tensor([0, 1, 1],"float32"), Tensor([0, 8, 8],"float32"), 0.3, )
 
 [paddle error] paddle.lerp(Tensor([0, 1, 1],"float32"), Tensor([0, 8, 8],"float32"), 0.3, ) 
