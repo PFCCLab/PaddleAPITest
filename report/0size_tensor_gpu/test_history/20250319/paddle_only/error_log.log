@@ -4,6 +4,7 @@
  (External) CUDA error(9), invalid configuration argument. 
   [Hint: 'cudaErrorInvalidConfiguration'. This indicates that a kernel launch is requesting resources that can never be satisfied by the current device. Requestingmore shared memory per block than the device supports will trigger this error, as will requesting too many threads or blocks.See cudaDeviceProp for more device limitations.] (at ../paddle/fluid/pybind/eager_functions.cc:1388)
 
+
 2025-03-03 17:02:28.866555 test begin: paddle.allclose(Tensor([0, 13, 128],"float32"), Tensor([0, 13, 128],"float32"), rtol=0.0001, atol=0.0001, )
 
 [cuda error] paddle.allclose(Tensor([0, 13, 128],"float32"), Tensor([0, 13, 128],"float32"), rtol=0.0001, atol=0.0001, ) 
