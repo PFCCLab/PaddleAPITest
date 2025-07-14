@@ -1681,6 +1681,10 @@ class TensorConfig:
             elif api_config.api_name == "paddle.tile":
                 if self.check_arg(api_config, 1, "repeat_times"):
                     self.numpy_tensor = numpy.random.randint(1, 128, size=self.shape).astype(self.dtype)
+            
+            elif api_config.api_name == "paddle.nn.functional.grid_sample":
+                if self.check_arg(api_config, 1, "grid"):
+                    self.numpy_tensor = numpy.random.uniform(-1, 1, size=self.shape).astype(self.dtype)
 
             elif api_config.api_name in {"paddle.topk", "paddle.Tensor.topk"}:
                 if self.check_arg(api_config, 0, "x"):
