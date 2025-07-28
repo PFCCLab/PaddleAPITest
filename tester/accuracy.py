@@ -401,6 +401,12 @@ class APITestAccuracy(APITestBase):
             }:
                 paddle_out_grads = []
                 torch_out_grads = []
+            elif  self.api_config.api_name in {
+                "paddle.linalg.cholesky_solve",
+                "paddle.Tensor.cholesky_solve",
+            }:
+                paddle_out_grads = paddle_out_grads[0]
+                torch_out_grads = torch_out_grads[0]
 
             if isinstance(paddle_out_grads, paddle.Tensor):
                 if isinstance(torch_out_grads, torch.Tensor):
