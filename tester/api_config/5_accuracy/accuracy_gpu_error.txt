@@ -2244,8 +2244,6 @@ paddle.incubate.softmax_mask_fuse(x=Tensor([2, 8, 8, 1020],"float16"), mask=Tens
 paddle.incubate.softmax_mask_fuse(x=Tensor([2, 8, 8, 32],"float16"), mask=Tensor([2, 1, 8, 32],"float16"), )
 paddle.incubate.softmax_mask_fuse(x=Tensor([6, 8, 8, 32],"float16"), mask=Tensor([6, 1, 8, 32],"float16"), )
 paddle.incubate.softmax_mask_fuse(x=Tensor([7, 3, 16, 32],"float16"), mask=Tensor([7, 1, 16, 32],"float16"), )
-paddle.index_put(Tensor([110, 42, 32, 56],"float64"), tuple(Tensor([16, 16],"int32"),Tensor([16, 16],"int32"),Tensor([32],"bool"),), Tensor([16, 16, 56],"float64"), False, )
-paddle.index_put(Tensor([110, 42, 56, 56],"float64"), tuple(Tensor([16, 16],"int32"),Tensor([16, 16],"int32"),Tensor([1, 16],"int32"),), Tensor([16, 16, 56],"float64"), False, )
 paddle.linalg.norm(Tensor([16, 16],"float32"), 2.0, )
 paddle.linalg.norm(x=Tensor([3, 4],"float32"), p=2, axis=None, keepdim=False, )
 paddle.linalg.norm(x=Tensor([3, 4],"float32"), p=2, axis=None, keepdim=True, )
