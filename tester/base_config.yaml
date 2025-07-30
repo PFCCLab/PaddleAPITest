@@ -20,6 +20,7 @@ paddle_error_dismiss:
   paddle.incubate.nn.functional.fused_rms_norm : "(Fatal) Failed to launch RMSNorm kernel"
   paddle.nn.functional.ctc_loss: "(InvalidArgument) The total number of elements "
   paddle.unbind: "(PreconditionNotMet) The number of proposals in unbind"
+  paddle.einsum: "(Unimplemented) cublas GEMM does not support N >"
 
 # some accuracy error can be considered tolerable
 special_accuracy_atol_rtol:
