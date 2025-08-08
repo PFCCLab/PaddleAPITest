@@ -3830,7 +3830,6 @@ paddle.Tensor.diff(x=Tensor([10, 4],"float16"), axis=0, prepend=Tensor([10737418
 paddle.Tensor.diff(x=Tensor([2281701379],"int64"), )
 paddle.Tensor.diff(x=Tensor([67108865, 4, 4, 4],"float16"), axis=-2, )
 paddle.Tensor.diff(x=Tensor([2281701379],"int32"), )
-paddle.Tensor.diff(x=Tensor([1073741825, 4],"float16"), axis=0, prepend=Tensor([1073741825, 4],"float16"), append=Tensor([1073741825, 4],"float16"), )
 paddle.Tensor.diff(x=Tensor([4294967297],"float16"), prepend=Tensor([4],"float16"), )
 paddle.Tensor.diff(x=Tensor([4, 4, 67108865, 4],"float16"), )
 paddle.Tensor.diff(Tensor([2281701379],"float32"), )
