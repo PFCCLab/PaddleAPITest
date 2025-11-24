@@ -7,8 +7,8 @@ class APITestCustomDeviceVSCPU(APITestBase):
     def __init__(self, api_config, **kwargs):
         super().__init__(api_config)
         self.test_amp = kwargs.get("test_amp", False)
+        self.custom_device_type = self._get_first_custom_device_type()
         if self.check_custom_device_available():
-            self.custom_device_type = self._get_first_custom_device_type()
             self.custom_device_id = 0
         if self.check_xpu_available():
             self.xpu_device_id = kwargs.get("xpu_device_id", 0)
