@@ -94,12 +94,22 @@ def get_device_type() -> str:
                 return "xpu"
         except Exception:
             pass
+    if shutil.which("ixsmi"):
+        try:
+            out = subprocess.check_output(["ixsmi"], text=True, stderr=subprocess.STDOUT)
+            if any(re.match(r"^\|\s*\d+\s+Iluvatar", line) for line in out.splitlines()):
+                return "iluvatar"
+        except Exception:
+            pass
     return "cpu"
 
 def get_device_count() -> int:
     """Get the number of available devices (GPUs or XPUs)."""
     device_type = get_device_type()
     
+    if device_type == "gpu":
+        out = subprocess.check_output(["nvidia-smi", "-L"], text=True)
+        return sum(1 for l in out.splitlines() if l.startswith("GPU "))
     if device_type == "xpu":
         out = subprocess.check_output(["xpu-smi"], text=True, stderr=subprocess.STDOUT)
         ids = set()
@@ -110,10 +120,14 @@ def get_device_count() -> int:
             if m:
                 ids.add(int(m.group(1)))
         return len(ids)
-    elif device_type == "gpu":
-        out = subprocess.check_output(["nvidia-smi", "-L"], text=True)
-        return sum(1 for l in out.splitlines() if l.startswith("GPU "))
-    
+    if device_type == "iluvatar":
+        out = subprocess.check_output(["ixsmi"], text=True, stderr=subprocess.STDOUT)
+        ids = set()
+        for line in out.splitlines():
+            m = re.match(r"^\|\s*(\d+)\s+Iluvatar", line)
+            if m:
+                ids.add(int(m.group(1)))
+        return len(ids)    
     return 0
 
 
@@ -193,7 +207,7 @@ def get_memory_info(gpu_id):
             return int(mem_info.total) / (1024**3), int(mem_info.used) / (1024**3)
         finally:
             pynvml.nvmlShutdown()
-    elif device_type == "xpu":
+    if device_type == "xpu":
         out = subprocess.check_output(["xpu-smi"], text=True, stderr=subprocess.STDOUT)
         lines = out.splitlines()
         for i, line in enumerate(lines):
@@ -206,8 +220,21 @@ def get_memory_info(gpu_id):
                         return total_mib / 1024.0, used_mib / 1024.0
                 break
         raise RuntimeError(f"Failed to parse xpu-smi memory for device {gpu_id}")
+    if device_type == "iluvatar":
+        out = subprocess.check_output(["ixsmi"], text=True, stderr=subprocess.STDOUT)
+        lines = out.splitlines()
+        for i, line in enumerate(lines):
+            if re.match(rf"^\|\s*{gpu_id}\s+Iluvatar", line):
+                for j in range(i + 1, min(i + 5, len(lines))):
+                    m = re.search(r"(\d+)\s*MiB\s*/\s*(\d+)\s*MiB", lines[j])
+                    if m:
+                        used_mib = int(m.group(1))
+                        total_mib = int(m.group(2))
+                        return total_mib / 1024.0, used_mib / 1024.0
+                break
+        raise RuntimeError(f"Failed to parse ixsmi memory for Iluvatar device {gpu_id}")
     else:
-        raise RuntimeError("Neither NVIDIA GPU nor XPU environment detected.")
+        raise RuntimeError("Neither NVIDIA GPU, Iluvatar GPU nor XPU environment detected.")
 
 def check_gpu_memory(
     gpu_ids, num_workers_per_gpu, required_memory
