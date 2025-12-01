@@ -1411,7 +1411,7 @@ class TensorConfig:
                             all = all - self.numpy_tensor[i]
                     self.numpy_tensor[self.numel()-1] = all
 
-            elif api_config.api_name == "paddle.repeat_interleave":
+            elif api_config.api_name.find(".repeat_interleave") > 0:
                 if self.check_arg(api_config, 0, "x"):
                     if self.dtype=='bfloat16':
                         self.dtype='float32'
@@ -1747,10 +1747,13 @@ class TensorConfig:
                         self.numpy_tensor[...,i]=(numpy.random.randint(0,org[i], size=self.numpy_tensor[...,i].shape)).astype(self.dtype)
 
             elif api_config.api_name in {"paddle.Tensor.index_select", "paddle.index_select"}:
-                if self.check_arg(api_config,1,'index'):
+
+                if self.check_arg(api_config,1,'index') or self.check_arg(api_config,2,'index'):
                     axis=self.get_arg(api_config, 2, 'axis')
                     if axis is None:
-                        axis=0
+                        axis=self.get_arg(api_config, 1, 'axis')
+                        if axis is None:
+                            axis=0
                     inputs=self.get_arg(api_config, 0, "x")
                     self.numpy_tensor = numpy.random.randint(0,inputs.shape[axis], size=self.shape).astype(self.dtype)
 
@@ -2043,7 +2046,11 @@ class TensorConfig:
             print("Warning ", self.dtype, "not supported")
             return
 
-        device = torch.device("cuda:0")
+        if torch.cuda.is_available():
+
+            device = torch.device("cuda:0")
+        else :
+            device = torch.device("cpu")
         torch.set_default_device(device)
         if self.torch_tensor is None:
             self.torch_tensor = torch.tensor(
