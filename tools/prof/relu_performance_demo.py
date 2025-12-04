@@ -2,6 +2,7 @@ import torch
 import paddle
 import numpy
 import time
+paddle.set_flags({'FLAGS_share_tensor_for_grad_tensor_holder': 1})
 
 device = torch.device("cuda:0")
 torch.set_default_device(device)

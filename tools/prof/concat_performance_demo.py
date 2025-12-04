@@ -2,6 +2,7 @@ import torch
 import paddle
 import numpy
 import time
+paddle.set_flags({'FLAGS_share_tensor_for_grad_tensor_holder': 1})
 
 device = torch.device("cuda:0")
 torch.set_default_device(device)
@@ -23,7 +24,7 @@ def init_input(numpy_tensor):
 
 # paddle.concat(list[Tensor([4, 178176, 1],"float32"),Tensor([4, 44544, 1],"float32"),Tensor([4, 11136, 1],"float32"),Tensor([4, 2784, 1],"float32"),Tensor([4, 720, 1],"float32"),], axis=1, )
 
-m =  4
+m =  1
 n1 = 178176
 n2 = 44544
 n3 = 11136
