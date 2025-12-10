@@ -1754,9 +1754,7 @@ class TensorConfig:
                 if self.check_arg(api_config,1,'index') or self.check_arg(api_config,2,'index'):
                     axis=self.get_arg(api_config, 2, 'axis')
                     if axis is None:
-                        axis=self.get_arg(api_config, 1, 'axis')
-                        if axis is None:
-                            axis=0
+                        axis=0
                     inputs=self.get_arg(api_config, 0, "x")
                     self.numpy_tensor = numpy.random.randint(0,inputs.shape[axis], size=self.shape).astype(self.dtype)
 
