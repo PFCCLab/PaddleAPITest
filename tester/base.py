@@ -610,6 +610,7 @@ class APITestBase:
             result_output_grad = paddle.to_tensor(
                 numpy_tensor,
                 dtype=dtype if dtype != "bfloat16" else "float32",
+                place=result_outputs[i].place,
             )
             result_output_grad.stop_gradient = False
             if dtype == "bfloat16":
