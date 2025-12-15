@@ -9,12 +9,19 @@ from datetime import datetime
 import paddle
 import torch
 
-from tester import (APIConfig, APITestAccuracy, APITestAccuracyStable,
-                    APITestCINNVSDygraph, APITestPaddleGPUPerformance,
-                    APITestPaddleOnly, APITestPaddleTorchGPUPerformance,
-                    APITestTorchGPUPerformance,APITestCustomDeviceVSCPU,set_cfg)
-from tester.api_config.log_writer import (close_process_files, read_log,
-                                          write_to_log)
+from tester import (
+    APIConfig,
+    APITestAccuracy,
+    APITestAccuracyStable,
+    APITestCINNVSDygraph,
+    APITestPaddleGPUPerformance,
+    APITestPaddleOnly,
+    APITestPaddleTorchGPUPerformance,
+    APITestTorchGPUPerformance,
+    APITestCustomDeviceVSCPU,
+    set_cfg,
+)
+from tester.api_config.log_writer import close_process_files, read_log, write_to_log
 
 
 def parse_bool(value):
@@ -222,6 +229,7 @@ def main():
         #         # res.terminate()
 
     close_process_files()
+
 
 if __name__ == "__main__":
     main()

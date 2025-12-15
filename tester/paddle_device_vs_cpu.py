@@ -3,6 +3,7 @@ from .api_config.log_writer import write_to_log
 from .base import APITestBase
 import torch
 
+
 class APITestCustomDeviceVSCPU(APITestBase):
     def __init__(self, api_config, **kwargs):
         super().__init__(api_config)
@@ -55,35 +56,52 @@ class APITestCustomDeviceVSCPU(APITestBase):
             if self.test_amp:
                 with paddle.amp.auto_cast():
                     output = self.paddle_api(
-                        *tuple(self.paddle_args), **self.paddle_kwargs)
+                        *tuple(self.paddle_args), **self.paddle_kwargs
+                    )
             else:
-                output = self.paddle_api(
-                    *tuple(self.paddle_args), **self.paddle_kwargs)
+                output = self.paddle_api(*tuple(self.paddle_args), **self.paddle_kwargs)
 
             # Backward
             out_grads = None
             if self.need_check_grad():
                 inputs_list = self.get_paddle_input_list()
-                result_outputs, result_outputs_grads = self.gen_paddle_output_and_output_grad(
-                    output)
+                result_outputs, result_outputs_grads = (
+                    self.gen_paddle_output_and_output_grad(output)
+                )
 
                 if inputs_list and result_outputs and result_outputs_grads:
                     try:
                         out_grads = paddle.grad(
-                            result_outputs, inputs_list, grad_outputs=result_outputs_grads, allow_unused=True)
+                            result_outputs,
+                            inputs_list,
+                            grad_outputs=result_outputs_grads,
+                            allow_unused=True,
+                        )
                     except Exception as grad_err:
-                        print(f"[{device_type} backward error]", self.api_config.config, "\n", str(
-                            grad_err), flush=True)
+                        print(
+                            f"[{device_type} backward error]",
+                            self.api_config.config,
+                            "\n",
+                            str(grad_err),
+                            flush=True,
+                        )
                         out_grads = None
                 else:
                     print(
-                        f"[backward skip] No valid inputs or outputs for gradient computation on {device_type}", flush=True)
+                        f"[backward skip] No valid inputs or outputs for gradient computation on {device_type}",
+                        flush=True,
+                    )
 
             return output, out_grads
 
         except Exception as err:
-            print(f"[{device_type} error]", self.api_config.config,
-                  "\n", str(err), flush=True)
+            print(
+                f"[{device_type} error]",
+                self.api_config.config,
+                "\n",
+                str(err),
+                flush=True,
+            )
             return None, None
 
     def _compare_single_tensor(self, cpu_tensor, custom_tensor, tensor_name=""):
@@ -102,17 +120,13 @@ class APITestCustomDeviceVSCPU(APITestBase):
 
             # 使用 torch.testing.assert_close 来替代 numpy.testing.assert_allclose
             torch.testing.assert_close(
-                cpu_torch,
-                custom_torch,
-                rtol=1e-2,
-                atol=1e-2,
-                equal_nan=True
+                cpu_torch, custom_torch, rtol=1e-2, atol=1e-2, equal_nan=True
             )
 
             return True
 
         except Exception as err:
-            error_msg = f"[accuracy error]"
+            error_msg = "[accuracy error]"
             if tensor_name:
                 error_msg += f" {tensor_name}"
             error_msg += f"\n{self.api_config.config}\n{str(err)}"
@@ -127,8 +141,7 @@ class APITestCustomDeviceVSCPU(APITestBase):
 
         if isinstance(cpu_output, paddle.Tensor):
             if not isinstance(custom_output, paddle.Tensor):
-                print("[output type diff error]",
-                      self.api_config.config, flush=True)
+                print("[output type diff error]", self.api_config.config, flush=True)
                 return False
 
             return self._compare_single_tensor(cpu_output, custom_output)
@@ -136,8 +149,7 @@ class APITestCustomDeviceVSCPU(APITestBase):
         # list/tuple case
         elif isinstance(cpu_output, (list, tuple)):
             if not isinstance(custom_output, (list, tuple)):
-                print("[output type diff error]",
-                      self.api_config.config, flush=True)
+                print("[output type diff error]", self.api_config.config, flush=True)
                 return False
 
             # Convert to list
@@ -147,26 +159,32 @@ class APITestCustomDeviceVSCPU(APITestBase):
                 custom_output = list(custom_output)
 
             if len(cpu_output) != len(custom_output):
-                print("[output length diff error]",
-                      self.api_config.config, flush=True)
+                print("[output length diff error]", self.api_config.config, flush=True)
                 return False
 
             # Compare
             for i in range(len(cpu_output)):
                 if not isinstance(cpu_output[i], paddle.Tensor):
                     print(
-                        f"skip non-tensor output[{i}]:", cpu_output[i], custom_output[i], flush=True)
+                        f"skip non-tensor output[{i}]:",
+                        cpu_output[i],
+                        custom_output[i],
+                        flush=True,
+                    )
                     continue
 
-                if not self._compare_single_tensor(cpu_output[i], custom_output[i], f"output[{i}]"):
+                if not self._compare_single_tensor(
+                    cpu_output[i], custom_output[i], f"output[{i}]"
+                ):
                     return False
 
             return True
 
         else:
             # Non-Tensor output, print comparison directly
-            print("non-tensor output comparison:",
-                  cpu_output, custom_output, flush=True)
+            print(
+                "non-tensor output comparison:", cpu_output, custom_output, flush=True
+            )
             return True
 
     def compare_gradients(self, cpu_grads, custom_grads):
@@ -181,7 +199,9 @@ class APITestCustomDeviceVSCPU(APITestBase):
         if isinstance(custom_grads, paddle.Tensor):
             custom_grads = [custom_grads]
 
-        if not isinstance(cpu_grads, (list, tuple)) or not isinstance(custom_grads, (list, tuple)):
+        if not isinstance(cpu_grads, (list, tuple)) or not isinstance(
+            custom_grads, (list, tuple)
+        ):
             print("[gradients type error]", self.api_config.config, flush=True)
             return False
 
@@ -190,8 +210,7 @@ class APITestCustomDeviceVSCPU(APITestBase):
         custom_grads = list(custom_grads)
 
         if len(cpu_grads) != len(custom_grads):
-            print("[gradients length diff error]",
-                  self.api_config.config, flush=True)
+            print("[gradients length diff error]", self.api_config.config, flush=True)
             return False
 
         # Compare gradients one by one
@@ -199,12 +218,12 @@ class APITestCustomDeviceVSCPU(APITestBase):
             if cpu_grad is None and custom_grad is None:
                 continue
             elif cpu_grad is None or custom_grad is None:
-                print(f"[gradient {i} none error]",
-                      self.api_config.config, flush=True)
+                print(f"[gradient {i} none error]", self.api_config.config, flush=True)
                 return False
-            elif not isinstance(cpu_grad, paddle.Tensor) or not isinstance(custom_grad, paddle.Tensor):
-                print(f"[gradient {i} type error]",
-                      self.api_config.config, flush=True)
+            elif not isinstance(cpu_grad, paddle.Tensor) or not isinstance(
+                custom_grad, paddle.Tensor
+            ):
+                print(f"[gradient {i} type error]", self.api_config.config, flush=True)
                 return False
 
             if not self._compare_single_tensor(cpu_grad, custom_grad, f"gradient {i}"):
@@ -226,7 +245,7 @@ class APITestCustomDeviceVSCPU(APITestBase):
         elif self.check_custom_device_available():
             target_device, device_id = self.custom_device_type, self.custom_device_id
         else:
-            print(f"[no available device]", self.api_config.config, flush=True)
+            print("[no available device]", self.api_config.config, flush=True)
             write_to_log("crash", self.api_config.config)
             return
 
@@ -255,9 +274,12 @@ class APITestCustomDeviceVSCPU(APITestBase):
         # 6. Run API on target device (including forward and backward)
         tgt_output, tgt_grads = self.run_on_device(target_device, device_id)
         if tgt_output is None:
-            print(f"[{target_device} execution failed]",
-                  self.api_config.config, flush=True)
-            write_to_log(f"paddle_error", self.api_config.config)
+            print(
+                f"[{target_device} execution failed]",
+                self.api_config.config,
+                flush=True,
+            )
+            write_to_log("paddle_error", self.api_config.config)
             return
 
         # 7. Compare forward results
@@ -270,14 +292,20 @@ class APITestCustomDeviceVSCPU(APITestBase):
             print("[Backward test begin]")
 
             if cpu_grads is None:
-                print("[cpu backward execution failed]",
-                      self.api_config.config, flush=True)
+                print(
+                    "[cpu backward execution failed]",
+                    self.api_config.config,
+                    flush=True,
+                )
                 write_to_log("paddle_error", self.api_config.config)
                 backward_pass = False
             elif tgt_grads is None:
-                print(f"[{target_device} backward execution failed]",
-                      self.api_config.config, flush=True)
-                write_to_log(f"paddle_error", self.api_config.config)
+                print(
+                    f"[{target_device} backward execution failed]",
+                    self.api_config.config,
+                    flush=True,
+                )
+                write_to_log("paddle_error", self.api_config.config)
                 backward_pass = False
             else:
                 backward_pass = self.compare_gradients(cpu_grads, tgt_grads)

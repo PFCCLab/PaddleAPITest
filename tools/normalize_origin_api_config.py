@@ -143,10 +143,7 @@
 #         f2.write(api+"\n")
 
 
-
-logs = [
-"/host_home/wanghuan29/APItest/PaddleAPITest/tester/api_config/api_config.txt"
-]
+logs = ["/host_home/wanghuan29/APItest/PaddleAPITest/tester/api_config/api_config.txt"]
 
 configs = set()
 
@@ -160,6 +157,9 @@ for log in logs:
 
 # configs = configs - get_notsupport_config()
 
-with open("/host_home/wanghuan29/APItest/PaddleAPITest/tester/api_config/api_config_CE_PaddleScience.txt", "w") as f:
+with open(
+    "/host_home/wanghuan29/APItest/PaddleAPITest/tester/api_config/api_config_CE_PaddleScience.txt",
+    "w",
+) as f:
     for config in sorted(configs):
         f.write(config)

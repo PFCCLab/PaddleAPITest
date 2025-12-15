@@ -895,11 +895,11 @@ if not isinstance(axis, int) and axis != None:
 """
         post = ""
         if paddle_api == "paddle.cumsum":
-            core = f"result = torch.cumsum(**_kwargs)"
+            core = "result = torch.cumsum(**_kwargs)"
         elif paddle_api == "paddle.Tensor.cumsum":
-            core = f"result = x.cumsum(**_kwargs)"
+            core = "result = x.cumsum(**_kwargs)"
         elif paddle_api == "paddle.Tensor.cumsum_":
-            core = f"x.cumsum_(**_kwargs)"
+            core = "x.cumsum_(**_kwargs)"
             post = "result = x"
         else:
             return ConvertResult.error(paddle_api, f"Unsupported api: {paddle_api}")
@@ -4746,7 +4746,7 @@ if mode == "r":
 # r
 class RankRule(BaseRule):
     def apply(self, paddle_api: str) -> ConvertResult:
-        core = f"result = torch.tensor(input.dim(),dtype=torch.int64)"
+        core = "result = torch.tensor(input.dim(),dtype=torch.int64)"
         post = """
 result = result.to(torch.int32)
 """
@@ -4885,9 +4885,9 @@ if 'axis' in locals() and isinstance(axis, torch.Tensor):
         axis = axis.tolist()
 """
         if paddle_api == "paddle.roll":
-            core = f"result = torch.roll(**_kwargs)"
+            core = "result = torch.roll(**_kwargs)"
         else:
-            core = f"result = x.roll(**_kwargs)"
+            core = "result = x.roll(**_kwargs)"
         code = Code(
             preprocess=defaults_code + pre.splitlines() + map_code,
             core=[core],
@@ -4964,7 +4964,7 @@ if isinstance(axis, tuple) and not keepdim:
     result = torch.squeeze(result, dim=axis)
 """
         elif paddle_api == "paddle.sum":
-            core = f"result = torch.sum(x, dim=axis, keepdim=keepdim, dtype=dtype)"
+            core = "result = torch.sum(x, dim=axis, keepdim=keepdim, dtype=dtype)"
             post = ""
         else:
             core = f"result = {self.torch_api}(x, dim=axis, keepdim=keepdim)"

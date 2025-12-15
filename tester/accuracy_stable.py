@@ -504,7 +504,7 @@ class APITestAccuracyStable(APITestBase):
             err_str = str(err)
             is_acc_err = False
             if err_str.startswith("Comparing"):
-                print(f"torch_assert failed, try np_assert", flush=True)
+                print("torch_assert failed, try np_assert", flush=True)
                 try:
                     numpy.testing.assert_allclose(
                         tensor1.cpu().numpy(),

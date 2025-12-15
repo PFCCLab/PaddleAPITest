@@ -21,10 +21,14 @@ def _load_api_data(filepath: str) -> Union[List[str], Dict[str, List[str]]]:
                     if not value:
                         data[key] = []
                     elif not isinstance(value, list):
-                        raise TypeError(f"[APIMap] The value for key '{key}' in '{filepath}' is not a list.")
+                        raise TypeError(
+                            f"[APIMap] The value for key '{key}' in '{filepath}' is not a list."
+                        )
                 return data
             else:
-                raise TypeError(f"[APIMap] YAML file '{filepath}' is not a list or a dictionary.")
+                raise TypeError(
+                    f"[APIMap] YAML file '{filepath}' is not a list or a dictionary."
+                )
     elif extension == ".txt":
         with open(filepath, "r", encoding="utf-8") as f:
             return [line.strip() for line in f if line.strip()]
@@ -63,7 +67,7 @@ def get_mapped_model_apis(
     mapping_df = pd.read_excel(mapping_table_path)
     if "Pytorch" not in mapping_df.columns or "Paddle" not in mapping_df.columns:
         raise ValueError(
-            f"[APIMap] 'Pytorch' and 'Paddle' columns must exist in the mapping table."
+            "[APIMap] 'Pytorch' and 'Paddle' columns must exist in the mapping table."
         )
     print(f"[APIMap] Successfully loaded Mapping table: '{mapping_table_path}'")
 
@@ -75,7 +79,7 @@ def get_mapped_model_apis(
         raise TypeError(f"'{torch_static_path}' is not in dictionary format.")
     if not isinstance(torch_dynamic_data, dict):
         raise TypeError(f"'{torch_dynamic_path}' is not in dictionary format.")
-    
+
     priority_dict = {category: idx for idx, category in enumerate(category_priority)}
     max_priority = len(category_priority)
 
@@ -87,7 +91,9 @@ def get_mapped_model_apis(
         for api in apis:
             if api not in torch_api_category_map:
                 torch_api_category_map[api] = category
-            elif current_priority < priority_dict.get(torch_api_category_map[api], max_priority):
+            elif current_priority < priority_dict.get(
+                torch_api_category_map[api], max_priority
+            ):
                 torch_api_category_map[api] = category
 
     torch_dynamic_list = []
@@ -97,13 +103,19 @@ def get_mapped_model_apis(
         for api in apis:
             if api not in torch_api_category_map:
                 torch_api_category_map[api] = category
-            elif current_priority < priority_dict.get(torch_api_category_map[api], max_priority):
+            elif current_priority < priority_dict.get(
+                torch_api_category_map[api], max_priority
+            ):
                 torch_api_category_map[api] = category
 
     torch_static_set = set(torch_static_list)
-    print(f"[APIMap] Successfully loaded {len(torch_static_set)} Torch Static APIs from {len(torch_static_data)} categories.")
+    print(
+        f"[APIMap] Successfully loaded {len(torch_static_set)} Torch Static APIs from {len(torch_static_data)} categories."
+    )
     torch_dynamic_set = set(torch_dynamic_list)
-    print(f"[APIMap] Successfully loaded {len(torch_dynamic_set)} Torch Dynamic APIs from {len(torch_dynamic_data)} categories.")
+    print(
+        f"[APIMap] Successfully loaded {len(torch_dynamic_set)} Torch Dynamic APIs from {len(torch_dynamic_data)} categories."
+    )
 
     paddle_dynamic_list = _load_api_data(paddle_dynamic_path)
     paddle_dynamic_set = set(paddle_dynamic_list)
@@ -163,7 +175,9 @@ def get_mapped_model_apis(
         report_data.append(row)
 
     result_df = pd.DataFrame(report_data).fillna("无")
-    result_df.sort_values(by=["类别", "TorchAPI", "PaddleAPI"], inplace=True, ignore_index=True)
+    result_df.sort_values(
+        by=["类别", "TorchAPI", "PaddleAPI"], inplace=True, ignore_index=True
+    )
 
     def get_mapping_status(row):
         torch_in_source = row["Torch静"] == "是" or row["Torch动"] == "是"
@@ -216,7 +230,6 @@ def get_mapped_model_apis(
 
 # --- 主执行块 (用于演示) ---
 if __name__ == "__main__":
-
     MAPPING_FILE = "tools/api_tracer/api_list/torch_paddle_mapping.xls"
     TORCH_STATIC_FILE = "tools/api_tracer/api_list/torch_api_static.yaml"
     TORCH_DYNAMIC_FILE = "tools/api_tracer/api_list/torch_api_dynamic.yaml"

@@ -8,6 +8,7 @@ torch.set_default_device(device)
 
 # paddle.device.set_device('cpu')
 
+
 def init_input(numpy_tensor):
     paddle_x = paddle.to_tensor(numpy_tensor)
     torch_x = torch.tensor(numpy_tensor, requires_grad=True)
@@ -18,9 +19,10 @@ def init_input(numpy_tensor):
         torch_x.cpu().detach().numpy(),
         1e-10,
         1e-10,
-        err_msg='intput diff'
+        err_msg="intput diff",
     )
     return paddle_x, torch_x
+
 
 test_loop = 240662
 # paddle.nn.functional.relu(Tensor([2, 528, 13, 13],"float32"), )
@@ -66,7 +68,9 @@ with torch.no_grad():
 torch.cuda.synchronize()
 start = time.time()
 for i in range(test_loop):
-    torch.autograd.grad([torch_out], [torch_x], grad_outputs=torch_grad, retain_graph=True)
+    torch.autograd.grad(
+        [torch_out], [torch_x], grad_outputs=torch_grad, retain_graph=True
+    )
 torch.cuda.synchronize()
 end = time.time()
 timeused = end - start

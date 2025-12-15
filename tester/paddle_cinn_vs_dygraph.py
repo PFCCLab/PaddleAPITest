@@ -12,7 +12,6 @@ class APITestCINNVSDygraph(APITestBase):
         self.test_backward = kwargs.get("test_backward", False)
 
     def test(self):
-
         if self.need_skip():
             print("[Skip]", flush=True)
             return
@@ -279,10 +278,12 @@ class APITestCINNVSDygraph(APITestBase):
             return
 
         if need_check_grad:
-            if not self.compare(dynamic_bwd_output, static_bwd_output, is_backward=True):  # type: ignore
+            if not self.compare(
+                dynamic_bwd_output, static_bwd_output, is_backward=True
+            ):  # type: ignore
                 return
 
-        print(f"[Pass] {self.api_config.config,}\n", flush=True)
+        print(f"[Pass] {(self.api_config.config,)}\n", flush=True)
         write_to_log("pass", self.api_config.config)
 
     def compare(self, dygraph_output, static_output, is_backward=False):

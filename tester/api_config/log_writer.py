@@ -166,8 +166,8 @@ def aggregate_logs(end=False):
                     file_path.write_bytes(b"")
 
     log_success = True
-    log_file = TEST_LOG_PATH / f"log_inorder.log"
-    tmp_log_files = sorted(TMP_LOG_PATH.glob(f"log_*.log"))
+    log_file = TEST_LOG_PATH / "log_inorder.log"
+    tmp_log_files = sorted(TMP_LOG_PATH.glob("log_*.log"))
     BUFFER_SIZE = 4 * 1024 * 1024
     try:
         with log_file.open("ab") as out_f:
@@ -205,8 +205,8 @@ def aggregate_logs(end=False):
                 file_path.write_bytes(b"")
 
     tol_success = True
-    tol_file = TEST_LOG_PATH / f"tol.csv"
-    tmp_tol_files = sorted(TMP_LOG_PATH.glob(f"tol_*.csv"))
+    tol_file = TEST_LOG_PATH / "tol.csv"
+    tmp_tol_files = sorted(TMP_LOG_PATH.glob("tol_*.csv"))
     if tmp_tol_files:
         try:
             with tol_file.open("a", newline="") as out_f:
@@ -249,8 +249,8 @@ def aggregate_logs(end=False):
                     file_path.write_bytes(b"")
 
     stable_success = True
-    stable_file = TEST_LOG_PATH / f"stable.csv"
-    tmp_stable_files = sorted(TMP_LOG_PATH.glob(f"stable_*.csv"))
+    stable_file = TEST_LOG_PATH / "stable.csv"
+    tmp_stable_files = sorted(TMP_LOG_PATH.glob("stable_*.csv"))
     if tmp_stable_files:
         try:
             with stable_file.open("a", newline="") as out_f:

@@ -9,14 +9,20 @@ from pathlib import Path
 import torch
 import torchvision.transforms as T
 from api_tracer import APITracer
-from diffusers.pipelines.auto_pipeline import (AutoPipelineForImage2Image,
-                                               AutoPipelineForText2Image)
+from diffusers.pipelines.auto_pipeline import (
+    AutoPipelineForImage2Image,
+    AutoPipelineForText2Image,
+)
 from diffusers.pipelines.pipeline_utils import DiffusionPipeline
 from PIL import Image
 from torchvision.transforms.functional import InterpolationMode
-from transformers import (AutoModel, AutoModelForCausalLM,
-                          AutoModelForImageTextToText, AutoProcessor,
-                          AutoTokenizer)
+from transformers import (
+    AutoModel,
+    AutoModelForCausalLM,
+    AutoModelForImageTextToText,
+    AutoProcessor,
+    AutoTokenizer,
+)
 
 MODELS_DIR = Path("/root/paddlejob/workspace/env_run/models")
 # MODELS_DIR = Path("/root/paddlejob/workspace/env_run/bos/huggingface")

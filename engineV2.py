@@ -1,7 +1,6 @@
 import argparse
 import errno
 import gc
-import math
 import os
 import re
 import shutil
@@ -42,11 +41,10 @@ VALID_TEST_ARGS = {"test_amp", "test_backward", "atol", "rtol", "test_tol"}
 
 DEVICE_TYPE = None
 DEVICE_TYPE_DETECTED = False
-DEVICE_COUNT = None    # total number of devices
-_MEM_SNAPSHOT = None    # dict: gpu_id -> (total_gb, used_gb)
+DEVICE_COUNT = None  # total number of devices
+_MEM_SNAPSHOT = None  # dict: gpu_id -> (total_gb, used_gb)
 _MEM_SNAPSHOT_TS = 0.0
-_MEM_SNAPSHOT_TTL = 2.0   # seconds — snapshot cache ttl
-
+_MEM_SNAPSHOT_TTL = 2.0  # seconds — snapshot cache ttl
 
 
 def cleanup(pool):
@@ -88,6 +86,7 @@ def estimate_timeout(api_config) -> float:
     # return TIMEOUT_STEPS[-1][1]
     return 1800
 
+
 def detect_device_type() -> str:
     global DEVICE_TYPE, DEVICE_TYPE_DETECTED
     if DEVICE_TYPE_DETECTED:
@@ -109,7 +108,9 @@ def detect_device_type() -> str:
     # 再尝试 XPU
     if shutil.which("xpu-smi"):
         try:
-            out = subprocess.check_output(["xpu-smi"], text=True, stderr=subprocess.STDOUT)
+            out = subprocess.check_output(
+                ["xpu-smi"], text=True, stderr=subprocess.STDOUT
+            )
             if any(re.match(r"^\|\s*\d+\s+\S", line) for line in out.splitlines()):
                 DEVICE_TYPE = "xpu"
                 DEVICE_TYPE_DETECTED = True
@@ -120,8 +121,12 @@ def detect_device_type() -> str:
     # 再尝试 Iluvatar
     if shutil.which("ixsmi"):
         try:
-            out = subprocess.check_output(["ixsmi"], text=True, stderr=subprocess.STDOUT)
-            if any(re.match(r"^\|\s*\d+\s+Iluvatar", line) for line in out.splitlines()):
+            out = subprocess.check_output(
+                ["ixsmi"], text=True, stderr=subprocess.STDOUT
+            )
+            if any(
+                re.match(r"^\|\s*\d+\s+Iluvatar", line) for line in out.splitlines()
+            ):
                 DEVICE_TYPE = "iluvatar"
                 DEVICE_TYPE_DETECTED = True
                 return DEVICE_TYPE
@@ -132,6 +137,7 @@ def detect_device_type() -> str:
     DEVICE_TYPE = "cpu"
     DEVICE_TYPE_DETECTED = True
     return DEVICE_TYPE
+
 
 def get_device_count() -> int:
     """Get the number of available devices (accelerators)."""
@@ -175,7 +181,6 @@ def get_device_count() -> int:
     # CPU case／no accelerator
     DEVICE_COUNT = 0
     return 0
-
 
 
 def _refresh_snapshot(device_type):
@@ -225,6 +230,7 @@ def _refresh_snapshot(device_type):
     _MEM_SNAPSHOT = snapshot
     _MEM_SNAPSHOT_TS = now
 
+
 def get_memory_info(gpu_id):
     """Return (total_memory, used_memory) in GB for accelerator device."""
     device_type = detect_device_type()
@@ -241,7 +247,9 @@ def get_memory_info(gpu_id):
     if device_type in ("xpu", "iluvatar"):
         _refresh_snapshot(device_type)
         if _MEM_SNAPSHOT is None or gpu_id not in _MEM_SNAPSHOT:
-            raise RuntimeError(f"Failed to get memory info for {device_type} device {gpu_id}")
+            raise RuntimeError(
+                f"Failed to get memory info for {device_type} device {gpu_id}"
+            )
         return _MEM_SNAPSHOT[gpu_id]
 
     raise RuntimeError("No supported accelerator (GPU / XPU / Iluvatar) detected.")
@@ -335,7 +343,7 @@ def check_gpu_memory(
         except pynvml.NVMLError as e:
             print(f"[WARNING] Failed to check GPU {gpu_id}: {str(e)}", flush=True)
             continue
-        
+
     return available_gpus, max_workers_per_gpu
 
 
@@ -379,12 +387,17 @@ def init_worker_gpu(
         globals()["torch"] = torch
         globals()["paddle"] = paddle
 
-        from tester import (APIConfig, APITestAccuracy, APITestAccuracyStable,
-                            APITestCINNVSDygraph, APITestPaddleGPUPerformance,
-                            APITestPaddleOnly,
-                            APITestPaddleTorchGPUPerformance,
-                            APITestTorchGPUPerformance,
-                            APITestCustomDeviceVSCPU)
+        from tester import (
+            APIConfig,
+            APITestAccuracy,
+            APITestAccuracyStable,
+            APITestCINNVSDygraph,
+            APITestPaddleGPUPerformance,
+            APITestPaddleOnly,
+            APITestPaddleTorchGPUPerformance,
+            APITestTorchGPUPerformance,
+            APITestCustomDeviceVSCPU,
+        )
 
         test_classes = {
             "APIConfig": APIConfig,
@@ -395,7 +408,7 @@ def init_worker_gpu(
             "APITestTorchGPUPerformance": APITestTorchGPUPerformance,
             "APITestPaddleTorchGPUPerformance": APITestPaddleTorchGPUPerformance,
             "APITestAccuracyStable": APITestAccuracyStable,
-            "APITestCustomDeviceVSCPU": APITestCustomDeviceVSCPU
+            "APITestCustomDeviceVSCPU": APITestCustomDeviceVSCPU,
         }
         globals().update(test_classes)
 
@@ -684,23 +697,28 @@ def main():
         )
         return
     if options.test_tol and not options.accuracy:
-        print(f"--test_tol takes effect when --accuracy is True.", flush=True)
+        print("--test_tol takes effect when --accuracy is True.", flush=True)
     if options.test_backward and not options.paddle_cinn:
-        print(f"--test_backward takes effect when --paddle_cinn is True.", flush=True)
+        print("--test_backward takes effect when --paddle_cinn is True.", flush=True)
     os.environ["USE_CACHED_NUMPY"] = str(options.use_cached_numpy)
     if options.bitwise_alignment:
-        options.atol=0.0
-        options.rtol=0.0
+        options.atol = 0.0
+        options.rtol = 0.0
     if options.log_dir:
         set_test_log_path(options.log_dir)
 
     if options.api_config:
         # Single config execution
-        from tester import (APIConfig, APITestAccuracy, APITestAccuracyStable,
-                            APITestCINNVSDygraph, APITestPaddleGPUPerformance,
-                            APITestPaddleOnly,
-                            APITestPaddleTorchGPUPerformance,
-                            APITestTorchGPUPerformance)
+        from tester import (
+            APIConfig,
+            APITestAccuracy,
+            APITestAccuracyStable,
+            APITestCINNVSDygraph,
+            APITestPaddleGPUPerformance,
+            APITestPaddleOnly,
+            APITestPaddleTorchGPUPerformance,
+            APITestTorchGPUPerformance,
+        )
 
         # set log_writer
         set_engineV2()
@@ -739,8 +757,7 @@ def main():
                 atol=options.atol,
                 rtol=options.rtol,
                 test_tol=options.test_tol,
-                bitwise_alignment = options.bitwise_alignment
-                
+                bitwise_alignment=options.bitwise_alignment,
             )
         else:
             case = test_class(api_config, test_amp=options.test_amp)
@@ -932,14 +949,14 @@ def main():
             print(f"Unexpected error: {e}", flush=True)
             cleanup(pool)
             total_time = time.time() - start_time
-            print(f"Test time: {round(total_time/60, 3)} minutes.", flush=True)
+            print(f"Test time: {round(total_time / 60, 3)} minutes.", flush=True)
         finally:
             print(f"{tested_case} cases have been tested.", flush=True)
             log_counts = aggregate_logs(end=True)
             print_log_info(all_case, log_counts)
             end_time = time.time()
             total_time = end_time - start_time
-            print(f"Test time: {round(total_time/60, 3)} minutes.", flush=True)
+            print(f"Test time: {round(total_time / 60, 3)} minutes.", flush=True)
     print("Done.")
 
 

@@ -92,7 +92,7 @@ def remove_configs_from_files(input_paths, remove_config_file, backup=False):
             print(f"Error processing {input_file}: {err}")
             continue
 
-    print(f"\nSummary:")
+    print("\nSummary:")
     print(f"Files processed: {len(input_files)}")
     print(f"Files modified: {files_modified}")
     print(f"Total configs removed: {total_removed}")

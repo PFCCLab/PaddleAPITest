@@ -123,7 +123,7 @@ def get_merged_model_apis(
         for unassigned_model in unassigned_models:
             print(
                 f"[APIMerge] Model '{unassigned_model}' is not in any group but found in data.",
-                f"It will be displayed in the final table.",
+                "It will be displayed in the final table.",
             )
 
     all_apis = set().union(*apis_per_model.values())

@@ -6,9 +6,7 @@ os.environ["HF_HOME"] = "tools/api_tracer/.huggingface"
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
 import traceback
-from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple, Union
 
 import numpy as np
 import torch
@@ -18,14 +16,18 @@ from decord import VideoReader, cpu
 from diffusers.pipelines.auto_pipeline import AutoPipelineForText2Image
 from PIL import Image
 from torch import nn
-from transformers import (AutoModelForCausalLM, AutoModelForImageTextToText,
-                          AutoProcessor, AutoTokenizer)
-from transformers.data.data_collator import (DataCollatorForLanguageModeling,
-                                             DataCollatorForSeq2Seq)
-from transformers.tokenization_utils_base import PreTrainedTokenizerBase
+from transformers import (
+    AutoModelForCausalLM,
+    AutoModelForImageTextToText,
+    AutoProcessor,
+    AutoTokenizer,
+)
+from transformers.data.data_collator import (
+    DataCollatorForLanguageModeling,
+    DataCollatorForSeq2Seq,
+)
 from transformers.trainer import Trainer
 from transformers.training_args import TrainingArguments
-from transformers.utils.generic import PaddingStrategy
 
 MODELS_DIR = Path("/root/paddlejob/workspace/env_run/models")
 # MODELS_DIR = Path("/root/paddlejob/workspace/env_run/bos/huggingface")

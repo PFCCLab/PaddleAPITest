@@ -21,7 +21,6 @@ class APITracerKwargs(TypedDict, total=False):
 
 
 class APITracer:
-
     def __init__(
         self,
         dialect: str,

@@ -2,7 +2,7 @@ error_configs = set()
 error_apis = set()
 with open("test_pipline/gpu_paddleonly/error_log.log", "w") as error_log:
     for i in range(19):
-        test_log = "test_pipline/gpu_paddleonly/paddleonly_{}.log".format(i+1)
+        test_log = "test_pipline/gpu_paddleonly/paddleonly_{}.log".format(i + 1)
         with open(test_log, "r") as file:
             lines = file.readlines()
             is_log_str = False
@@ -10,13 +10,22 @@ with open("test_pipline/gpu_paddleonly/error_log.log", "w") as error_log:
             config = ""
             for line in lines:
                 if "test begin" in line:
-                    if "accuracy error" in log_str or "paddle error" in log_str or "cudaErrorIllegalAddress" in log_str or "cudaErrorLaunchFailure" in log_str or "cuda error" in log_str or "CUDA error" in log_str or "CUDNN error" in log_str or "TID" in log_str:
+                    if (
+                        "accuracy error" in log_str
+                        or "paddle error" in log_str
+                        or "cudaErrorIllegalAddress" in log_str
+                        or "cudaErrorLaunchFailure" in log_str
+                        or "cuda error" in log_str
+                        or "CUDA error" in log_str
+                        or "CUDNN error" in log_str
+                        or "TID" in log_str
+                    ):
                         error_log.write(log_str)
                         error_configs.add(config)
                         error_apis.add(api)
                     log_str = line
-                    config = line[line.index("test begin: ")+12:]
-                    api = config[0:config.index("(")]
+                    config = line[line.index("test begin: ") + 12 :]
+                    api = config[0 : config.index("(")]
                 else:
                     log_str += line
 

@@ -244,7 +244,7 @@ class TorchFunctionHook(TracingHook):
         self.tracing_mode = TorchFunctionModeTracer(serializer, level, dialect)
 
     def install(self):
-        print(f"[TorchFunctionHook] Enabling __torch_function__ tracing mode...")
+        print("[TorchFunctionHook] Enabling __torch_function__ tracing mode...")
         self.tracing_mode.__enter__()
         print("[TorchFunctionHook] Mode enabled.")
 
@@ -281,7 +281,7 @@ class TorchDispatchHook(TracingHook):
         self.tracing_mode = TorchDispatchModeTracer(serializer, level, dialect)
 
     def install(self):
-        print(f"[TorchDispatchHook] Enabling __torch_dispatch__ tracing mode...")
+        print("[TorchDispatchHook] Enabling __torch_dispatch__ tracing mode...")
         self.tracing_mode.__enter__()
         print("[TorchDispatchHook] Mode enabled.")
 
@@ -619,7 +619,7 @@ class PyTorchDialect(FrameworkDialect):
         "torch.device": lambda item: f'"{item["value"]}"',
         "torch.memory_format": lambda item: f'"{item["value"]}"',
         "torch.layout": lambda item: f'"{item["value"].replace("torch.", "")}"',
-        "torch.Size": lambda item: f'list{item["value"]}',
+        "torch.Size": lambda item: f"list{item['value']}",
         # TODO(@cangtianhuang): add more formatting logic here
     }
 

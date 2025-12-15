@@ -5,7 +5,8 @@ import time
 
 device = torch.device("cuda:0")
 torch.set_default_device(device)
-paddle.device.set_device('gpu:0')
+paddle.device.set_device("gpu:0")
+
 
 def init_input(numpy_tensor):
     paddle_x = paddle.to_tensor(numpy_tensor)
@@ -17,13 +18,14 @@ def init_input(numpy_tensor):
         torch_x.cpu().detach().numpy(),
         1e-10,
         1e-10,
-        err_msg='intput diff'
+        err_msg="intput diff",
     )
     return paddle_x, torch_x
 
+
 # paddle.concat(list[Tensor([4, 178176, 1],"float32"),Tensor([4, 44544, 1],"float32"),Tensor([4, 11136, 1],"float32"),Tensor([4, 2784, 1],"float32"),Tensor([4, 720, 1],"float32"),], axis=1, )
 
-m =  4
+m = 4
 n1 = 178176
 n2 = 44544
 n3 = 11136
@@ -42,13 +44,21 @@ paddle_x2, torch_x2 = init_input(numpy_tensor2)
 paddle_x3, torch_x3 = init_input(numpy_tensor3)
 paddle_x4, torch_x4 = init_input(numpy_tensor4)
 paddle_x5, torch_x5 = init_input(numpy_tensor5)
-numel = (numpy_tensor1.size + numpy_tensor2.size + numpy_tensor3.size + numpy_tensor4.size + numpy_tensor5.size)
+numel = (
+    numpy_tensor1.size
+    + numpy_tensor2.size
+    + numpy_tensor3.size
+    + numpy_tensor4.size
+    + numpy_tensor5.size
+)
 test_loop = 2147483647 * 20 // numel
-print("numel=", numel , "test_loop=", test_loop)
+print("numel=", numel, "test_loop=", test_loop)
 
 print(torch_x1.device)
 
-paddle_out = paddle.concat((paddle_x1, paddle_x2, paddle_x3, paddle_x4, paddle_x5), axis=1)
+paddle_out = paddle.concat(
+    (paddle_x1, paddle_x2, paddle_x3, paddle_x4, paddle_x5), axis=1
+)
 
 with paddle.no_grad():
     paddle.base.core._cuda_synchronize(paddle.CUDAPlace(0))
@@ -66,7 +76,12 @@ paddle_grad, torch_grad = init_input(numpy_tensor)
 paddle.base.core._cuda_synchronize(paddle.CUDAPlace(0))
 start = time.time()
 for i in range(test_loop):
-    paddle.grad([paddle_out], [paddle_x1, paddle_x2], grad_outputs=paddle_grad, allow_unused=True)
+    paddle.grad(
+        [paddle_out],
+        [paddle_x1, paddle_x2],
+        grad_outputs=paddle_grad,
+        allow_unused=True,
+    )
 paddle.base.core._cuda_synchronize(paddle.CUDAPlace(0))
 end = time.time()
 timeused = end - start
@@ -87,7 +102,12 @@ with torch.no_grad():
 torch.cuda.synchronize()
 start = time.time()
 for i in range(test_loop):
-    torch.autograd.grad([torch_out], [torch_x1, torch_x2, torch_x3, torch_x4, torch_x5], grad_outputs=torch_grad, retain_graph=True)
+    torch.autograd.grad(
+        [torch_out],
+        [torch_x1, torch_x2, torch_x3, torch_x4, torch_x5],
+        grad_outputs=torch_grad,
+        retain_graph=True,
+    )
 torch.cuda.synchronize()
 end = time.time()
 timeused = end - start

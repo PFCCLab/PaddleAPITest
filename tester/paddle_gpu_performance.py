@@ -1,16 +1,17 @@
-
 import paddle
 
 from .api_config.log_writer import write_to_log
 from .base import APITestBase
 import time
-from .api_config.config_analyzer import TensorConfig, APIConfig, analyse_configs
+from .api_config.config_analyzer import TensorConfig
+
 
 def tensor_numel(tensor_config):
     numel = 1
     for i in tensor_config.shape:
         numel = numel * i
     return numel
+
 
 def get_tensor_configs(api_config):
     tensor_configs = []
@@ -39,6 +40,7 @@ def get_tensor_configs(api_config):
                     tensor_configs.append(arg_config[j])
     return tensor_configs
 
+
 def total_numel(api_config):
     tensor_configs = get_tensor_configs(api_config)
     numel = 0
@@ -51,9 +53,8 @@ class APITestPaddleGPUPerformance(APITestBase):
     def __init__(self, api_config, **kwargs):
         super().__init__(api_config)
         self.test_amp = kwargs.get("test_amp", False)
-    
+
     def test(self):
-        
         if self.need_skip(paddle_only=True):
             print("[Skip]", flush=True)
             return
@@ -74,14 +75,18 @@ class APITestPaddleGPUPerformance(APITestBase):
         try:
             if not self.gen_paddle_input():
                 print("gen_paddle_input failed", flush=True)
-                return  
+                return
             numel = total_numel(self.api_config)
             test_loop = 2147483647 * 20 // numel
             if self.test_amp:
                 with paddle.amp.auto_cast():
-                    paddle_output = self.paddle_api(*tuple(self.paddle_args), **self.paddle_kwargs)
+                    paddle_output = self.paddle_api(
+                        *tuple(self.paddle_args), **self.paddle_kwargs
+                    )
             else:
-                paddle_output = self.paddle_api(*tuple(self.paddle_args), **self.paddle_kwargs)
+                paddle_output = self.paddle_api(
+                    *tuple(self.paddle_args), **self.paddle_kwargs
+                )
 
             with paddle.no_grad():
                 if self.test_amp:
@@ -89,11 +94,23 @@ class APITestPaddleGPUPerformance(APITestBase):
                         paddle.base.core._cuda_synchronize(paddle.CUDAPlace(0))
                         start = time.time()
                         for i in range(test_loop):
-                            self.paddle_api(*tuple(self.paddle_args), **self.paddle_kwargs)
+                            self.paddle_api(
+                                *tuple(self.paddle_args), **self.paddle_kwargs
+                            )
                         paddle.base.core._cuda_synchronize(paddle.CUDAPlace(0))
                         end = time.time()
                         timeused = end - start
-                        print(self.api_config.api_name, "\t", self.api_config.config, "\tforward\t", numel, "\t", test_loop, "\t", timeused)
+                        print(
+                            self.api_config.api_name,
+                            "\t",
+                            self.api_config.config,
+                            "\tforward\t",
+                            numel,
+                            "\t",
+                            test_loop,
+                            "\t",
+                            timeused,
+                        )
                 else:
                     paddle.base.core._cuda_synchronize(paddle.CUDAPlace(0))
                     start = time.time()
@@ -102,13 +119,33 @@ class APITestPaddleGPUPerformance(APITestBase):
                     paddle.base.core._cuda_synchronize(paddle.CUDAPlace(0))
                     end = time.time()
                     timeused = end - start
-                    print(self.api_config.api_name, "\t", self.api_config.config, "\tforward\t", numel, "\t", test_loop, "\t", timeused)
+                    print(
+                        self.api_config.api_name,
+                        "\t",
+                        self.api_config.config,
+                        "\tforward\t",
+                        numel,
+                        "\t",
+                        test_loop,
+                        "\t",
+                        timeused,
+                    )
         except Exception as err:
             paddle_output = None
             result_outputs = None
             result_outputs_grads = None
             out_grads = None
-            print(self.api_config.api_name, "\t", self.api_config.config, "\tforward\t", numel, "\t", test_loop, "\t", "faild")
+            print(
+                self.api_config.api_name,
+                "\t",
+                self.api_config.config,
+                "\tforward\t",
+                numel,
+                "\t",
+                test_loop,
+                "\t",
+                "faild",
+            )
             if self.should_ignore_paddle_error(str(err)):
                 return
             if "CUDA error" in str(err) or "memory corruption" in str(err):
@@ -120,22 +157,53 @@ class APITestPaddleGPUPerformance(APITestBase):
         try:
             if self.need_check_grad():
                 inputs_list = self.get_paddle_input_list()
-                result_outputs, result_outputs_grads = self.gen_paddle_output_and_output_grad(paddle_output)
-                if len(inputs_list) != 0 and len(result_outputs) != 0 and len(result_outputs_grads) != 0:
+                result_outputs, result_outputs_grads = (
+                    self.gen_paddle_output_and_output_grad(paddle_output)
+                )
+                if (
+                    len(inputs_list) != 0
+                    and len(result_outputs) != 0
+                    and len(result_outputs_grads) != 0
+                ):
                     paddle.base.core._cuda_synchronize(paddle.CUDAPlace(0))
                     start = time.time()
                     for i in range(test_loop):
-                        out_grads = paddle.grad(result_outputs, inputs_list, grad_outputs=result_outputs_grads,allow_unused=True)
+                        out_grads = paddle.grad(
+                            result_outputs,
+                            inputs_list,
+                            grad_outputs=result_outputs_grads,
+                            allow_unused=True,
+                        )
                     paddle.base.core._cuda_synchronize(paddle.CUDAPlace(0))
                     end = time.time()
                     timeused = end - start
-                    print(self.api_config.api_name, "\t", self.api_config.config, "\tbackward\t", numel, "\t", test_loop, "\t", timeused)
+                    print(
+                        self.api_config.api_name,
+                        "\t",
+                        self.api_config.config,
+                        "\tbackward\t",
+                        numel,
+                        "\t",
+                        test_loop,
+                        "\t",
+                        timeused,
+                    )
         except Exception as err:
             paddle_output = None
             result_outputs = None
             result_outputs_grads = None
             out_grads = None
-            print(self.api_config.api_name, "\t", self.api_config.config, "\tbackward\t", numel, "\t", test_loop, "\t", "faild")
+            print(
+                self.api_config.api_name,
+                "\t",
+                self.api_config.config,
+                "\tbackward\t",
+                numel,
+                "\t",
+                test_loop,
+                "\t",
+                "faild",
+            )
             if self.should_ignore_paddle_error(str(err)):
                 return
             if "CUDA error" in str(err) or "memory corruption" in str(err):
