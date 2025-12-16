@@ -228,7 +228,10 @@ class ConfigSerializer:
                     kwargs = dict(list(kwargs.items())[: self.max_args_count - len(args) - 1])
                     kwargs["__truncated__"] = "<Truncated: max args exceeded>"
                 else:
-                    args = (*list(args)[:self.max_args_count - 1], "<Truncated: max args exceeded>")
+                    args = (
+                        *list(args)[: self.max_args_count - 1],
+                        "<Truncated: max args exceeded>",
+                    )
                     kwargs = {}
 
             call_record = {
@@ -274,7 +277,7 @@ class ConfigSerializer:
 
     def _serialize_list(self, item: list, depth: int) -> dict:
         if len(item) > self.max_item_count:
-            item = [*item[:self.max_item_count - 1], "<Truncated: max item count>"]
+            item = [*item[: self.max_item_count - 1], "<Truncated: max item count>"]
         return {
             "type": "list",
             "value": [self._serialize_item(sub_item, depth) for sub_item in item],
@@ -282,7 +285,7 @@ class ConfigSerializer:
 
     def _serialize_tuple(self, item: tuple, depth: int) -> dict:
         if len(item) > self.max_item_count:
-            item = (*item[:self.max_item_count - 1], "<Truncated: max item count>")
+            item = (*item[: self.max_item_count - 1], "<Truncated: max item count>")
         return {
             "type": "tuple",
             "value": [self._serialize_item(sub_item, depth) for sub_item in item],

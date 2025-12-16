@@ -462,9 +462,7 @@ def run_inference_test_i2d(model_name: str):
         input_image = Image.open(image_path).convert("RGB").resize((256, 256))
 
         with torch.no_grad():
-            pipe(
-                input_image, num_inference_steps=64, frame_size=256, output_type="pil"
-            ).images
+            pipe(input_image, num_inference_steps=64, frame_size=256, output_type="pil").images
 
         print(f"✅ Test for {model_name} finished.")
     except Exception as e:

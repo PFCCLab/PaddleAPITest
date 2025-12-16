@@ -700,8 +700,8 @@ class APITestPaddleTorchGPUPerformance(APITestBase):
         numel = total_numel(self.api_config)
         # test_loop = 1000
         test_loop = api_loop.get(self.api_config.api_name, 1000)
-            # test_loop = 2147483647 * 20 // numel
-            # test_loop = 100000 if test_loop > 100000 else test_loop
+        # test_loop = 2147483647 * 20 // numel
+        # test_loop = 100000 if test_loop > 100000 else test_loop
 
         combined = ""
         paddle_forward = None

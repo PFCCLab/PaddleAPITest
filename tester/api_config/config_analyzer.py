@@ -2148,7 +2148,8 @@ class TensorConfig:
                             for i in range(self.numel()):
                                 self.numpy_tensor[i] = numpy.random.randint(0, num)
                                 while (
-                                    api_config.shape2[self.numpy_tensor[i]] != api_config.shape1[api_config.tensor1[i]]
+                                    api_config.shape2[self.numpy_tensor[i]]
+                                    != api_config.shape1[api_config.tensor1[i]]
                                     or self.numpy_tensor[i] in used
                                 ):
                                     self.numpy_tensor[i] = numpy.random.randint(0, num)

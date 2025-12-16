@@ -140,7 +140,9 @@ def run_training_test_tg(model_name: str):
 
         def preprocess_function(examples):
             all_texts = []
-            for conv_a, conv_b in zip(examples["conversation_a"], examples["conversation_b"], strict=False):
+            for conv_a, conv_b in zip(
+                examples["conversation_a"], examples["conversation_b"], strict=False
+            ):
                 if "mistralai" in model_name:
                     text_a = tokenizer.apply_chat_template(
                         conv_a, tokenize=False, continue_final_message=True
@@ -393,7 +395,10 @@ def run_training_test_i2t(model_name: str):
                         ],
                     },
                 ]
-                full_conversation_messages = [*user_prompt_messages, {"role": "assistant", "content": [{"type": "text", "text": groundtruth}]}]
+                full_conversation_messages = [
+                    *user_prompt_messages,
+                    {"role": "assistant", "content": [{"type": "text", "text": groundtruth}]},
+                ]
 
                 if processor.tokenizer.chat_template is not None:
                     prompt_only_text = processor.tokenizer.apply_chat_template(

@@ -276,7 +276,7 @@ class APITestCINNVSDygraph(APITestBase):
             return
 
         if need_check_grad:
-            if not self.compare(dynamic_bwd_output, static_bwd_output, is_backward=True):   # type: ignore[reportGeneralTypeIssues]
+            if not self.compare(dynamic_bwd_output, static_bwd_output, is_backward=True):  # type: ignore[reportGeneralTypeIssues]
                 return
 
         print(f"[Pass] {(self.api_config.config,)}\n", flush=True)
@@ -322,7 +322,9 @@ class APITestCINNVSDygraph(APITestBase):
                 )
                 write_to_log("match_error", self.api_config.config)
                 return False
-            for i, (dygraph_item, static_item) in enumerate(zip(dygraph_output, static_output, strict=False)):
+            for i, (dygraph_item, static_item) in enumerate(
+                zip(dygraph_output, static_output, strict=False)
+            ):
                 if dygraph_item is None and static_item is None:
                     continue
                 if not isinstance(dygraph_item, paddle.Tensor) or not isinstance(

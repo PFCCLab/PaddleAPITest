@@ -345,7 +345,9 @@ class APITestAccuracy(APITestBase):
                 )
                 write_to_log("accuracy_error", self.api_config.config)
                 return
-            for i, (paddle_item, torch_item) in enumerate(zip(paddle_output, torch_output, strict=False)):
+            for i, (paddle_item, torch_item) in enumerate(
+                zip(paddle_output, torch_output, strict=False)
+            ):
                 if isinstance(paddle_item, int) or self.api_config.api_name.endswith("tolist"):
                     self.np_assert_accuracy(
                         numpy.array(paddle_item),
@@ -358,7 +360,9 @@ class APITestAccuracy(APITestBase):
                     if any(isinstance(x, paddle.Tensor) for x in paddle_item) and any(
                         isinstance(x, torch.Tensor) for x in torch_item
                     ):
-                        for paddle_item_sub, torch_item_sub in zip(paddle_item, torch_item, strict=False):
+                        for paddle_item_sub, torch_item_sub in zip(
+                            paddle_item, torch_item, strict=False
+                        ):
                             if not compare_paddle_and_torch(paddle_item_sub, torch_item_sub, i):
                                 return
                     else:

@@ -479,9 +479,10 @@ class APITestBase:
                         self.paddle_kwargs["input"], axis=axis
                     )
 
-        if self.need_check_grad() and ((
-            self.api_config.api_name[-1] == "_" and self.api_config.api_name[-2:] != "__"
-        ) or self.api_config.api_name == "paddle.Tensor.__setitem__"):
+        if self.need_check_grad() and (
+            (self.api_config.api_name[-1] == "_" and self.api_config.api_name[-2:] != "__")
+            or self.api_config.api_name == "paddle.Tensor.__setitem__"
+        ):
             self.paddle_args, self.paddle_kwargs = self.copy_paddle_input()
 
         return True
@@ -577,7 +578,9 @@ class APITestBase:
                 if isinstance(output, paddle.Tensor)
                 and (output._is_initialized() or output.numel() == 0)
             ]
-        elif isinstance(outputs, (paddle.autograd.autograd.Hessian, paddle.autograd.autograd.Jacobian)):
+        elif isinstance(
+            outputs, (paddle.autograd.autograd.Hessian, paddle.autograd.autograd.Jacobian)
+        ):
             result_outputs.append(outputs[:])
         elif isinstance(outputs, tuple):
             for output in outputs:
@@ -592,7 +595,9 @@ class APITestBase:
                     for item in output:
                         if isinstance(item, paddle.Tensor):
                             result_outputs.append(item)
-                elif isinstance(output, (paddle.autograd.autograd.Hessian, paddle.autograd.autograd.Jacobian)):
+                elif isinstance(
+                    output, (paddle.autograd.autograd.Hessian, paddle.autograd.autograd.Jacobian)
+                ):
                     result_outputs.extend(output[:])
                 elif (
                     isinstance(output, tuple)
@@ -908,15 +913,17 @@ class APITestBase:
                 is_tuple = isinstance(arg_config, tuple)
                 self.torch_kwargs[key] = self._handle_list_or_tuple_torch(arg_config, is_tuple)
             elif (
-                isinstance(arg_config, (paddle.dtype, paddle.base.libpaddle.VarDesc.VarType)) or key == "dtype"
+                isinstance(arg_config, (paddle.dtype, paddle.base.libpaddle.VarDesc.VarType))
+                or key == "dtype"
             ):
                 self.torch_kwargs[key] = self.convert_dtype_to_torch_type(arg_config)
             else:
                 self.torch_kwargs[key] = arg_config
 
-        if self.need_check_grad() and ((
-            self.api_config.api_name[-1] == "_" and self.api_config.api_name[-2:] != "__"
-        ) or self.api_config.api_name == "paddle.Tensor.__setitem__"):
+        if self.need_check_grad() and (
+            (self.api_config.api_name[-1] == "_" and self.api_config.api_name[-2:] != "__")
+            or self.api_config.api_name == "paddle.Tensor.__setitem__"
+        ):
             self.torch_args, self.torch_kwargs = self.copy_torch_input()
 
         torch.cuda.empty_cache()
@@ -951,11 +958,11 @@ class APITestBase:
             expected_paddle_tensor = expected_paddle_tensor.contiguous()
         expected_paddle_tensor = expected_paddle_tensor.cpu().detach()
 
-        actual_paddle_dlpack = paddle.utils.dlpack.to_dlpack(actual_paddle_tensor)   # type: ignore[reportGeneralTypeIssues]
-        torch.utils.dlpack.from_dlpack(actual_paddle_dlpack)   # type: ignore[reportGeneralTypeIssues]
+        actual_paddle_dlpack = paddle.utils.dlpack.to_dlpack(actual_paddle_tensor)  # type: ignore[reportGeneralTypeIssues]
+        torch.utils.dlpack.from_dlpack(actual_paddle_dlpack)  # type: ignore[reportGeneralTypeIssues]
 
-        expected_paddle_dlpack = paddle.utils.dlpack.to_dlpack(expected_paddle_tensor)   # type: ignore[reportGeneralTypeIssues]
-        converted_paddle_tensor = torch.utils.dlpack.from_dlpack(expected_paddle_dlpack)   # type: ignore[reportGeneralTypeIssues]
+        expected_paddle_dlpack = paddle.utils.dlpack.to_dlpack(expected_paddle_tensor)  # type: ignore[reportGeneralTypeIssues]
+        converted_paddle_tensor = torch.utils.dlpack.from_dlpack(expected_paddle_dlpack)  # type: ignore[reportGeneralTypeIssues]
 
         def error_msg(msg):
             return (
@@ -1005,8 +1012,8 @@ class APITestBase:
             torch_tensor = torch_tensor.contiguous()
         torch_tensor = torch_tensor.cpu().detach()
 
-        paddle_dlpack = paddle.utils.dlpack.to_dlpack(paddle_tensor)   # type: ignore[reportGeneralTypeIssues]
-        converted_paddle_tensor = torch.utils.dlpack.from_dlpack(paddle_dlpack)   # type: ignore[reportGeneralTypeIssues]
+        paddle_dlpack = paddle.utils.dlpack.to_dlpack(paddle_tensor)  # type: ignore[reportGeneralTypeIssues]
+        converted_paddle_tensor = torch.utils.dlpack.from_dlpack(paddle_dlpack)  # type: ignore[reportGeneralTypeIssues]
 
         def error_msg(msg):
             return (
