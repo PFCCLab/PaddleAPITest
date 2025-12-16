@@ -1,10 +1,10 @@
 from typing import TYPE_CHECKING, Any
 
 __all__ = [
-    "TensorConfig",
-    "APIConfig",
-    "analyse_configs",
     "USE_CACHED_NUMPY",
+    "APIConfig",
+    "TensorConfig",
+    "analyse_configs",
     "cached_numpy",
     "get_cfg",
     "set_cfg",
@@ -12,10 +12,10 @@ __all__ = [
 
 if TYPE_CHECKING:
     from .config_analyzer import (
-        TensorConfig,
-        APIConfig,
-        analyse_configs,
         USE_CACHED_NUMPY,
+        APIConfig,
+        TensorConfig,
+        analyse_configs,
         cached_numpy,
     )
     from .log_writer import get_cfg, set_cfg

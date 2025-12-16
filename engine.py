@@ -1,6 +1,8 @@
+from __future__ import annotations
+
 import os
 
-os.environ["FLAGS_use_system_allocator"] = "1"
+os.environ["FLAGS_USE_SYSTEM_ALLOCATOR"] = "1"
 os.environ["NVIDIA_TF32_OVERRIDE"] = "0"
 
 import argparse
@@ -8,17 +10,16 @@ from datetime import datetime
 
 import paddle
 import torch
-
 from tester import (
     APIConfig,
     APITestAccuracy,
     APITestAccuracyStable,
     APITestCINNVSDygraph,
+    APITestCustomDeviceVSCPU,
     APITestPaddleGPUPerformance,
     APITestPaddleOnly,
     APITestPaddleTorchGPUPerformance,
     APITestTorchGPUPerformance,
-    APITestCustomDeviceVSCPU,
     set_cfg,
 )
 from tester.api_config.log_writer import close_process_files, read_log, write_to_log
@@ -170,8 +171,8 @@ def main():
             paddle.device.cuda.empty_cache()
     elif options.api_config_file != "":
         finish_configs = read_log("checkpoint")
-        with open(options.api_config_file, "r") as f:
-            api_configs = set(line.strip() for line in f if line.strip())
+        with open(options.api_config_file) as f:
+            api_configs = {line.strip() for line in f if line.strip()}
         api_configs = api_configs - finish_configs
         api_configs = sorted(api_configs)
         for api_config_str in api_configs:

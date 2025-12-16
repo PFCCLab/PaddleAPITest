@@ -1,7 +1,10 @@
-import torch
-import paddle
-import numpy
+from __future__ import annotations
+
 import time
+
+import numpy
+import paddle
+import torch
 
 device = torch.device("cuda:0")
 torch.set_default_device(device)
@@ -44,7 +47,7 @@ paddle_out = paddle.incubate.nn.functional.swiglu(paddle_x1, paddle_x2)
 with paddle.no_grad():
     paddle.base.core._cuda_synchronize(paddle.CUDAPlace(0))
     start = time.time()
-    for i in range(test_loop):
+    for _i in range(test_loop):
         paddle.incubate.nn.functional.swiglu(paddle_x1, paddle_x2)
     paddle.base.core._cuda_synchronize(paddle.CUDAPlace(0))
     end = time.time()
@@ -56,7 +59,7 @@ paddle_grad, torch_grad = init_input(numpy_tensor)
 
 paddle.base.core._cuda_synchronize(paddle.CUDAPlace(0))
 start = time.time()
-for i in range(test_loop):
+for _i in range(test_loop):
     paddle.grad(
         [paddle_out],
         [paddle_x1, paddle_x2],
@@ -73,7 +76,7 @@ torch_out = torch.nn.functional.silu(torch_x1) * torch_x2
 with torch.no_grad():
     torch.cuda.synchronize()
     start = time.time()
-    for i in range(test_loop):
+    for _i in range(test_loop):
         torch.nn.functional.silu(torch_x1) * torch_x2
     torch.cuda.synchronize()
     end = time.time()
@@ -82,7 +85,7 @@ with torch.no_grad():
 
 torch.cuda.synchronize()
 start = time.time()
-for i in range(test_loop):
+for _i in range(test_loop):
     torch.autograd.grad(
         [torch_out], [torch_x1, torch_x2], grad_outputs=torch_grad, retain_graph=True
     )

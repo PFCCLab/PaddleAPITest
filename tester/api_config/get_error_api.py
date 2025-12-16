@@ -1,6 +1,9 @@
+from __future__ import annotations
+
+
 def read_file(file_path):
-    with open(file_path, "r", encoding="utf-8") as file:
-        return set(line.strip() for line in file)
+    with open(file_path, encoding="utf-8") as file:
+        return {line.strip() for line in file}
 
 
 def write_to_file(file_path, data):

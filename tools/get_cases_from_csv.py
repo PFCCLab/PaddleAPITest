@@ -1,13 +1,16 @@
-import typer
+from __future__ import annotations
+
 import csv
 from pathlib import Path
+
+import typer
 
 app = typer.Typer()
 
 
 def _get_cases(api_name: str, only_diff: bool, original_csv: str):
     with (
-        open(original_csv, "r") as infile,
+        open(original_csv) as infile,
         open(f"filtered_result_{api_name}.csv", "w", newline="") as outfile,
     ):
         reader = csv.reader(infile)
@@ -33,7 +36,7 @@ def _get_cases(api_name: str, only_diff: bool, original_csv: str):
             writer.writerow(row)
 
     with (
-        open(f"filtered_result_{api_name}.csv", "r") as infile,
+        open(f"filtered_result_{api_name}.csv") as infile,
         open(f"error_config_{api_name}.txt", "w") as outfile,
     ):
         reader = csv.reader(infile)

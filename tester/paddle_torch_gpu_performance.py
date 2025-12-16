@@ -1,11 +1,15 @@
+from __future__ import annotations
+
+import time
+
 import paddle
 import torch
+from func_timeout import func_set_timeout
+
+from .api_config.config_analyzer import TensorConfig
 from .api_config.log_writer import write_to_log
 from .base import APITestBase
-import time
-from .api_config.config_analyzer import TensorConfig
 from .paddle_to_torch import get_converter
-from func_timeout import func_set_timeout
 
 
 def tensor_numel(tensor_config):
@@ -20,23 +24,15 @@ def get_tensor_configs(api_config):
     for arg_config in api_config.args:
         if isinstance(arg_config, TensorConfig):
             tensor_configs.append(arg_config)
-        elif isinstance(arg_config, list):
-            for j in range(len(arg_config)):
-                if isinstance(arg_config[j], TensorConfig):
-                    tensor_configs.append(arg_config[j])
-        elif isinstance(arg_config, tuple):
+        elif isinstance(arg_config, (list, tuple)):
             for j in range(len(arg_config)):
                 if isinstance(arg_config[j], TensorConfig):
                     tensor_configs.append(arg_config[j])
 
-    for key, arg_config in api_config.kwargs.items():
+    for _key, arg_config in api_config.kwargs.items():
         if isinstance(arg_config, TensorConfig):
             tensor_configs.append(arg_config)
-        elif isinstance(arg_config, list):
-            for j in range(len(arg_config)):
-                if isinstance(arg_config[j], TensorConfig):
-                    tensor_configs.append(arg_config[j])
-        elif isinstance(arg_config, tuple):
+        elif isinstance(arg_config, (list, tuple)):
             for j in range(len(arg_config)):
                 if isinstance(arg_config[j], TensorConfig):
                     tensor_configs.append(arg_config[j])
@@ -681,7 +677,7 @@ class APITestPaddleTorchGPUPerformance(APITestBase):
             convert_result = self.converter.convert(self.api_config.api_name)
         except Exception as e:
             print(
-                f"[paddle_to_torch] Convertion failed for {self.api_config.config}: {str(e)}",
+                f"[paddle_to_torch] Convertion failed for {self.api_config.config}: {e!s}",
                 flush=True,
             )
             write_to_log("paddle_to_torch_failed", self.api_config.config)
@@ -703,10 +699,7 @@ class APITestPaddleTorchGPUPerformance(APITestBase):
 
         numel = total_numel(self.api_config)
         # test_loop = 1000
-        if self.api_config.api_name in api_loop:
-            test_loop = api_loop[self.api_config.api_name]
-        else:
-            test_loop = 1000
+        test_loop = api_loop.get(self.api_config.api_name, 1000)
             # test_loop = 2147483647 * 20 // numel
             # test_loop = 100000 if test_loop > 100000 else test_loop
 
@@ -736,23 +729,17 @@ class APITestPaddleTorchGPUPerformance(APITestBase):
 
             if self.test_amp:
                 with paddle.amp.auto_cast():
-                    paddle_output = self.paddle_api(
-                        *tuple(self.paddle_args), **self.paddle_kwargs
-                    )
+                    paddle_output = self.paddle_api(*tuple(self.paddle_args), **self.paddle_kwargs)
             else:
-                paddle_output = self.paddle_api(
-                    *tuple(self.paddle_args), **self.paddle_kwargs
-                )
+                paddle_output = self.paddle_api(*tuple(self.paddle_args), **self.paddle_kwargs)
 
             with paddle.no_grad():
                 if self.test_amp:
                     with paddle.amp.auto_cast():
                         paddle.base.core._cuda_synchronize(paddle.CUDAPlace(0))
                         start = time.time()
-                        for i in range(test_loop):
-                            self.paddle_api(
-                                *tuple(self.paddle_args), **self.paddle_kwargs
-                            )
+                        for _i in range(test_loop):
+                            self.paddle_api(*tuple(self.paddle_args), **self.paddle_kwargs)
                         before_sync = time.time()
                         paddle.base.core._cuda_synchronize(paddle.CUDAPlace(0))
                         end = time.time()
@@ -761,7 +748,7 @@ class APITestPaddleTorchGPUPerformance(APITestBase):
                 else:
                     paddle.base.core._cuda_synchronize(paddle.CUDAPlace(0))
                     start = time.time()
-                    for i in range(test_loop):
+                    for _i in range(test_loop):
                         self.paddle_api(*tuple(self.paddle_args), **self.paddle_kwargs)
                     before_sync = time.time()
                     paddle.base.core._cuda_synchronize(paddle.CUDAPlace(0))
@@ -783,8 +770,8 @@ class APITestPaddleTorchGPUPerformance(APITestBase):
         try:
             if self.need_check_grad():
                 inputs_list = self.get_paddle_input_list()
-                result_outputs, result_outputs_grads = (
-                    self.gen_paddle_output_and_output_grad(paddle_output)
+                result_outputs, result_outputs_grads = self.gen_paddle_output_and_output_grad(
+                    paddle_output
                 )
                 if (
                     len(inputs_list) != 0
@@ -799,7 +786,7 @@ class APITestPaddleTorchGPUPerformance(APITestBase):
                     )
                     paddle.base.core._cuda_synchronize(paddle.CUDAPlace(0))
                     start = time.time()
-                    for i in range(test_loop):
+                    for _i in range(test_loop):
                         paddle.grad(
                             result_outputs,
                             inputs_list,
@@ -923,8 +910,8 @@ class APITestPaddleTorchGPUPerformance(APITestBase):
         try:
             if self.need_check_grad():
                 inputs_list = self.get_torch_input_list()
-                result_outputs, result_outputs_grads = (
-                    self.gen_torch_output_and_output_grad(torch_output)
+                result_outputs, result_outputs_grads = self.gen_torch_output_and_output_grad(
+                    torch_output
                 )
                 del self.torch_args, self.torch_kwargs
                 if inputs_list and result_outputs and result_outputs_grads:
@@ -936,7 +923,7 @@ class APITestPaddleTorchGPUPerformance(APITestBase):
                     )
                     torch.cuda.synchronize()
                     start = time.time()
-                    for i in range(test_loop):
+                    for _i in range(test_loop):
                         torch.autograd.grad(
                             outputs=result_outputs,
                             inputs=inputs_list,

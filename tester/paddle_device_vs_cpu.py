@@ -1,7 +1,10 @@
+from __future__ import annotations
+
 import paddle
+import torch
+
 from .api_config.log_writer import write_to_log
 from .base import APITestBase
-import torch
 
 
 class APITestCustomDeviceVSCPU(APITestBase):
@@ -33,10 +36,7 @@ class APITestCustomDeviceVSCPU(APITestBase):
 
     def check_xpu_available(self):
         """Check if XPU is available"""
-        if paddle.device.is_compiled_with_xpu():
-            return True
-        else:
-            return False
+        return bool(paddle.device.is_compiled_with_xpu())
 
     def run_on_device(self, device_type, device_id=0):
         """Run API on specified device"""
@@ -55,9 +55,7 @@ class APITestCustomDeviceVSCPU(APITestBase):
             # Forward
             if self.test_amp:
                 with paddle.amp.auto_cast():
-                    output = self.paddle_api(
-                        *tuple(self.paddle_args), **self.paddle_kwargs
-                    )
+                    output = self.paddle_api(*tuple(self.paddle_args), **self.paddle_kwargs)
             else:
                 output = self.paddle_api(*tuple(self.paddle_args), **self.paddle_kwargs)
 
@@ -65,8 +63,8 @@ class APITestCustomDeviceVSCPU(APITestBase):
             out_grads = None
             if self.need_check_grad():
                 inputs_list = self.get_paddle_input_list()
-                result_outputs, result_outputs_grads = (
-                    self.gen_paddle_output_and_output_grad(output)
+                result_outputs, result_outputs_grads = self.gen_paddle_output_and_output_grad(
+                    output
                 )
 
                 if inputs_list and result_outputs and result_outputs_grads:
@@ -129,7 +127,7 @@ class APITestCustomDeviceVSCPU(APITestBase):
             error_msg = "[accuracy error]"
             if tensor_name:
                 error_msg += f" {tensor_name}"
-            error_msg += f"\n{self.api_config.config}\n{str(err)}"
+            error_msg += f"\n{self.api_config.config}\n{err!s}"
             print(error_msg, flush=True)
             return False
 
@@ -173,18 +171,14 @@ class APITestCustomDeviceVSCPU(APITestBase):
                     )
                     continue
 
-                if not self._compare_single_tensor(
-                    cpu_output[i], custom_output[i], f"output[{i}]"
-                ):
+                if not self._compare_single_tensor(cpu_output[i], custom_output[i], f"output[{i}]"):
                     return False
 
             return True
 
         else:
             # Non-Tensor output, print comparison directly
-            print(
-                "non-tensor output comparison:", cpu_output, custom_output, flush=True
-            )
+            print("non-tensor output comparison:", cpu_output, custom_output, flush=True)
             return True
 
     def compare_gradients(self, cpu_grads, custom_grads):
@@ -199,9 +193,7 @@ class APITestCustomDeviceVSCPU(APITestBase):
         if isinstance(custom_grads, paddle.Tensor):
             custom_grads = [custom_grads]
 
-        if not isinstance(cpu_grads, (list, tuple)) or not isinstance(
-            custom_grads, (list, tuple)
-        ):
+        if not isinstance(cpu_grads, (list, tuple)) or not isinstance(custom_grads, (list, tuple)):
             print("[gradients type error]", self.api_config.config, flush=True)
             return False
 
@@ -214,7 +206,7 @@ class APITestCustomDeviceVSCPU(APITestBase):
             return False
 
         # Compare gradients one by one
-        for i, (cpu_grad, custom_grad) in enumerate(zip(cpu_grads, custom_grads)):
+        for i, (cpu_grad, custom_grad) in enumerate(zip(cpu_grads, custom_grads, strict=False)):
             if cpu_grad is None and custom_grad is None:
                 continue
             elif cpu_grad is None or custom_grad is None:
@@ -233,7 +225,6 @@ class APITestCustomDeviceVSCPU(APITestBase):
 
     def test(self):
         """Main test function"""
-
         # 1. Skip APIs that don't need testing
         if self.need_skip():
             print("[Skip]", flush=True)

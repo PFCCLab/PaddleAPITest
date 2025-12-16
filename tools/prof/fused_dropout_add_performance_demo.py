@@ -1,7 +1,10 @@
-import torch
-import paddle
-import numpy
+from __future__ import annotations
+
 import time
+
+import numpy
+import paddle
+import torch
 
 device = torch.device("cuda:0")
 torch.set_default_device(device)
@@ -15,10 +18,7 @@ def fused_dropout_add(x, y, p=0.5, training=True, mode="upscale_in_train"):
     else:
         # handle downscale dropout
         mask = torch.bernoulli(torch.full(x.shape, 1 - p)).to(x.device)
-        if training:
-            x = x * mask
-        else:
-            x = x * (1 - p)
+        x = x * mask if training else x * (1 - p)
         x = x + y
     return x
 
@@ -60,7 +60,7 @@ paddle_out = paddle.incubate.nn.functional.fused_dropout_add(
 with paddle.no_grad():
     paddle.base.core._cuda_synchronize(paddle.CUDAPlace(0))
     start = time.time()
-    for i in range(test_loop):
+    for _i in range(test_loop):
         paddle.incubate.nn.functional.fused_dropout_add(
             paddle_x1, paddle_x2, p=0.0, training=True, mode="upscale_in_train"
         )
@@ -74,7 +74,7 @@ paddle_grad, torch_grad = init_input(numpy_tensor)
 
 paddle.base.core._cuda_synchronize(paddle.CUDAPlace(0))
 start = time.time()
-for i in range(test_loop):
+for _i in range(test_loop):
     paddle.grad(
         [paddle_out],
         [paddle_x1, paddle_x2],
@@ -86,17 +86,13 @@ end = time.time()
 timeused = end - start
 print("paddle backward", timeused)
 
-torch_out = fused_dropout_add(
-    torch_x1, torch_x2, p=0.0, training=True, mode="upscale_in_train"
-)
+torch_out = fused_dropout_add(torch_x1, torch_x2, p=0.0, training=True, mode="upscale_in_train")
 
 with torch.no_grad():
     torch.cuda.synchronize()
     start = time.time()
-    for i in range(test_loop):
-        fused_dropout_add(
-            torch_x1, torch_x2, p=0.0, training=True, mode="upscale_in_train"
-        )
+    for _i in range(test_loop):
+        fused_dropout_add(torch_x1, torch_x2, p=0.0, training=True, mode="upscale_in_train")
     torch.cuda.synchronize()
     end = time.time()
     timeused = end - start
@@ -104,7 +100,7 @@ with torch.no_grad():
 
 torch.cuda.synchronize()
 start = time.time()
-for i in range(test_loop):
+for _i in range(test_loop):
     torch.autograd.grad(
         [torch_out], [torch_x1, torch_x2], grad_outputs=torch_grad, retain_graph=True
     )

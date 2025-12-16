@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import gc
 import traceback
 
@@ -39,7 +41,7 @@ class APITestAccuracy(APITestBase):
             convert_result = self.converter.convert(self.api_config.api_name)
         except Exception as e:
             print(
-                f"[paddle_to_torch] Convertion failed for {self.api_config.config}: {str(e)}",
+                f"[paddle_to_torch] Convertion failed for {self.api_config.config}: {e!s}",
                 flush=True,
             )
             write_to_log("paddle_to_torch_failed", self.api_config.config)
@@ -64,7 +66,7 @@ class APITestAccuracy(APITestBase):
                 print("gen_numpy_input failed")
                 return
         except Exception as err:
-            print(f"[numpy error] {self.api_config.config}\n{str(err)}")
+            print(f"[numpy error] {self.api_config.config}\n{err!s}")
             traceback.print_exc()
             write_to_log("numpy_error", self.api_config.config)
             return
@@ -133,7 +135,7 @@ class APITestAccuracy(APITestBase):
 
             paddle.base.core.eager._for_test_check_cuda_error()
         except Exception as err:
-            print(f"[torch error] {self.api_config.config}\n{str(err)}", flush=True)
+            print(f"[torch error] {self.api_config.config}\n{err!s}", flush=True)
             traceback.print_exc()
             write_to_log("torch_error", self.api_config.config)
             if any(cuda_err in str(err) for cuda_err in CUDA_ERROR) or any(
@@ -147,8 +149,8 @@ class APITestAccuracy(APITestBase):
         if self.need_check_grad():
             try:
                 inputs_list = self.get_torch_input_list()
-                result_outputs, result_outputs_grads = (
-                    self.gen_torch_output_and_output_grad(torch_output)
+                result_outputs, result_outputs_grads = self.gen_torch_output_and_output_grad(
+                    torch_output
                 )
                 del self.torch_args, self.torch_kwargs
                 if inputs_list and result_outputs and result_outputs_grads:
@@ -161,7 +163,7 @@ class APITestAccuracy(APITestBase):
                 del inputs_list, result_outputs, result_outputs_grads
             except Exception as err:
                 if str(err).startswith("Too large tensor to get cached numpy: "):
-                    print(f"[numpy error] {self.api_config.config}\n{str(err)}")
+                    print(f"[numpy error] {self.api_config.config}\n{err!s}")
                     write_to_log("numpy_error", self.api_config.config)
                     return
                 # some torch backward error can be tolerable, so we catch cuda error here
@@ -169,7 +171,7 @@ class APITestAccuracy(APITestBase):
                     cuda_err in str(err) for cuda_err in CUDA_OOM
                 ):
                     print(
-                        f"[torch error] backward {self.api_config.config}\n{str(err)}",
+                        f"[torch error] backward {self.api_config.config}\n{err!s}",
                         flush=True,
                     )
                     write_to_log("torch_error", self.api_config.config)
@@ -179,7 +181,7 @@ class APITestAccuracy(APITestBase):
                 paddle.base.core.eager._for_test_check_cuda_error()
             except Exception as err:
                 print(
-                    f"[torch error] backward {self.api_config.config}\n{str(err)}",
+                    f"[torch error] backward {self.api_config.config}\n{err!s}",
                     flush=True,
                 )
                 write_to_log("torch_error", self.api_config.config)
@@ -213,9 +215,7 @@ class APITestAccuracy(APITestBase):
             if "paddle.Tensor." in self.api_config.api_name:
                 api = getattr(
                     self.paddle_args[0],
-                    self.api_config.api_name[
-                        self.api_config.api_name.rindex(".") + 1 :
-                    ],
+                    self.api_config.api_name[self.api_config.api_name.rindex(".") + 1 :],
                 )
                 if self.test_amp:
                     with paddle.amp.auto_cast():
@@ -229,12 +229,9 @@ class APITestAccuracy(APITestBase):
                             *tuple(self.paddle_args), **self.paddle_kwargs
                         )
                 else:
-                    paddle_output = self.paddle_api(
-                        *tuple(self.paddle_args), **self.paddle_kwargs
-                    )
+                    paddle_output = self.paddle_api(*tuple(self.paddle_args), **self.paddle_kwargs)
             if (
-                self.api_config.api_name[-1] == "_"
-                and self.api_config.api_name[-2:] != "__"
+                self.api_config.api_name[-1] == "_" and self.api_config.api_name[-2:] != "__"
             ) or self.api_config.api_name == "paddle.Tensor.__setitem__":
                 paddle_output = (
                     self.paddle_args[0]
@@ -247,14 +244,14 @@ class APITestAccuracy(APITestBase):
                 write_to_log("pass", self.api_config.config)
                 return
             if any(cuda_err in str(err) for cuda_err in CUDA_ERROR):
-                print(f"[cuda error] {self.api_config.config}\n{str(err)}", flush=True)
+                print(f"[cuda error] {self.api_config.config}\n{err!s}", flush=True)
                 write_to_log("cuda_error", self.api_config.config)
                 raise
             if any(cuda_err in str(err) for cuda_err in CUDA_OOM):
-                print(f"[oom] {self.api_config.config}\n{str(err)}", flush=True)
+                print(f"[oom] {self.api_config.config}\n{err!s}", flush=True)
                 write_to_log("oom", self.api_config.config)
                 raise
-            print(f"[paddle error] {self.api_config.config}\n{str(err)}", flush=True)
+            print(f"[paddle error] {self.api_config.config}\n{err!s}", flush=True)
             write_to_log("paddle_error", self.api_config.config)
             if self.exit_on_error:
                 raise
@@ -263,13 +260,11 @@ class APITestAccuracy(APITestBase):
         try:
             paddle.base.core.eager._for_test_check_cuda_error()
         except Exception as err:
-            print(f"[cuda error] {self.api_config.config}\n{str(err)}", flush=True)
+            print(f"[cuda error] {self.api_config.config}\n{err!s}", flush=True)
             write_to_log("cuda_error", self.api_config.config)
             raise
 
-        paddle_output, torch_output = process_output(
-            self.api_config, paddle_output, torch_output
-        )
+        paddle_output, torch_output = process_output(self.api_config, paddle_output, torch_output)
 
         self.is_backward = False
 
@@ -286,12 +281,12 @@ class APITestAccuracy(APITestBase):
             except Exception as err:
                 if self.is_backward:
                     print(
-                        f"[accuracy error] backward at {idx} {self.api_config.config}\n{str(err)}",
+                        f"[accuracy error] backward at {idx} {self.api_config.config}\n{err!s}",
                         flush=True,
                     )
                 else:
                     print(
-                        f"[accuracy error] at {idx} {self.api_config.config}\n{str(err)}",
+                        f"[accuracy error] at {idx} {self.api_config.config}\n{err!s}",
                         flush=True,
                     )
                 write_to_log("accuracy_error", self.api_config.config)
@@ -307,23 +302,19 @@ class APITestAccuracy(APITestBase):
                     return
             elif isinstance(torch_output, bool):
                 try:
-                    assert paddle_output.dtype == paddle.bool, (
-                        "paddle_output dtype is not bool"
-                    )
+                    assert paddle_output.dtype == paddle.bool, "paddle_output dtype is not bool"
                     assert paddle_output.shape == [], "paddle_output shape is not []"
                     assert bool(paddle_output) == torch_output, (
                         f"paddle_output {bool(paddle_output)} is not equal to torch_output {torch_output}"
                     )
                 except Exception as err:
                     print(
-                        f"[not compare] {self.api_config.config}\n{str(err)}",
+                        f"[not compare] {self.api_config.config}\n{err!s}",
                         flush=True,
                     )
                     write_to_log("accuracy_error", self.api_config.config)
                     return
-            elif isinstance(
-                torch_output, (torch.return_types.max, torch.return_types.min)
-            ):
+            elif isinstance(torch_output, (torch.return_types.max, torch.return_types.min)):
                 torch_output = torch_output.values
                 if not compare_paddle_and_torch(paddle_output, torch_output):
                     return
@@ -354,12 +345,8 @@ class APITestAccuracy(APITestBase):
                 )
                 write_to_log("accuracy_error", self.api_config.config)
                 return
-            for i, (paddle_item, torch_item) in enumerate(
-                zip(paddle_output, torch_output)
-            ):
-                if isinstance(paddle_item, int) or self.api_config.api_name.endswith(
-                    "tolist"
-                ):
+            for i, (paddle_item, torch_item) in enumerate(zip(paddle_output, torch_output, strict=False)):
+                if isinstance(paddle_item, int) or self.api_config.api_name.endswith("tolist"):
                     self.np_assert_accuracy(
                         numpy.array(paddle_item),
                         numpy.array(torch_item),
@@ -371,12 +358,8 @@ class APITestAccuracy(APITestBase):
                     if any(isinstance(x, paddle.Tensor) for x in paddle_item) and any(
                         isinstance(x, torch.Tensor) for x in torch_item
                     ):
-                        for paddle_item_sub, torch_item_sub in zip(
-                            paddle_item, torch_item
-                        ):
-                            if not compare_paddle_and_torch(
-                                paddle_item_sub, torch_item_sub, i
-                            ):
+                        for paddle_item_sub, torch_item_sub in zip(paddle_item, torch_item, strict=False):
+                            if not compare_paddle_and_torch(paddle_item_sub, torch_item_sub, i):
                                 return
                     else:
                         print(
@@ -388,8 +371,10 @@ class APITestAccuracy(APITestBase):
                         return
                 elif (
                     paddle_item is None
-                    or isinstance(paddle_item, paddle.Tensor)
-                    and not (paddle_item._is_initialized() or paddle_item.numel() == 0)
+                    or (
+                        isinstance(paddle_item, paddle.Tensor)
+                        and not (paddle_item._is_initialized() or paddle_item.numel() == 0)
+                    )
                 ) and torch_item is None:
                     # paddle is None and torch is None
                     # paddle is Tensor but uninitialized and torch is None
@@ -415,8 +400,8 @@ class APITestAccuracy(APITestBase):
             try:
                 paddle_out_grads = None
                 inputs_list = self.get_paddle_input_list()
-                result_outputs, result_outputs_grads = (
-                    self.gen_paddle_output_and_output_grad(paddle_output)
+                result_outputs, result_outputs_grads = self.gen_paddle_output_and_output_grad(
+                    paddle_output
                 )
                 del self.paddle_args, self.paddle_kwargs
                 if inputs_list and result_outputs and result_outputs_grads:
@@ -430,7 +415,7 @@ class APITestAccuracy(APITestBase):
             except Exception as err:
                 if str(err).startswith("Too large tensor to get cached numpy: "):
                     print(
-                        f"[numpy error] backward {self.api_config.config}\n{str(err)}",
+                        f"[numpy error] backward {self.api_config.config}\n{err!s}",
                         flush=True,
                     )
                     write_to_log("numpy_error", self.api_config.config)
@@ -441,20 +426,20 @@ class APITestAccuracy(APITestBase):
                     return
                 if any(cuda_err in str(err) for cuda_err in CUDA_ERROR):
                     print(
-                        f"[cuda error] backward {self.api_config.config}\n{str(err)}",
+                        f"[cuda error] backward {self.api_config.config}\n{err!s}",
                         flush=True,
                     )
                     write_to_log("cuda_error", self.api_config.config)
                     raise
                 if any(cuda_err in str(err) for cuda_err in CUDA_OOM):
                     print(
-                        f"[oom] backward {self.api_config.config}\n{str(err)}",
+                        f"[oom] backward {self.api_config.config}\n{err!s}",
                         flush=True,
                     )
                     write_to_log("oom", self.api_config.config)
                     raise
                 print(
-                    f"[paddle error] backward {self.api_config.config}\n{str(err)}",
+                    f"[paddle error] backward {self.api_config.config}\n{err!s}",
                     flush=True,
                 )
                 if self.exit_on_error:
@@ -466,7 +451,7 @@ class APITestAccuracy(APITestBase):
                 paddle.base.core.eager._for_test_check_cuda_error()
             except Exception as err:
                 print(
-                    f"[cuda error] backward {self.api_config.config}\n{str(err)}",
+                    f"[cuda error] backward {self.api_config.config}\n{err!s}",
                     flush=True,
                 )
                 write_to_log("cuda_error", self.api_config.config)
@@ -509,7 +494,7 @@ class APITestAccuracy(APITestBase):
                     write_to_log("accuracy_error", self.api_config.config)
                     return
                 for i, (paddle_item, torch_item) in enumerate(
-                    zip(paddle_out_grads, torch_out_grads)
+                    zip(paddle_out_grads, torch_out_grads, strict=False)
                 ):
                     if isinstance(paddle_item, int):
                         self.np_assert_accuracy(
@@ -520,9 +505,9 @@ class APITestAccuracy(APITestBase):
                         )
                     elif (
                         paddle_item is None
-                        or isinstance(paddle_item, paddle.Tensor)
-                        and not (
-                            paddle_item._is_initialized() or paddle_item.numel() == 0
+                        or (
+                            isinstance(paddle_item, paddle.Tensor)
+                            and not (paddle_item._is_initialized() or paddle_item.numel() == 0)
                         )
                     ) and torch_item is None:
                         # paddle is None and torch is None
@@ -576,12 +561,8 @@ def process_output(api_config, paddle_output, torch_output):
         # are all the same and whether the |coef| == 1 for simplicity.
         paddle_output, torch_output = list(paddle_output), list(torch_output)
         eigvector_len = paddle_output[1].shape[-2]
-        paddle_eigvectors = (
-            paddle_output.pop(1).matrix_transpose().reshape([-1, eigvector_len])
-        )
-        torch_eigvectors = (
-            torch_output.pop(1).transpose(-1, -2).reshape((-1, eigvector_len))
-        )
+        paddle_eigvectors = paddle_output.pop(1).matrix_transpose().reshape([-1, eigvector_len])
+        torch_eigvectors = torch_output.pop(1).transpose(-1, -2).reshape((-1, eigvector_len))
         paddle_output, torch_output = [], []
         for i in range(paddle_eigvectors.shape[0]):
             coef_vector = paddle.to_tensor(
@@ -642,14 +623,9 @@ def process_grad_output(api_config, paddle_out_grads, torch_out_grads):
         else:
             is_upper = False
         torch_out_grads[1] = (
-            torch.triu(torch_out_grads[1])
-            if is_upper
-            else torch.tril(torch_out_grads[1])
+            torch.triu(torch_out_grads[1]) if is_upper else torch.tril(torch_out_grads[1])
         )
-    elif (
-        api_config.api_name
-        == "paddle.incubate.nn.functional.fused_rotary_position_embedding"
-    ):
+    elif api_config.api_name == "paddle.incubate.nn.functional.fused_rotary_position_embedding":
         # Paddle only has 3 outputs/grads Q, K, V
         valid_out_num = len([out for out in paddle_out_grads if out is not None])
         paddle_out_grads = paddle_out_grads[:valid_out_num]

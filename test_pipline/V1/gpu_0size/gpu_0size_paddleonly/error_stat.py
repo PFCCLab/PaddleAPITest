@@ -1,13 +1,11 @@
+from __future__ import annotations
+
 error_configs = set()
 error_apis = set()
-with open(
-    "test_pipline/gpu_0size/gpu_0size_paddleonly/error_log.log", "w"
-) as error_log:
+with open("test_pipline/gpu_0size/gpu_0size_paddleonly/error_log.log", "w") as error_log:
     for i in range(24):
-        test_log = "test_pipline/gpu_0size/gpu_0size_paddleonly/0sizetensor_paddleonly_{}.log".format(
-            i + 1
-        )
-        with open(test_log, "r") as file:
+        test_log = f"test_pipline/gpu_0size/gpu_0size_paddleonly/0sizetensor_paddleonly_{i + 1}.log"
+        with open(test_log) as file:
             lines = file.readlines()
             is_log_str = False
             log_str = ""
@@ -31,13 +29,9 @@ with open(
                 else:
                     log_str += line
 
-with open(
-    "test_pipline/gpu_0size/gpu_0size_paddleonly/error_config.txt", "w"
-) as error_config_file:
+with open("test_pipline/gpu_0size/gpu_0size_paddleonly/error_config.txt", "w") as error_config_file:
     for config in error_configs:
         error_config_file.write(config)
-with open(
-    "test_pipline/gpu_0size/gpu_0size_paddleonly/error_api.txt", "w"
-) as error_api_file:
+with open("test_pipline/gpu_0size/gpu_0size_paddleonly/error_api.txt", "w") as error_api_file:
     for api in error_apis:
         error_api_file.write(api + "\n")

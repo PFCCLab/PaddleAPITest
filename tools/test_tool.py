@@ -83,7 +83,7 @@
 #                         log_str = line
 #                     else:
 #                         log_str += line
-
+from __future__ import annotations
 
 logs = [
     "/host_home/wanghuan29/APItest3/PaddleAPITest/tester/api_config/test_log/log1.log",
@@ -161,7 +161,7 @@ with open(
     "w",
 ) as error:
     for log in logs:
-        with open(log, "r") as f:
+        with open(log) as f:
             lines = f.readlines()
             is_log_str = False
             log_str = ""

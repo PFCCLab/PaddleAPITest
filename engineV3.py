@@ -1,18 +1,19 @@
 #!/bin/env python3
-# -*- coding: utf-8 -*-
 # @author DDDivano
 # encoding=utf-8 vi:ts=4:sw=4:expandtab:ft=python
+from __future__ import annotations
+
 import argparse
 import multiprocessing as mp
 import os
+import shutil
+import signal
 import sys
 import time
-import signal
-import shutil
 import zipfile
 from datetime import datetime
 
-os.environ["FLAGS_use_system_allocator"] = "1"
+os.environ["FLAGS_USE_SYSTEM_ALLOCATOR"] = "1"
 os.environ["NVIDIA_TF32_OVERRIDE"] = "0"
 
 
@@ -94,10 +95,10 @@ def worker_process(gpu_id, task_queue, result_queue, idx, args_mode):
 
                     if test_class is None:
                         from tester import (
-                            APITestAccuracy,
-                            APITestPaddleOnly,
-                            APITestCINNVSDygraph,
                             APIConfig,
+                            APITestAccuracy,
+                            APITestCINNVSDygraph,
+                            APITestPaddleOnly,
                         )
 
                         mode_to_test_class = {
@@ -167,12 +168,10 @@ def pack():
     with zipfile.ZipFile(pack_name, "w", zipfile.ZIP_DEFLATED) as zipf:
         for folder in ["logs", "worker_logs"]:
             if os.path.exists(folder):
-                for root, dirs, files in os.walk(folder):
+                for root, _dirs, files in os.walk(folder):
                     for file in files:
                         file_path = os.path.join(root, file)
-                        arcname = os.path.relpath(
-                            file_path, start=os.path.dirname(folder)
-                        )
+                        arcname = os.path.relpath(file_path, start=os.path.dirname(folder))
                         zipf.write(file_path, arcname)
     print(f"[Master] Packed logs into {pack_name}")
 
@@ -187,12 +186,8 @@ def main():
 
     parser.add_argument("--api_config_file", required=True, help="API 配置文件路径")
     parser.add_argument("--gpus", required=True, help="用逗号分隔的 GPU ID 列表")
-    parser.add_argument(
-        "--per_gpu_concurrency", type=int, default=1, help="每块 GPU 并发数"
-    )
-    parser.add_argument(
-        "--timeout", type=int, default=1800, help="每个任务超时时间（秒）"
-    )
+    parser.add_argument("--per_gpu_concurrency", type=int, default=1, help="每块 GPU 并发数")
+    parser.add_argument("--timeout", type=int, default=1800, help="每个任务超时时间（秒）")
 
     args = parser.parse_args()
 
@@ -219,7 +214,7 @@ def main():
     error_cases = open(os.path.join("logs", "error_cases.txt"), "w")
 
     # 加载API配置
-    with open(args.api_config_file, "r") as f:
+    with open(args.api_config_file) as f:
         pending_api_configs = [line.strip() for line in f if line.strip()]
 
     task_queue = mp.Queue()
@@ -237,9 +232,7 @@ def main():
     master_log.flush()
 
     for idx in range(total_worker_num):
-        p = spawn_worker(
-            gpu_list, concurrency, idx, task_queue, result_queue, selected_mode
-        )
+        p = spawn_worker(gpu_list, concurrency, idx, task_queue, result_queue, selected_mode)
         workers[idx] = p
         worker_last_task_time[idx] = time.time()
 
@@ -282,9 +275,7 @@ def main():
 
             if status == "success":
                 success_count += 1
-                master_log.write(
-                    f"{datetime.now()} Task {task_id} SUCCESS: {api_config_str}\n"
-                )
+                master_log.write(f"{datetime.now()} Task {task_id} SUCCESS: {api_config_str}\n")
             elif status == "error":
                 error_count += 1
                 error_msg = others[0] if others else "Unknown error"
@@ -299,10 +290,7 @@ def main():
             pass  # 超时，下面补充任务 + 手动检查超时
 
         # 补充新任务：保持队列里有任务在跑
-        while (
-            pending_task_index < len(pending_api_configs)
-            and task_queue.qsize() < max_queue_size
-        ):
+        while pending_task_index < len(pending_api_configs) and task_queue.qsize() < max_queue_size:
             api_config_str = pending_api_configs[pending_task_index]
             task_queue.put((task_id_counter, api_config_str))
             task_status[task_id_counter] = (None, api_config_str)
@@ -316,9 +304,7 @@ def main():
                 continue  # 还没真正开始执行
             if tid not in completed_task_ids and (now - start_time) > timeout:
                 print(f"[Timeout] Task {tid} after {timeout}s")
-                master_log.write(
-                    f"{datetime.now()} Task {tid} TIMEOUT: {api_config_str}\n"
-                )
+                master_log.write(f"{datetime.now()} Task {tid} TIMEOUT: {api_config_str}\n")
                 timeout_cases.write(f"{api_config_str}\n")
                 master_log.flush()
                 timeout_cases.flush()
@@ -347,9 +333,7 @@ def main():
         # 检查worker意外挂掉  这里之前有个bug，就是如果hang了，很多时候进程会自己kill，然后到超时的时候任务会二次kill进程，导致正常任务被杀死，所以禁用了这个检测
         for idx, p in list(workers.items()):
             if not p.is_alive():
-                print(
-                    f"[Master] Worker {idx} (PID={p.pid}) died unexpectedly, restarting..."
-                )
+                print(f"[Master] Worker {idx} (PID={p.pid}) died unexpectedly, restarting...")
 
                 # 找出这个worker正在执行的任务
                 tasks_of_dead_worker = [

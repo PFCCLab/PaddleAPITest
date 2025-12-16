@@ -1,9 +1,11 @@
+from __future__ import annotations
+
 error_configs = set()
 error_apis = set()
 with open("report/0size_tensor_cpu/accuracy/error_log.txt", "w") as error_log:
-    for i in range(1):
+    for _i in range(1):
         test_log = "report/0size_tensor_cpu/accuracy/error_log.log"
-        with open(test_log, "r") as file:
+        with open(test_log) as file:
             lines = file.readlines()
             is_log_str = False
             log_str = ""
@@ -29,9 +31,7 @@ with open("report/0size_tensor_cpu/accuracy/error_log.txt", "w") as error_log:
                 else:
                     log_str += line
 
-with open(
-    "report/0size_tensor_cpu/accuracy/error_config.txt", "w"
-) as error_config_file:
+with open("report/0size_tensor_cpu/accuracy/error_config.txt", "w") as error_config_file:
     for config in error_configs:
         error_config_file.write(config)
 with open(

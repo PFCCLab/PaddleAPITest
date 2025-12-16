@@ -1,10 +1,11 @@
-import re
+from __future__ import annotations
+
 import glob
+import re
 
 
 def delete_lines_with_keywords(file_pattern, keyword_set, case_sensitive=True):
-    """
-    删除匹配模式文件中包含关键字的行
+    """删除匹配模式文件中包含关键字的行
     :param file_pattern: 文件匹配模式（如"A*"）
     :param keyword_set: 关键字集合
     :param case_sensitive: 是否区分大小写
@@ -23,15 +24,13 @@ def delete_lines_with_keywords(file_pattern, keyword_set, case_sensitive=True):
     for file_path in target_files:
         try:
             # 读取文件内容
-            with open(file_path, "r") as f:
+            with open(file_path) as f:
                 lines = f.readlines()
 
             # 过滤包含关键字的行
             original_count = len(lines)
             new_lines = [
-                line
-                for line in lines
-                if not any(pattern.search(line) for pattern in patterns)
+                line for line in lines if not any(pattern.search(line) for pattern in patterns)
             ]
             removed_count = original_count - len(new_lines)
             total_removed += removed_count
@@ -44,7 +43,7 @@ def delete_lines_with_keywords(file_pattern, keyword_set, case_sensitive=True):
             )
 
         except Exception as e:
-            print(f"处理文件 {file_path} 时出错: {str(e)}")
+            print(f"处理文件 {file_path} 时出错: {e!s}")
 
     print(f"\n处理完成！共处理 {len(target_files)} 个文件, 总计删除 {total_removed} 行")
 
@@ -52,7 +51,7 @@ def delete_lines_with_keywords(file_pattern, keyword_set, case_sensitive=True):
 def load_keywords(keyword_file):
     """从文件加载关键字集合"""
     try:
-        with open(keyword_file, "r") as f:
+        with open(keyword_file) as f:
             return {line.strip() for line in f if line.strip()}
     except FileNotFoundError:
         print(f"错误：关键字文件 {keyword_file} 不存在")

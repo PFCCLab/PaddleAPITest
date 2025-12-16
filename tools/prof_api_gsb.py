@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 info = (
     ["paddle.abs", "G"],
     ["paddle.abs", "S"],

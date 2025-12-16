@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import random
 
 
@@ -6,7 +8,7 @@ def extract_random_lines(input_path, output_path, patterns):
     pattern_buckets = {pattern: [] for pattern in patterns}
 
     # 第一次遍历：分类收集匹配行
-    with open(input_path, "r", encoding="utf-8") as f:
+    with open(input_path, encoding="utf-8") as f:
         for line in f:
             stripped_line = line.strip()
             for pattern in patterns:

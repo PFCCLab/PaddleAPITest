@@ -1,13 +1,11 @@
+from __future__ import annotations
+
 error_configs = set()
 error_apis = set()
-with open(
-    "test_pipline/gpu_bigtensor/gpu_bigtensor_paddleonly/error_log.log", "w"
-) as error_log:
+with open("test_pipline/gpu_bigtensor/gpu_bigtensor_paddleonly/error_log.log", "w") as error_log:
     for i in range(8):
-        test_log = "test_pipline/gpu_bigtensor/gpu_bigtensor_paddleonly/gpu_bigtensor_paddleonly_errorconfig_{}.log".format(
-            i + 1
-        )
-        with open(test_log, "r") as file:
+        test_log = f"test_pipline/gpu_bigtensor/gpu_bigtensor_paddleonly/gpu_bigtensor_paddleonly_errorconfig_{i + 1}.log"
+        with open(test_log) as file:
             lines = file.readlines()
             is_log_str = False
             log_str = ""

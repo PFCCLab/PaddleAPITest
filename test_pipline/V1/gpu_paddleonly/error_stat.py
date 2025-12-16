@@ -1,9 +1,11 @@
+from __future__ import annotations
+
 error_configs = set()
 error_apis = set()
 with open("test_pipline/gpu_paddleonly/error_log.log", "w") as error_log:
     for i in range(19):
-        test_log = "test_pipline/gpu_paddleonly/paddleonly_{}.log".format(i + 1)
-        with open(test_log, "r") as file:
+        test_log = f"test_pipline/gpu_paddleonly/paddleonly_{i + 1}.log"
+        with open(test_log) as file:
             lines = file.readlines()
             is_log_str = False
             log_str = ""

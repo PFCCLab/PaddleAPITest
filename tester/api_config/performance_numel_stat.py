@@ -1,13 +1,13 @@
+from __future__ import annotations
+
+import random
+
 from config_analyzer import TensorConfig, analyse_configs
 from tqdm import tqdm
-import random
 
 
 def is_0_size_tensor(tensor_config):
-    for i in tensor_config.shape:
-        if i == 0:
-            return True
-    return False
+    return any(i == 0 for i in tensor_config.shape)
 
 
 def is_0D_tensor(tensor_config):
@@ -26,23 +26,15 @@ def get_tensor_configs(api_config):
     for arg_config in api_config.args:
         if isinstance(arg_config, TensorConfig):
             tensor_configs.append(arg_config)
-        elif isinstance(arg_config, list):
-            for j in range(len(arg_config)):
-                if isinstance(arg_config[j], TensorConfig):
-                    tensor_configs.append(arg_config[j])
-        elif isinstance(arg_config, tuple):
+        elif isinstance(arg_config, (list, tuple)):
             for j in range(len(arg_config)):
                 if isinstance(arg_config[j], TensorConfig):
                     tensor_configs.append(arg_config[j])
 
-    for key, arg_config in api_config.kwargs.items():
+    for _key, arg_config in api_config.kwargs.items():
         if isinstance(arg_config, TensorConfig):
             tensor_configs.append(arg_config)
-        elif isinstance(arg_config, list):
-            for j in range(len(arg_config)):
-                if isinstance(arg_config[j], TensorConfig):
-                    tensor_configs.append(arg_config[j])
-        elif isinstance(arg_config, tuple):
+        elif isinstance(arg_config, (list, tuple)):
             for j in range(len(arg_config)):
                 if isinstance(arg_config[j], TensorConfig):
                     tensor_configs.append(arg_config[j])
@@ -97,39 +89,25 @@ if __name__ == "__main__":
                 numel = numel + tensor_numel(tensor_config)
             apis_map[api_config.api_name].count += 1
             if numel < 100:
-                apis_map[api_config.api_name].numel_100_configs.append(
-                    api_config.config
-                )
+                apis_map[api_config.api_name].numel_100_configs.append(api_config.config)
                 apis_map[api_config.api_name].numel_100 += 1
             elif numel < 1000:
-                apis_map[api_config.api_name].numel_1000_configs.append(
-                    api_config.config
-                )
+                apis_map[api_config.api_name].numel_1000_configs.append(api_config.config)
                 apis_map[api_config.api_name].numel_1000 += 1
             elif numel < 10000:
-                apis_map[api_config.api_name].numel_10000_configs.append(
-                    api_config.config
-                )
+                apis_map[api_config.api_name].numel_10000_configs.append(api_config.config)
                 apis_map[api_config.api_name].numel_10000 += 1
             elif numel < 100000:
-                apis_map[api_config.api_name].numel_100000_configs.append(
-                    api_config.config
-                )
+                apis_map[api_config.api_name].numel_100000_configs.append(api_config.config)
                 apis_map[api_config.api_name].numel_100000 += 1
             elif numel < 1000000:
-                apis_map[api_config.api_name].numel_1000000_configs.append(
-                    api_config.config
-                )
+                apis_map[api_config.api_name].numel_1000000_configs.append(api_config.config)
                 apis_map[api_config.api_name].numel_1000000 += 1
             elif numel < 2147483647:
-                apis_map[api_config.api_name].numel_2147483647_configs.append(
-                    api_config.config
-                )
+                apis_map[api_config.api_name].numel_2147483647_configs.append(api_config.config)
                 apis_map[api_config.api_name].numel_2147483647 += 1
             else:
-                apis_map[api_config.api_name].numel_other_configs.append(
-                    api_config.config
-                )
+                apis_map[api_config.api_name].numel_other_configs.append(api_config.config)
                 apis_map[api_config.api_name].numel_other += 1
 
     with open("tester/api_config/10_performance/numel_stat.txt", "w") as f:
@@ -164,12 +142,8 @@ if __name__ == "__main__":
                     for api_name, api_info in apis_map.items():
                         config_count = 500
                         # big
-                        big_count = (
-                            100 if api_info.numel_other > 100 else api_info.numel_other
-                        )
-                        for config in random.sample(
-                            api_info.numel_other_configs, big_count
-                        ):
+                        big_count = 100 if api_info.numel_other > 100 else api_info.numel_other
+                        for config in random.sample(api_info.numel_other_configs, big_count):
                             big.write(str(config) + "\n")
                         config_count -= big_count
                         # middle

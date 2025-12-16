@@ -1,9 +1,12 @@
+from __future__ import annotations
+
+import time
+
 import paddle
 
+from .api_config.config_analyzer import TensorConfig
 from .api_config.log_writer import write_to_log
 from .base import APITestBase
-import time
-from .api_config.config_analyzer import TensorConfig
 
 
 def tensor_numel(tensor_config):
@@ -18,23 +21,15 @@ def get_tensor_configs(api_config):
     for arg_config in api_config.args:
         if isinstance(arg_config, TensorConfig):
             tensor_configs.append(arg_config)
-        elif isinstance(arg_config, list):
-            for j in range(len(arg_config)):
-                if isinstance(arg_config[j], TensorConfig):
-                    tensor_configs.append(arg_config[j])
-        elif isinstance(arg_config, tuple):
+        elif isinstance(arg_config, (list, tuple)):
             for j in range(len(arg_config)):
                 if isinstance(arg_config[j], TensorConfig):
                     tensor_configs.append(arg_config[j])
 
-    for key, arg_config in api_config.kwargs.items():
+    for _key, arg_config in api_config.kwargs.items():
         if isinstance(arg_config, TensorConfig):
             tensor_configs.append(arg_config)
-        elif isinstance(arg_config, list):
-            for j in range(len(arg_config)):
-                if isinstance(arg_config[j], TensorConfig):
-                    tensor_configs.append(arg_config[j])
-        elif isinstance(arg_config, tuple):
+        elif isinstance(arg_config, (list, tuple)):
             for j in range(len(arg_config)):
                 if isinstance(arg_config[j], TensorConfig):
                     tensor_configs.append(arg_config[j])
@@ -80,23 +75,17 @@ class APITestPaddleGPUPerformance(APITestBase):
             test_loop = 2147483647 * 20 // numel
             if self.test_amp:
                 with paddle.amp.auto_cast():
-                    paddle_output = self.paddle_api(
-                        *tuple(self.paddle_args), **self.paddle_kwargs
-                    )
+                    paddle_output = self.paddle_api(*tuple(self.paddle_args), **self.paddle_kwargs)
             else:
-                paddle_output = self.paddle_api(
-                    *tuple(self.paddle_args), **self.paddle_kwargs
-                )
+                paddle_output = self.paddle_api(*tuple(self.paddle_args), **self.paddle_kwargs)
 
             with paddle.no_grad():
                 if self.test_amp:
                     with paddle.amp.auto_cast():
                         paddle.base.core._cuda_synchronize(paddle.CUDAPlace(0))
                         start = time.time()
-                        for i in range(test_loop):
-                            self.paddle_api(
-                                *tuple(self.paddle_args), **self.paddle_kwargs
-                            )
+                        for _i in range(test_loop):
+                            self.paddle_api(*tuple(self.paddle_args), **self.paddle_kwargs)
                         paddle.base.core._cuda_synchronize(paddle.CUDAPlace(0))
                         end = time.time()
                         timeused = end - start
@@ -114,7 +103,7 @@ class APITestPaddleGPUPerformance(APITestBase):
                 else:
                     paddle.base.core._cuda_synchronize(paddle.CUDAPlace(0))
                     start = time.time()
-                    for i in range(test_loop):
+                    for _i in range(test_loop):
                         self.paddle_api(*tuple(self.paddle_args), **self.paddle_kwargs)
                     paddle.base.core._cuda_synchronize(paddle.CUDAPlace(0))
                     end = time.time()
@@ -134,7 +123,6 @@ class APITestPaddleGPUPerformance(APITestBase):
             paddle_output = None
             result_outputs = None
             result_outputs_grads = None
-            out_grads = None
             print(
                 self.api_config.api_name,
                 "\t",
@@ -157,8 +145,8 @@ class APITestPaddleGPUPerformance(APITestBase):
         try:
             if self.need_check_grad():
                 inputs_list = self.get_paddle_input_list()
-                result_outputs, result_outputs_grads = (
-                    self.gen_paddle_output_and_output_grad(paddle_output)
+                result_outputs, result_outputs_grads = self.gen_paddle_output_and_output_grad(
+                    paddle_output
                 )
                 if (
                     len(inputs_list) != 0
@@ -167,8 +155,8 @@ class APITestPaddleGPUPerformance(APITestBase):
                 ):
                     paddle.base.core._cuda_synchronize(paddle.CUDAPlace(0))
                     start = time.time()
-                    for i in range(test_loop):
-                        out_grads = paddle.grad(
+                    for _i in range(test_loop):
+                        paddle.grad(
                             result_outputs,
                             inputs_list,
                             grad_outputs=result_outputs_grads,
@@ -192,7 +180,6 @@ class APITestPaddleGPUPerformance(APITestBase):
             paddle_output = None
             result_outputs = None
             result_outputs_grads = None
-            out_grads = None
             print(
                 self.api_config.api_name,
                 "\t",
@@ -215,4 +202,3 @@ class APITestPaddleGPUPerformance(APITestBase):
         paddle_output = None
         result_outputs = None
         result_outputs_grads = None
-        out_grads = None

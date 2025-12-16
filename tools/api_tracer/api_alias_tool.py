@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import os
 import re
 from pathlib import Path
@@ -18,8 +20,7 @@ def parse_api(api):
 
 @staticmethod
 def get_alias_apis(input_path: str, yaml_path: str):
-    """
-    解析 api_apis.txt 文件, 生成 alias_api.txt 和 excluded_api.txt
+    """解析 api_apis.txt 文件, 生成 alias_api.txt 和 excluded_api.txt
 
     Args:
     - input_path (str): 输入文件路径
@@ -27,7 +28,7 @@ def get_alias_apis(input_path: str, yaml_path: str):
     """
     if not os.path.exists(yaml_path):
         raise FileNotFoundError(f"[APIAlias] Not found yaml file: {yaml_path}")
-    with open(yaml_path, "r", encoding="utf-8") as f:
+    with open(yaml_path, encoding="utf-8") as f:
         target_apis = yaml.safe_load(f)
     print(f"[APIAlias] Successfully loaded {len(target_apis)} target APIs.")
 
@@ -40,7 +41,7 @@ def get_alias_apis(input_path: str, yaml_path: str):
 
     apis = set()
     with input_file.open("r") as f:
-        apis = set([line.strip() for line in f if line.strip()])
+        apis = {line.strip() for line in f if line.strip()}
     print(f"[APIAlias] Read {len(apis)} apis from {input_path}")
 
     alias_apis = set()
@@ -63,9 +64,7 @@ def get_alias_apis(input_path: str, yaml_path: str):
 
     with output_excluded_path.open("w") as f:
         f.writelines(f"{line}\n" for line in sorted(excluded_apis))
-    print(
-        f"[APIAlias] Write {len(excluded_apis)} excluded apis to {output_excluded_path}"
-    )
+    print(f"[APIAlias] Write {len(excluded_apis)} excluded apis to {output_excluded_path}")
 
 
 if __name__ == "__main__":

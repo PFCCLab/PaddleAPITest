@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import argparse
 import errno
 import gc
@@ -18,23 +20,23 @@ import pynvml
 from pebble import ProcessExpired, ProcessPool
 
 if TYPE_CHECKING:
+    import paddle
+    import torch
     from tester import (
         APIConfig,
         APITestAccuracy,
-        APITestCINNVSDygraph,
-        APITestPaddleOnly,
-        APITestPaddleGPUPerformance,
-        APITestTorchGPUPerformance,
-        APITestPaddleTorchGPUPerformance,
         APITestAccuracyStable,
+        APITestCINNVSDygraph,
         APITestCustomDeviceVSCPU,
+        APITestPaddleGPUPerformance,
+        APITestPaddleOnly,
+        APITestPaddleTorchGPUPerformance,
+        APITestTorchGPUPerformance,
     )
-    import torch
-    import paddle
 
 from tester.api_config.log_writer import *
 
-os.environ["FLAGS_use_system_allocator"] = "1"
+os.environ["FLAGS_USE_SYSTEM_ALLOCATOR"] = "1"
 os.environ["NVIDIA_TF32_OVERRIDE"] = "0"
 
 VALID_TEST_ARGS = {"test_amp", "test_backward", "atol", "rtol", "test_tol"}
@@ -108,9 +110,7 @@ def detect_device_type() -> str:
     # 再尝试 XPU
     if shutil.which("xpu-smi"):
         try:
-            out = subprocess.check_output(
-                ["xpu-smi"], text=True, stderr=subprocess.STDOUT
-            )
+            out = subprocess.check_output(["xpu-smi"], text=True, stderr=subprocess.STDOUT)
             if any(re.match(r"^\|\s*\d+\s+\S", line) for line in out.splitlines()):
                 DEVICE_TYPE = "xpu"
                 DEVICE_TYPE_DETECTED = True
@@ -121,12 +121,8 @@ def detect_device_type() -> str:
     # 再尝试 Iluvatar
     if shutil.which("ixsmi"):
         try:
-            out = subprocess.check_output(
-                ["ixsmi"], text=True, stderr=subprocess.STDOUT
-            )
-            if any(
-                re.match(r"^\|\s*\d+\s+Iluvatar", line) for line in out.splitlines()
-            ):
+            out = subprocess.check_output(["ixsmi"], text=True, stderr=subprocess.STDOUT)
+            if any(re.match(r"^\|\s*\d+\s+Iluvatar", line) for line in out.splitlines()):
                 DEVICE_TYPE = "iluvatar"
                 DEVICE_TYPE_DETECTED = True
                 return DEVICE_TYPE
@@ -247,9 +243,7 @@ def get_memory_info(gpu_id):
     if device_type in ("xpu", "iluvatar"):
         _refresh_snapshot(device_type)
         if _MEM_SNAPSHOT is None or gpu_id not in _MEM_SNAPSHOT:
-            raise RuntimeError(
-                f"Failed to get memory info for {device_type} device {gpu_id}"
-            )
+            raise RuntimeError(f"Failed to get memory info for {device_type} device {gpu_id}")
         return _MEM_SNAPSHOT[gpu_id]
 
     raise RuntimeError("No supported accelerator (GPU / XPU / Iluvatar) detected.")
@@ -282,7 +276,7 @@ def validate_gpu_options(options) -> tuple:
             ) from None
         if len(gpu_ids) != len(set(gpu_ids)):
             raise ValueError(f"Invalid gpu_ids: {options.gpu_ids} (duplicates)")
-        gpu_ids = sorted(list(set(gpu_ids)))
+        gpu_ids = sorted(set(gpu_ids))
         if len(gpu_ids) > 1 and -1 in gpu_ids:
             raise ValueError(f"Invalid gpu_ids: {options.gpu_ids} (-1 allowed only)")
         if gpu_ids != [-1] and not all(0 <= id < device_count for id in gpu_ids):
@@ -291,11 +285,7 @@ def validate_gpu_options(options) -> tuple:
             )
     else:
         gpu_ids = [-1]
-    if (
-        options.num_gpus < -1
-        or options.num_gpus == 0
-        or options.num_gpus > device_count
-    ):
+    if options.num_gpus < -1 or options.num_gpus == 0 or options.num_gpus > device_count:
         raise ValueError(f"Invalid num_gpus: {options.num_gpus}")
     if options.num_gpus == -1:
         options.num_gpus = device_count if gpu_ids == [-1] else len(gpu_ids)
@@ -321,9 +311,7 @@ def parse_bool(value):
         raise ValueError(f"Invalid boolean value: {value} parsed from command line")
 
 
-def check_gpu_memory(
-    gpu_ids, num_workers_per_gpu, required_memory
-):  # required_memory in GB
+def check_gpu_memory(gpu_ids, num_workers_per_gpu, required_memory):  # required_memory in GB
     assert isinstance(gpu_ids, tuple) and len(gpu_ids) > 0
     available_gpus = []
     max_workers_per_gpu = {}
@@ -341,15 +329,13 @@ def check_gpu_memory(
                     else min(max_workers, num_workers_per_gpu)
                 )
         except pynvml.NVMLError as e:
-            print(f"[WARNING] Failed to check GPU {gpu_id}: {str(e)}", flush=True)
+            print(f"[WARNING] Failed to check GPU {gpu_id}: {e!s}", flush=True)
             continue
 
     return available_gpus, max_workers_per_gpu
 
 
-def init_worker_gpu(
-    gpu_worker_list, lock, available_gpus, max_workers_per_gpu, options
-):
+def init_worker_gpu(gpu_worker_list, lock, available_gpus, max_workers_per_gpu, options):
     if options.log_dir:
         set_test_log_path(options.log_dir)
     set_engineV2()
@@ -392,11 +378,11 @@ def init_worker_gpu(
             APITestAccuracy,
             APITestAccuracyStable,
             APITestCINNVSDygraph,
+            APITestCustomDeviceVSCPU,
             APITestPaddleGPUPerformance,
             APITestPaddleOnly,
             APITestPaddleTorchGPUPerformance,
             APITestTorchGPUPerformance,
-            APITestCustomDeviceVSCPU,
         )
 
         test_classes = {
@@ -432,9 +418,7 @@ def init_worker_gpu(
             flush=True,
         )
     except Exception as e:
-        print(
-            f"{datetime.now()} Worker {my_pid} initialization failed: {e}", flush=True
-        )
+        print(f"{datetime.now()} Worker {my_pid} initialization failed: {e}", flush=True)
         raise
 
 
@@ -467,7 +451,7 @@ def run_test_case(api_config_str, options):
     try:
         api_config = APIConfig(api_config_str)
     except Exception as err:
-        print(f"[config parse error] {api_config_str} {str(err)}", flush=True)
+        print(f"[config parse error] {api_config_str} {err!s}", flush=True)
         return
 
     option_to_class = {
@@ -728,7 +712,7 @@ def main():
         try:
             api_config = APIConfig(options.api_config)
         except Exception as err:
-            print(f"[config parse error] {options.api_config} {str(err)}", flush=True)
+            print(f"[config parse error] {options.api_config} {err!s}", flush=True)
             return
 
         option_to_class = {
@@ -742,11 +726,7 @@ def main():
             "paddle_custom_device": APITestCustomDeviceVSCPU,
         }
         test_class = next(
-            (
-                cls
-                for opt, cls in option_to_class.items()
-                if getattr(options, opt, False)
-            ),
+            (cls for opt, cls in option_to_class.items() if getattr(options, opt, False)),
             APITestAccuracy,  # default fallback
         )
 
@@ -808,7 +788,7 @@ def main():
         api_configs = set()
         for config_file in config_files:
             try:
-                with open(config_file, "r") as f:
+                with open(config_file) as f:
                     lines = [line.strip() for line in f if line.strip()]
                     api_config_count += len(lines)
                     api_configs.update(lines)
@@ -854,9 +834,7 @@ def main():
 
         # initialize process pool
         manager = Manager()
-        gpu_worker_list = manager.dict(
-            {gpu_id: manager.list() for gpu_id in available_gpus}
-        )
+        gpu_worker_list = manager.dict({gpu_id: manager.list() for gpu_id in available_gpus})
         lock = Lock()
 
         pool = ProcessPool(
@@ -906,9 +884,7 @@ def main():
                             )
                         future.result()
                         if options.show_runtime_status or tested_case % 10000 == 0:
-                            print(
-                                f"[info] Test case succeeded for {config}", flush=True
-                            )
+                            print(f"[info] Test case succeeded for {config}", flush=True)
                     except TimeoutError as err:
                         write_to_log("timeout", config)
                         print(

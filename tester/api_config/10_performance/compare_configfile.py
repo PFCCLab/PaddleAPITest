@@ -1,8 +1,11 @@
 # 定义读取文件的函数
+from __future__ import annotations
+
+
 def read_file(file_path):
-    with open(file_path, "r", encoding="utf-8") as file:
+    with open(file_path, encoding="utf-8") as file:
         # 返回文件中的所有行，并去掉行尾的换行符
-        return set(line.strip() for line in file)
+        return {line.strip() for line in file}
 
 
 # 定义写入文件的函数

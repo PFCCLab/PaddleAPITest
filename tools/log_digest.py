@@ -1,14 +1,15 @@
+from __future__ import annotations
+
 import argparse
-import re
-import sys
 import glob
-import shutil
 import os
+import re
+import shutil
+import sys
 
 
 def remove_time_stamp(file_path):
-    """
-    Process a log file by removing timestamp before 'test begin:' but keeping the 'test begin:' prefix.
+    """Process a log file by removing timestamp before 'test begin:' but keeping the 'test begin:' prefix.
     Writes the processed content back to the same file.
 
     Args:
@@ -16,7 +17,7 @@ def remove_time_stamp(file_path):
     """
     try:
         # Read the file content
-        with open(file_path, "r") as file:
+        with open(file_path) as file:
             lines = file.readlines()
 
         # Process each line
@@ -63,8 +64,7 @@ def extract_api_name(config_line):
 
 
 def process_log_entries(file_path, id, ckpt_id, write_pass, write_pass_amp):
-    """
-    Process log file by categorizing entries based on their status and distributing
+    """Process log file by categorizing entries based on their status and distributing
     them to appropriate files.
 
     Args:
@@ -79,7 +79,7 @@ def process_log_entries(file_path, id, ckpt_id, write_pass, write_pass_amp):
         remove_time_stamp(file_path)
 
         # Now read the processed file
-        with open(file_path, "r") as file:
+        with open(file_path) as file:
             content = file.read()
 
         # Remove grep warning if present
@@ -121,12 +121,8 @@ def process_log_entries(file_path, id, ckpt_id, write_pass, write_pass_amp):
             # Determine the status of the test
             if "[Pass]" in entry:
                 # Write config to accuracy support file if passing write_pass
-                support2torch_file = (
-                    f"tester/api_config/api_config_support2torch{id}.txt"
-                )
-                support2torch_amp_file = (
-                    f"tester/api_config/api_config_support2torch_amp{id}.txt"
-                )
+                support2torch_file = f"tester/api_config/api_config_support2torch{id}.txt"
+                support2torch_amp_file = f"tester/api_config/api_config_support2torch_amp{id}.txt"
                 if write_pass:
                     with open(support2torch_file, "a") as f:
                         f.write(f"{config_line}\n")
@@ -157,9 +153,7 @@ def process_log_entries(file_path, id, ckpt_id, write_pass, write_pass_amp):
                     written_warned_log_files.append(log_file)
                 else:
                     if log_file not in written_warned_log_files:
-                        print(
-                            f"[warn] log file {log_file} already exists, appending to it"
-                        )
+                        print(f"[warn] log file {log_file} already exists, appending to it")
                         written_warned_log_files.append(log_file)
                         with open(log_file, "a") as f:
                             f.write(
@@ -176,9 +170,7 @@ def process_log_entries(file_path, id, ckpt_id, write_pass, write_pass_amp):
                     written_warned_config_files.append(config_file)
                 else:
                     if config_file not in written_warned_config_files:
-                        print(
-                            f"[warn] config file {config_file} already exists, appending to it"
-                        )
+                        print(f"[warn] config file {config_file} already exists, appending to it")
                         written_warned_config_files.append(config_file)
                         with open(config_file, "a") as f:
                             f.write(
@@ -202,7 +194,7 @@ def process_log_entries(file_path, id, ckpt_id, write_pass, write_pass_amp):
         checkpoint_file = f"tester/api_config/test_log/checkpoint{ckpt_id}.txt"
         checkpoint_count = 0
         try:
-            with open(checkpoint_file, "r") as f:
+            with open(checkpoint_file) as f:
                 checkpoint_lines = f.readlines()
                 checkpoint_count = len(checkpoint_lines)
         except FileNotFoundError:
@@ -260,9 +252,7 @@ def main():
         required=False,
         help='log file path to process, eg. if you run engine.py by " ... engine.py ... 2&>1 > log.log", then file=log.log',
     )
-    parser.add_argument(
-        "--dir", required=False, help="Directory containing log files to process"
-    )
+    parser.add_argument("--dir", required=False, help="Directory containing log files to process")
     parser.add_argument(
         "--id",
         default="",
@@ -299,16 +289,16 @@ def main():
         # Check if error directories exist
         error_dirs = glob.glob("tester/api_config/test_log/*_error")
         if error_dirs:
-            question = f"Found error directories: {', '.join(error_dirs)}. Do you want to delete them?"
+            question = (
+                f"Found error directories: {', '.join(error_dirs)}. Do you want to delete them?"
+            )
             answer = input(f"{question} (y/n): ").strip().lower()
             if answer in ["y", "yes"]:
                 for dir_path in error_dirs:
                     shutil.rmtree(dir_path)
                 print(f"[info] Deleted error directories: {', '.join(error_dirs)}")
 
-        process_log_entries(
-            args.file, args.id, args.ckpt_id, args.write_pass, args.write_pass_amp
-        )
+        process_log_entries(args.file, args.id, args.ckpt_id, args.write_pass, args.write_pass_amp)
         if not args.write_pass and not args.write_pass_amp:
             print(
                 "\n[warn] --write-pass and --write-pass-amp are not set, passed api config will not be written to file"

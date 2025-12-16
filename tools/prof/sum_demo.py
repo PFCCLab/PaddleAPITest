@@ -1,7 +1,10 @@
-import torch
-import paddle
-import numpy
+from __future__ import annotations
+
 import time
+
+import numpy
+import paddle
+import torch
 
 device = torch.device("cuda:0")
 torch.set_default_device(device)
@@ -40,7 +43,7 @@ paddle_out = paddle.sum(
 with paddle.no_grad():
     paddle.base.core._cuda_synchronize(paddle.CUDAPlace(0))
     start = time.time()
-    for i in range(test_loop):
+    for _i in range(test_loop):
         paddle.sum(
             paddle_x,
             axis=1,
@@ -58,7 +61,7 @@ torch_grad = torch_grad.to(dtype=torch.bfloat16)
 
 paddle.base.core._cuda_synchronize(paddle.CUDAPlace(0))
 start = time.time()
-for i in range(test_loop):
+for _i in range(test_loop):
     paddle.grad([paddle_out], [paddle_x], grad_outputs=paddle_grad, allow_unused=True)
 paddle.base.core._cuda_synchronize(paddle.CUDAPlace(0))
 end = time.time()
@@ -70,7 +73,7 @@ torch_out = torch.sum(torch_x, dim=1, keepdim=False)
 with torch.no_grad():
     torch.cuda.synchronize()
     start = time.time()
-    for i in range(test_loop):
+    for _i in range(test_loop):
         torch.sum(torch_x, dim=1, keepdim=False)
     torch.cuda.synchronize()
     end = time.time()
@@ -79,10 +82,8 @@ with torch.no_grad():
 
 torch.cuda.synchronize()
 start = time.time()
-for i in range(test_loop):
-    torch.autograd.grad(
-        [torch_out], [torch_x], grad_outputs=torch_grad, retain_graph=True
-    )
+for _i in range(test_loop):
+    torch.autograd.grad([torch_out], [torch_x], grad_outputs=torch_grad, retain_graph=True)
 torch.cuda.synchronize()
 end = time.time()
 timeused = end - start

@@ -1,6 +1,8 @@
-import torch
-import paddle
+from __future__ import annotations
+
 import numpy
+import paddle
+import torch
 
 device = torch.device("cuda:0")
 torch.set_default_device(device)

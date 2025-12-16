@@ -1,5 +1,7 @@
-import os
+from __future__ import annotations
+
 import argparse
+import os
 
 path = "/root/PaddleAPITest/tester/api_config/5_accuracy/"
 keyword = "accuracy"
@@ -7,7 +9,7 @@ keyword = "accuracy"
 
 def getnum(dst):
     s = set()
-    with open(path + dst, "r") as f:
+    with open(path + dst) as f:
         data = f.readlines()
         for j in data:
             tmp = j.split("(")[0]
@@ -28,7 +30,7 @@ def isclean(config):
     exist_nums = {}
     for i in merge_list:
         cnt2 = 0
-        with open(path + i, "r", encoding="utf8") as f:
+        with open(path + i, encoding="utf8") as f:
             data = f.readlines()
             for j in data:
                 if config in j:
@@ -56,7 +58,7 @@ def add(config, dst):
             merge_list.append(i)
 
     for i in merge_list:
-        with open(path + i, "r") as f:
+        with open(path + i) as f:
             lines = f.readlines()
 
         matched_lines = [line for line in lines if config in line]
@@ -76,7 +78,7 @@ def remove(config):
             merge_list.append(i)
 
     for i in merge_list:
-        with open(path + i, "r") as f:
+        with open(path + i) as f:
             lines = f.readlines()
 
         count = sum(config in line for line in lines)
@@ -91,12 +93,8 @@ def remove(config):
 
 def main():
     parser = argparse.ArgumentParser(description="Process config and temporary file.")
-    parser.add_argument(
-        "--config", type=str, required=True, help="配置字符串，例如 paddle.numel"
-    )
-    parser.add_argument(
-        "--dst", type=str, default="mytmp.txt", help="临时文件名，默认是 mytmp.txt"
-    )
+    parser.add_argument("--config", type=str, required=True, help="配置字符串，例如 paddle.numel")
+    parser.add_argument("--dst", type=str, default="mytmp.txt", help="临时文件名，默认是 mytmp.txt")
     parser.add_argument("--remove", action="store_true", help="是否执行删除配置")
     args = parser.parse_args()
 

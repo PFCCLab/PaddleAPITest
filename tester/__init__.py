@@ -3,45 +3,45 @@
 from typing import TYPE_CHECKING, Any
 
 __all__ = [
-    "APITestBase",
-    "APITestAccuracy",
-    "APITestPaddleOnly",
-    "APITestCINNVSDygraph",
-    "APITestPaddleGPUPerformance",
-    "APITestTorchGPUPerformance",
-    "APITestPaddleTorchGPUPerformance",
-    "APITestAccuracyStable",
-    "APITestCustomDeviceVSCPU",
-    "paddle_to_torch",
-    "TensorConfig",
-    "APIConfig",
-    "analyse_configs",
     "USE_CACHED_NUMPY",
+    "APIConfig",
+    "APITestAccuracy",
+    "APITestAccuracyStable",
+    "APITestBase",
+    "APITestCINNVSDygraph",
+    "APITestCustomDeviceVSCPU",
+    "APITestPaddleGPUPerformance",
+    "APITestPaddleOnly",
+    "APITestPaddleTorchGPUPerformance",
+    "APITestTorchGPUPerformance",
+    "TensorConfig",
+    "analyse_configs",
     "cached_numpy",
     "get_cfg",
+    "paddle_to_torch",
     "set_cfg",
 ]
 
 if TYPE_CHECKING:
-    from .base import APITestBase
-    from .accuracy import APITestAccuracy
-    from .paddle_only import APITestPaddleOnly
-    from .paddle_gpu_performance import APITestPaddleGPUPerformance
-    from .torch_gpu_performance import APITestTorchGPUPerformance
-    from .paddle_torch_gpu_performance import APITestPaddleTorchGPUPerformance
-    from .paddle_cinn_vs_dygraph import APITestCINNVSDygraph
-    from .accuracy_stable import APITestAccuracyStable
-    from .paddle_device_vs_cpu import APITestCustomDeviceVSCPU
     from . import paddle_to_torch
+    from .accuracy import APITestAccuracy
+    from .accuracy_stable import APITestAccuracyStable
     from .api_config import (
-        TensorConfig,
-        APIConfig,
-        analyse_configs,
         USE_CACHED_NUMPY,
+        APIConfig,
+        TensorConfig,
+        analyse_configs,
         cached_numpy,
         get_cfg,
         set_cfg,
     )
+    from .base import APITestBase
+    from .paddle_cinn_vs_dygraph import APITestCINNVSDygraph
+    from .paddle_device_vs_cpu import APITestCustomDeviceVSCPU
+    from .paddle_gpu_performance import APITestPaddleGPUPerformance
+    from .paddle_only import APITestPaddleOnly
+    from .paddle_torch_gpu_performance import APITestPaddleTorchGPUPerformance
+    from .torch_gpu_performance import APITestTorchGPUPerformance
 
 
 def __getattr__(name: str) -> Any:

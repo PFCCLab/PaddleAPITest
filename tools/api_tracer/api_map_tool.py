@@ -1,18 +1,19 @@
+from __future__ import annotations
+
 import os
-from typing import Dict, List, Union
 
 import pandas as pd
 import yaml
 
 
-def _load_api_data(filepath: str) -> Union[List[str], Dict[str, List[str]]]:
+def _load_api_data(filepath: str) -> list[str] | dict[str, list[str]]:
     if not os.path.exists(filepath):
         raise FileNotFoundError(f"[APIMap] Not found API list file: '{filepath}'")
 
     _, extension = os.path.splitext(filepath.lower())
 
     if extension in [".yaml", ".yml"]:
-        with open(filepath, "r", encoding="utf-8") as f:
+        with open(filepath, encoding="utf-8") as f:
             data = yaml.safe_load(f)
             if isinstance(data, list):
                 return [str(item) for item in data]
@@ -26,11 +27,9 @@ def _load_api_data(filepath: str) -> Union[List[str], Dict[str, List[str]]]:
                         )
                 return data
             else:
-                raise TypeError(
-                    f"[APIMap] YAML file '{filepath}' is not a list or a dictionary."
-                )
+                raise TypeError(f"[APIMap] YAML file '{filepath}' is not a list or a dictionary.")
     elif extension == ".txt":
-        with open(filepath, "r", encoding="utf-8") as f:
+        with open(filepath, encoding="utf-8") as f:
             return [line.strip() for line in f if line.strip()]
     else:
         raise ValueError(
@@ -44,11 +43,10 @@ def get_mapped_model_apis(
     torch_dynamic_path: str,
     paddle_dynamic_path: str,
     mapping_table_path: str,
-    category_priority: List[str],
+    category_priority: list[str],
     output_path: str,
 ):
-    """
-    根据给定的 API 列表和映射表文件, 生成详细的 API 映射报告
+    """根据给定的 API 列表和映射表文件, 生成详细的 API 映射报告
 
     Args:
         torch_static_path (str): Torch 静态API列表的文件路径 (.yaml 或 .txt)
@@ -60,15 +58,11 @@ def get_mapped_model_apis(
     print("[APIMap] Start mapping...")
 
     if not os.path.exists(mapping_table_path):
-        raise FileNotFoundError(
-            f"[APIMap] Not found mapping table: '{mapping_table_path}'"
-        )
+        raise FileNotFoundError(f"[APIMap] Not found mapping table: '{mapping_table_path}'")
 
     mapping_df = pd.read_excel(mapping_table_path)
     if "Pytorch" not in mapping_df.columns or "Paddle" not in mapping_df.columns:
-        raise ValueError(
-            "[APIMap] 'Pytorch' and 'Paddle' columns must exist in the mapping table."
-        )
+        raise ValueError("[APIMap] 'Pytorch' and 'Paddle' columns must exist in the mapping table.")
     print(f"[APIMap] Successfully loaded Mapping table: '{mapping_table_path}'")
 
     # Load API lists
@@ -89,9 +83,7 @@ def get_mapped_model_apis(
         torch_static_list.extend(apis)
         current_priority = priority_dict.get(category, max_priority)
         for api in apis:
-            if api not in torch_api_category_map:
-                torch_api_category_map[api] = category
-            elif current_priority < priority_dict.get(
+            if api not in torch_api_category_map or current_priority < priority_dict.get(
                 torch_api_category_map[api], max_priority
             ):
                 torch_api_category_map[api] = category
@@ -101,9 +93,7 @@ def get_mapped_model_apis(
         torch_dynamic_list.extend(apis)
         current_priority = priority_dict.get(category, max_priority)
         for api in apis:
-            if api not in torch_api_category_map:
-                torch_api_category_map[api] = category
-            elif current_priority < priority_dict.get(
+            if api not in torch_api_category_map or current_priority < priority_dict.get(
                 torch_api_category_map[api], max_priority
             ):
                 torch_api_category_map[api] = category
@@ -119,29 +109,23 @@ def get_mapped_model_apis(
 
     paddle_dynamic_list = _load_api_data(paddle_dynamic_path)
     paddle_dynamic_set = set(paddle_dynamic_list)
-    print(
-        f"[APIMap] Successfully loaded {len(paddle_dynamic_set)} Paddle Dynamic APIs."
-    )
+    print(f"[APIMap] Successfully loaded {len(paddle_dynamic_set)} Paddle Dynamic APIs.")
 
     source_torch_apis = torch_static_set | torch_dynamic_set
     source_paddle_apis = paddle_dynamic_set
 
     torch_to_paddle_map = (
-        pd.Series(mapping_df["Paddle"].values, index=mapping_df["Pytorch"])
-        .dropna()
-        .to_dict()
+        pd.Series(mapping_df["Paddle"].values, index=mapping_df["Pytorch"]).dropna().to_dict()
     )
     paddle_to_torch_map = (
-        pd.Series(mapping_df["Pytorch"].values, index=mapping_df["Paddle"])
-        .dropna()
-        .to_dict()
+        pd.Series(mapping_df["Pytorch"].values, index=mapping_df["Paddle"]).dropna().to_dict()
     )
 
     report_data = []
     processed_paddle_apis = set()
 
     # From Torch to Paddle
-    for torch_api in sorted(list(source_torch_apis)):
+    for torch_api in sorted(source_torch_apis):
         paddle_api = torch_to_paddle_map.get(torch_api)
         category = torch_api_category_map.get(torch_api, "未分类")
         row = {
@@ -151,9 +135,7 @@ def get_mapped_model_apis(
             "Torch": "有" if torch_api in source_torch_apis else "无",
             "Torch静": "是" if torch_api in torch_static_set else "否",
             "Torch动": "是" if torch_api in torch_dynamic_set else "否",
-            "Paddle动": (
-                "是" if paddle_api and paddle_api in source_paddle_apis else "否"
-            ),
+            "Paddle动": ("是" if paddle_api and paddle_api in source_paddle_apis else "否"),
         }
         report_data.append(row)
         if paddle_api and paddle_api in source_paddle_apis:
@@ -161,7 +143,7 @@ def get_mapped_model_apis(
 
     # From Paddle to Torch
     remaining_paddle_apis = source_paddle_apis - processed_paddle_apis
-    for paddle_api in sorted(list(remaining_paddle_apis)):
+    for paddle_api in sorted(remaining_paddle_apis):
         torch_api = paddle_to_torch_map.get(paddle_api)
         row = {
             "类别": "无",
@@ -175,9 +157,7 @@ def get_mapped_model_apis(
         report_data.append(row)
 
     result_df = pd.DataFrame(report_data).fillna("无")
-    result_df.sort_values(
-        by=["类别", "TorchAPI", "PaddleAPI"], inplace=True, ignore_index=True
-    )
+    result_df.sort_values(by=["类别", "TorchAPI", "PaddleAPI"], inplace=True, ignore_index=True)
 
     def get_mapping_status(row):
         torch_in_source = row["Torch静"] == "是" or row["Torch动"] == "是"
@@ -187,9 +167,9 @@ def get_mapped_model_apis(
 
         if torch_in_source and paddle_in_source:
             return "已映射"
-        elif torch_in_source and paddle_exists and not paddle_in_source:
-            return "有映射但无采集"
-        elif paddle_in_source and torch_exists and not torch_in_source:
+        elif (torch_in_source and paddle_exists and not paddle_in_source) or (
+            paddle_in_source and torch_exists and not torch_in_source
+        ):
             return "有映射但无采集"
         elif torch_in_source and not paddle_exists:
             return "无对应Paddle API"

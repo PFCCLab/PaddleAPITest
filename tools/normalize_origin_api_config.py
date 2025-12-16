@@ -141,14 +141,14 @@
 #         apis.add(api)
 #     for api in apis:
 #         f2.write(api+"\n")
-
+from __future__ import annotations
 
 logs = ["/host_home/wanghuan29/APItest/PaddleAPITest/tester/api_config/api_config.txt"]
 
 configs = set()
 
 for log in logs:
-    with open(log, "r") as f:
+    with open(log) as f:
         origin_configs = f.readlines()
         f.close()
 

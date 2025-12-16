@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import re
 
 error_configs = set()
@@ -41,10 +43,10 @@ def process_log_entry(log_str, config, api, error_log, error_configs, error_apis
 
 with open("test_pipline/cpu_accuracy/error_log.log", "w") as error_log_file:
     for i in range(14):
-        test_log = "test_pipline/cpu_accuracy/cpu_accuracy_{}.log".format(i + 1)
+        test_log = f"test_pipline/cpu_accuracy/cpu_accuracy_{i + 1}.log"
         print(f"Processing file: {test_log}")
         try:
-            with open(test_log, "r") as file:
+            with open(test_log) as file:
                 lines = file.readlines()
                 current_log_str = ""
                 current_config = ""
@@ -72,9 +74,7 @@ with open("test_pipline/cpu_accuracy/error_log.log", "w") as error_log_file:
                                 current_api = api_match.group(1).strip()
                             else:
                                 current_api = "UnknownAPI"
-                                print(
-                                    f"Warning: Could not parse API from config: {current_config}"
-                                )
+                                print(f"Warning: Could not parse API from config: {current_config}")
                         except IndexError:
                             print(f"Warning: Could not parse config from line: {line}")
                             current_config = "UnknownConfig"
@@ -100,11 +100,11 @@ with open("test_pipline/cpu_accuracy/error_log.log", "w") as error_log_file:
 
 print("\nWriting error config and API files...")
 with open("test_pipline/cpu_accuracy/error_config.txt", "w") as error_config_file:
-    for config_entry in sorted(list(error_configs)):
+    for config_entry in sorted(error_configs):
         error_config_file.write(config_entry + "\n")
 
 with open("test_pipline/cpu_accuracy/error_api.txt", "w") as error_api_file:
-    for api_entry in sorted(list(error_apis)):
+    for api_entry in sorted(error_apis):
         error_api_file.write(api_entry + "\n")
 
 print("Processing complete.")
