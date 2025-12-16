@@ -393,7 +393,7 @@ def init_worker_gpu(gpu_worker_list, lock, available_gpus, max_workers_per_gpu, 
             APITestAccuracyStable,
             APITestCINNVSDygraph,
             APITestCustomDeviceVSCPU,
-            APITestPaddleDeviceVSGPU
+            APITestPaddleDeviceVSGPU,
             APITestPaddleGPUPerformance,
             APITestPaddleOnly,
             APITestPaddleTorchGPUPerformance,
@@ -410,7 +410,7 @@ def init_worker_gpu(gpu_worker_list, lock, available_gpus, max_workers_per_gpu, 
             "APITestPaddleTorchGPUPerformance": APITestPaddleTorchGPUPerformance,
             "APITestAccuracyStable": APITestAccuracyStable,
             "APITestCustomDeviceVSCPU": APITestCustomDeviceVSCPU,
-            "APITestPaddleDeviceVSGPU": APITestPaddleDeviceVSGPU
+            "APITestPaddleDeviceVSGPU": APITestPaddleDeviceVSGPU,
         }
         globals().update(test_classes)
 
