@@ -33,8 +33,6 @@ if TYPE_CHECKING:
         APITestPaddleGPUPerformance,
         APITestPaddleOnly,
         APITestPaddleTorchGPUPerformance,
-        APITestAccuracyStable,
-        APITestCustomDeviceVSCPU,
         APITestPaddleDeviceVSGPU,
         APITestTorchGPUPerformance,
     )
