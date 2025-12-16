@@ -276,7 +276,7 @@ class APITestCINNVSDygraph(APITestBase):
             return
 
         if need_check_grad:
-            if not self.compare(dynamic_bwd_output, static_bwd_output, is_backward=True):  # type: ignore
+            if not self.compare(dynamic_bwd_output, static_bwd_output, is_backward=True):   # type: ignore[reportGeneralTypeIssues]
                 return
 
         print(f"[Pass] {(self.api_config.config,)}\n", flush=True)

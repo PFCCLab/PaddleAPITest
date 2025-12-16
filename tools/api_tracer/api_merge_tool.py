@@ -68,8 +68,8 @@ def get_merged_model_apis(
     col_groups = []
     current_model = None
     col_start = 0
-    for col in range(df.shape[1]):  # type: ignore
-        val = df.iloc[0, col]  # type: ignore
+    for col in range(df.shape[1]): # type: ignore[reportGeneralTypeIssues]
+        val = df.iloc[0, col] # type: ignore[reportGeneralTypeIssues]
         if pd.notna(val) and str(val).strip():
             if current_model:
                 col_groups.append((col_start, col))
@@ -77,7 +77,7 @@ def get_merged_model_apis(
             models.append(current_model)
             col_start = col
     if current_model:
-        col_groups.append((col_start, df.shape[1]))  # type: ignore
+        col_groups.append((col_start, df.shape[1])) # type: ignore[reportGeneralTypeIssues]
 
     dup_models = []
     for model in models:
@@ -96,7 +96,7 @@ def get_merged_model_apis(
                 f"Please check the structure of your file."
             )
 
-        model_api_slices = df.iloc[2:, start_col:end_col].values.flatten()  # type: ignore
+        model_api_slices = df.iloc[2:, start_col:end_col].values.flatten() # type: ignore[reportGeneralTypeIssues]
         model_apis = {
             str(api).strip() for api in model_api_slices if pd.notna(api) and str(api).strip()
         }

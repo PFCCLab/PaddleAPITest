@@ -459,11 +459,11 @@ class APITestAccuracyStable(APITestBase):
         second = "Paddle" if comp[2] == "P" else "Torch"
 
         if isinstance(tensor1, paddle.Tensor):
-            dlpack = paddle.utils.dlpack.to_dlpack(tensor1)  # type: ignore
-            tensor1 = torch.utils.dlpack.from_dlpack(dlpack)  # type: ignore
+            dlpack = paddle.utils.dlpack.to_dlpack(tensor1)   # type: ignore[reportGeneralTypeIssues]
+            tensor1 = torch.utils.dlpack.from_dlpack(dlpack)   # type: ignore[reportGeneralTypeIssues]
         if isinstance(tensor2, paddle.Tensor):
-            dlpack = paddle.utils.dlpack.to_dlpack(tensor2)  # type: ignore
-            tensor2 = torch.utils.dlpack.from_dlpack(dlpack)  # type: ignore
+            dlpack = paddle.utils.dlpack.to_dlpack(tensor2)   # type: ignore[reportGeneralTypeIssues]
+            tensor2 = torch.utils.dlpack.from_dlpack(dlpack)   # type: ignore[reportGeneralTypeIssues]
 
         def error_msg(msg):
             return (

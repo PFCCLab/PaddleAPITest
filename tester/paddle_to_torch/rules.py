@@ -6534,9 +6534,3 @@ else:
         code = Code(preprocess=pre.splitlines(), core=core.splitlines())
         return ConvertResult.success(paddle_api, code, is_torch_corresponding=False)
 
-
-__all__ = [
-    cls.__name__
-    for cls in globals().values()
-    if isinstance(cls, type) and issubclass(cls, BaseRule) and cls != BaseRule
-]  # type: ignore

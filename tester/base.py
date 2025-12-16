@@ -951,11 +951,11 @@ class APITestBase:
             expected_paddle_tensor = expected_paddle_tensor.contiguous()
         expected_paddle_tensor = expected_paddle_tensor.cpu().detach()
 
-        actual_paddle_dlpack = paddle.utils.dlpack.to_dlpack(actual_paddle_tensor)  # type: ignore
-        torch.utils.dlpack.from_dlpack(actual_paddle_dlpack)  # type: ignore
+        actual_paddle_dlpack = paddle.utils.dlpack.to_dlpack(actual_paddle_tensor)   # type: ignore[reportGeneralTypeIssues]
+        torch.utils.dlpack.from_dlpack(actual_paddle_dlpack)   # type: ignore[reportGeneralTypeIssues]
 
-        expected_paddle_dlpack = paddle.utils.dlpack.to_dlpack(expected_paddle_tensor)  # type: ignore
-        converted_paddle_tensor = torch.utils.dlpack.from_dlpack(expected_paddle_dlpack)  # type: ignore
+        expected_paddle_dlpack = paddle.utils.dlpack.to_dlpack(expected_paddle_tensor)   # type: ignore[reportGeneralTypeIssues]
+        converted_paddle_tensor = torch.utils.dlpack.from_dlpack(expected_paddle_dlpack)   # type: ignore[reportGeneralTypeIssues]
 
         def error_msg(msg):
             return (
@@ -1005,8 +1005,8 @@ class APITestBase:
             torch_tensor = torch_tensor.contiguous()
         torch_tensor = torch_tensor.cpu().detach()
 
-        paddle_dlpack = paddle.utils.dlpack.to_dlpack(paddle_tensor)  # type: ignore
-        converted_paddle_tensor = torch.utils.dlpack.from_dlpack(paddle_dlpack)  # type: ignore
+        paddle_dlpack = paddle.utils.dlpack.to_dlpack(paddle_tensor)   # type: ignore[reportGeneralTypeIssues]
+        converted_paddle_tensor = torch.utils.dlpack.from_dlpack(paddle_dlpack)   # type: ignore[reportGeneralTypeIssues]
 
         def error_msg(msg):
             return (
