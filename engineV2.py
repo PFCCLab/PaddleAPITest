@@ -479,16 +479,13 @@ def run_test_case(api_config_str, options):
         "paddle_torch_gpu_performance": APITestPaddleTorchGPUPerformance,
         "accuracy_stable": APITestAccuracyStable,
         "paddle_custom_device": APITestCustomDeviceVSCPU,
+        "custom_device_vs_gpu": APITestPaddleDeviceVSGPU,
     }
 
-    # 处理 custom_device_vs_gpu 模式
-    if options.custom_device_vs_gpu:
-        test_class = APITestPaddleDeviceVSGPU
-    else:
-        test_class = next(
-            (cls for opt, cls in option_to_class.items() if getattr(options, opt, False)),
-            APITestAccuracy,  # default fallback
-        )
+    test_class = next(
+        (cls for opt, cls in option_to_class.items() if getattr(options, opt, False)),
+        APITestAccuracy,  # default fallback
+    )
     kwargs = {k: v for k, v in vars(options).items() if k in VALID_TEST_ARGS}
     case = test_class(api_config, **kwargs)
     try:
@@ -666,10 +663,16 @@ def main():
     )
     parser.add_argument(
         "--custom_device_vs_gpu",
+        type=parse_bool,
+        default=False,
+        help="test paddle api on custom device vs GPU",
+    )
+    parser.add_argument(
+        "--custom_device_vs_gpu_mode",
         type=str,
         choices=["upload", "download"],
-        default=None,
-        help="test paddle api on custom device vs GPU: 'upload' or 'download'",
+        default="upload",
+        help="operation mode for custom_device_vs_gpu: 'upload' or 'download'",
     )
     parser.add_argument(
         "--bitwise_alignment",
@@ -692,7 +695,7 @@ def main():
         options.paddle_torch_gpu_performance,
         options.accuracy_stable,
         options.paddle_custom_device,
-        options.custom_device_vs_gpu is not None,
+        options.custom_device_vs_gpu,
     ]
     if len([m for m in mode if m is True]) != 1:
         print(
@@ -705,7 +708,7 @@ def main():
             "--paddle_torch_gpu_performance"
             "--accuracy_stable"
             "--paddle_custom_device"
-            "--custom_device_vs_gpu=upload or --custom_device_vs_gpu=download",
+            "--custom_device_vs_gpu",
             flush=True,
         )
         return
@@ -735,7 +738,7 @@ def main():
                 return
 
             # 将配置添加到 options 中，以便传递给测试类
-            options.operation_mode = options.custom_device_vs_gpu
+            options.operation_mode = options.custom_device_vs_gpu_mode
             options.bos_path = bos_config_data["bos_path"]
             options.bos_conf_path = bos_config_data["bos_conf_path"]
             options.bcecmd_path = bos_config_data["bcecmd_path"]
@@ -762,6 +765,8 @@ def main():
             APITestAccuracy,
             APITestAccuracyStable,
             APITestCINNVSDygraph,
+            APITestCustomDeviceVSCPU,
+            APITestPaddleDeviceVSGPU,
             APITestPaddleGPUPerformance,
             APITestPaddleOnly,
             APITestPaddleTorchGPUPerformance,
@@ -788,31 +793,26 @@ def main():
             "paddle_torch_gpu_performance": APITestPaddleTorchGPUPerformance,
             "accuracy_stable": APITestAccuracyStable,
             "paddle_custom_device": APITestCustomDeviceVSCPU,
+            "custom_device_vs_gpu": APITestPaddleDeviceVSGPU,
         }
 
-        # 处理 custom_device_vs_gpu 模式
-        if options.custom_device_vs_gpu:
-            from tester import APITestPaddleDeviceVSGPU
-
-            test_class = APITestPaddleDeviceVSGPU
-        else:
-            test_class = next(
-                (cls for opt, cls in option_to_class.items() if getattr(options, opt, False)),
-                APITestAccuracy,  # default fallback
-            )
+        test_class = next(
+            (cls for opt, cls in option_to_class.items() if getattr(options, opt, False)),
+            APITestAccuracy,  # default fallback
+        )
 
         if options.custom_device_vs_gpu:
             # custom_device_vs_gpu 模式需要传递额外参数
-            kwargs = {
-                "operation_mode": options.operation_mode,
-                "bos_path": options.bos_path,
-                "bos_conf_path": options.bos_conf_path,
-                "bcecmd_path": options.bcecmd_path,
-                "random_seed": options.random_seed,
-                "atol": options.atol,
-                "rtol": options.rtol,
-            }
-            case = test_class(api_config, **kwargs)
+            case = test_class(
+                api_config,
+                operation_mode=options.operation_mode,
+                bos_path=options.bos_path,
+                bos_conf_path=options.bos_conf_path,
+                bcecmd_path=options.bcecmd_path,
+                random_seed=options.random_seed,
+                atol=options.atol,
+                rtol=options.rtol,
+            )
         elif options.accuracy:
             case = test_class(
                 api_config,

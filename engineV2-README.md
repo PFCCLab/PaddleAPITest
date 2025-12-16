@@ -86,7 +86,8 @@
 | `--timeout`                      | int   | 单个测试用例执行超时秒数（默认 1800）                                                  |
 | `--show_runtime_status`          | bool  | 是否实时显示当前的测试进度（默认 True）                                               |
 | `--random_seed`                  | int   | numpy random的随机种子(默认为0，此时不会显式设置numpy random的seed)                   |
-| `--custom_device_vs_gpu`        | str   | 运行自定义设备与GPU的精度对比测试：`upload` 或 `download`（默认 None）                  |
+| `--custom_device_vs_gpu`        | bool  | 启用自定义设备与GPU的精度对比测试模式（默认 False）                                   |
+| `--custom_device_vs_gpu_mode`   | str   | 自定义设备与GPU对比的模式：`upload` 或 `download`（默认 `upload`）                    |
 | `--bitwise_alignment`            | bool  | 是否进行诸位对齐对比，开启后所有的api的精度对比都按照atol=0.0,rtol = 0.0的精度对比结果|
 
 
@@ -169,7 +170,8 @@ bcecmd_path: "./bcecmd"
 **在 GPU 上执行测试并上传结果**
 ```bash
 # 在 GPU 设备上执行，生成1210-xxx.pdtensor 文件并上传到 BOS
-python engineV2.py --custom_device_vs_gpu=upload \
+python engineV2.py --custom_device_vs_gpu=True \
+  --custom_device_vs_gpu_mode=upload \
   --random_seed=1210 \
   --api_config_file="./test1.txt" \
   --gpu_ids=7
@@ -177,7 +179,8 @@ python engineV2.py --custom_device_vs_gpu=upload \
 
 **在 XPU 上下载 GPU 的参考数据并进行精度对比**
 ```bash
-python engineV2.py --custom_device_vs_gpu=download \
+python engineV2.py --custom_device_vs_gpu=True \
+  --custom_device_vs_gpu_mode=download \
   --random_seed=1210 \
   --api_config_file="./test1.txt" \
   --gpu_ids=7
