@@ -1,11 +1,14 @@
+from __future__ import annotations
+
 import random
+
 
 def extract_random_lines(input_path, output_path, patterns):
     # 初始化模式匹配容器
     pattern_buckets = {pattern: [] for pattern in patterns}
-    
+
     # 第一次遍历：分类收集匹配行
-    with open(input_path, 'r', encoding='utf-8') as f:
+    with open(input_path, encoding="utf-8") as f:
         for line in f:
             stripped_line = line.strip()
             for pattern in patterns:
@@ -20,7 +23,7 @@ def extract_random_lines(input_path, output_path, patterns):
         if not bucket:
             print(f"警告：'{pattern}' 未找到匹配行")
             continue
-            
+
         actual_count = min(required_count, len(bucket))
         sampled_lines.extend(random.sample(bucket, actual_count))
         if len(bucket) < required_count:
@@ -30,23 +33,24 @@ def extract_random_lines(input_path, output_path, patterns):
     # sampled_lines = list(set(sampled_lines))
 
     # 保存结果
-    with open(output_path, 'w', encoding='utf-8') as f:
-        f.write('\n'.join(sampled_lines))
+    with open(output_path, "w", encoding="utf-8") as f:
+        f.write("\n".join(sampled_lines))
 
     print(f"提取完成，共保存 {len(sampled_lines)} 行到 {output_path}")
+
 
 if __name__ == "__main__":
     # 配置参数
     config = {
-        '/host_home/wanghuan29/PaddleAPITest/tester/api_config/8_big_tensor/17/big_tensor_17_2.txt': {  # 输入文件路径
-            '/host_home/wanghuan29/PaddleAPITest/tester/api_config/8_big_tensor/17/big_tensor_17_3.txt': {  # 输出文件路径
-                'patterns': {  # 模式配置
-                    'paddle.Tensor.reshape': 1000,
-                    'paddle.reshape': 300,
-                    'paddle.broadcast_to': 1000,
-                    'paddle.Tensor.__rmul__': 1000,
-                    'paddle.Tensor.__mul__': 1000,
-                    'paddle.Tensor.tile': 1000
+        "/host_home/wanghuan29/PaddleAPITest/tester/api_config/8_big_tensor/17/big_tensor_17_2.txt": {  # 输入文件路径
+            "/host_home/wanghuan29/PaddleAPITest/tester/api_config/8_big_tensor/17/big_tensor_17_3.txt": {  # 输出文件路径
+                "patterns": {  # 模式配置
+                    "paddle.Tensor.reshape": 1000,
+                    "paddle.reshape": 300,
+                    "paddle.broadcast_to": 1000,
+                    "paddle.Tensor.__rmul__": 1000,
+                    "paddle.Tensor.__mul__": 1000,
+                    "paddle.Tensor.tile": 1000,
                 }
             }
         }
@@ -55,4 +59,4 @@ if __name__ == "__main__":
     # 执行提取
     for input_file, outputs in config.items():
         for output_file, params in outputs.items():
-            extract_random_lines(input_file, output_file, params['patterns'])
+            extract_random_lines(input_file, output_file, params["patterns"])

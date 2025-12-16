@@ -1,15 +1,14 @@
-import paddle.signal as signal
-import paddle.incubate.nn.functional as F
-from pathlib import Path
+from __future__ import annotations
+
 import inspect
-import torch
 
 test_sig_list = []
 # Define the list of methods to test for signatures
 no_signature_methods = []
 
 # Combine all methods to test
-all_methods = test_sig_list + [
+all_methods = [
+    *test_sig_list,
     "paddle.add",
     "paddle.as_strided",
     "paddle.atleast_1d",
@@ -392,6 +391,7 @@ all_methods = test_sig_list + [
     "paddle.vision.ops.roi_pool",
 ]
 
+
 # Function to safely get signature and handle methods without signatures
 def get_signature_safely(func_name):
     try:
@@ -402,6 +402,7 @@ def get_signature_safely(func_name):
         # This function doesn't have a signature
         no_signature_methods.append(func_name)
         return None
+
 
 # Test all methods in the list
 for method in all_methods:

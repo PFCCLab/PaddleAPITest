@@ -1,18 +1,19 @@
 #!/bin/env python3
-# -*- coding: utf-8 -*-
 # @author DDDivano
 # encoding=utf-8 vi:ts=4:sw=4:expandtab:ft=python
+from __future__ import annotations
+
 import argparse
 import multiprocessing as mp
 import os
+import shutil
+import signal
 import sys
 import time
-import signal
-import shutil
 import zipfile
 from datetime import datetime
 
-os.environ["FLAGS_use_system_allocator"] = "1"
+os.environ["FLAGS_USE_SYSTEM_ALLOCATOR"] = "1"
 os.environ["NVIDIA_TF32_OVERRIDE"] = "0"
 
 
@@ -60,7 +61,10 @@ class LoggerRedirector:
             sys.stderr = sys.__stderr__
 
         except Exception as e:
-            print(f"[LoggerRedirector] Error restoring stdout/stderr: {e}", file=sys.__stderr__)
+            print(
+                f"[LoggerRedirector] Error restoring stdout/stderr: {e}",
+                file=sys.__stderr__,
+            )
 
         if self.log_file:
             self.log_file.close()
@@ -90,11 +94,17 @@ def worker_process(gpu_id, task_queue, result_queue, idx, args_mode):
                     os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
 
                     if test_class is None:
-                        from tester import APITestAccuracy, APITestPaddleOnly, APITestCINNVSDygraph, APIConfig
+                        from tester import (
+                            APIConfig,
+                            APITestAccuracy,
+                            APITestCINNVSDygraph,
+                            APITestPaddleOnly,
+                        )
+
                         mode_to_test_class = {
-                            'paddle_only': APITestPaddleOnly,
-                            'paddle_cinn': APITestCINNVSDygraph,
-                            'accuracy': APITestAccuracy,
+                            "paddle_only": APITestPaddleOnly,
+                            "paddle_cinn": APITestCINNVSDygraph,
+                            "accuracy": APITestAccuracy,
                         }
                         if args_mode not in mode_to_test_class:
                             raise ValueError(f"Unknown mode: {args_mode}")
@@ -120,8 +130,12 @@ def worker_process(gpu_id, task_queue, result_queue, idx, args_mode):
                 except Exception as e:
                     print(f"[Worker {idx}] Error on Task {task_id}: {e}")
                     result_queue.put((task_id, "error", str(e)))
-                    if "CUDA error" in str(e) or "memory corruption" in str(e) or "CUDA out of memory" in str(e):
-                        print(f"[Worker {idx}] OOM on Task {task_id}: {e}") 
+                    if (
+                        "CUDA error" in str(e)
+                        or "memory corruption" in str(e)
+                        or "CUDA out of memory" in str(e)
+                    ):
+                        print(f"[Worker {idx}] OOM on Task {task_id}: {e}")
                         exit(1)
 
         except Exception as e:
@@ -131,7 +145,10 @@ def worker_process(gpu_id, task_queue, result_queue, idx, args_mode):
 
 def spawn_worker(gpu_list, concurrency, idx, task_queue, result_queue, selected_mode):
     gpu_id = gpu_list[idx % len(gpu_list)]
-    p = mp.Process(target=worker_process, args=(gpu_id, task_queue, result_queue, idx, selected_mode))
+    p = mp.Process(
+        target=worker_process,
+        args=(gpu_id, task_queue, result_queue, idx, selected_mode),
+    )
     p.start()
     print(f"[Master] Spawned Worker {idx} on GPU {gpu_id} (PID={p.pid})")
     return p
@@ -148,10 +165,10 @@ def kill_worker(p):
 
 def pack():
     pack_name = f"result_pack_{datetime.now().strftime('%Y%m%d_%H%M%S')}.zip"
-    with zipfile.ZipFile(pack_name, 'w', zipfile.ZIP_DEFLATED) as zipf:
-        for folder in ['logs', 'worker_logs']:
+    with zipfile.ZipFile(pack_name, "w", zipfile.ZIP_DEFLATED) as zipf:
+        for folder in ["logs", "worker_logs"]:
             if os.path.exists(folder):
-                for root, dirs, files in os.walk(folder):
+                for root, _dirs, files in os.walk(folder):
                     for file in files:
                         file_path = os.path.join(root, file)
                         arcname = os.path.relpath(file_path, start=os.path.dirname(folder))
@@ -160,17 +177,17 @@ def pack():
 
 
 def main():
-    parser = argparse.ArgumentParser(description='Workerfarm 并行 API 测试运行器')
+    parser = argparse.ArgumentParser(description="Workerfarm 并行 API 测试运行器")
 
     group = parser.add_mutually_exclusive_group(required=True)
-    group.add_argument('--paddle_only', action='store_true', help='只测试 Paddle')
-    group.add_argument('--paddle_cinn', action='store_true', help='测试 Paddle CINN')
-    group.add_argument('--accuracy', action='store_true', help='测试精度')
+    group.add_argument("--paddle_only", action="store_true", help="只测试 Paddle")
+    group.add_argument("--paddle_cinn", action="store_true", help="测试 Paddle CINN")
+    group.add_argument("--accuracy", action="store_true", help="测试精度")
 
-    parser.add_argument('--api_config_file', required=True, help='API 配置文件路径')
-    parser.add_argument('--gpus', required=True, help='用逗号分隔的 GPU ID 列表')
-    parser.add_argument('--per_gpu_concurrency', type=int, default=1, help='每块 GPU 并发数')
-    parser.add_argument('--timeout', type=int, default=1800, help='每个任务超时时间（秒）')
+    parser.add_argument("--api_config_file", required=True, help="API 配置文件路径")
+    parser.add_argument("--gpus", required=True, help="用逗号分隔的 GPU ID 列表")
+    parser.add_argument("--per_gpu_concurrency", type=int, default=1, help="每块 GPU 并发数")
+    parser.add_argument("--timeout", type=int, default=1800, help="每个任务超时时间（秒）")
 
     args = parser.parse_args()
 
@@ -197,7 +214,7 @@ def main():
     error_cases = open(os.path.join("logs", "error_cases.txt"), "w")
 
     # 加载API配置
-    with open(args.api_config_file, "r") as f:
+    with open(args.api_config_file) as f:
         pending_api_configs = [line.strip() for line in f if line.strip()]
 
     task_queue = mp.Queue()
@@ -262,7 +279,9 @@ def main():
             elif status == "error":
                 error_count += 1
                 error_msg = others[0] if others else "Unknown error"
-                master_log.write(f"{datetime.now()} Task {task_id} ERROR: {api_config_str}, {error_msg}\n")
+                master_log.write(
+                    f"{datetime.now()} Task {task_id} ERROR: {api_config_str}, {error_msg}\n"
+                )
                 error_cases.write(f"{api_config_str}\n")
 
             master_log.flush()
@@ -297,9 +316,18 @@ def main():
                     p = workers.get(worker_idx)
                     # if p and p.is_alive():
                     if p:
-                        print(f"[Master] Killing Worker {worker_idx} (PID={p.pid}) due to task timeout...")
+                        print(
+                            f"[Master] Killing Worker {worker_idx} (PID={p.pid}) due to task timeout..."
+                        )
                         kill_worker(p)
-                        workers[worker_idx] = spawn_worker(gpu_list, concurrency, worker_idx, task_queue, result_queue, selected_mode)
+                        workers[worker_idx] = spawn_worker(
+                            gpu_list,
+                            concurrency,
+                            worker_idx,
+                            task_queue,
+                            result_queue,
+                            selected_mode,
+                        )
                         worker_last_task_time[worker_idx] = time.time()
 
         # 检查worker意外挂掉  这里之前有个bug，就是如果hang了，很多时候进程会自己kill，然后到超时的时候任务会二次kill进程，导致正常任务被杀死，所以禁用了这个检测
@@ -308,21 +336,28 @@ def main():
                 print(f"[Master] Worker {idx} (PID={p.pid}) died unexpectedly, restarting...")
 
                 # 找出这个worker正在执行的任务
-                tasks_of_dead_worker = [tid for tid, worker_idx in task_id_to_worker_idx.items() if
-                                        worker_idx == idx and tid not in completed_task_ids]
+                tasks_of_dead_worker = [
+                    tid
+                    for tid, worker_idx in task_id_to_worker_idx.items()
+                    if worker_idx == idx and tid not in completed_task_ids
+                ]
 
                 for tid in tasks_of_dead_worker:
                     start_time, api_config_str = task_status.pop(tid, (None, None))
                     if api_config_str:
                         completed_task_ids.add(tid)
                         error_count += 1
-                        master_log.write(f"{datetime.now()} Task {tid} ERROR (Worker died): {api_config_str}\n")
+                        master_log.write(
+                            f"{datetime.now()} Task {tid} ERROR (Worker died): {api_config_str}\n"
+                        )
                         error_cases.write(f"{api_config_str}\n")
                         master_log.flush()
                         error_cases.flush()
 
                 # 重启新的worker
-                workers[idx] = spawn_worker(gpu_list, concurrency, idx, task_queue, result_queue, selected_mode)
+                workers[idx] = spawn_worker(
+                    gpu_list, concurrency, idx, task_queue, result_queue, selected_mode
+                )
                 worker_last_task_time[idx] = time.time()
 
     # 收尾
@@ -332,8 +367,12 @@ def main():
     for p in workers.values():
         p.join()
 
-    print(f"{datetime.now()} Summary: {success_count} success, {error_count} error, {timeout_count} timeout.")
-    master_log.write(f"{datetime.now()} Summary: {success_count} success, {error_count} error, {timeout_count} timeout.\n")
+    print(
+        f"{datetime.now()} Summary: {success_count} success, {error_count} error, {timeout_count} timeout."
+    )
+    master_log.write(
+        f"{datetime.now()} Summary: {success_count} success, {error_count} error, {timeout_count} timeout.\n"
+    )
 
     master_log.close()
     timeout_cases.close()
@@ -341,7 +380,5 @@ def main():
     pack()
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()
-
-

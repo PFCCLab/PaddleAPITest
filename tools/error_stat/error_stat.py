@@ -2,6 +2,7 @@
 # @author: cangtianhuang
 # @date: 2025-11-11
 # 整理效果：pass + error + invalid （可按类型拆分）
+from __future__ import annotations
 
 import argparse
 import re
@@ -49,8 +50,8 @@ def check_count_consistency(parsed_keys, config_keys, prefix):
         msg = (
             f"[ASSERT ERROR] {prefix} 数量不一致: "
             f"config={config_len}, parsed={parsed_len}, "
-            f"缺失={len(missing_keys)} {sorted(list(missing_keys))[:3]}, "
-            f"多余={len(extra_keys)} {sorted(list(extra_keys))[:3]}"
+            f"缺失={len(missing_keys)} {sorted(missing_keys)[:3]}, "
+            f"多余={len(extra_keys)} {sorted(extra_keys)[:3]}"
         )
         raise AssertionError(msg)
 
@@ -60,8 +61,8 @@ def load_config_sets(input_path):
     for prefix, file_name in LOG_PREFIXES.items():
         file_path = Path(input_path) / f"{file_name}.txt"
         if file_path.exists():
-            with open(file_path, "r") as f:
-                configs = set(line.strip() for line in f if line.strip())
+            with open(file_path) as f:
+                configs = {line.strip() for line in f if line.strip()}
                 config_sets[prefix] = configs
                 print(f"Read {len(configs)} configs from {file_path}", flush=True)
         else:
@@ -135,7 +136,7 @@ def write_logs_and_meta(output_path, logs_dict, prefix):
     api_file = output_path / f"{prefix}_api.txt"
     config_file = output_path / f"{prefix}_config.txt"
 
-    apis = set(config.split("(", 1)[0] for config in logs_dict.keys())
+    apis = {config.split("(", 1)[0] for config in logs_dict}
 
     with open(log_file, "w") as f:
         for key in sorted(logs_dict.keys()):
@@ -158,9 +159,7 @@ def error_state(input_path, output_path, split_errors=False):
 
     # 分类 pass
     pass_logs_dict = {
-        key: content
-        for content in logs
-        if (key := get_sort_key(content)) in config_sets["pass"]
+        key: content for content in logs if (key := get_sort_key(content)) in config_sets["pass"]
     }
     check_count_consistency(set(pass_logs_dict.keys()), config_sets["pass"], "pass")
     write_logs_and_meta(output_path, pass_logs_dict, "pass")
@@ -168,7 +167,7 @@ def error_state(input_path, output_path, split_errors=False):
     # 处理 error 和 invalid
     error_logs_dict, invalid_logs_dict = classify_by_config(logs, config_sets)
     if split_errors:
-        for prefix in config_sets.keys():
+        for prefix in config_sets:
             if prefix in ("pass", "checkpoint"):
                 continue
             error_keys = set(error_logs_dict.get(prefix, {}).keys())
@@ -188,7 +187,7 @@ def error_state(input_path, output_path, split_errors=False):
         invalid_union = {}
         error_keys_union = set()
         invalid_keys_union = set()
-        for prefix in config_sets.keys():
+        for prefix in config_sets:
             if prefix in ("pass", "checkpoint"):
                 continue
             error_union.update(error_logs_dict.get(prefix, {}))
@@ -198,11 +197,7 @@ def error_state(input_path, output_path, split_errors=False):
             invalid_keys_union |= set(invalid_logs_dict.get(inv_prefix, {}).keys())
         all_keys = error_keys_union | invalid_keys_union
         all_configs = set().union(
-            *(
-                configs
-                for p, configs in config_sets.items()
-                if p not in ("pass", "checkpoint")
-            )
+            *(configs for p, configs in config_sets.items() if p not in ("pass", "checkpoint"))
         )
         check_count_consistency(all_keys, all_configs, "error+invalid")
         if error_union:
@@ -220,9 +215,7 @@ def main():
         default="tester/api_config/test_log_big_tensor",
         help="输入路径",
     )
-    parser.add_argument(
-        "--output", "-o", type=str, default=None, help="输出路径（默认同输入路径）"
-    )
+    parser.add_argument("--output", "-o", type=str, default=None, help="输出路径（默认同输入路径）")
     parser.add_argument(
         "--split-errors",
         "-s",

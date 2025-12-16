@@ -1,27 +1,22 @@
-import cProfile, pstats, io
-from pstats import SortKey
-from config_analyzer import TensorConfig, APIConfig, analyse_configs
+from __future__ import annotations
+
 import copy
-from tqdm import tqdm
-from pathlib import Path
-import re
-import collections
-import paddle
-import numpy
 import math
-import json
+from pathlib import Path
+
+import numpy
 import paddle
-import inspect
-import torch
+from config_analyzer import TensorConfig, analyse_configs
+from tqdm import tqdm
+
 
 def is_0_size_tensor(tensor_config):
-    for i in tensor_config.shape:
-        if i == 0:
-            return True
-    return False
+    return any(i == 0 for i in tensor_config.shape)
+
 
 def is_0D_tensor(tensor_config):
     return len(tensor_config.shape) == 0
+
 
 def tensor_numel(tensor_config):
     numel = 1
@@ -29,40 +24,35 @@ def tensor_numel(tensor_config):
         numel = numel * i
     return numel
 
+
 def get_tensor_configs(api_config):
     tensor_configs = []
     for arg_config in api_config.args:
         if isinstance(arg_config, TensorConfig):
             tensor_configs.append(arg_config)
-        elif isinstance(arg_config, list):
-            for j in range(len(arg_config)):
-                if isinstance(arg_config[j], TensorConfig):
-                    tensor_configs.append(arg_config[j])
-        elif isinstance(arg_config, tuple):
+        elif isinstance(arg_config, (list, tuple)):
             for j in range(len(arg_config)):
                 if isinstance(arg_config[j], TensorConfig):
                     tensor_configs.append(arg_config[j])
 
-    for key, arg_config in api_config.kwargs.items():
+    for _key, arg_config in api_config.kwargs.items():
         if isinstance(arg_config, TensorConfig):
             tensor_configs.append(arg_config)
-        elif isinstance(arg_config, list):
-            for j in range(len(arg_config)):
-                if isinstance(arg_config[j], TensorConfig):
-                    tensor_configs.append(arg_config[j])
-        elif isinstance(arg_config, tuple):
+        elif isinstance(arg_config, (list, tuple)):
             for j in range(len(arg_config)):
                 if isinstance(arg_config[j], TensorConfig):
                     tensor_configs.append(arg_config[j])
     return tensor_configs
 
+
 apis_map = {}
 base_size_map = {
-    "paddle.Tensor.__nonzero__" : 0,
-    "paddle.zeros" : 1,
-    "paddle.ones" : 1,
-    "paddle.full" : 1,
+    "paddle.Tensor.__nonzero__": 0,
+    "paddle.zeros": 1,
+    "paddle.ones": 1,
+    "paddle.full": 1,
 }
+
 
 def dump_item_str(item):
     type_mapping = {
@@ -110,28 +100,12 @@ def dump_item_str(item):
         result = result + ")"
         return result
     elif isinstance(item, slice):
-        return (
-            "slice("
-            + str(item.start)
-            + ","
-            + str(item.stop)
-            + ","
-            + str(item.step)
-            + ")"
-        )
+        return "slice(" + str(item.start) + "," + str(item.stop) + "," + str(item.step) + ")"
     elif isinstance(item, complex):
-        return (
-            "complex("
-            + dump_item_str(item.real)
-            + ","
-            + dump_item_str(item.imag)
-            + ")"
-        )
+        return "complex(" + dump_item_str(item.real) + "," + dump_item_str(item.imag) + ")"
     elif item is None:
         return "None"
-    elif isinstance(
-        item, (paddle.base.Variable, paddle.base.libpaddle.pir.Value)
-    ):
+    elif isinstance(item, (paddle.base.Variable, paddle.base.libpaddle.pir.Value)):
         return ""
     elif item == math.inf:
         return "math.inf"
@@ -146,11 +120,7 @@ def dump_item_str(item):
     elif isinstance(item, str):
         return '"' + item + '"'
     elif isinstance(item, type):
-        return (
-            "type("
-            + str(item)[str(item).index("'") + 1 : str(item).rindex("'")]
-            + ")"
-        )
+        return "type(" + str(item)[str(item).index("'") + 1 : str(item).rindex("'")] + ")"
     else:
         return str(item)
 
@@ -159,11 +129,12 @@ def config_key(api_config):
     result = ""
     for arg in api_config.args:
         result = result + dump_item_str(arg) + ", "
-    
+
     for key, value in api_config.kwargs.items():
         result = result + key + "=" + dump_item_str(value) + ", "
 
     return result
+
 
 def to_big_tensor_config(api_config):
     if api_config.api_name not in apis_map:
@@ -186,8 +157,8 @@ def to_big_tensor_config(api_config):
     if len(tensor_configs) == 0:
         return []
 
-    result = [] # 结果列表
-    
+    result = []  # 结果列表
+
     shape_len = len(tensor_configs[0].shape)
     shape_equal = True
     for tensor_config in tensor_configs:
@@ -203,26 +174,46 @@ def to_big_tensor_config(api_config):
         for j in range(len(tensor_configs[i].shape)):
             tmp_api_config = copy.deepcopy(api_config)
             tmp_tensor_configs = get_tensor_configs(tmp_api_config)
-            if api_config.api_name in base_size_map.keys():
+            if api_config.api_name in base_size_map:
                 base_size = base_size_map[api_config.api_name]
-            elif tmp_tensor_configs[i].dtype in ["float8", "float16", "bfloat16", "int16", "uint16", "int8", "uint8", "bool"]:
+            elif tmp_tensor_configs[i].dtype in [
+                "float8",
+                "float16",
+                "bfloat16",
+                "int16",
+                "uint16",
+                "int8",
+                "uint8",
+                "bool",
+            ]:
                 base_size = 101606400
             elif tmp_tensor_configs[i].dtype in ["int32", "uint32", "float32"]:
                 base_size = 50803200
-            elif tmp_tensor_configs[i].dtype in ["float64", "double", "int64", "complex64"]:
+            elif tmp_tensor_configs[i].dtype in [
+                "float64",
+                "double",
+                "int64",
+                "complex64",
+            ]:
                 base_size = 20401600
             else:
                 base_size = 10200800
-            
+
             old_dim = tmp_tensor_configs[i].shape[j]
-            new_dim = int(base_size / (tensor_numel(tmp_tensor_configs[i])/tmp_tensor_configs[i].shape[j])) + 1
+            new_dim = (
+                int(
+                    base_size
+                    / (tensor_numel(tmp_tensor_configs[i]) / tmp_tensor_configs[i].shape[j])
+                )
+                + 1
+            )
             tmp_tensor_configs[i].shape[j] = new_dim
             config_str = str(tmp_api_config)
             if len(config_str) < 1000:
                 result.append(config_str)
 
             valid = True
-            tmp_tensor_configs[i].shape[j] = old_dim # 恢复原来的shape
+            tmp_tensor_configs[i].shape[j] = old_dim  # 恢复原来的shape
             for m in range(len(tensor_configs)):
                 is_first = True
                 for n in range(len(tensor_configs[m].shape)):
@@ -244,27 +235,51 @@ def to_big_tensor_config(api_config):
             tmp_api_config = copy.deepcopy(api_config)
             tmp_tensor_configs = get_tensor_configs(tmp_api_config)
             for i in range(len(tensor_configs)):
-                if api_config.api_name in base_size_map.keys():
+                if api_config.api_name in base_size_map:
                     base_size = base_size_map[api_config.api_name]
-                elif tmp_tensor_configs[i].dtype in ["float8", "float16", "bfloat16", "int16", "uint16", "int8", "uint8", "bool"]:
+                elif tmp_tensor_configs[i].dtype in [
+                    "float8",
+                    "float16",
+                    "bfloat16",
+                    "int16",
+                    "uint16",
+                    "int8",
+                    "uint8",
+                    "bool",
+                ]:
                     base_size = 101606400
                 elif tmp_tensor_configs[i].dtype in ["int32", "uint32", "float32"]:
                     base_size = 50803200
-                elif tmp_tensor_configs[i].dtype in ["float64", "double", "int64", "complex64"]:
+                elif tmp_tensor_configs[i].dtype in [
+                    "float64",
+                    "double",
+                    "int64",
+                    "complex64",
+                ]:
                     base_size = 20401600
                 else:
                     base_size = 10200800
-                tmp_tensor_configs[i].shape[j] = int(base_size / (tensor_numel(tmp_tensor_configs[0])/tmp_tensor_configs[0].shape[j])) + 1
+                tmp_tensor_configs[i].shape[j] = (
+                    int(
+                        base_size
+                        / (tensor_numel(tmp_tensor_configs[0]) / tmp_tensor_configs[0].shape[j])
+                    )
+                    + 1
+                )
             config_str = str(tmp_api_config)
             if len(config_str) < 1000:
                 result.append(config_str)
     return result
 
-if __name__ == '__main__':
-    
-    INPUT_PATH = Path("/root/paddlejob/workspace/env_run/ningzs/PaddleAPITest/tester/api_config/10_performance/not_pass_top3.txt")
-    OUTPUT_PATH = Path("/root/paddlejob/workspace/env_run/ningzs/PaddleAPITest/tester/api_config/10_performance/not_pass_top3_gen.txt")
-    
+
+if __name__ == "__main__":
+    INPUT_PATH = Path(
+        "/root/paddlejob/workspace/env_run/ningzs/PaddleAPITest/tester/api_config/10_performance/not_pass_top3.txt"
+    )
+    OUTPUT_PATH = Path(
+        "/root/paddlejob/workspace/env_run/ningzs/PaddleAPITest/tester/api_config/10_performance/not_pass_top3_gen.txt"
+    )
+
     api_configs = analyse_configs(INPUT_PATH)
     # count = 0
     with open(OUTPUT_PATH, "w") as f:
@@ -274,18 +289,17 @@ if __name__ == '__main__':
                 configs = to_big_tensor_config(api_config)
                 # print(configs, "\n\n")
                 for a in configs:
-                    f.write(str(a)+"\n")
-            except Exception as e:
+                    f.write(str(a) + "\n")
+            except Exception:
                 continue
             # count += 1
             # if (count >= 2):
             #     break
-            
 
     # 去重
     api_configs = set()
     try:
-        with open(OUTPUT_PATH, "r") as f:
+        with open(OUTPUT_PATH) as f:
             lines = [line.strip() for line in f if line.strip()]
             print(f"Read {len(lines)} api configs from {INPUT_PATH}", flush=True)
             api_configs = set(lines)
@@ -300,6 +314,3 @@ if __name__ == '__main__':
         print(f"Error writing {OUTPUT_PATH}: {err}", flush=True)
         exit(0)
     print(f"Write {len(api_configs)} api configs to {OUTPUT_PATH}", flush=True)
-
-
-

@@ -1,5 +1,6 @@
+from __future__ import annotations
+
 from pathlib import Path
-from typing import Dict, List, Optional
 
 import pandas as pd
 import yaml
@@ -9,12 +10,11 @@ import yaml
 def get_merged_model_apis(
     input_path: str,
     output_path: str,
-    sheet_name: Optional[str] = None,
-    model_groups: Optional[Dict[str, List[str]]] = None,
-    yaml_paths: Optional[Dict[str, str]] = None,
+    sheet_name: str | None = None,
+    model_groups: dict[str, list[str]] | None = None,
+    yaml_paths: dict[str, str] | None = None,
 ):
-    """
-    从 XLSX 或 CSV 文件中读取 API 数据, 合并并分析 API
+    """从 XLSX 或 CSV 文件中读取 API 数据, 合并并分析 API
 
     Args:
     - excel_path (str): 输入的 XLSX 或 CSV 文件路径
@@ -47,14 +47,12 @@ def get_merged_model_apis(
     if yaml_paths is not None:
         for name, path in yaml_paths.items():
             try:
-                with open(path, "r", encoding="utf-8") as f:
+                with open(path, encoding="utf-8") as f:
                     apis = yaml.safe_load(f)
                 if not isinstance(apis, list):
                     print(f"[APIMerge] {path} should be a list, but got {type(apis)}")
                     continue
-                print(
-                    f"[APIMerge] Successfully loaded {len(apis)} APIs for '{name}' from {path}"
-                )
+                print(f"[APIMerge] Successfully loaded {len(apis)} APIs for '{name}' from {path}")
                 named_apis_set[name] = set(apis)
             except Exception as e:
                 print(f"[APIMerge] Error loading {path}: {e}")
@@ -70,8 +68,8 @@ def get_merged_model_apis(
     col_groups = []
     current_model = None
     col_start = 0
-    for col in range(df.shape[1]):  # type: ignore
-        val = df.iloc[0, col]  # type: ignore
+    for col in range(df.shape[1]):  # type: ignore[reportGeneralTypeIssues]
+        val = df.iloc[0, col]  # type: ignore[reportGeneralTypeIssues]
         if pd.notna(val) and str(val).strip():
             if current_model:
                 col_groups.append((col_start, col))
@@ -79,7 +77,7 @@ def get_merged_model_apis(
             models.append(current_model)
             col_start = col
     if current_model:
-        col_groups.append((col_start, df.shape[1]))  # type: ignore
+        col_groups.append((col_start, df.shape[1]))  # type: ignore[reportGeneralTypeIssues]
 
     dup_models = []
     for model in models:
@@ -98,11 +96,9 @@ def get_merged_model_apis(
                 f"Please check the structure of your file."
             )
 
-        model_api_slices = df.iloc[2:, start_col:end_col].values.flatten()  # type: ignore
+        model_api_slices = df.iloc[2:, start_col:end_col].values.flatten()  # type: ignore[reportGeneralTypeIssues]
         model_apis = {
-            str(api).strip()
-            for api in model_api_slices
-            if pd.notna(api) and str(api).strip()
+            str(api).strip() for api in model_api_slices if pd.notna(api) and str(api).strip()
         }
         apis_per_model[model] = model_apis
     print(f"[APIMerge] Successfully read {len(models)} models and their APIs.")
@@ -115,15 +111,13 @@ def get_merged_model_apis(
 
         missing_models = all_grouped_models - all_data_models
         for missing_model in missing_models:
-            print(
-                f"[APIMerge] Model '{missing_model}' is in groups but not found in data."
-            )
+            print(f"[APIMerge] Model '{missing_model}' is in groups but not found in data.")
 
         unassigned_models = all_data_models - all_grouped_models
         for unassigned_model in unassigned_models:
             print(
                 f"[APIMerge] Model '{unassigned_model}' is not in any group but found in data.",
-                f"It will be displayed in the final table.",
+                "It will be displayed in the final table.",
             )
 
     all_apis = set().union(*apis_per_model.values())
@@ -135,11 +129,7 @@ def get_merged_model_apis(
         print("--- APIs in each group ---")
         for group_name, group_models in model_groups.items():
             current_group_apis = set().union(
-                *(
-                    apis_per_model[model]
-                    for model in group_models
-                    if model in apis_per_model
-                )
+                *(apis_per_model[model] for model in group_models if model in apis_per_model)
             )
 
             newly_introduced_apis = current_group_apis - cumulative_apis
@@ -147,22 +137,18 @@ def get_merged_model_apis(
                 api_to_first_group[api] = group_name
 
             cumulative_apis.update(current_group_apis)
-            print(
-                f"'{group_name}' (and previous groups) API count : {len(cumulative_apis)}"
-            )
+            print(f"'{group_name}' (and previous groups) API count : {len(cumulative_apis)}")
         print("'未分组' API count : ", len(all_apis) - len(cumulative_apis), "\n")
 
     ordered_model_names = []
     if model_groups:
         for group_models_list in model_groups.values():
-            ordered_model_names.extend(
-                [model for model in group_models_list if model in models]
-            )
+            ordered_model_names.extend([model for model in group_models_list if model in models])
         ordered_model_names.extend([m for m in models if m not in ordered_model_names])
     else:
         ordered_model_names = models
 
-    sorted_apis = sorted(list(all_apis))
+    sorted_apis = sorted(all_apis)
     data = []
     for api in sorted_apis:
         row = [api]
@@ -186,7 +172,7 @@ def get_merged_model_apis(
     result_df = pd.DataFrame(data, columns=columns)
 
     if model_groups:
-        group_order = list(model_groups.keys()) + ["未分组"]
+        group_order = [*list(model_groups.keys()), "未分组"]
         result_df["首次出现分组"] = pd.Categorical(
             result_df["首次出现分组"], categories=group_order, ordered=True
         )

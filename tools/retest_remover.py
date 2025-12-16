@@ -1,6 +1,7 @@
 # 重测配置移除小工具
 # @author: cangtianhuang
 # @date: 2025-11-11
+from __future__ import annotations
 
 import argparse
 import os
@@ -37,7 +38,7 @@ def remove_configs(log_path, to_remove):
 
     try:
         with checkpoint_file.open("r") as f:
-            checkpoint_configs = set(line.strip() for line in f if line.strip())
+            checkpoint_configs = {line.strip() for line in f if line.strip()}
     except Exception as err:
         print(f"Error reading {checkpoint_file}: {err}", flush=True)
         return
@@ -54,7 +55,7 @@ def remove_configs(log_path, to_remove):
             continue
         try:
             with log_file.open("r") as f:
-                lines = set(line.strip() for line in f if line.strip())
+                lines = {line.strip() for line in f if line.strip()}
                 retest_configs.update(lines)
                 print(f"Read {len(lines)} api configs from {log_file}", flush=True)
         except Exception as err:

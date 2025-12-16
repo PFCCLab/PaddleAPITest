@@ -1,6 +1,7 @@
 # 整理 stable*.csv 精度统计数据，产出：stable_full.csv、stable_stat.csv、stable_stat_api.csv
 # @author: cangtianhuang
 # @date: 2025-07-30
+from __future__ import annotations
 
 import glob
 from collections import defaultdict
@@ -102,9 +103,7 @@ config_count = 0
 dfs = []
 for file_path in file_list:
     # 并行处理统计数据
-    file_stats, file_api_stats, file_config_count, file_chunks = parallel_process_csv(
-        file_path
-    )
+    file_stats, file_api_stats, file_config_count, file_chunks = parallel_process_csv(file_path)
     dfs.extend(file_chunks)
     config_count += file_config_count
     for key in file_stats:
@@ -127,9 +126,7 @@ merged_df = merged_df.groupby(["API", "dtype", "config", "comp"], as_index=False
     numeric_cols
 ].mean()
 # merged_df = merged_df.drop_duplicates(subset=["config", "comp"], keep="last")
-merged_df = merged_df.sort_values(
-    by=["API", "dtype", "config", "comp"], ignore_index=True
-)
+merged_df = merged_df.sort_values(by=["API", "dtype", "config", "comp"], ignore_index=True)
 for col in numeric_cols:
     merged_df[col] = merged_df[col].apply(lambda x: f"{float(x):.6e}")
 output_file = OUTPUT_PATH / "stable_full.csv"
@@ -184,12 +181,8 @@ api_stats_data = []
 for api in sorted(api_stats.keys()):
     api_dtype = api_stats[api]
     dtypes = "/".join(sorted(api_dtype.keys()))
-    total = sum(
-        api_dtype[dtype][comp] for dtype in api_dtype for comp in api_dtype[dtype]
-    )
-    all_comps = "/".join(
-        sorted(set(comp for dtype in api_dtype for comp in api_dtype[dtype]))
-    )
+    total = sum(api_dtype[dtype][comp] for dtype in api_dtype for comp in api_dtype[dtype])
+    all_comps = "/".join(sorted({comp for dtype in api_dtype for comp in api_dtype[dtype]}))
 
     # 统计所有 comp 的模式
     api_stats_data.append(
@@ -210,9 +203,7 @@ for api in sorted(api_stats.keys()):
 
     for comp in sorted(comp_counts.keys()):
         comp_total = comp_counts[comp]
-        comp_dtypes = "/".join(
-            sorted(dtype for dtype in api_dtype if comp in api_dtype[dtype])
-        )
+        comp_dtypes = "/".join(sorted(dtype for dtype in api_dtype if comp in api_dtype[dtype]))
         api_stats_data.append(
             {
                 "API": api,

@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import collections
 import inspect
 
@@ -9,7 +11,7 @@ import yaml
 from .api_config import USE_CACHED_NUMPY, TensorConfig, cached_numpy
 from .api_config.log_writer import log_accuracy_tolerance
 
-with open("tester/base_config.yaml", "r", encoding="utf-8") as f:
+with open("tester/base_config.yaml", encoding="utf-8") as f:
     config = yaml.safe_load(f)
 
 forward_only_apis = frozenset(config.get("forward_only_apis", []))
@@ -22,7 +24,7 @@ single_op_no_signature_apis = frozenset(config.get("single_op_no_signature_apis"
 paddle_error_dismiss = config.get("paddle_error_dismiss", {})
 special_accuracy_atol_rtol = config.get("special_accuracy_atol_rtol", {})
 
-with open("tester/api_config/torch_error_skip.txt", "r") as f:
+with open("tester/api_config/torch_error_skip.txt") as f:
     torch_error_skip = frozenset(line.strip() for line in f if line.strip())
 
 del config
@@ -41,6 +43,7 @@ CUDA_OOM = frozenset(
     ]
 )
 
+
 def get_arg(api_config, arg_pos, arg_name, default=None):
     if 0 <= arg_pos < len(api_config.args):
         return api_config.args[arg_pos]
@@ -56,6 +59,7 @@ no_signature_api_mappings = {
     }
     for method in single_op_no_signature_apis
 }
+
 
 class APITestBase:
     def __init__(self, api_config):
@@ -80,34 +84,39 @@ class APITestBase:
             if isinstance(self.api_config.args[i], TensorConfig):
                 if self.api_config.args[i].dtype in ["float8_e5m2", "float8_e4m3fn"]:
                     return True
-            elif isinstance(self.api_config.args[i], list):
+            elif isinstance(self.api_config.args[i], list) or isinstance(
+                self.api_config.args[i], tuple
+            ):
                 for j in range(len(self.api_config.args[i])):
                     if isinstance(self.api_config.args[i][j], TensorConfig):
-                        if self.api_config.args[i][j].dtype in ["float8_e5m2", "float8_e4m3fn"]:
+                        if self.api_config.args[i][j].dtype in [
+                            "float8_e5m2",
+                            "float8_e4m3fn",
+                        ]:
                             return True
-            elif isinstance(self.api_config.args[i], tuple):
-                for j in range(len(self.api_config.args[i])):
-                    if isinstance(self.api_config.args[i][j], TensorConfig):
-                        if self.api_config.args[i][j].dtype in ["float8_e5m2", "float8_e4m3fn"]:
-                            return True
-            elif self.api_config.args[i] in [paddle.base.core.DataType.FLOAT8_E4M3FN, paddle.base.core.DataType.FLOAT8_E5M2, "float8_e5m2", "float8_e4m3fn"]:
+            elif self.api_config.args[i] in [
+                paddle.base.core.DataType.FLOAT8_E4M3FN,
+                paddle.base.core.DataType.FLOAT8_E5M2,
+                "float8_e5m2",
+                "float8_e4m3fn",
+            ]:
                 return True
 
-        for key, arg_config in self.api_config.kwargs.items():
+        for _key, arg_config in self.api_config.kwargs.items():
             if isinstance(arg_config, TensorConfig):
                 if arg_config.dtype in ["float8_e5m2", "float8_e4m3fn"]:
                     return True
-            elif isinstance(arg_config, list):
+            elif isinstance(arg_config, (list, tuple)):
                 for i in range(len(arg_config)):
                     if isinstance(arg_config[i], TensorConfig):
                         if arg_config[i].dtype in ["float8_e5m2", "float8_e4m3fn"]:
                             return True
-            elif isinstance(arg_config, tuple):
-                for i in range(len(arg_config)):
-                    if isinstance(arg_config[i], TensorConfig):
-                        if arg_config[i].dtype in ["float8_e5m2", "float8_e4m3fn"]:
-                            return True
-            elif arg_config in [paddle.base.core.DataType.FLOAT8_E4M3FN, paddle.base.core.DataType.FLOAT8_E5M2, "float8_e5m2", "float8_e4m3fn"]:
+            elif arg_config in [
+                paddle.base.core.DataType.FLOAT8_E4M3FN,
+                paddle.base.core.DataType.FLOAT8_E5M2,
+                "float8_e5m2",
+                "float8_e4m3fn",
+            ]:
                 return True
 
         return False
@@ -121,8 +130,7 @@ class APITestBase:
                 self.paddle_args_config[0], list
             )
             has_second_arg = (
-                len(self.paddle_args_config) > 1
-                and self.paddle_args_config[1] is not None
+                len(self.paddle_args_config) > 1 and self.paddle_args_config[1] is not None
             )
             if has_list_arg or has_second_arg:
                 return False
@@ -163,10 +171,7 @@ class APITestBase:
         self.paddle_merged_kwargs_config = collections.OrderedDict()
 
         api_name = self.api_config.api_name
-        if (
-            api_name == "paddle.Tensor.__getitem__"
-            or api_name == "paddle.Tensor.__setitem__"
-        ):
+        if api_name == "paddle.Tensor.__getitem__" or api_name == "paddle.Tensor.__setitem__":
             self.torch_args_config = self.api_config.args
             return True
 
@@ -190,13 +195,16 @@ class APITestBase:
 
         self.paddle_merged_kwargs_config = paddle_args_dict
         self.torch_kwargs_config.update(paddle_args_dict)
-        self.torch_kwargs_config.pop('name', None)
+        self.torch_kwargs_config.pop("name", None)
 
         return True
 
-    def _handle_list_or_tuple(self, config_items, is_tuple=False, index=None, key=None, list_index=[]):
-        """处理 list 或 tuple """
-
+    def _handle_list_or_tuple(
+        self, config_items, is_tuple=False, index=None, key=None, list_index=None
+    ):
+        """处理 list 或 tuple"""
+        if list_index is None:
+            list_index = []
         need_axes_handling = self.api_config.api_name in handle_axes_api
         need_indices_handling = self.api_config.api_name == "paddle.index_put"
 
@@ -207,22 +215,19 @@ class APITestBase:
 
         tmp = []
         for i, item in enumerate(config_items):
-            current_list_index = list_index + [i]
+            current_list_index = [*list_index, i]
             if isinstance(item, (list, tuple)):
                 is_nested_tuple = isinstance(item, tuple)
                 processed_item = self._handle_list_or_tuple(
-                    item, 
-                    is_tuple=is_nested_tuple, 
-                    index=index, 
-                    key=key, 
-                    list_index=current_list_index
+                    item,
+                    is_tuple=is_nested_tuple,
+                    index=index,
+                    key=key,
+                    list_index=current_list_index,
                 )
             elif isinstance(item, TensorConfig):
                 processed_item = item.get_numpy_tensor(
-                    self.api_config,
-                    index=index,
-                    key=key,
-                    list_index=current_list_index
+                    self.api_config, index=index, key=key, list_index=current_list_index
                 )
             else:
                 processed_item = item
@@ -231,8 +236,12 @@ class APITestBase:
 
     def _handle_axis_arg(self, config_items, is_tuple=False):
         """处理 axis 参数"""
-        x = self.paddle_args_config[0] if len(self.paddle_args_config) > 0 else self.paddle_kwargs_config["x"]
-        max_dim = max(len(x.shape), 1) # scalar
+        x = (
+            self.paddle_args_config[0]
+            if len(self.paddle_args_config) > 0
+            else self.paddle_kwargs_config["x"]
+        )
+        max_dim = max(len(x.shape), 1)  # scalar
 
         tmp = []
         used_axes = set()
@@ -241,9 +250,11 @@ class APITestBase:
         for item in config_items:
             if isinstance(item, TensorConfig):
                 if item.shape not in [[], [1]] or item.dtype not in ["int32", "int64"]:
-                    raise ValueError(f"Invalid TensorConfig for axis: shape {item.shape} or dtype {item.dtype}")
+                    raise ValueError(
+                        f"Invalid TensorConfig for axis: shape {item.shape} or dtype {item.dtype}"
+                    )
                 tensor_configs.append(item)
-                tmp.append(0) # placeholder
+                tmp.append(0)  # placeholder
             elif isinstance(item, int):
                 if not (-max_dim <= item < max_dim):
                     raise ValueError(f"Axis value {item} out of range [-{max_dim}, {max_dim})")
@@ -258,8 +269,12 @@ class APITestBase:
         if tensor_configs:
             available_dims = list(set(range(max_dim)) - used_axes)
             if len(available_dims) < len(tensor_configs):
-                raise ValueError(f"Not enough available dimensions ({len(available_dims)}) for {len(tensor_configs)} TensorConfig items")
-            selected_dims = numpy.random.choice(available_dims, size=len(tensor_configs), replace=False)
+                raise ValueError(
+                    f"Not enough available dimensions ({len(available_dims)}) for {len(tensor_configs)} TensorConfig items"
+                )
+            selected_dims = numpy.random.choice(
+                available_dims, size=len(tensor_configs), replace=False
+            )
             mask = numpy.random.randint(0, 2, size=len(tensor_configs)).astype(bool)
             final_dims = numpy.where(mask, selected_dims - max_dim, selected_dims)
             tensor_idx = 0
@@ -273,13 +288,9 @@ class APITestBase:
     def _generate_int_indices(self, item_shape, dim_size):
         num_elements = numpy.prod(item_shape).item()
         if num_elements > dim_size:
-            indices_flat = numpy.random.randint(
-                -dim_size, dim_size, size=num_elements
-            )
+            indices_flat = numpy.random.randint(-dim_size, dim_size, size=num_elements)
         else:
-            indices_flat = numpy.random.choice(
-                dim_size, size=num_elements, replace=False
-            )
+            indices_flat = numpy.random.choice(dim_size, size=num_elements, replace=False)
         return indices_flat.reshape(item_shape)
 
     def _generate_constrained_bool_mask(self, shape, num_true):
@@ -338,7 +349,10 @@ class APITestBase:
                     and advanced_shape[-1] == 1
                     and value_shape[-num_remaining_dims - 1] != 1
                 ):
-                    advanced_shape = (*advanced_shape[:-1], value_shape[-num_remaining_dims - 1])
+                    advanced_shape = (
+                        *advanced_shape[:-1],
+                        value_shape[-num_remaining_dims - 1],
+                    )
                 num_true_needed = advanced_shape[-1]
             except Exception:
                 raise ValueError(
@@ -380,7 +394,7 @@ class APITestBase:
 
             processed_indices.append(item.numpy_tensor)
 
-        return tuple(processed_indices) if is_tuple else processed_indices       
+        return tuple(processed_indices) if is_tuple else processed_indices
 
     def gen_numpy_input(self):
         for i, arg_config in enumerate(self.paddle_args_config):
@@ -398,14 +412,12 @@ class APITestBase:
         return True
 
     def _handle_list_or_tuple_paddle(self, config_items, is_tuple=False):
-        """处理 list 或 tuple """
+        """处理 list 或 tuple"""
         tmp = []
         for item in config_items:
             if isinstance(item, (list, tuple)):
                 is_nested_tuple = isinstance(item, tuple)
-                processed_item = self._handle_list_or_tuple_paddle(
-                    item, 
-                    is_tuple=is_nested_tuple)
+                processed_item = self._handle_list_or_tuple_paddle(item, is_tuple=is_nested_tuple)
             elif isinstance(item, TensorConfig):
                 processed_item = item.get_paddle_tensor(self.api_config)
                 item.clear_paddle_tensor()
@@ -415,12 +427,10 @@ class APITestBase:
         return tuple(tmp) if is_tuple else tmp
 
     def gen_paddle_input(self):
-        """
-        generate paddle input by config, for tensor config initlize paddle tensor by get_paddle_tensor()
-        
+        """Generate paddle input by config, for tensor config initlize paddle tensor by get_paddle_tensor()
+
         be sure to call gen_numpy_input() before use gen_paddle_input() since gen_paddle_input() do not pass index or key to get_paddle_tensor() or get_numpy_tensor() while gen_numpy_input() pass.
         """
-
         self.paddle_args = []
         self.paddle_kwargs = collections.OrderedDict()
         self.paddle_merged_kwargs = collections.OrderedDict()
@@ -448,7 +458,10 @@ class APITestBase:
         if len(self.paddle_args) == 0 and self.api_config.api_name.startswith("paddle.Tensor."):
             self.paddle_args.append(self.paddle_kwargs.popitem(last=False)[1])
 
-        if self.api_config.api_name == "paddle.linalg.lstsq" and 'gpu' in paddle.device.get_device():
+        if (
+            self.api_config.api_name == "paddle.linalg.lstsq"
+            and "gpu" in paddle.device.get_device()
+        ):
             if len(self.paddle_args) > 3:
                 self.paddle_args[3] = "gels"
             elif "driver" in self.paddle_kwargs:
@@ -458,18 +471,23 @@ class APITestBase:
             if not use_softmax:
                 axis = get_arg(self.api_config, 7, "axis", -1)
                 if len(self.paddle_args) > 0:
-                    self.paddle_args[0] = paddle.nn.functional.softmax(self.paddle_args[0], axis=axis)
+                    self.paddle_args[0] = paddle.nn.functional.softmax(
+                        self.paddle_args[0], axis=axis
+                    )
                 else:
-                    self.paddle_kwargs["input"] = paddle.nn.functional.softmax(self.paddle_kwargs["input"], axis=axis)
+                    self.paddle_kwargs["input"] = paddle.nn.functional.softmax(
+                        self.paddle_kwargs["input"], axis=axis
+                    )
 
-        if self.need_check_grad():
-            if (self.api_config.api_name[-1] == "_" and self.api_config.api_name[-2:] != "__") or self.api_config.api_name == "paddle.Tensor.__setitem__":
-                self.paddle_args, self.paddle_kwargs = self.copy_paddle_input()
+        if self.need_check_grad() and (
+            (self.api_config.api_name[-1] == "_" and self.api_config.api_name[-2:] != "__")
+            or self.api_config.api_name == "paddle.Tensor.__setitem__"
+        ):
+            self.paddle_args, self.paddle_kwargs = self.copy_paddle_input()
 
         return True
 
     def copy_paddle_input(self):
-
         def _deep_copy(data):
             if isinstance(data, paddle.Tensor):
                 return paddle.assign(data)
@@ -478,9 +496,7 @@ class APITestBase:
             return data
 
         args = [_deep_copy(arg) for arg in self.paddle_args]
-        kwargs = collections.OrderedDict(
-            (k, _deep_copy(v)) for k, v in self.paddle_kwargs.items()
-        )
+        kwargs = collections.OrderedDict((k, _deep_copy(v)) for k, v in self.paddle_kwargs.items())
         return args, kwargs
 
     def get_paddle_input_list(self):
@@ -501,17 +517,13 @@ class APITestBase:
                     if isinstance(value, paddle.Tensor):
                         result.append(value)
                     elif isinstance(value, (tuple, list)):
-                        result.extend(
-                            item for item in value if isinstance(item, paddle.Tensor)
-                        )
+                        result.extend(item for item in value if isinstance(item, paddle.Tensor))
         else:  #  paddle_only
             for key, value in self.paddle_kwargs.items():
                 if isinstance(value, paddle.Tensor):
                     result.append(value)
                 elif isinstance(value, (tuple, list)):
-                    result.extend(
-                        item for item in value if isinstance(item, paddle.Tensor)
-                    )
+                    result.extend(item for item in value if isinstance(item, paddle.Tensor))
 
         return result
 
@@ -525,7 +537,7 @@ class APITestBase:
                     if isinstance(item, torch.Tensor):
                         result.append(item)
 
-        for key, value in self.torch_kwargs.items():
+        for _key, value in self.torch_kwargs.items():
             if isinstance(value, torch.Tensor):
                 result.append(value)
             elif isinstance(value, (tuple, list)):
@@ -543,14 +555,16 @@ class APITestBase:
 
         start = (4300000000 - numel - 100) if (4300000000 - numel - 100) > 0 else 0
         if dtype in cached_numpy:
-            tensor = cached_numpy[dtype][start:start+numel].reshape(shape)
+            tensor = cached_numpy[dtype][start : start + numel].reshape(shape)
         else:
             if "int" in dtype:
-                cached_numpy[dtype] = numpy.random.randint(-65535, 65535, size=4300000000, dtype="int64").astype(dtype)
-                tensor = cached_numpy[dtype][start:start+numel].reshape(shape)
+                cached_numpy[dtype] = numpy.random.randint(
+                    -65535, 65535, size=4300000000, dtype="int64"
+                ).astype(dtype)
+                tensor = cached_numpy[dtype][start : start + numel].reshape(shape)
             else:
                 cached_numpy[dtype] = (numpy.random.random([4300000000]) - 0.5).astype(dtype)
-                tensor = cached_numpy[dtype][start:start+numel].reshape(shape)
+                tensor = cached_numpy[dtype][start : start + numel].reshape(shape)
         return tensor
 
     def gen_paddle_output_and_output_grad(self, outputs):
@@ -564,8 +578,9 @@ class APITestBase:
                 if isinstance(output, paddle.Tensor)
                 and (output._is_initialized() or output.numel() == 0)
             ]
-        elif isinstance(outputs, paddle.autograd.autograd.Hessian) or \
-                isinstance(outputs, paddle.autograd.autograd.Jacobian):
+        elif isinstance(
+            outputs, (paddle.autograd.autograd.Hessian, paddle.autograd.autograd.Jacobian)
+        ):
             result_outputs.append(outputs[:])
         elif isinstance(outputs, tuple):
             for output in outputs:
@@ -580,12 +595,18 @@ class APITestBase:
                     for item in output:
                         if isinstance(item, paddle.Tensor):
                             result_outputs.append(item)
-                elif isinstance(output, paddle.autograd.autograd.Hessian) or \
-                        isinstance(output, paddle.autograd.autograd.Jacobian):
+                elif isinstance(
+                    output, (paddle.autograd.autograd.Hessian, paddle.autograd.autograd.Jacobian)
+                ):
                     result_outputs.extend(output[:])
-                elif isinstance(output, tuple) and len(output) > 0 and \
-                        (isinstance(output[0], paddle.autograd.autograd.Hessian) or \
-                        isinstance(output[0], paddle.autograd.autograd.Jacobian)):
+                elif (
+                    isinstance(output, tuple)
+                    and len(output) > 0
+                    and (
+                        isinstance(output[0], paddle.autograd.autograd.Hessian)
+                        or isinstance(output[0], paddle.autograd.autograd.Jacobian)
+                    )
+                ):
                     for lazy_obj in output:
                         result_outputs.append(lazy_obj[:])
                 else:
@@ -600,7 +621,9 @@ class APITestBase:
                     numpy_tensor = self.get_cached_numpy(dtype, output.shape)
                 else:
                     if "int" in dtype:
-                        numpy_tensor = (numpy.random.randint(-65535, 65535, size=output.shape)).astype(dtype)
+                        numpy_tensor = (
+                            numpy.random.randint(-65535, 65535, size=output.shape)
+                        ).astype(dtype)
                     else:
                         dtype = "float32" if dtype == "bfloat16" else dtype
                         numpy_tensor = (numpy.random.random(output.shape) - 0.5).astype(dtype)
@@ -643,7 +666,9 @@ class APITestBase:
                     numpy_tensor = self.get_cached_numpy(dtype, output.shape)
                 else:
                     if "int" in dtype:
-                        numpy_tensor = (numpy.random.randint(-65535, 65535, size=output.shape)).astype(dtype)
+                        numpy_tensor = (
+                            numpy.random.randint(-65535, 65535, size=output.shape)
+                        ).astype(dtype)
                     else:
                         dtype = "float32" if dtype == "bfloat16" else dtype
                         numpy_tensor = (numpy.random.random(output.shape) - 0.5).astype(dtype)
@@ -653,7 +678,7 @@ class APITestBase:
             result_output_grad = torch.tensor(
                 numpy_tensor,
                 dtype=self.convert_dtype_to_torch_type(dtype)
-                if dtype != 'bfloat16'
+                if dtype != "bfloat16"
                 else torch.float32,
             )
             if dtype == "bfloat16":
@@ -663,34 +688,102 @@ class APITestBase:
 
     def convert_dtype_to_torch_type(self, dtype):
         # for python built-in types, mappings are int -> torch.int64, bool -> torch.bool, float -> torch.float64, complex -> torch.complex128, None -> None
-        if dtype in ['float32', numpy.float32, paddle.float32, paddle.base.libpaddle.VarDesc.VarType.FP32]:
+        if dtype in [
+            "float32",
+            numpy.float32,
+            paddle.float32,
+            paddle.base.libpaddle.VarDesc.VarType.FP32,
+        ]:
             return torch.float32
-        elif dtype in ['float16', numpy.float16, paddle.float16, paddle.base.libpaddle.VarDesc.VarType.FP16]:
+        elif dtype in [
+            "float16",
+            numpy.float16,
+            paddle.float16,
+            paddle.base.libpaddle.VarDesc.VarType.FP16,
+        ]:
             return torch.float16
-        elif dtype in ['float64', 'float', 'double', numpy.float64, paddle.float64, paddle.base.libpaddle.VarDesc.VarType.FP64, float]:
+        elif dtype in [
+            "float64",
+            "float",
+            "double",
+            numpy.float64,
+            paddle.float64,
+            paddle.base.libpaddle.VarDesc.VarType.FP64,
+            float,
+        ]:
             return torch.float64
-        elif dtype in ['int16', numpy.int16, paddle.int16, paddle.base.libpaddle.VarDesc.VarType.INT16]:
+        elif dtype in [
+            "int16",
+            numpy.int16,
+            paddle.int16,
+            paddle.base.libpaddle.VarDesc.VarType.INT16,
+        ]:
             return torch.int16
-        elif dtype in ['int8', numpy.int8, paddle.int8, paddle.base.libpaddle.VarDesc.VarType.INT8]:
+        elif dtype in [
+            "int8",
+            numpy.int8,
+            paddle.int8,
+            paddle.base.libpaddle.VarDesc.VarType.INT8,
+        ]:
             return torch.int8
-        elif dtype in ['bool', numpy.bool_, paddle.bool, paddle.base.libpaddle.VarDesc.VarType.BOOL, bool]:
+        elif dtype in [
+            "bool",
+            numpy.bool_,
+            paddle.bool,
+            paddle.base.libpaddle.VarDesc.VarType.BOOL,
+            bool,
+        ]:
             return torch.bool
-        elif dtype in ['bfloat16','uint16', numpy.uint16, paddle.bfloat16, paddle.base.libpaddle.VarDesc.VarType.BF16]:
+        elif dtype in [
+            "bfloat16",
+            "uint16",
+            numpy.uint16,
+            paddle.bfloat16,
+            paddle.base.libpaddle.VarDesc.VarType.BF16,
+        ]:
             return torch.bfloat16
-        elif dtype in ['uint8', numpy.uint8, paddle.uint8, paddle.base.libpaddle.VarDesc.VarType.UINT8]:
+        elif dtype in [
+            "uint8",
+            numpy.uint8,
+            paddle.uint8,
+            paddle.base.libpaddle.VarDesc.VarType.UINT8,
+        ]:
             return torch.uint8
-        elif dtype in ['int32', numpy.int32, paddle.int32, paddle.base.libpaddle.VarDesc.VarType.INT32]:
+        elif dtype in [
+            "int32",
+            numpy.int32,
+            paddle.int32,
+            paddle.base.libpaddle.VarDesc.VarType.INT32,
+        ]:
             return torch.int32
-        elif dtype in ['int64', "int", numpy.int64, paddle.int64, paddle.base.libpaddle.VarDesc.VarType.INT64, int]:
+        elif dtype in [
+            "int64",
+            "int",
+            numpy.int64,
+            paddle.int64,
+            paddle.base.libpaddle.VarDesc.VarType.INT64,
+            int,
+        ]:
             return torch.int64
-        elif dtype in ['complex64', numpy.complex64, paddle.complex64, paddle.base.libpaddle.VarDesc.VarType.COMPLEX64]:
+        elif dtype in [
+            "complex64",
+            numpy.complex64,
+            paddle.complex64,
+            paddle.base.libpaddle.VarDesc.VarType.COMPLEX64,
+        ]:
             return torch.complex64
-        elif dtype in ['complex128', numpy.complex128, paddle.complex128, paddle.base.libpaddle.VarDesc.VarType.COMPLEX128, complex]:
+        elif dtype in [
+            "complex128",
+            numpy.complex128,
+            paddle.complex128,
+            paddle.base.libpaddle.VarDesc.VarType.COMPLEX128,
+            complex,
+        ]:
             return torch.complex128
         elif dtype is None:
             return None
         else:
-            raise ValueError(f'Unsupport dtype: {dtype}')
+            raise ValueError(f"Unsupport dtype: {dtype}")
 
     def gen_paddle_input_with_merged_kwargs(self):
         self.paddle_args = []
@@ -699,7 +792,9 @@ class APITestBase:
 
         for i in range(len(self.paddle_args_config)):
             if isinstance(self.paddle_args_config[i], TensorConfig):
-                self.paddle_args.append(self.paddle_args_config[i].get_paddle_tensor(self.api_config))
+                self.paddle_args.append(
+                    self.paddle_args_config[i].get_paddle_tensor(self.api_config)
+                )
             elif isinstance(self.paddle_args_config[i], list):
                 tmp = []
                 for j in range(len(self.paddle_args_config[i])):
@@ -765,7 +860,6 @@ class APITestBase:
         return True
 
     def copy_torch_input(self):
-
         def _deep_copy(data):
             if isinstance(data, torch.Tensor):
                 return torch.clone(data)
@@ -774,20 +868,16 @@ class APITestBase:
             return data
 
         args = [_deep_copy(arg) for arg in self.torch_args]
-        kwargs = collections.OrderedDict(
-            (k, _deep_copy(v)) for k, v in self.torch_kwargs.items()
-        )
+        kwargs = collections.OrderedDict((k, _deep_copy(v)) for k, v in self.torch_kwargs.items())
         return args, kwargs
 
     def _handle_list_or_tuple_torch(self, config_items, is_tuple=False):
-        """处理 list 或 tuple """
+        """处理 list 或 tuple"""
         tmp = []
         for item in config_items:
             if isinstance(item, (list, tuple)):
                 is_nested_tuple = isinstance(item, tuple)
-                processed_item = self._handle_list_or_tuple_torch(
-                    item, 
-                    is_tuple=is_nested_tuple)
+                processed_item = self._handle_list_or_tuple_torch(item, is_tuple=is_nested_tuple)
             elif isinstance(item, TensorConfig):
                 processed_item = item.get_torch_tensor(self.api_config)
                 item.clear_torch_tensor()
@@ -797,12 +887,10 @@ class APITestBase:
         return tuple(tmp) if is_tuple else tmp
 
     def gen_torch_input(self):
-        """
-        generate torch input by config, for tensor config initlize torch tensor by get_torch_tensor()
-        
+        """Generate torch input by config, for tensor config initlize torch tensor by get_torch_tensor()
+
         be sure to call gen_numpy_input() before use gen_torch_input() since gen_torch_input() do not pass index or key to get_torch_tensor() or get_numpy_tensor() while gen_numpy_input() pass.
         """
-
         self.torch_args = []
         self.torch_kwargs = collections.OrderedDict()
         for arg_config in self.torch_args_config:
@@ -812,7 +900,7 @@ class APITestBase:
             elif isinstance(arg_config, (list, tuple)):
                 is_tuple = isinstance(arg_config, tuple)
                 self.torch_args.append(self._handle_list_or_tuple_torch(arg_config, is_tuple))
-            elif isinstance(arg_config, paddle.dtype) or isinstance(arg_config, paddle.base.libpaddle.VarDesc.VarType):
+            elif isinstance(arg_config, (paddle.dtype, paddle.base.libpaddle.VarDesc.VarType)):
                 self.torch_args.append(self.convert_dtype_to_torch_type(arg_config))
             else:
                 self.torch_args.append(arg_config)
@@ -824,14 +912,19 @@ class APITestBase:
             elif isinstance(arg_config, (list, tuple)):
                 is_tuple = isinstance(arg_config, tuple)
                 self.torch_kwargs[key] = self._handle_list_or_tuple_torch(arg_config, is_tuple)
-            elif isinstance(arg_config, paddle.dtype) or isinstance(arg_config, paddle.base.libpaddle.VarDesc.VarType) or key == "dtype":
+            elif (
+                isinstance(arg_config, (paddle.dtype, paddle.base.libpaddle.VarDesc.VarType))
+                or key == "dtype"
+            ):
                 self.torch_kwargs[key] = self.convert_dtype_to_torch_type(arg_config)
             else:
                 self.torch_kwargs[key] = arg_config
 
-        if self.need_check_grad():
-            if (self.api_config.api_name[-1] == "_" and self.api_config.api_name[-2:] != "__") or self.api_config.api_name == "paddle.Tensor.__setitem__":
-                self.torch_args, self.torch_kwargs = self.copy_torch_input()
+        if self.need_check_grad() and (
+            (self.api_config.api_name[-1] == "_" and self.api_config.api_name[-2:] != "__")
+            or self.api_config.api_name == "paddle.Tensor.__setitem__"
+        ):
+            self.torch_args, self.torch_kwargs = self.copy_torch_input()
 
         torch.cuda.empty_cache()
         return True
@@ -865,11 +958,11 @@ class APITestBase:
             expected_paddle_tensor = expected_paddle_tensor.contiguous()
         expected_paddle_tensor = expected_paddle_tensor.cpu().detach()
 
-        actual_paddle_dlpack = paddle.utils.dlpack.to_dlpack(actual_paddle_tensor)  # type: ignore
-        converted_actual_paddle_tensor = torch.utils.dlpack.from_dlpack(actual_paddle_dlpack)  # type: ignore
+        actual_paddle_dlpack = paddle.utils.dlpack.to_dlpack(actual_paddle_tensor)  # type: ignore[reportGeneralTypeIssues]
+        torch.utils.dlpack.from_dlpack(actual_paddle_dlpack)  # type: ignore[reportGeneralTypeIssues]
 
-        expected_paddle_dlpack = paddle.utils.dlpack.to_dlpack(expected_paddle_tensor)  # type: ignore
-        converted_paddle_tensor = torch.utils.dlpack.from_dlpack(expected_paddle_dlpack)  # type: ignore
+        expected_paddle_dlpack = paddle.utils.dlpack.to_dlpack(expected_paddle_tensor)  # type: ignore[reportGeneralTypeIssues]
+        converted_paddle_tensor = torch.utils.dlpack.from_dlpack(expected_paddle_dlpack)  # type: ignore[reportGeneralTypeIssues]
 
         def error_msg(msg):
             return (
@@ -880,6 +973,7 @@ class APITestBase:
                 f"DESIRED: (shape={converted_paddle_tensor.shape}, dtype={converted_paddle_tensor.dtype})\n"
                 f"{converted_paddle_tensor}"
             )
+
         bitwise_alignment = getattr(self, "bitwise_alignment", False)
         if not bitwise_alignment and self.api_config.api_name in special_accuracy_atol_rtol:
             atol, rtol = special_accuracy_atol_rtol[self.api_config.api_name]
@@ -897,7 +991,7 @@ class APITestBase:
         except Exception as e:
             error_str = str(e)
             if error_str.startswith("Comparing"):
-                print(f"torch_assert failed, try np_assert", flush=True)
+                print("torch_assert failed, try np_assert", flush=True)
                 self.np_assert_accuracy(
                     actual_paddle_tensor.numpy(),
                     expected_paddle_tensor.numpy(),
@@ -918,8 +1012,8 @@ class APITestBase:
             torch_tensor = torch_tensor.contiguous()
         torch_tensor = torch_tensor.cpu().detach()
 
-        paddle_dlpack = paddle.utils.dlpack.to_dlpack(paddle_tensor)  # type: ignore
-        converted_paddle_tensor = torch.utils.dlpack.from_dlpack(paddle_dlpack)  # type: ignore
+        paddle_dlpack = paddle.utils.dlpack.to_dlpack(paddle_tensor)  # type: ignore[reportGeneralTypeIssues]
+        converted_paddle_tensor = torch.utils.dlpack.from_dlpack(paddle_dlpack)  # type: ignore[reportGeneralTypeIssues]
 
         def error_msg(msg):
             return (
@@ -930,8 +1024,9 @@ class APITestBase:
                 f"DESIRED: (shape={torch_tensor.shape}, dtype={torch_tensor.dtype})\n"
                 f"{torch_tensor}"
             )
+
         bitwise_alignment = getattr(self, "bitwise_alignment", False)
-        
+
         if not bitwise_alignment and self.api_config.api_name in special_accuracy_atol_rtol:
             atol, rtol = special_accuracy_atol_rtol[self.api_config.api_name]
         test_tol = getattr(self, "test_tol", False)
@@ -961,7 +1056,7 @@ class APITestBase:
         except Exception as e:
             error_str = str(e)
             if error_str.startswith("Comparing"):
-                print(f"torch_assert failed, try np_assert", flush=True)
+                print("torch_assert failed, try np_assert", flush=True)
                 self.np_assert_accuracy(
                     paddle_tensor.numpy(),
                     torch_tensor.numpy(),
@@ -969,12 +1064,9 @@ class APITestBase:
                     rtol,
                 )
             elif test_tol:
-                error_info = (
-                    error_str.split("\n", maxsplit=2)[1] if "\n" in error_str else None
-                )
+                error_info = error_str.split("\n", maxsplit=2)[1] if "\n" in error_str else None
                 if error_info and (
-                    error_info.startswith("Tensor-likes")
-                    or error_info.startswith("Scalars")
+                    error_info.startswith("Tensor-likes") or error_info.startswith("Scalars")
                 ):
                     api_name = self.api_config.api_name
                     config = self.api_config.config[:120000]
@@ -994,14 +1086,10 @@ class APITestBase:
     def clear_tensor(self):
         if not hasattr(self, "torch_kwargs_config"):
             return
-        for key, arg_config in self.torch_kwargs_config.items():
+        for _key, arg_config in self.torch_kwargs_config.items():
             if isinstance(arg_config, TensorConfig):
                 arg_config.clear_tensor()
-            elif isinstance(arg_config, list):
-                for i in range(len(arg_config)):
-                    if isinstance(arg_config[i], TensorConfig):
-                        arg_config[i].clear_tensor()
-            elif isinstance(arg_config, tuple):
+            elif isinstance(arg_config, (list, tuple)):
                 for i in range(len(arg_config)):
                     if isinstance(arg_config[i], TensorConfig):
                         arg_config[i].clear_tensor()
@@ -1011,14 +1099,10 @@ class APITestBase:
     def clear_paddle_tensor(self):
         if not hasattr(self, "torch_kwargs_config"):
             return
-        for key, arg_config in self.torch_kwargs_config.items():
+        for _key, arg_config in self.torch_kwargs_config.items():
             if isinstance(arg_config, TensorConfig):
                 arg_config.clear_paddle_tensor()
-            elif isinstance(arg_config, list):
-                for i in range(len(arg_config)):
-                    if isinstance(arg_config[i], TensorConfig):
-                        arg_config[i].clear_paddle_tensor()
-            elif isinstance(arg_config, tuple):
+            elif isinstance(arg_config, (list, tuple)):
                 for i in range(len(arg_config)):
                     if isinstance(arg_config[i], TensorConfig):
                         arg_config[i].clear_paddle_tensor()
@@ -1027,14 +1111,10 @@ class APITestBase:
     def clear_torch_tensor(self):
         if not hasattr(self, "torch_kwargs_config"):
             return
-        for key, arg_config in self.torch_kwargs_config.items():
+        for _key, arg_config in self.torch_kwargs_config.items():
             if isinstance(arg_config, TensorConfig):
                 arg_config.clear_torch_tensor()
-            elif isinstance(arg_config, list):
-                for i in range(len(arg_config)):
-                    if isinstance(arg_config[i], TensorConfig):
-                        arg_config[i].clear_torch_tensor()
-            elif isinstance(arg_config, tuple):
+            elif isinstance(arg_config, (list, tuple)):
                 for i in range(len(arg_config)):
                     if isinstance(arg_config[i], TensorConfig):
                         arg_config[i].clear_torch_tensor()
@@ -1043,20 +1123,16 @@ class APITestBase:
     def clear_numpy_tensor(self):
         if not hasattr(self, "torch_kwargs_config"):
             return
-        for key, arg_config in self.torch_kwargs_config.items():
+        for _key, arg_config in self.torch_kwargs_config.items():
             if isinstance(arg_config, TensorConfig):
                 arg_config.clear_numpy_tensor()
-            elif isinstance(arg_config, list):
-                for i in range(len(arg_config)):
-                    if isinstance(arg_config[i], TensorConfig):
-                        arg_config[i].clear_numpy_tensor()
-            elif isinstance(arg_config, tuple):
+            elif isinstance(arg_config, (list, tuple)):
                 for i in range(len(arg_config)):
                     if isinstance(arg_config[i], TensorConfig):
                         arg_config[i].clear_numpy_tensor()
 
     def is_forward_only(self):
-        api = self.api_config.api_name[self.api_config.api_name.rindex(".")+1:]
+        api = self.api_config.api_name[self.api_config.api_name.rindex(".") + 1 :]
         return api in forward_only_apis
 
     def should_ignore_paddle_error(self, error_msg):

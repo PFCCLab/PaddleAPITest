@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import abc
 import functools
 import importlib
@@ -6,7 +8,7 @@ import os
 import pkgutil
 import traceback
 import types
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Set, Tuple, Union
+from typing import TYPE_CHECKING, Any
 
 import torch
 import yaml
@@ -21,9 +23,9 @@ class TracingHook(abc.ABC):
 
     def __init__(
         self,
-        serializer: "ConfigSerializer",
+        serializer: ConfigSerializer,
         level: int,
-        dialect: Optional["FrameworkDialect"] = None,
+        dialect: FrameworkDialect | None = None,
     ):
         self.serializer = serializer
         self.level = level
@@ -42,17 +44,15 @@ class TracingHook(abc.ABC):
 class SetattrHook(TracingHook):
     def __init__(
         self,
-        serializer: "ConfigSerializer",
+        serializer: ConfigSerializer,
         level: int,
-        dialect: "FrameworkDialect",
+        dialect: FrameworkDialect,
     ):
         super().__init__(serializer, level, dialect)
-        self._original_apis: Dict[str, Any] = {}
-        self._module_cache: Dict[str, Any] = {}
+        self._original_apis: dict[str, Any] = {}
+        self._module_cache: dict[str, Any] = {}
 
-    def _get_api_parent_and_name(
-        self, api_name: str
-    ) -> Tuple[Optional[Any], Optional[str]]:
+    def _get_api_parent_and_name(self, api_name: str) -> tuple[Any | None, str | None]:
         parts = api_name.split(".")
         if len(parts) < 2:
             return None, None
@@ -78,7 +78,7 @@ class SetattrHook(TracingHook):
     def _create_wrapper(
         api_name: str,
         original_api: Any,
-        serializer: "ConfigSerializer",
+        serializer: ConfigSerializer,
         level: int,
     ):
         @torch.compiler.disable  # disable this in low version of torch
@@ -133,11 +133,7 @@ class SetattrHook(TracingHook):
                         api_name, original_func, self.serializer, self.level
                     )
                     wrapper = type(original_api)(wrapped_func)
-                elif (
-                    isinstance(original_api, property)
-                    and original_api.fget
-                    and original_api.fset
-                ):
+                elif isinstance(original_api, property) and original_api.fget and original_api.fset:
                     wrapped_getter = self._create_wrapper(
                         f"{api_name}.fget",
                         original_api.fget,
@@ -195,9 +191,7 @@ class SetattrHook(TracingHook):
 
 
 class TorchFunctionModeTracer(torch.overrides.TorchFunctionMode):
-    def __init__(
-        self, serializer: "ConfigSerializer", level: int, dialect: "FrameworkDialect"
-    ):
+    def __init__(self, serializer: ConfigSerializer, level: int, dialect: FrameworkDialect):
         self.serializer = serializer
         self.level = level
         self.disable_torch_api_list = getattr(dialect, "disable_torch_api_list", False)
@@ -226,7 +220,9 @@ class TorchFunctionModeTracer(torch.overrides.TorchFunctionMode):
             if hasattr(func, "__module__"):
                 api_name = f"{func.__module__}.{func.__name__}"
             elif hasattr(func, "__objclass__"):
-                api_name = f"{func.__objclass__.__module__}.{func.__objclass__.__name__}.{func.__name__}"
+                api_name = (
+                    f"{func.__objclass__.__module__}.{func.__objclass__.__name__}.{func.__name__}"
+                )
             else:
                 api_name = f"unknown.{func.__name__}"
                 print(f"Unknown func: {func}, type: {type(func)}")
@@ -237,14 +233,12 @@ class TorchFunctionModeTracer(torch.overrides.TorchFunctionMode):
 
 
 class TorchFunctionHook(TracingHook):
-    def __init__(
-        self, serializer: "ConfigSerializer", level: int, dialect: "FrameworkDialect"
-    ):
+    def __init__(self, serializer: ConfigSerializer, level: int, dialect: FrameworkDialect):
         super().__init__(serializer, level, dialect)
         self.tracing_mode = TorchFunctionModeTracer(serializer, level, dialect)
 
     def install(self):
-        print(f"[TorchFunctionHook] Enabling __torch_function__ tracing mode...")
+        print("[TorchFunctionHook] Enabling __torch_function__ tracing mode...")
         self.tracing_mode.__enter__()
         print("[TorchFunctionHook] Mode enabled.")
 
@@ -255,9 +249,7 @@ class TorchFunctionHook(TracingHook):
 
 
 class TorchDispatchModeTracer(TorchDispatchMode):
-    def __init__(
-        self, serializer: "ConfigSerializer", level: int, dialect: "FrameworkDialect"
-    ):
+    def __init__(self, serializer: ConfigSerializer, level: int, dialect: FrameworkDialect):
         self.serializer = serializer
         self.level = level
         self.disable_torch_api_list = getattr(dialect, "disable_torch_api_list", False)
@@ -274,14 +266,12 @@ class TorchDispatchModeTracer(TorchDispatchMode):
 
 
 class TorchDispatchHook(TracingHook):
-    def __init__(
-        self, serializer: "ConfigSerializer", level: int, dialect: "FrameworkDialect"
-    ):
+    def __init__(self, serializer: ConfigSerializer, level: int, dialect: FrameworkDialect):
         super().__init__(serializer, level, dialect)
         self.tracing_mode = TorchDispatchModeTracer(serializer, level, dialect)
 
     def install(self):
-        print(f"[TorchDispatchHook] Enabling __torch_dispatch__ tracing mode...")
+        print("[TorchDispatchHook] Enabling __torch_dispatch__ tracing mode...")
         self.tracing_mode.__enter__()
         print("[TorchDispatchHook] Mode enabled.")
 
@@ -299,16 +289,16 @@ class FrameworkDialect(abc.ABC):
         """返回框架名称"""
         raise NotImplementedError
 
-    def discover_apis(self) -> List[str]:
+    def discover_apis(self) -> list[str]:
         """返回框架API列表"""
         return []
 
-    def discover_custom_ops(self) -> List[str]:
+    def discover_custom_ops(self) -> list[str]:
         """返回自定义算子API列表"""
         return []
 
     @abc.abstractmethod
-    def serialize_special_type(self, item: Any) -> Optional[Dict]:
+    def serialize_special_type(self, item: Any) -> dict | None:
         """序列化框架所特有的数据类型"""
         raise NotImplementedError
 
@@ -319,13 +309,13 @@ class FrameworkDialect(abc.ABC):
 
     @abc.abstractmethod
     def get_hooks(
-        self, serializer: "ConfigSerializer", level: Union[int, List[int]], **kwargs
-    ) -> List[TracingHook]:
+        self, serializer: ConfigSerializer, level: int | list[int], **kwargs
+    ) -> list[TracingHook]:
         """获取跟踪钩子, 用于在API调用时进行记录"""
         raise NotImplementedError
 
     @classmethod
-    def get_dialect(cls, framework_name: str) -> "FrameworkDialect":
+    def get_dialect(cls, framework_name: str) -> FrameworkDialect:
         dialect_map = {"torch": PyTorchDialect}
         dialect_class = dialect_map.get(framework_name)
         if not dialect_class:
@@ -472,24 +462,19 @@ class PyTorchDialect(FrameworkDialect):
         return "torch"
 
     # Only takes effect in SetattrHook
-    def discover_apis(self) -> List[str]:
+    def discover_apis(self) -> list[str]:
         """使用pkgutil遍历torch包"""
-        print(
-            f"[{self.__class__.__name__}] Discovering APIs for '{self.get_framework_name()}'..."
-        )
+        print(f"[{self.__class__.__name__}] Discovering APIs for '{self.get_framework_name()}'...")
 
         base_module = importlib.import_module(self.get_framework_name())
-        api_set: Set[str] = set()
+        api_set: set[str] = set()
         modules = {base_module}
 
         if hasattr(base_module, "__path__"):
             for module_info in pkgutil.walk_packages(
                 base_module.__path__, prefix=base_module.__name__ + "."
             ):
-                if any(
-                    module_info.name.startswith(pattern)
-                    for pattern in self.MODULE_BLACKLIST
-                ):
+                if any(module_info.name.startswith(pattern) for pattern in self.MODULE_BLACKLIST):
                     # print(
                     #     f"[Discovery Info] Skipping blacklisted module: {module_info.name}"
                     # )
@@ -503,9 +488,7 @@ class PyTorchDialect(FrameworkDialect):
                     )
                     continue
 
-        print(
-            f"[{self.__class__.__name__}] Discovered {len(modules)} modules to inspect."
-        )
+        print(f"[{self.__class__.__name__}] Discovered {len(modules)} modules to inspect.")
 
         for module in modules:
             for member_name in dir(module):
@@ -518,10 +501,7 @@ class PyTorchDialect(FrameworkDialect):
                         or not obj.__module__.startswith("torch")
                     ):
                         continue
-                    if (
-                        not self.disable_torch_api_list
-                        and full_name not in self.target_apis
-                    ):
+                    if not self.disable_torch_api_list and full_name not in self.target_apis:
                         continue
                     if full_name in self.IGNORE_CLASSES_OR_METHODS:
                         continue
@@ -564,9 +544,7 @@ class PyTorchDialect(FrameworkDialect):
                                     staticmethod,
                                     classmethod,
                                 ),
-                            ):
-                                api_set.add(full_cls_name)
-                            elif (
+                            ) or (
                                 isinstance(cls_member, property)
                                 and cls_member.fget
                                 and cls_member.fset
@@ -579,12 +557,12 @@ class PyTorchDialect(FrameworkDialect):
                     )
                     continue
 
-        api_list = sorted(list(api_set))
+        api_list = sorted(api_set)
         print(f"[{self.__class__.__name__}] Discovered {len(api_list)} native APIs.")
         return api_list
 
     # Only takes effect in SetattrHook
-    def discover_custom_ops(self) -> List[str]:
+    def discover_custom_ops(self) -> list[str]:
         # TODO(@cangtianhuang): implemente me
         return []
 
@@ -609,7 +587,7 @@ class PyTorchDialect(FrameworkDialect):
         # TODO(@cangtianhuang): add more serialization logic here
     }
 
-    def serialize_special_type(self, item: Any) -> Optional[Dict]:
+    def serialize_special_type(self, item: Any) -> dict | None:
         handler = self._special_type_handlers.get(type(item))
         return handler(item) if handler else None
 
@@ -619,15 +597,15 @@ class PyTorchDialect(FrameworkDialect):
         "torch.device": lambda item: f'"{item["value"]}"',
         "torch.memory_format": lambda item: f'"{item["value"]}"',
         "torch.layout": lambda item: f'"{item["value"].replace("torch.", "")}"',
-        "torch.Size": lambda item: f'list{item["value"]}',
+        "torch.Size": lambda item: f"list{item['value']}",
         # TODO(@cangtianhuang): add more formatting logic here
     }
 
-    def format_special_type(self, item: Dict) -> Optional[str]:
+    def format_special_type(self, item: dict) -> str | None:
         handler = self._format_handlers.get(item.get("type", ""))
         return handler(item) if handler else None
 
-    def get_hooks(self, serializer, levels: List[int], **kwargs) -> List[TracingHook]:
+    def get_hooks(self, serializer, levels: list[int], **kwargs) -> list[TracingHook]:
         self.target_apis = []
         self.disable_torch_api_list = kwargs.get("disable_torch_api_list", False)
         if not self.disable_torch_api_list and 0 in levels:
@@ -636,11 +614,9 @@ class PyTorchDialect(FrameworkDialect):
                 "api_list",
                 "torch_api_list.yaml",
             )
-            with open(yaml_path, "r", encoding="utf-8") as f:
+            with open(yaml_path, encoding="utf-8") as f:
                 self.target_apis = yaml.safe_load(f)
-            print(
-                f"[{self.__class__.__name__}] Loaded {len(self.target_apis)} target APIs."
-            )
+            print(f"[{self.__class__.__name__}] Loaded {len(self.target_apis)} target APIs.")
 
         hooks = []
         hook_map = {0: SetattrHook, 1: TorchFunctionHook, 2: TorchDispatchHook}

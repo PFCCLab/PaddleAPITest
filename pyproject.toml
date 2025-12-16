@@ -1,0 +1,43 @@
+[project]
+name = "paddleapitest"
+version = "0.1.0"
+description = "PaddleAPITest"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = []
+
+[tool.ruff]
+line-length = 100
+src = ["src", "packages", "tests"]
+target-version = "py313"
+
+[tool.ruff.lint]
+select = [
+  # "F",
+  # "SIM",
+  "UP",
+  "FA",  # flake8-annotations
+  "I",  # isort
+  # "B",  # flake8-bugbear
+  "C4",  # flake8-comprehensions
+  "PGH",  # pygrep-hooks
+  # "RUF",
+  "W",  # pycodestyle
+  "YTT",  # flake8-2020
+]
+
+[tool.ruff.lint.pydocstyle]
+convention = "google"
+
+[tool.ruff.lint.isort]
+known-first-party = ["boning"]
+required-imports = ["from __future__ import annotations"]
+
+[tool.ruff.lint.per-file-ignores]
+"__init__.py" = ["F401", "I002"]
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
+skip-magic-trailing-comma = false
+line-ending = "auto"

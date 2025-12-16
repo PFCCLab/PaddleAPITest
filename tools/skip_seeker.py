@@ -1,6 +1,7 @@
 # 筛选 skip 配置小工具
 # @author: cangtianhuang
 # @date: 2025-11-11
+from __future__ import annotations
 
 from pathlib import Path
 
@@ -32,7 +33,7 @@ if not checkpoint_file.exists():
     exit(0)
 try:
     with checkpoint_file.open("r") as f:
-        checkpoint_configs = set(line.strip() for line in f if line.strip())
+        checkpoint_configs = {line.strip() for line in f if line.strip()}
         log_counts["checkpoint"] = len(checkpoint_configs)
 except Exception as err:
     print(f"Error reading {checkpoint_file}: {err}", flush=True)
@@ -48,7 +49,7 @@ for log_type, prefix in LOG_PREFIXES.items():
         continue
     try:
         with log_file.open("r") as f:
-            lines = set(line.strip() for line in f if line.strip())
+            lines = {line.strip() for line in f if line.strip()}
             api_configs -= lines
             log_counts[log_type] = len(lines)
     except Exception as err:
@@ -75,9 +76,7 @@ if api_configs:
 
     checkpoint_count = len(checkpoint_configs)
     checkpoint_configs -= api_configs
-    print(
-        f"checkpoint removed: {checkpoint_count - len(checkpoint_configs)}", flush=True
-    )
+    print(f"checkpoint removed: {checkpoint_count - len(checkpoint_configs)}", flush=True)
     print(f"checkpoint remaining: {len(checkpoint_configs)}", flush=True)
     try:
         with checkpoint_file.open("w") as f:

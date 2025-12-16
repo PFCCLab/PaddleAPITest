@@ -1,10 +1,11 @@
 # 召回配置小工具
 # @author: cangtianhuang
 # @date: 2025-09-26
+from __future__ import annotations
 
-from pathlib import Path
-import re
 import argparse
+import re
+from pathlib import Path
 
 
 def collect_input_files(input_paths):
@@ -26,13 +27,9 @@ def search_files(input_paths, keywords, output_file, exact_match=False):
         return
 
     if exact_match:
-        pattern = re.compile(
-            "|".join(rf"\b{re.escape(kw)}\b[^(\n]*\(" for kw in keywords)
-        )
+        pattern = re.compile("|".join(rf"\b{re.escape(kw)}\b[^(\n]*\(" for kw in keywords))
     else:
-        pattern = re.compile(
-            "|".join(rf"^[^(\n]*{re.escape(kw)}[^(\n]*\(" for kw in keywords)
-        )
+        pattern = re.compile("|".join(rf"^[^(\n]*{re.escape(kw)}[^(\n]*\(" for kw in keywords))
 
     configs = set()
     prefixes = set()
