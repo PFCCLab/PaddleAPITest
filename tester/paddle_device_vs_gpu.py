@@ -19,7 +19,6 @@ class APITestPaddleDeviceVSGPU(APITestCustomDeviceVSCPU):
         # 新增参数
         self.operation_mode = kwargs.get("operation_mode", None)
         self.bos_path = kwargs.get("bos_path", "")
-        self.target_device_type = kwargs.get("target_device_type", "")
         self.random_seed = kwargs.get("random_seed", 0)
         self.atol = kwargs.get("atol", 1e-2)
         self.rtol = kwargs.get("rtol", 1e-2)
@@ -48,11 +47,9 @@ class APITestPaddleDeviceVSGPU(APITestCustomDeviceVSCPU):
         from engineV2 import detect_device_type
         return detect_device_type()
 
-    def _get_filename(self, device_type=None):
-        """生成PDTensor文件名"""
-        if device_type is None:
-            device_type = self._get_local_device_type()
-        return f"{device_type}-{self.random_seed}-{self._get_config_hash()}.pdtensor"
+    def _get_filename(self):
+        """生成PDTensor文件名（不再包含设备前缀，只依赖随机种子和配置哈希）"""
+        return f"{self.random_seed}-{self._get_config_hash()}.pdtensor"
 
     def _save_tensor_locally(self, output, grads=None):
         """保存结果到本地PDTensor文件"""
@@ -374,8 +371,8 @@ class APITestPaddleDeviceVSGPU(APITestCustomDeviceVSCPU):
             flush=True,
         )
 
-        # 确定要下载的文件名
-        target_filename = self._get_filename(self.target_device_type)
+        # 确定要下载的文件名（与 GPU 上传时保持一致）
+        target_filename = self._get_filename()
 
         # 下载文件
         downloaded_file = self._download_from_bos(target_filename)

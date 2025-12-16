@@ -49,7 +49,6 @@ VALID_TEST_ARGS = {
     "test_tol",
     "operation_mode",
     "bos_path",
-    "target_device_type",
     "random_seed",
     "bos_conf_path",
     "bcecmd_path",
@@ -676,12 +675,6 @@ def main():
         help="test paddle api on custom device vs GPU: 'upload' or 'download'",
     )
     parser.add_argument(
-        "--target_device_type",
-        type=str,
-        choices=["gpu", "xpu", "iluvatar_gpu"],
-        help="Target device type for download mode",
-    )
-    parser.add_argument(
         "--bitwise_alignment",
         type=bool,
         default=False,
@@ -754,9 +747,6 @@ def main():
             print(f"Failed to load BOS config file {bos_config_path}: {e}", flush=True)
             return
         
-        if options.custom_device_vs_gpu == "download" and not options.target_device_type:
-            print("--target_device_type is required in download mode", flush=True)
-            return
     if options.test_tol and not options.accuracy:
         print(f"--test_tol takes effect when --accuracy is True.", flush=True)
     if options.test_backward and not options.paddle_cinn:
@@ -824,8 +814,6 @@ def main():
                 "atol": options.atol,
                 "rtol": options.rtol,
             }
-            if options.target_device_type:
-                kwargs["target_device_type"] = options.target_device_type
             case = test_class(api_config, **kwargs)
         elif options.accuracy:
             case = test_class(
