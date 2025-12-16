@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import hashlib
 import json
 import subprocess
@@ -45,6 +47,7 @@ class APITestPaddleDeviceVSGPU(APITestCustomDeviceVSCPU):
     def _get_local_device_type(self):
         """获取当前设备的类型，优先复用 engineV2 的检测逻辑。"""
         from engineV2 import detect_device_type
+
         return detect_device_type()
 
     def _get_filename(self):
@@ -163,15 +166,13 @@ class APITestPaddleDeviceVSGPU(APITestCustomDeviceVSCPU):
                 print("gen_paddle_input failed", flush=True)
                 return None, None
 
-            paddle_output = self.paddle_api(
-                *tuple(self.paddle_args), **self.paddle_kwargs
-            )
+            paddle_output = self.paddle_api(*tuple(self.paddle_args), **self.paddle_kwargs)
 
             paddle_grads = None
             if self.need_check_grad():
                 inputs_list = self.get_paddle_input_list()
-                result_outputs, result_outputs_grads = (
-                    self.gen_paddle_output_and_output_grad(paddle_output)
+                result_outputs, result_outputs_grads = self.gen_paddle_output_and_output_grad(
+                    paddle_output
                 )
                 if inputs_list and result_outputs and result_outputs_grads:
                     paddle_grads = paddle.grad(
@@ -194,9 +195,7 @@ class APITestPaddleDeviceVSGPU(APITestCustomDeviceVSCPU):
     def _compare_with_downloaded(self, local_output, local_grads, downloaded_tensor):
         """与下载的结果进行对比"""
         try:
-            print(
-                f"[compare] Comparing results for {self.api_config.config}", flush=True
-            )
+            print(f"[compare] Comparing results for {self.api_config.config}", flush=True)
 
             # 加载下载的数据
             remote_data = paddle.load(str(downloaded_tensor))
@@ -219,9 +218,7 @@ class APITestPaddleDeviceVSGPU(APITestCustomDeviceVSCPU):
                     remote_output, (list, tuple)
                 ):
                     # 列表或元组对比
-                    for i, (local_item, remote_item) in enumerate(
-                        zip(local_output, remote_output)
-                    ):
+                    for i, (local_item, remote_item) in enumerate(zip(local_output, remote_output)):
                         if isinstance(local_item, paddle.Tensor) and isinstance(
                             remote_item, paddle.Tensor
                         ):
@@ -360,9 +357,7 @@ class APITestPaddleDeviceVSGPU(APITestCustomDeviceVSCPU):
         # 异步上传到BOS
         self._upload_to_bos(local_path)
 
-        print(
-            f"[upload] Upload mode completed for {self.api_config.config}", flush=True
-        )
+        print(f"[upload] Upload mode completed for {self.api_config.config}", flush=True)
 
     def _test_download_mode(self):
         """Download模式：下载对比数据并验证"""
@@ -395,9 +390,7 @@ class APITestPaddleDeviceVSGPU(APITestCustomDeviceVSCPU):
             return
 
         # 与下载的结果进行对比
-        success = self._compare_with_downloaded(
-            local_output, local_grads, downloaded_file
-        )
+        success = self._compare_with_downloaded(local_output, local_grads, downloaded_file)
 
         # 清理下载的文件
         downloaded_file.unlink(missing_ok=True)

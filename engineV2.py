@@ -30,10 +30,10 @@ if TYPE_CHECKING:
         APITestAccuracyStable,
         APITestCINNVSDygraph,
         APITestCustomDeviceVSCPU,
+        APITestPaddleDeviceVSGPU,
         APITestPaddleGPUPerformance,
         APITestPaddleOnly,
         APITestPaddleTorchGPUPerformance,
-        APITestPaddleDeviceVSGPU,
         APITestTorchGPUPerformance,
     )
 
@@ -480,7 +480,7 @@ def run_test_case(api_config_str, options):
         "accuracy_stable": APITestAccuracyStable,
         "paddle_custom_device": APITestCustomDeviceVSCPU,
     }
-    
+
     # 处理 custom_device_vs_gpu 模式
     if options.custom_device_vs_gpu:
         test_class = APITestPaddleDeviceVSGPU
@@ -709,7 +709,7 @@ def main():
             flush=True,
         )
         return
-    
+
     # 处理 custom_device_vs_gpu 模式的配置
     bos_config_data = None
     if options.custom_device_vs_gpu:
@@ -718,32 +718,32 @@ def main():
         if not bos_config_path.exists():
             print(f"BOS config file not found: {bos_config_path}", flush=True)
             return
-        
+
         try:
-            with open(bos_config_path, "r", encoding="utf-8") as f:
+            with open(bos_config_path, encoding="utf-8") as f:
                 bos_config_data = yaml.safe_load(f)
-            
+
             if not bos_config_data:
                 print(f"BOS config file is empty: {bos_config_path}", flush=True)
                 return
-            
+
             # 验证必需的配置项
             required_keys = ["bos_path", "bos_conf_path", "bcecmd_path"]
             missing_keys = [key for key in required_keys if key not in bos_config_data]
             if missing_keys:
                 print(f"Missing required keys in BOS config: {missing_keys}", flush=True)
                 return
-            
+
             # 将配置添加到 options 中，以便传递给测试类
             options.operation_mode = options.custom_device_vs_gpu
             options.bos_path = bos_config_data["bos_path"]
             options.bos_conf_path = bos_config_data["bos_conf_path"]
             options.bcecmd_path = bos_config_data["bcecmd_path"]
-            
+
         except Exception as e:
             print(f"Failed to load BOS config file {bos_config_path}: {e}", flush=True)
             return
-        
+
     if options.test_tol and not options.accuracy:
         print("--test_tol takes effect when --accuracy is True.", flush=True)
     if options.test_backward and not options.paddle_cinn:
@@ -789,10 +789,11 @@ def main():
             "accuracy_stable": APITestAccuracyStable,
             "paddle_custom_device": APITestCustomDeviceVSCPU,
         }
-        
+
         # 处理 custom_device_vs_gpu 模式
         if options.custom_device_vs_gpu:
             from tester import APITestPaddleDeviceVSGPU
+
             test_class = APITestPaddleDeviceVSGPU
         else:
             test_class = next(
