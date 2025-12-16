@@ -1,8 +1,10 @@
+from __future__ import annotations
+
 import json
 import os
 import threading
 from collections import OrderedDict
-from typing import Any, Dict, List, Type
+from typing import Any
 
 import torch
 
@@ -13,26 +15,24 @@ PADDLE2TORCH_WRONG_CONFIG = frozenset([])
 
 
 class Paddle2TorchConverter:
-    __slots__ = ("rules", "mapping", "cached_results")
+    __slots__ = ("cached_results", "mapping", "rules")
 
     def __init__(self):
-        self.rules: Dict[str, Any] = {}
-        self.mapping: Dict[str, Any] = {}
-        self.cached_results: Dict[str, ConvertResult] = {}
+        self.rules: dict[str, Any] = {}
+        self.mapping: dict[str, Any] = {}
+        self.cached_results: dict[str, ConvertResult] = {}
         self._load_mapping_and_rules()
 
     def _load_mapping_and_rules(self):
-        rule_cls_map: Dict[str, Type[BaseRule]] = {
+        rule_cls_map: dict[str, type[BaseRule]] = {
             "GenericRule": GenericRule,
             "ErrorRule": ErrorRule,
         }
         for rule_name in rules.__all__:
             rule_cls_map[rule_name] = getattr(rules, rule_name)
 
-        mapping_file = os.path.join(
-            os.path.dirname(os.path.abspath(__file__)), "mapping.json"
-        )
-        with open(mapping_file, "r") as f:
+        mapping_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), "mapping.json")
+        with open(mapping_file) as f:
             paddle2torch_mapping = json.load(f, object_pairs_hook=OrderedDict)
             for key, value in paddle2torch_mapping.items():
                 if not key.startswith("paddle.") or key in self.rules:
@@ -47,8 +47,7 @@ class Paddle2TorchConverter:
                     self.rules[key] = ErrorRule
 
     def convert(self, paddle_api: str) -> ConvertResult:
-        """
-        将 Paddle API 转换为 Torch API
+        """将 Paddle API 转换为 Torch API
 
         Args:
             paddle_api (str): 需要转换的 Paddle API 名称
@@ -63,18 +62,14 @@ class Paddle2TorchConverter:
             pass
 
         if paddle_api in PADDLE2TORCH_WRONG_CONFIG:
-            result = ConvertResult.error(
-                paddle_api, f"{paddle_api} is in the wrong config"
-            )
+            result = ConvertResult.error(paddle_api, f"{paddle_api} is in the wrong config")
             self.cached_results[paddle_api] = result
             return result
 
         try:
             rule = self.rules[paddle_api]()
         except KeyError:
-            result = ConvertResult.error(
-                paddle_api, f"Rule for {paddle_api} is not implemented"
-            )
+            result = ConvertResult.error(paddle_api, f"Rule for {paddle_api} is not implemented")
             self.cached_results[paddle_api] = result
             return result
 
@@ -86,11 +81,10 @@ class Paddle2TorchConverter:
     @staticmethod
     def execute(
         convert_result: ConvertResult,
-        torch_args: List,
+        torch_args: list,
         torch_kwargs: OrderedDict,
     ) -> Any:
-        """
-        执行转换后的代码。
+        """执行转换后的代码。
 
         Args:
             convert_result (ConvertResult): 转换结果对象
@@ -125,9 +119,7 @@ class Paddle2TorchConverter:
             if code.postprocess_compiled:
                 exec(code.postprocess_compiled, exec_globals, exec_locals)
         except Exception as e:
-            raise RuntimeError(
-                f"Error during execution of converted code: {str(e)}"
-            ) from e
+            raise RuntimeError(f"Error during execution of converted code: {e!s}") from e
 
         output_var = convert_result.output_var or "result"
         try:

@@ -1,6 +1,7 @@
 # 获取 api 配置集合小工具
 # @author: cangtianhuang
 # @date: 2025-10-29
+from __future__ import annotations
 
 import argparse
 from pathlib import Path
@@ -84,12 +85,8 @@ def main():
         default=default_input,
         help="输入路径列表（支持文件或目录）",
     )
-    parser.add_argument(
-        "--output-dir", "-o", default=default_output, help="输出目录路径"
-    )
-    parser.add_argument(
-        "--max-configs", type=int, default=500000, help="单个输出文件最大配置数量"
-    )
+    parser.add_argument("--output-dir", "-o", default=default_output, help="输出目录路径")
+    parser.add_argument("--max-configs", type=int, default=500000, help="单个输出文件最大配置数量")
 
     args = parser.parse_args()
     process_api_configs(args.input, args.output_dir, args.max_configs)

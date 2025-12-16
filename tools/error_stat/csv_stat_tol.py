@@ -1,11 +1,13 @@
 # 整理 tol_*.csv 精度统计数据，产出：tol_full.csv、tol_stat.csv、tol_stat_api.csv
 # @author: cangtianhuang
 # @date: 2025-06-21
+from __future__ import annotations
 
-from pathlib import Path
-import pandas as pd
 import glob
 from collections import defaultdict
+from pathlib import Path
+
+import pandas as pd
 
 TEST_LOG_PATH = Path("tester/api_config/test_log")
 OUTPUT_PATH = TEST_LOG_PATH
@@ -52,9 +54,7 @@ if not stats:
 # 合并所有DataFrame并保存
 merged_df = pd.concat(dfs, ignore_index=True)
 merged_df = merged_df.drop_duplicates(subset=["config", "mode"], keep="last")
-merged_df = merged_df.sort_values(
-    by=["API", "dtype", "config", "mode"], ignore_index=True
-)
+merged_df = merged_df.sort_values(by=["API", "dtype", "config", "mode"], ignore_index=True)
 numeric_cols = ["max_abs_diff", "max_rel_diff"]
 for col in numeric_cols:
     merged_df[col] = merged_df[col].apply(lambda x: f"{float(x):.6e}")
@@ -81,12 +81,12 @@ for api, dtype, mode in sorted(stats.keys()):
             "API": api,
             "dtype": dtype,
             "mode": mode,
-            "abs_min": "{:.6e}".format(abs_min),
-            "abs_max": "{:.6e}".format(abs_max),
-            "abs_mean": "{:.6e}".format(abs_mean),
-            "rel_min": "{:.6e}".format(rel_min),
-            "rel_max": "{:.6e}".format(rel_max),
-            "rel_mean": "{:.6e}".format(rel_mean),
+            "abs_min": f"{abs_min:.6e}",
+            "abs_max": f"{abs_max:.6e}",
+            "abs_mean": f"{abs_mean:.6e}",
+            "rel_min": f"{rel_min:.6e}",
+            "rel_max": f"{rel_max:.6e}",
+            "rel_mean": f"{rel_mean:.6e}",
             "count": count,
         }
     )
@@ -107,10 +107,7 @@ api_stats_data = []
 for api in sorted(api_stats.keys()):
     api_dtype = api_stats[api]
     dtypes = "/".join(sorted(api_dtype.keys()))
-    total = sum(
-        api_dtype[dtype]["forward"] + api_dtype[dtype]["backward"]
-        for dtype in api_dtype
-    )
+    total = sum(api_dtype[dtype]["forward"] + api_dtype[dtype]["backward"] for dtype in api_dtype)
 
     api_stats_data.append(
         {

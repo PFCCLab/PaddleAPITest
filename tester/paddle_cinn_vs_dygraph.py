@@ -1,8 +1,10 @@
+from __future__ import annotations
+
 import paddle
 from paddle.jit import to_static
 
 from .api_config.log_writer import write_to_log
-from .base import APITestBase, CUDA_ERROR, CUDA_OOM
+from .base import CUDA_ERROR, CUDA_OOM, APITestBase
 
 
 class APITestCINNVSDygraph(APITestBase):
@@ -12,7 +14,6 @@ class APITestCINNVSDygraph(APITestBase):
         self.test_backward = kwargs.get("test_backward", False)
 
     def test(self):
-
         if self.need_skip():
             print("[Skip]", flush=True)
             return
@@ -26,7 +27,7 @@ class APITestCINNVSDygraph(APITestBase):
                 print("gen_numpy_input failed", flush=True)
                 return
         except Exception as err:
-            print(f"[numpy error] {self.api_config.config}\n{str(err)}", flush=True)
+            print(f"[numpy error] {self.api_config.config}\n{err!s}", flush=True)
             write_to_log("numpy_error", self.api_config.config)
             return
 
@@ -37,7 +38,7 @@ class APITestCINNVSDygraph(APITestBase):
         try:
 
             def func(args, kwargs):
-                """forward function"""
+                """Forward function"""
                 if self.api_config.api_name.startswith("paddle.Tensor."):
                     api_name = self.api_config.api_name.split(".")[-1]
                     api = getattr(args[0], api_name)
@@ -45,7 +46,7 @@ class APITestCINNVSDygraph(APITestBase):
                 return self.paddle_api(*args, **kwargs)
 
             def func_backward(outputs_list, inputs_list, grads_input_list):
-                """backward function"""
+                """Backward function"""
                 return paddle.grad(
                     outputs_list,
                     inputs_list,
@@ -65,18 +66,18 @@ class APITestCINNVSDygraph(APITestBase):
                 return
             if any(cuda_err in str(err) for cuda_err in CUDA_ERROR):
                 print(
-                    f"[cuda error] dynamic forward {self.api_config.config}\n{str(err)}",
+                    f"[cuda error] dynamic forward {self.api_config.config}\n{err!s}",
                 )
                 write_to_log("cuda_error", self.api_config.config)
                 raise
             if any(cuda_err in str(err) for cuda_err in CUDA_OOM):
                 print(
-                    f"[oom] dynamic forward {self.api_config.config}\n{str(err)}",
+                    f"[oom] dynamic forward {self.api_config.config}\n{err!s}",
                 )
                 write_to_log("oom", self.api_config.config)
                 raise
             print(
-                f"[paddle error] dynamic forward {self.api_config.config}\n{str(err)}",
+                f"[paddle error] dynamic forward {self.api_config.config}\n{err!s}",
                 flush=True,
             )
             write_to_log("paddle_error", self.api_config.config)
@@ -86,7 +87,7 @@ class APITestCINNVSDygraph(APITestBase):
             paddle.base.core.eager._for_test_check_cuda_error()
         except Exception as err:
             print(
-                f"[cuda error] dynamic forward {self.api_config.config}\n{str(err)}",
+                f"[cuda error] dynamic forward {self.api_config.config}\n{err!s}",
                 flush=True,
             )
             write_to_log("cuda_error", self.api_config.config)
@@ -115,7 +116,7 @@ class APITestCINNVSDygraph(APITestBase):
             except Exception as err:
                 if str(err).startswith("Too large tensor to get cached numpy: "):
                     print(
-                        f"[numpy error] dynamic backward {self.api_config.config}\n{str(err)}",
+                        f"[numpy error] dynamic backward {self.api_config.config}\n{err!s}",
                         flush=True,
                     )
                     write_to_log("numpy_error", self.api_config.config)
@@ -126,20 +127,20 @@ class APITestCINNVSDygraph(APITestBase):
                     return
                 if any(cuda_err in str(err) for cuda_err in CUDA_ERROR):
                     print(
-                        f"[cuda error] dynamic backward {self.api_config.config}\n{str(err)}",
+                        f"[cuda error] dynamic backward {self.api_config.config}\n{err!s}",
                         flush=True,
                     )
                     write_to_log("cuda_error", self.api_config.config)
                     raise
                 if any(cuda_err in str(err) for cuda_err in CUDA_OOM):
                     print(
-                        f"[oom] dynamic backward {self.api_config.config}\n{str(err)}",
+                        f"[oom] dynamic backward {self.api_config.config}\n{err!s}",
                         flush=True,
                     )
                     write_to_log("oom", self.api_config.config)
                     raise
                 print(
-                    f"[paddle error] dynamic backward {self.api_config.config}\n{str(err)}",
+                    f"[paddle error] dynamic backward {self.api_config.config}\n{err!s}",
                     flush=True,
                 )
                 write_to_log("paddle_error", self.api_config.config)
@@ -149,7 +150,7 @@ class APITestCINNVSDygraph(APITestBase):
                 paddle.base.core.eager._for_test_check_cuda_error()
             except Exception as err:
                 print(
-                    f"[cuda error] dynamic backward {self.api_config.config}\n{str(err)}",
+                    f"[cuda error] dynamic backward {self.api_config.config}\n{err!s}",
                     flush=True,
                 )
                 write_to_log("cuda_error", self.api_config.config)
@@ -214,11 +215,7 @@ class APITestCINNVSDygraph(APITestBase):
 
                 # static_grads_input_list is as same as dynamic_grads_input_list, generated in graph mode but used in static graph mode.
                 # Note that its shape and dtype may differ from static graph mode outputs.
-                if (
-                    not static_inputs_list
-                    or not static_outputs_list
-                    or not static_grads_input_list
-                ):
+                if not static_inputs_list or not static_outputs_list or not static_grads_input_list:
                     return static_fwd_output, None
 
                 static_bwd_output = func_backward(
@@ -237,7 +234,7 @@ class APITestCINNVSDygraph(APITestBase):
         except Exception as err:
             if str(err).startswith("Too large tensor to get cached numpy: "):
                 print(
-                    f"[numpy error] static backward {self.api_config.config}\n{str(err)}",
+                    f"[numpy error] static backward {self.api_config.config}\n{err!s}",
                     flush=True,
                 )
                 write_to_log("numpy_error", self.api_config.config)
@@ -248,18 +245,18 @@ class APITestCINNVSDygraph(APITestBase):
                 return
             if any(cuda_err in str(err) for cuda_err in CUDA_ERROR):
                 print(
-                    f"[cuda error] static {self.api_config.config}\n{str(err)}",
+                    f"[cuda error] static {self.api_config.config}\n{err!s}",
                 )
                 write_to_log("cuda_error", self.api_config.config)
                 raise
             if any(cuda_err in str(err) for cuda_err in CUDA_OOM):
                 print(
-                    f"[oom] static {self.api_config.config}\n{str(err)}",
+                    f"[oom] static {self.api_config.config}\n{err!s}",
                 )
                 write_to_log("oom", self.api_config.config)
                 raise
             print(
-                f"[paddle error] static {self.api_config.config}\n{str(err)}",
+                f"[paddle error] static {self.api_config.config}\n{err!s}",
                 flush=True,
             )
             write_to_log("paddle_error", self.api_config.config)
@@ -269,7 +266,7 @@ class APITestCINNVSDygraph(APITestBase):
             paddle.base.core.eager._for_test_check_cuda_error()
         except Exception as err:
             print(
-                f"[cuda error] static {self.api_config.config}\n{str(err)}",
+                f"[cuda error] static {self.api_config.config}\n{err!s}",
                 flush=True,
             )
             write_to_log("cuda_error", self.api_config.config)
@@ -279,10 +276,10 @@ class APITestCINNVSDygraph(APITestBase):
             return
 
         if need_check_grad:
-            if not self.compare(dynamic_bwd_output, static_bwd_output, is_backward=True):  # type: ignore
+            if not self.compare(dynamic_bwd_output, static_bwd_output, is_backward=True):  # type: ignore[reportGeneralTypeIssues]
                 return
 
-        print(f"[Pass] {self.api_config.config,}\n", flush=True)
+        print(f"[Pass] {(self.api_config.config,)}\n", flush=True)
         write_to_log("pass", self.api_config.config)
 
     def compare(self, dygraph_output, static_output, is_backward=False):
@@ -301,7 +298,7 @@ class APITestCINNVSDygraph(APITestBase):
                 self.paddle_assert_accuracy(dygraph_output, static_output)
             except Exception as err:
                 print(
-                    f"[accuracy error] {backward_str}{self.api_config.config}\n{str(err)}",
+                    f"[accuracy error] {backward_str}{self.api_config.config}\n{err!s}",
                     flush=True,
                 )
                 write_to_log("accuracy_error", self.api_config.config)
@@ -326,7 +323,7 @@ class APITestCINNVSDygraph(APITestBase):
                 write_to_log("match_error", self.api_config.config)
                 return False
             for i, (dygraph_item, static_item) in enumerate(
-                zip(dygraph_output, static_output)
+                zip(dygraph_output, static_output, strict=False)
             ):
                 if dygraph_item is None and static_item is None:
                     continue
@@ -344,7 +341,7 @@ class APITestCINNVSDygraph(APITestBase):
                     self.paddle_assert_accuracy(dygraph_item, static_item)
                 except Exception as err:
                     print(
-                        f"[accuracy error] {backward_str}{self.api_config.config}\n{str(err)}",
+                        f"[accuracy error] {backward_str}{self.api_config.config}\n{err!s}",
                         flush=True,
                     )
                     write_to_log("accuracy_error", self.api_config.config)

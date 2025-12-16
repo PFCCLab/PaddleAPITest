@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import itertools
 import linecache
 import os
@@ -5,9 +7,10 @@ import queue
 import sys
 from collections import defaultdict
 from threading import Event, Thread
-from typing import Any, Dict, List, TextIO
+from typing import Any, TextIO
 
 import yaml
+
 from .framework_dialect import FrameworkDialect
 
 
@@ -18,7 +21,7 @@ class ConfigSerializer:
         self,
         dialect: FrameworkDialect,
         output_path: str,
-        levels: List[int],
+        levels: list[int],
         **kwargs: Any,
     ):
         self.dialect = dialect
@@ -28,9 +31,9 @@ class ConfigSerializer:
         self.record_stack = kwargs.get("record_stack", False)
         self.stack_format = kwargs.get("stack_format", "short")
 
-        self.file_handlers: Dict[int, Dict[str, TextIO]] = {}
+        self.file_handlers: dict[int, dict[str, TextIO]] = {}
         self.buffer_limit = 20000
-        self.buffers: Dict[int, List[Dict]] = defaultdict(list)
+        self.buffers: dict[int, list[dict]] = defaultdict(list)
 
         self.max_args_count = 100
         self.max_item_count = 100
@@ -68,9 +71,7 @@ class ConfigSerializer:
     def open(self):
         if self.merge_output:
             self.file_handlers[0] = {
-                "yaml": open(
-                    f"{self.output_path}/api_trace.yaml", "w", encoding="utf-8"
-                ),
+                "yaml": open(f"{self.output_path}/api_trace.yaml", "w", encoding="utf-8"),
                 "txt": open(f"{self.output_path}/api_trace.txt", "w", encoding="utf-8"),
             }
         else:
@@ -115,13 +116,9 @@ class ConfigSerializer:
                     if self.stack_format == "api":
                         api_stack = [self._format_frame_to_api(f) for f in frames_data]
                     elif self.stack_format == "full":
-                        api_stack = [
-                            self._format_frame_to_traceback(f) for f in frames_data
-                        ]
+                        api_stack = [self._format_frame_to_traceback(f) for f in frames_data]
                     else:  # "short" format
-                        api_stack = [
-                            self._format_frame_to_short(f) for f in frames_data
-                        ]
+                        api_stack = [self._format_frame_to_short(f) for f in frames_data]
                     call_record["stack"] = api_stack
 
                 level = call_record.pop("level")
@@ -228,14 +225,12 @@ class ConfigSerializer:
             total_args = len(args) + len(kwargs)
             if total_args > self.max_args_count:
                 if len(args) < self.max_args_count:
-                    kwargs = dict(
-                        list(kwargs.items())[: self.max_args_count - len(args) - 1]
-                    )
+                    kwargs = dict(list(kwargs.items())[: self.max_args_count - len(args) - 1])
                     kwargs["__truncated__"] = "<Truncated: max args exceeded>"
                 else:
-                    args = tuple(
-                        list(args)[: self.max_args_count - 1]
-                        + ["<Truncated: max args exceeded>"]
+                    args = (
+                        *list(args)[: self.max_args_count - 1],
+                        "<Truncated: max args exceeded>",
                     )
                     kwargs = {}
 
@@ -244,8 +239,7 @@ class ConfigSerializer:
                 "api": api_name,
                 "args": [self._serialize_item(arg, depth=0) for arg in args],
                 "kwargs": {
-                    key: self._serialize_item(value, depth=0)
-                    for key, value in kwargs.items()
+                    key: self._serialize_item(value, depth=0) for key, value in kwargs.items()
                 },
                 # "output_summary": self._serialize_item(output, depth=0)
             }
@@ -257,9 +251,7 @@ class ConfigSerializer:
                 frames_data = []
                 frame = sys._getframe(1)
                 while frame:
-                    if not frame.f_code.co_filename.endswith(
-                        self._excluded_record_files
-                    ):
+                    if not frame.f_code.co_filename.endswith(self._excluded_record_files):
                         f_locals = frame.f_locals
                         class_name = None
                         if "self" in f_locals:
@@ -283,23 +275,23 @@ class ConfigSerializer:
         except Exception as e:
             print(f"[ConfigSerializer] Error serializing call for '{api_name}': {e}")
 
-    def _serialize_list(self, item: list, depth: int) -> Dict:
+    def _serialize_list(self, item: list, depth: int) -> dict:
         if len(item) > self.max_item_count:
-            item = item[: self.max_item_count - 1] + ["<Truncated: max item count>"]
+            item = [*item[: self.max_item_count - 1], "<Truncated: max item count>"]
         return {
             "type": "list",
             "value": [self._serialize_item(sub_item, depth) for sub_item in item],
         }
 
-    def _serialize_tuple(self, item: tuple, depth: int) -> Dict:
+    def _serialize_tuple(self, item: tuple, depth: int) -> dict:
         if len(item) > self.max_item_count:
-            item = item[: self.max_item_count - 1] + ("<Truncated: max item count>",)
+            item = (*item[: self.max_item_count - 1], "<Truncated: max item count>")
         return {
             "type": "tuple",
             "value": [self._serialize_item(sub_item, depth) for sub_item in item],
         }
 
-    def _serialize_set(self, item: set, depth: int) -> Dict:
+    def _serialize_set(self, item: set, depth: int) -> dict:
         if len(item) > self.max_item_count:
             item = set(list(item)[: self.max_item_count - 1])
         return {
@@ -307,7 +299,7 @@ class ConfigSerializer:
             "value": [self._serialize_item(sub_item, depth) for sub_item in item],
         }
 
-    def _serialize_dict(self, item: dict, depth: int) -> Dict:
+    def _serialize_dict(self, item: dict, depth: int) -> dict:
         if len(item) > self.max_item_count:
             item = dict(list(item.items())[: self.max_item_count - 1])
             item["__truncated__"] = "<Truncated: max item count>"
@@ -316,16 +308,16 @@ class ConfigSerializer:
             "value": {str(k): self._serialize_item(v, depth) for k, v in item.items()},
         }
 
-    def _serialize_type(self, item: type, depth: int) -> Dict:
+    def _serialize_type(self, item: type, depth: int) -> dict:
         return {"type": "type", "value": f"{item.__module__}.{item.__name__}"}
 
-    def _serialize_slice(self, item: slice, depth: int) -> Dict:
+    def _serialize_slice(self, item: slice, depth: int) -> dict:
         return {
             "type": "slice",
             "value": {"start": item.start, "stop": item.stop, "step": item.step},
         }
 
-    def _serialize_ellipsis(self, item: Any, depth: int) -> Dict:
+    def _serialize_ellipsis(self, item: Any, depth: int) -> dict:
         return {"type": "ellipsis", "value": "..."}
 
     def _serialize_item(self, item: Any, depth=0) -> Any:
@@ -393,9 +385,7 @@ class ConfigSerializer:
             for level in self.levels:
                 suffix = f"_level_{level}"
                 input_path = os.path.join(self.output_path, f"api_trace{suffix}.txt")
-                ConfigSerializer.parse_trace_configs(
-                    input_path, self.output_path, suffix
-                )
+                ConfigSerializer.parse_trace_configs(input_path, self.output_path, suffix)
 
     def get_api_stacks(self):
         if self.merge_output:
@@ -405,9 +395,7 @@ class ConfigSerializer:
             for level in self.levels:
                 suffix = f"_level_{level}"
                 input_path = os.path.join(self.output_path, f"api_trace{suffix}.yaml")
-                ConfigSerializer.parse_trace_stacks(
-                    input_path, self.output_path, suffix
-                )
+                ConfigSerializer.parse_trace_stacks(input_path, self.output_path, suffix)
 
     @staticmethod
     def parse_trace_configs(input_path: str, output_path: str, output_suffix: str = ""):
@@ -418,16 +406,14 @@ class ConfigSerializer:
             print(f"[ConfigSerializer] Trace file not found, skipping: {input_path}")
             return
 
-        if not os.path.splitext(input_path)[1].lower() == ".txt":
-            print(
-                f"[ConfigSerializer] Trace file is not a txt file, skipping: {input_path}"
-            )
+        if os.path.splitext(input_path)[1].lower() != ".txt":
+            print(f"[ConfigSerializer] Trace file is not a txt file, skipping: {input_path}")
             return
 
         api_apis, api_configs = set(), set()
         api_counts = defaultdict(int)
 
-        with open(input_path, "r", encoding="utf-8") as f:
+        with open(input_path, encoding="utf-8") as f:
             current = ""
             for line in f:
                 line = line.strip()
@@ -448,9 +434,7 @@ class ConfigSerializer:
                     current = line
 
         trace_count = sum(api_counts.values())
-        print(
-            f"[ConfigSerializer] Read {trace_count} traces from {os.path.basename(input_path)}"
-        )
+        print(f"[ConfigSerializer] Read {trace_count} traces from {os.path.basename(input_path)}")
 
         with open(
             os.path.join(output_path, f"api_apis{output_suffix}.txt"),
@@ -459,9 +443,7 @@ class ConfigSerializer:
         ) as f:
             for api in sorted(api_apis):
                 f.write(api + "\n")
-        print(
-            f"[ConfigSerializer] Write {len(api_apis)} apis to api_apis{output_suffix}.txt"
-        )
+        print(f"[ConfigSerializer] Write {len(api_apis)} apis to api_apis{output_suffix}.txt")
 
         with open(
             os.path.join(output_path, f"api_configs{output_suffix}.txt"),
@@ -477,9 +459,7 @@ class ConfigSerializer:
         total_calls = sum(api_counts.values())
         if total_calls == 0:
             return
-        api_percentages = {
-            api: (count / total_calls) * 100 for api, count in api_counts.items()
-        }
+        api_percentages = {api: (count / total_calls) * 100 for api, count in api_counts.items()}
         sorted_api_counts = sorted(api_counts.items(), key=lambda x: x[1], reverse=True)
 
         with open(
@@ -491,9 +471,7 @@ class ConfigSerializer:
             f.write(f"Total API calls: {total_calls}\n\n")
             for api, count in sorted_api_counts:
                 f.write(f"{api}: {count} ({api_percentages[api]:.2f}%)\n")
-        print(
-            f"[ConfigSerializer] Write detailed statistics to api_statistics{output_suffix}.txt"
-        )
+        print(f"[ConfigSerializer] Write detailed statistics to api_statistics{output_suffix}.txt")
 
     @staticmethod
     def parse_trace_stacks(input_path: str, output_path: str, output_suffix: str = ""):
@@ -504,17 +482,15 @@ class ConfigSerializer:
             print(f"[ConfigSerializer] Trace file not found, skipping: {input_path}")
             return
 
-        if not os.path.splitext(input_path)[1].lower() == ".yaml":
-            print(
-                f"[ConfigSerializer] Trace file is not a yaml file, skipping: {input_path}"
-            )
+        if os.path.splitext(input_path)[1].lower() != ".yaml":
+            print(f"[ConfigSerializer] Trace file is not a yaml file, skipping: {input_path}")
             return
 
         api_stack = {}
         completed_apis = set()
         Loader = yaml.CLoader if hasattr(yaml, "CLoader") else yaml.FullLoader
 
-        with open(input_path, "r", encoding="utf-8") as f:
+        with open(input_path, encoding="utf-8") as f:
             for call in yaml.load_all(f, Loader=Loader):
                 api_name = call.get("api", "UnknownAPI")
                 if api_name in completed_apis:

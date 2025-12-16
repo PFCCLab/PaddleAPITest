@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import os
 
 os.environ["HF_HOME"] = "tools/api_tracer/.huggingface"
@@ -9,14 +11,20 @@ from pathlib import Path
 import torch
 import torchvision.transforms as T
 from api_tracer import APITracer
-from diffusers.pipelines.auto_pipeline import (AutoPipelineForImage2Image,
-                                               AutoPipelineForText2Image)
+from diffusers.pipelines.auto_pipeline import (
+    AutoPipelineForImage2Image,
+    AutoPipelineForText2Image,
+)
 from diffusers.pipelines.pipeline_utils import DiffusionPipeline
 from PIL import Image
 from torchvision.transforms.functional import InterpolationMode
-from transformers import (AutoModel, AutoModelForCausalLM,
-                          AutoModelForImageTextToText, AutoProcessor,
-                          AutoTokenizer)
+from transformers import (
+    AutoModel,
+    AutoModelForCausalLM,
+    AutoModelForImageTextToText,
+    AutoProcessor,
+    AutoTokenizer,
+)
 
 MODELS_DIR = Path("/root/paddlejob/workspace/env_run/models")
 # MODELS_DIR = Path("/root/paddlejob/workspace/env_run/bos/huggingface")
@@ -86,9 +94,7 @@ def run_inference_test_tg(model_name: str):
     print(f"🚀 Running Text Generation Inference Test for: {model_name}")
     model_path = MODELS_DIR / model_name
     output_path = f"tools/api_tracer/trace_output_test_infer/{model_name}"
-    tracer = APITracer(
-        "torch", output_path=output_path, levels=[0, 1], merge_output=True
-    )
+    tracer = APITracer("torch", output_path=output_path, levels=[0, 1], merge_output=True)
     tracer.start()
 
     try:
@@ -154,9 +160,7 @@ def run_inference_test_i2t(model_name: str):
     model_path = MODELS_DIR / model_name
     output_path = f"tools/api_tracer/trace_output_test_infer/{model_name}"
     os.makedirs(output_path, exist_ok=True)
-    tracer = APITracer(
-        "torch", output_path=output_path, levels=[0, 1], merge_output=True
-    )
+    tracer = APITracer("torch", output_path=output_path, levels=[0, 1], merge_output=True)
     tracer.start()
 
     try:
@@ -167,11 +171,7 @@ def run_inference_test_i2t(model_name: str):
                 device_map="auto",
                 trust_remote_code=True,
             )
-        elif (
-            "baidu" in model_name
-            or "moonshotai" in model_name
-            or "deepseek" in model_name
-        ):
+        elif "baidu" in model_name or "moonshotai" in model_name or "deepseek" in model_name:
             model = AutoModelForCausalLM.from_pretrained(
                 model_path,
                 torch_dtype=torch.bfloat16,
@@ -260,13 +260,8 @@ def run_inference_test_i2t(model_name: str):
                     ],
                 }
             ]
-            if (
-                hasattr(processor, "chat_template")
-                and processor.chat_template is not None
-            ):
-                prompt = processor.apply_chat_template(
-                    conversation, add_generation_prompt=True
-                )
+            if hasattr(processor, "chat_template") and processor.chat_template is not None:
+                prompt = processor.apply_chat_template(conversation, add_generation_prompt=True)
             else:
                 prompt = f"<|im_start|>user\n<image>\n{question}<|im_end|>\n<|im_start|>assistant\n"
             image = Image.open(image_path).convert("RGB")
@@ -275,7 +270,7 @@ def run_inference_test_i2t(model_name: str):
             )
 
         if "OpenGVLab" in model_name:
-            generation_config = dict(max_new_tokens=1024, do_sample=False)
+            generation_config = {"max_new_tokens": 1024, "do_sample": False}
             with torch.no_grad():
                 outputs = model.chat(
                     tokenizer,
@@ -312,9 +307,7 @@ def run_inference_test_v2t(model_name: str):
     model_path = MODELS_DIR / model_name
     output_path = f"tools/api_tracer/trace_output_test_infer/{model_name}"
     os.makedirs(output_path, exist_ok=True)
-    tracer = APITracer(
-        "torch", output_path=output_path, levels=[0, 1], merge_output=True
-    )
+    tracer = APITracer("torch", output_path=output_path, levels=[0, 1], merge_output=True)
     tracer.start()
 
     video_path = "tools/api_tracer/sample_video.mp4"
@@ -341,13 +334,11 @@ def run_inference_test_v2t(model_name: str):
                 ],
             }
         ]
-        text = processor.apply_chat_template(
-            messages, tokenize=False, add_generation_prompt=True
-        )
+        text = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
 
         from keye_vl_utils import process_vision_info
 
-        image_inputs, video_inputs, video_kwargs = process_vision_info(
+        image_inputs, video_inputs, _video_kwargs = process_vision_info(
             messages, return_video_kwargs=True
         )
         inputs = processor(
@@ -382,9 +373,7 @@ def run_inference_test_t2i(model_name: str):
     model_path = MODELS_DIR / model_name
     output_path = f"tools/api_tracer/trace_output_test_infer/{model_name}"
     os.makedirs(output_path, exist_ok=True)
-    tracer = APITracer(
-        "torch", output_path=output_path, levels=[0, 1], merge_output=True
-    )
+    tracer = APITracer("torch", output_path=output_path, levels=[0, 1], merge_output=True)
     tracer.start()
 
     try:
@@ -404,9 +393,7 @@ def run_inference_test_t2i(model_name: str):
         if "SD3.5M-FlowGRPO-GenEval" in lora_ckpt_path:
             from peft import PeftModel
 
-            pipe.transformer = PeftModel.from_pretrained(
-                pipe.transformer, lora_ckpt_path
-            )
+            pipe.transformer = PeftModel.from_pretrained(pipe.transformer, lora_ckpt_path)
             pipe.transformer = pipe.transformer.merge_and_unload()
 
         print(f"Pipeline Class: {pipe.__class__}")
@@ -414,7 +401,7 @@ def run_inference_test_t2i(model_name: str):
         prompt = "A majestic lion jumping from a big rock, high quality, cinematic"
 
         with torch.no_grad(), torch.inference_mode():
-            image = pipe(prompt=prompt, num_inference_steps=25).images[0]
+            pipe(prompt=prompt, num_inference_steps=25).images[0]
 
         print(f"✅ Test for {model_name} finished.")
     except Exception as e:
@@ -429,9 +416,7 @@ def run_inference_test_t2v(model_name: str):
     model_path = MODELS_DIR / model_name
     output_path = f"tools/api_tracer/trace_output_test_infer/{model_name}"
     os.makedirs(output_path, exist_ok=True)
-    tracer = APITracer(
-        "torch", output_path=output_path, levels=[0, 1], merge_output=True
-    )
+    tracer = APITracer("torch", output_path=output_path, levels=[0, 1], merge_output=True)
     tracer.start()
 
     try:
@@ -444,7 +429,7 @@ def run_inference_test_t2v(model_name: str):
         prompt = "A panda eating bamboo on a rock."
 
         with torch.no_grad(), torch.inference_mode():
-            video_frames = pipe(prompt, num_inference_steps=25, num_frames=20).frames
+            pipe(prompt, num_inference_steps=25, num_frames=20).frames
 
         print(f"✅ Test for {model_name} finished.")
     except Exception as e:
@@ -459,9 +444,7 @@ def run_inference_test_i2d(model_name: str):
     model_path = MODELS_DIR / model_name
     output_path = f"tools/api_tracer/trace_output_test_infer/{model_name}"
     os.makedirs(output_path, exist_ok=True)
-    tracer = APITracer(
-        "torch", output_path=output_path, levels=[0, 1], merge_output=True
-    )
+    tracer = APITracer("torch", output_path=output_path, levels=[0, 1], merge_output=True)
     tracer.start()
 
     image_path = "tools/api_tracer/sample_image.jpg"
@@ -479,9 +462,7 @@ def run_inference_test_i2d(model_name: str):
         input_image = Image.open(image_path).convert("RGB").resize((256, 256))
 
         with torch.no_grad():
-            images = pipe(
-                input_image, num_inference_steps=64, frame_size=256, output_type="pil"
-            ).images
+            pipe(input_image, num_inference_steps=64, frame_size=256, output_type="pil").images
 
         print(f"✅ Test for {model_name} finished.")
     except Exception as e:
@@ -496,9 +477,7 @@ def run_inference_test_a2a(model_name: str):
     model_path = MODELS_DIR / model_name
     output_path = f"tools/api_tracer/trace_output_test_infer/{model_name}"
     os.makedirs(output_path, exist_ok=True)
-    tracer = APITracer(
-        "torch", output_path=output_path, levels=[0, 1], merge_output=True
-    )
+    tracer = APITracer("torch", output_path=output_path, levels=[0, 1], merge_output=True)
     tracer.start()
 
     try:

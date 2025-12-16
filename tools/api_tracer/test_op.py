@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import torch
 from api_tracer import APITracer
 
@@ -51,9 +53,9 @@ def run_pytorch_code():
     c = a + b
     d = torch.relu(c)
     e = d + 10
-    f = torch.nn.functional.softmax(e, dim=1)
+    torch.nn.functional.softmax(e, dim=1)
     g = torch.cat((a, b), dim=0)
-    h = g.argmax(dim=0)
+    g.argmax(dim=0)
 
     # # 2. 自定义算子调用
     print("--- [Demo] Calling custom operator ---")
@@ -61,7 +63,7 @@ def run_pytorch_code():
     y = CustomReLUFunction.apply(x)
     y.backward(torch.ones_like(y))
     y = custom_leaky_relu(x, 0.2)
-    (grad_x,) = torch.autograd.grad(y, x, torch.ones_like(y))
+    (_grad_x,) = torch.autograd.grad(y, x, torch.ones_like(y))
     print("--- [Demo] PyTorch code finished ---")
 
 

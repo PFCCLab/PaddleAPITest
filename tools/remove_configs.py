@@ -1,6 +1,7 @@
 # 移除指定配置小工具
 # @author: cangtianhuang
 # @date: 2025-09-26
+from __future__ import annotations
 
 import argparse
 from pathlib import Path
@@ -92,7 +93,7 @@ def remove_configs_from_files(input_paths, remove_config_file, backup=False):
             print(f"Error processing {input_file}: {err}")
             continue
 
-    print(f"\nSummary:")
+    print("\nSummary:")
     print(f"Files processed: {len(input_files)}")
     print(f"Files modified: {files_modified}")
     print(f"Total configs removed: {total_removed}")
@@ -112,13 +113,9 @@ def main():
         """,
     )
 
-    parser.add_argument(
-        "-i", "--input", nargs="+", required=True, help="待处理的文件或目录"
-    )
+    parser.add_argument("-i", "--input", nargs="+", required=True, help="待处理的文件或目录")
     parser.add_argument("-r", "--remove", required=True, help="包含要删除配置的文件")
-    parser.add_argument(
-        "-b", "--backup", action="store_true", default=False, help="创建备份文件"
-    )
+    parser.add_argument("-b", "--backup", action="store_true", default=False, help="创建备份文件")
 
     args = parser.parse_args()
 
