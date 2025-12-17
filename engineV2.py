@@ -13,10 +13,12 @@ import time
 from concurrent.futures import TimeoutError, as_completed
 from datetime import datetime
 from multiprocessing import Lock, Manager, cpu_count, set_start_method
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 import numpy as np
 import pynvml
+import yaml
 from pebble import ProcessExpired, ProcessPool
 
 if TYPE_CHECKING:
@@ -28,6 +30,7 @@ if TYPE_CHECKING:
         APITestAccuracyStable,
         APITestCINNVSDygraph,
         APITestCustomDeviceVSCPU,
+        APITestPaddleDeviceVSGPU,
         APITestPaddleGPUPerformance,
         APITestPaddleOnly,
         APITestPaddleTorchGPUPerformance,
@@ -39,7 +42,18 @@ from tester.api_config.log_writer import *
 os.environ["FLAGS_USE_SYSTEM_ALLOCATOR"] = "1"
 os.environ["NVIDIA_TF32_OVERRIDE"] = "0"
 
-VALID_TEST_ARGS = {"test_amp", "test_backward", "atol", "rtol", "test_tol"}
+VALID_TEST_ARGS = {
+    "test_amp",
+    "test_backward",
+    "atol",
+    "rtol",
+    "test_tol",
+    "operation_mode",
+    "bos_path",
+    "random_seed",
+    "bos_conf_path",
+    "bcecmd_path",
+}
 
 DEVICE_TYPE = None
 DEVICE_TYPE_DETECTED = False
@@ -123,7 +137,7 @@ def detect_device_type() -> str:
         try:
             out = subprocess.check_output(["ixsmi"], text=True, stderr=subprocess.STDOUT)
             if any(re.match(r"^\|\s*\d+\s+Iluvatar", line) for line in out.splitlines()):
-                DEVICE_TYPE = "iluvatar"
+                DEVICE_TYPE = "iluvatar_gpu"
                 DEVICE_TYPE_DETECTED = True
                 return DEVICE_TYPE
         except Exception:
@@ -164,7 +178,7 @@ def get_device_count() -> int:
         DEVICE_COUNT = len(ids)
         return DEVICE_COUNT
 
-    if device_type == "iluvatar":
+    if device_type == "iluvatar_gpu":
         out = subprocess.check_output(["ixsmi"], text=True, stderr=subprocess.STDOUT)
         ids = set()
         for line in out.splitlines():
@@ -202,7 +216,7 @@ def _refresh_snapshot(device_type):
                         snapshot[dev_id] = (total_mib / 1024.0, used_mib / 1024.0)
                         break
 
-    elif device_type == "iluvatar":
+    elif device_type == "iluvatar_gpu":
         out = subprocess.check_output(["ixsmi"], text=True, stderr=subprocess.STDOUT)
         lines = out.splitlines()
         for i, line in enumerate(lines):
@@ -240,7 +254,7 @@ def get_memory_info(gpu_id):
         finally:
             pynvml.nvmlShutdown()
 
-    if device_type in ("xpu", "iluvatar"):
+    if device_type in ("xpu", "iluvatar_gpu"):
         _refresh_snapshot(device_type)
         if _MEM_SNAPSHOT is None or gpu_id not in _MEM_SNAPSHOT:
             raise RuntimeError(f"Failed to get memory info for {device_type} device {gpu_id}")
@@ -379,6 +393,7 @@ def init_worker_gpu(gpu_worker_list, lock, available_gpus, max_workers_per_gpu, 
             APITestAccuracyStable,
             APITestCINNVSDygraph,
             APITestCustomDeviceVSCPU,
+            APITestPaddleDeviceVSGPU,
             APITestPaddleGPUPerformance,
             APITestPaddleOnly,
             APITestPaddleTorchGPUPerformance,
@@ -395,6 +410,7 @@ def init_worker_gpu(gpu_worker_list, lock, available_gpus, max_workers_per_gpu, 
             "APITestPaddleTorchGPUPerformance": APITestPaddleTorchGPUPerformance,
             "APITestAccuracyStable": APITestAccuracyStable,
             "APITestCustomDeviceVSCPU": APITestCustomDeviceVSCPU,
+            "APITestPaddleDeviceVSGPU": APITestPaddleDeviceVSGPU,
         }
         globals().update(test_classes)
 
@@ -463,7 +479,9 @@ def run_test_case(api_config_str, options):
         "paddle_torch_gpu_performance": APITestPaddleTorchGPUPerformance,
         "accuracy_stable": APITestAccuracyStable,
         "paddle_custom_device": APITestCustomDeviceVSCPU,
+        "custom_device_vs_gpu": APITestPaddleDeviceVSGPU,
     }
+
     test_class = next(
         (cls for opt, cls in option_to_class.items() if getattr(options, opt, False)),
         APITestAccuracy,  # default fallback
@@ -644,6 +662,19 @@ def main():
         help="The numpy random seed ",
     )
     parser.add_argument(
+        "--custom_device_vs_gpu",
+        type=parse_bool,
+        default=False,
+        help="test paddle api on custom device vs GPU",
+    )
+    parser.add_argument(
+        "--custom_device_vs_gpu_mode",
+        type=str,
+        choices=["upload", "download"],
+        default="upload",
+        help="operation mode for custom_device_vs_gpu: 'upload' or 'download'",
+    )
+    parser.add_argument(
         "--bitwise_alignment",
         type=bool,
         default=False,
@@ -664,6 +695,7 @@ def main():
         options.paddle_torch_gpu_performance,
         options.accuracy_stable,
         options.paddle_custom_device,
+        options.custom_device_vs_gpu,
     ]
     if len([m for m in mode if m is True]) != 1:
         print(
@@ -676,10 +708,45 @@ def main():
             "--paddle_torch_gpu_performance"
             "--accuracy_stable"
             "--paddle_custom_device"
-            " to True.",
+            "--custom_device_vs_gpu",
             flush=True,
         )
         return
+
+    # 处理 custom_device_vs_gpu 模式的配置
+    bos_config_data = None
+    if options.custom_device_vs_gpu:
+        # 读取 BOS 配置文件（固定路径：tester/bos_config.yaml）
+        bos_config_path = Path("tester/bos_config.yaml")
+        if not bos_config_path.exists():
+            print(f"BOS config file not found: {bos_config_path}", flush=True)
+            return
+
+        try:
+            with open(bos_config_path, encoding="utf-8") as f:
+                bos_config_data = yaml.safe_load(f)
+
+            if not bos_config_data:
+                print(f"BOS config file is empty: {bos_config_path}", flush=True)
+                return
+
+            # 验证必需的配置项
+            required_keys = ["bos_path", "bos_conf_path", "bcecmd_path"]
+            missing_keys = [key for key in required_keys if key not in bos_config_data]
+            if missing_keys:
+                print(f"Missing required keys in BOS config: {missing_keys}", flush=True)
+                return
+
+            # 将配置添加到 options 中，以便传递给测试类
+            options.operation_mode = options.custom_device_vs_gpu_mode
+            options.bos_path = bos_config_data["bos_path"]
+            options.bos_conf_path = bos_config_data["bos_conf_path"]
+            options.bcecmd_path = bos_config_data["bcecmd_path"]
+
+        except Exception as e:
+            print(f"Failed to load BOS config file {bos_config_path}: {e}", flush=True)
+            return
+
     if options.test_tol and not options.accuracy:
         print("--test_tol takes effect when --accuracy is True.", flush=True)
     if options.test_backward and not options.paddle_cinn:
@@ -698,6 +765,8 @@ def main():
             APITestAccuracy,
             APITestAccuracyStable,
             APITestCINNVSDygraph,
+            APITestCustomDeviceVSCPU,
+            APITestPaddleDeviceVSGPU,
             APITestPaddleGPUPerformance,
             APITestPaddleOnly,
             APITestPaddleTorchGPUPerformance,
@@ -724,13 +793,27 @@ def main():
             "paddle_torch_gpu_performance": APITestPaddleTorchGPUPerformance,
             "accuracy_stable": APITestAccuracyStable,
             "paddle_custom_device": APITestCustomDeviceVSCPU,
+            "custom_device_vs_gpu": APITestPaddleDeviceVSGPU,
         }
+
         test_class = next(
             (cls for opt, cls in option_to_class.items() if getattr(options, opt, False)),
             APITestAccuracy,  # default fallback
         )
 
-        if options.accuracy:
+        if options.custom_device_vs_gpu:
+            # custom_device_vs_gpu 模式需要传递额外参数
+            case = test_class(
+                api_config,
+                operation_mode=options.operation_mode,
+                bos_path=options.bos_path,
+                bos_conf_path=options.bos_conf_path,
+                bcecmd_path=options.bcecmd_path,
+                random_seed=options.random_seed,
+                atol=options.atol,
+                rtol=options.rtol,
+            )
+        elif options.accuracy:
             case = test_class(
                 api_config,
                 test_amp=options.test_amp,
