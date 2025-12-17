@@ -1,0 +1,12 @@
+# BOS 配置文件
+# 用于自定义设备与 GPU 精度对比测试的云存储配置
+
+# BOS 存储路径（如：xly-devops/liujingzong/）
+bos_path: "xly-devops/liujingzong/"
+
+# BOS 配置文件路径（bcecmd 使用的配置文件路径）
+bos_conf_path: "./conf"
+
+# bcecmd 命令行工具路径
+bcecmd_path: "./bcecmd"
+

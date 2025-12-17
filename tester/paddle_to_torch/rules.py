@@ -3190,6 +3190,9 @@ if isinstance(scale_factor, torch.Tensor):
 elif scale_factor is None:
     del scale_factor
 
+if "linear" in mode and not align_corners and align_mode==1:
+    assert False
+
 if data_format == "NHWC":
     x = x.permute(0, 3, 1, 2)
 elif data_format == "NDHWC":

@@ -86,6 +86,8 @@
 | `--timeout`                      | int   | 单个测试用例执行超时秒数（默认 1800）                                                  |
 | `--show_runtime_status`          | bool  | 是否实时显示当前的测试进度（默认 True）                                               |
 | `--random_seed`                  | int   | numpy random的随机种子(默认为0，此时不会显式设置numpy random的seed)                   |
+| `--custom_device_vs_gpu`        | bool  | 启用自定义设备与GPU的精度对比测试模式（默认 False）                                   |
+| `--custom_device_vs_gpu_mode`   | str   | 自定义设备与GPU对比的模式：`upload` 或 `download`（默认 `upload`）                    |
 | `--bitwise_alignment`            | bool  | 是否进行诸位对齐对比，开启后所有的api的精度对比都按照atol=0.0,rtol = 0.0的精度对比结果|
 
 
@@ -122,6 +124,67 @@ python engineV2.py --accuracy=True --api_config_file="tester/api_config/api_conf
 ./run.sh
 ```
 该脚本使用参数：`NUM_GPUS=-1, NUM_WORKERS_PER_GPU=-1, GPU_IDS="4,5,6,7"`，在后台运行程序，可在修改 `run.sh` 参数后使用
+
+### 自定义设备与 GPU 精度对比测试
+
+#### 功能说明
+
+`APITestPaddleDeviceVSGPU` 类支持跨设备的精度对比测试，目前主要面向 **GPU 上传 + XPU（或其他设备）下载对比** 这一典型场景。该功能分为两个模式：
+
+- **Upload 模式（GPU 侧）**：在 GPU 上执行测试，保存结果到本地，然后上传到 BOS 云存储
+- **Download 模式（XPU/其他设备侧）**：在 XPU 或其他设备上执行测试，从 BOS 下载 GPU 侧的参考数据进行精度对比
+
+#### 工作流程
+
+1. **Upload 模式工作流（GPU 侧）**：
+   - 在 GPU 设备上执行 Paddle API 测试
+   - 保存 Forward 输出和 Backward 梯度到本地 PDTensor 文件
+   - 文件名依赖随机种子与配置哈希（如 `1210-xxx.pdtensor`）
+   - 使用 bcecmd 工具将文件上传到 BOS 云存储
+
+2. **Download 模式工作流（XPU/其他设备侧）**：
+   - 在 XPU 或其他设备上执行相同的 Paddle API 测试
+   - 使用与 GPU 侧上传时一致的随机种子和配置，构造同名 PDTensor 文件名
+   - 从 BOS 云存储下载对应的 GPU 参考数据
+   - 对比 Forward 输出和 Backward 梯度，验证与 GPU 的精度一致性
+
+#### 配置文件设置
+
+首先，编辑 `tester/bos_config.yaml` 配置文件：
+
+```yaml
+# BOS 配置文件
+# 用于自定义设备与 GPU 精度对比测试的云存储配置
+
+# BOS 存储路径（如：xly-devops/liujingzong/）
+bos_path: "xly-devops/liujingzong/"
+
+# BOS 配置文件路径（bcecmd 使用的配置文件路径）
+bos_conf_path: "./conf"
+
+# bcecmd 命令行工具路径
+bcecmd_path: "./bcecmd"
+```
+
+#### 命令示例
+**在 GPU 上执行测试并上传结果**
+```bash
+# 在 GPU 设备上执行，生成1210-xxx.pdtensor 文件并上传到 BOS
+python engineV2.py --custom_device_vs_gpu=True \
+  --custom_device_vs_gpu_mode=upload \
+  --random_seed=1210 \
+  --api_config_file="./test1.txt" \
+  --gpu_ids=7
+```
+
+**在 XPU 上下载 GPU 的参考数据并进行精度对比**
+```bash
+python engineV2.py --custom_device_vs_gpu=True \
+  --custom_device_vs_gpu_mode=download \
+  --random_seed=1210 \
+  --api_config_file="./test1.txt" \
+  --gpu_ids=7
+```
 
 ## 监控方法
 
