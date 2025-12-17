@@ -28,7 +28,7 @@ class Paddle2TorchConverter:
             "GenericRule": GenericRule,
             "ErrorRule": ErrorRule,
         }
-        for rule_name in rules.__all__:
+        for rule_name in rules.ALL_RULES:
             rule_cls_map[rule_name] = getattr(rules, rule_name)
 
         mapping_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), "mapping.json")
