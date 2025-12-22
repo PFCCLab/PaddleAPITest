@@ -3190,7 +3190,7 @@ if isinstance(scale_factor, torch.Tensor):
 elif scale_factor is None:
     del scale_factor
 
-if "linear" in mode and not align_corners and align_mode==1:
+if "linear" in mode and not locals().get("align_corners", False) and locals().get("align_mode", 0)==1:
     assert False
 
 if data_format == "NHWC":
