@@ -53,6 +53,7 @@ VALID_TEST_ARGS = {
     "random_seed",
     "bos_conf_path",
     "bcecmd_path",
+    "generate_failed_tests",
 }
 
 DEVICE_TYPE = None
@@ -679,6 +680,12 @@ def main():
         type=bool,
         default=False,
         help="Whether to using bitwise alignment when run accuracy test",
+    )
+    parser.add_argument(
+        "--generate_failed_tests",
+        type=parse_bool,
+        default=False,
+        help="Whether to generate reproducible test files for failed cases",
     )
 
     options = parser.parse_args()
