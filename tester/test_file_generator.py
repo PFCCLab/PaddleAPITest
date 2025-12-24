@@ -6,7 +6,7 @@ import hashlib
 import os
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any
 
 
 def _generate_random_tensor_code(shape: tuple, dtype: str, var_name: str) -> str:
@@ -40,7 +40,9 @@ def _extract_tensor_configs(
     """从API配置中提取所有TensorConfig信息"""
     from .api_config.config_analyzer import TensorConfig
 
-    ar
+    args_configs = []
+    kwargs_configs = {}
+
     def extract_from_config(config_item, index=None, key=None):
         if isinstance(config_item, TensorConfig):
             return config_item
