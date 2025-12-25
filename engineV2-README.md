@@ -88,8 +88,8 @@
 | `--random_seed`                  | int   | numpy random的随机种子(默认为0，此时不会显式设置numpy random的seed)                   |
 | `--custom_device_vs_gpu`        | bool  | 启用自定义设备与GPU的精度对比测试模式（默认 False）                                   |
 | `--custom_device_vs_gpu_mode`   | str   | 自定义设备与GPU对比的模式：`upload` 或 `download`（默认 `upload`）                    |
-| `--bitwise_alignment`            | bool  | 是否进行诸位对齐对比，开启后所有的api的精度对比都按照atol=0.0,rtol = 0.0的精度对比结果|
-
+| `--bitwise_alignment`            | bool  | 是否进行诸位对齐对比，开启后所有的api的精度对比都按照atol=0.0,rtol = 0.0的精度对比结果(默认False)|
+| `--exit_on_error`                | bool  | 是否在精度测试出现`paddle_error`或者 `accuracy_error`  错误时立即退出测试进程(exit code 为1)。默认为False，测试进程会继续执行 |
 
 ### 示例命令
 
