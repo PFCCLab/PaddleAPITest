@@ -9,31 +9,33 @@ from pathlib import Path
 from typing import Any
 
 
-def _generate_random_tensor_code(shape: tuple, dtype: str, var_name: str) -> str:
-    """生成随机tensor的Python代码，复用 TensorConfig.get_random_numpy_tensor"""
-    return (
-        f"# 生成随机tensor: shape={shape}, dtype={dtype}\n"
-        f"{var_name}_cfg = TensorConfig({shape}, '{dtype}')\n"
-        f"{var_name} = {var_name}_cfg.get_random_numpy_tensor(shape={shape}, data_type='{dtype}')"
-    )
-
-
-def _generate_numpy_data_code(numpy_data, var_name: str) -> str:
-    """生成使用实际numpy数据的Python代码"""
-    import numpy as np
-    # 将numpy数组序列化为字符串
-    data_str = repr(numpy_data.tolist())
-    dtype_str = str(numpy_data.dtype)
-    shape_str = str(numpy_data.shape)
-    # 处理numpy dtype字符串，确保可以正确使用
-    # 例如：float32 -> float32, int64 -> int64
-    dtype_python = dtype_str
-    if '.' in dtype_str:
-        dtype_python = dtype_str.split('.')[-1]
-    return (
-        f"# 使用实际numpy数据: shape={shape_str}, dtype={dtype_str}\n"
-        f"{var_name} = numpy.array({data_str}, dtype=numpy.{dtype_python})"
-    )
+def _generate_tensor_code_using_get_numpy_tensor(
+    tensor_config, var_name: str, api_config_var: str, index: int = None, key: str = None
+) -> str:
+    """生成使用TensorConfig.get_numpy_tensor()的Python代码，与paddle_device_vs_cpu.py中的逻辑一致"""
+    shape_str = str(tensor_config.shape)
+    dtype_str = tensor_config.dtype
+    if index is not None:
+        return (
+            f"# 生成tensor: shape={shape_str}, dtype={dtype_str}\n"
+            f"{var_name}_cfg = TensorConfig({shape_str}, '{dtype_str}')\n"
+            f"{var_name}_cfg.get_numpy_tensor({api_config_var}, index={index})\n"
+            f"{var_name} = {var_name}_cfg.numpy_tensor"
+        )
+    elif key is not None:
+        return (
+            f"# 生成tensor: shape={shape_str}, dtype={dtype_str}\n"
+            f"{var_name}_cfg = TensorConfig({shape_str}, '{dtype_str}')\n"
+            f"{var_name}_cfg.get_numpy_tensor({api_config_var}, key='{key}')\n"
+            f"{var_name} = {var_name}_cfg.numpy_tensor"
+        )
+    else:
+        # 如果没有index和key，使用get_random_numpy_tensor作为fallback
+        return (
+            f"# 生成随机tensor: shape={shape_str}, dtype={dtype_str}\n"
+            f"{var_name}_cfg = TensorConfig({shape_str}, '{dtype_str}')\n"
+            f"{var_name} = {var_name}_cfg.get_random_numpy_tensor(shape={shape_str}, data_type='{dtype_str}')"
+        )
 
 
 def _extract_tensor_config_from_item(config_item):
@@ -97,9 +99,6 @@ def _generate_test_code(
     device_id: int = 0,
     non_tensor_args: list[tuple[int, Any]] = None,
     non_tensor_kwargs: dict[str, Any] = None,
-    use_actual_data: bool = False,
-    actual_args_data: list[Any] = None,
-    actual_kwargs_data: dict[str, Any] = None,
 ) -> str:
     """生成单测文件代码"""
     code_lines = [
@@ -122,7 +121,10 @@ def _generate_test_code(
         "import paddle",
         "import numpy",
         "import torch",
-        "from tester.api_config.config_analyzer import TensorConfig",
+        "from tester.api_config.config_analyzer import TensorConfig, APIConfig",
+        "",
+        f"# 创建API配置对象",
+        f'api_config = APIConfig("{api_config_str}")',
         "",
         f"# 设置目标设备",
     ]
@@ -148,131 +150,68 @@ def _generate_test_code(
 
     from .api_config.config_analyzer import TensorConfig
 
-    # 如果使用实际数据，优先使用实际数据
-    if use_actual_data and actual_args_data is not None:
-        for i, arg_data in enumerate(actual_args_data):
-            var_name = f"arg_{i}"
-            if hasattr(arg_data, 'numpy'):  # paddle.Tensor
-                numpy_data = arg_data.numpy()
-                code_lines.append(f"# 位置参数 {var_name} (使用实际数据)")
-                code_lines.append(_generate_numpy_data_code(numpy_data, var_name))
-                tensor_var = f"{var_name}_tensor"
-                code_lines.append(f"{tensor_var} = paddle.to_tensor({var_name})")
-                tensor_vars[var_name] = tensor_var
-                all_inputs.append(tensor_var)
-            elif isinstance(arg_data, (list, tuple)):
-                code_lines.append(f"# 位置参数 {var_name} (list/tuple, 使用实际数据)")
-                tensor_list = []
-                for j, item in enumerate(arg_data):
-                    if hasattr(item, 'numpy'):  # paddle.Tensor
-                        item_var = f"{var_name}_item_{j}"
-                        numpy_data = item.numpy()
-                        code_lines.append(_generate_numpy_data_code(numpy_data, item_var))
-                        tensor_var = f"{item_var}_tensor"
-                        code_lines.append(f"{tensor_var} = paddle.to_tensor({item_var})")
-                        tensor_list.append(tensor_var)
-                        all_inputs.append(tensor_var)
-                if tensor_list:
-                    code_lines.append(f"{var_name}_tensors = [{', '.join(tensor_list)}]")
-            else:
-                # 非tensor数据，直接使用（会在non_tensor_args中处理）
-                pass
-    else:
-        # 使用配置方式生成数据
-        for i, (var_name, tensor_config) in enumerate(args_configs):
-            if isinstance(tensor_config, (list, tuple)):
-                code_lines.append(f"# 位置参数 {var_name} (list/tuple)")
-                tensor_list = []
-                for j, item in enumerate(tensor_config):
-                    if isinstance(item, TensorConfig):
-                        item_var = f"{var_name}_item_{j}"
-                        code_lines.append(
-                            _generate_random_tensor_code(item.shape, item.dtype, item_var)
+    # 使用TensorConfig.get_numpy_tensor()方法生成数据，与paddle_device_vs_cpu.py中的逻辑一致
+    for i, (var_name, tensor_config) in enumerate(args_configs):
+        if isinstance(tensor_config, (list, tuple)):
+            code_lines.append(f"# 位置参数 {var_name} (list/tuple)")
+            tensor_list = []
+            for j, item in enumerate(tensor_config):
+                if isinstance(item, TensorConfig):
+                    item_var = f"{var_name}_item_{j}"
+                    code_lines.append(
+                        _generate_tensor_code_using_get_numpy_tensor(
+                            item, item_var, "api_config", index=i
                         )
-                        tensor_var = f"{item_var}_tensor"
-                        code_lines.append(f"{tensor_var} = paddle.to_tensor({item_var})")
-                        tensor_list.append(tensor_var)
-                        all_inputs.append(tensor_var)
-                if tensor_list:
-                    code_lines.append(f"{var_name}_tensors = [{', '.join(tensor_list)}]")
-            elif isinstance(tensor_config, TensorConfig):
-                code_lines.append(f"# 位置参数 {var_name}")
-                code_lines.append(
-                    _generate_random_tensor_code(tensor_config.shape, tensor_config.dtype, var_name)
+                    )
+                    tensor_var = f"{item_var}_tensor"
+                    code_lines.append(f"{tensor_var} = paddle.to_tensor({item_var})")
+                    tensor_list.append(tensor_var)
+                    all_inputs.append(tensor_var)
+            if tensor_list:
+                code_lines.append(f"{var_name}_tensors = [{', '.join(tensor_list)}]")
+        elif isinstance(tensor_config, TensorConfig):
+            code_lines.append(f"# 位置参数 {var_name}")
+            code_lines.append(
+                _generate_tensor_code_using_get_numpy_tensor(
+                    tensor_config, var_name, "api_config", index=i
                 )
-                tensor_var = f"{var_name}_tensor"
-                code_lines.append(f"{tensor_var} = paddle.to_tensor({var_name})")
-                tensor_vars[var_name] = tensor_var
-                all_inputs.append(tensor_var)
+            )
+            tensor_var = f"{var_name}_tensor"
+            code_lines.append(f"{tensor_var} = paddle.to_tensor({var_name})")
+            tensor_vars[var_name] = tensor_var
+            all_inputs.append(tensor_var)
 
-    # 处理kwargs
-    if use_actual_data and actual_kwargs_data is not None:
-        for key, kwarg_data in actual_kwargs_data.items():
-            if hasattr(kwarg_data, 'numpy'):  # paddle.Tensor
-                var_name = f"kwarg_{key}"
-                numpy_data = kwarg_data.numpy()
-                code_lines.append(f"# 关键字参数 {key} (使用实际数据)")
-                code_lines.append(_generate_numpy_data_code(numpy_data, var_name))
-                tensor_var = f"{var_name}_tensor"
-                code_lines.append(f"{tensor_var} = paddle.to_tensor({var_name})")
-                tensor_vars[key] = tensor_var
-                all_inputs.append(tensor_var)
-            elif isinstance(kwarg_data, (list, tuple)):
-                code_lines.append(f"# 关键字参数 {key} (list/tuple, 使用实际数据)")
-                tensor_list = []
-                for j, item in enumerate(kwarg_data):
-                    if hasattr(item, 'numpy'):  # paddle.Tensor
-                        item_var = f"kwarg_{key}_item_{j}"
-                        numpy_data = item.numpy()
-                        code_lines.append(_generate_numpy_data_code(numpy_data, item_var))
-                        tensor_var = f"{item_var}_tensor"
-                        code_lines.append(f"{tensor_var} = paddle.to_tensor({item_var})")
-                        tensor_list.append(tensor_var)
-                        all_inputs.append(tensor_var)
-                if tensor_list:
-                    code_lines.append(f"kwarg_{key}_tensors = [{', '.join(tensor_list)}]")
-            else:
-                # 非tensor数据，使用配置方式
-                if key in kwargs_configs:
-                    tensor_config = kwargs_configs[key]
-                    if isinstance(tensor_config, TensorConfig):
-                        var_name = f"kwarg_{key}"
-                        code_lines.append(f"# 关键字参数 {key}")
-                        code_lines.append(
-                            _generate_random_tensor_code(tensor_config.shape, tensor_config.dtype, var_name)
+    # 处理kwargs，使用TensorConfig.get_numpy_tensor()方法
+    for key, tensor_config in kwargs_configs.items():
+        if isinstance(tensor_config, (list, tuple)):
+            code_lines.append(f"# 关键字参数 {key} (list/tuple)")
+            tensor_list = []
+            for j, item in enumerate(tensor_config):
+                if isinstance(item, TensorConfig):
+                    item_var = f"kwarg_{key}_item_{j}"
+                    code_lines.append(
+                        _generate_tensor_code_using_get_numpy_tensor(
+                            item, item_var, "api_config", key=key
                         )
-                        tensor_var = f"{var_name}_tensor"
-                        code_lines.append(f"{tensor_var} = paddle.to_tensor({var_name})")
-                        tensor_vars[key] = tensor_var
-                        all_inputs.append(tensor_var)
-    else:
-        # 使用配置方式生成数据
-        for key, tensor_config in kwargs_configs.items():
-            if isinstance(tensor_config, (list, tuple)):
-                code_lines.append(f"# 关键字参数 {key} (list/tuple)")
-                tensor_list = []
-                for j, item in enumerate(tensor_config):
-                    if isinstance(item, TensorConfig):
-                        item_var = f"kwarg_{key}_item_{j}"
-                        code_lines.append(
-                            _generate_random_tensor_code(item.shape, item.dtype, item_var)
-                        )
-                        tensor_var = f"{item_var}_tensor"
-                        code_lines.append(f"{tensor_var} = paddle.to_tensor({item_var})")
-                        tensor_list.append(tensor_var)
-                        all_inputs.append(tensor_var)
-                if tensor_list:
-                    code_lines.append(f"kwarg_{key}_tensors = [{', '.join(tensor_list)}]")
-            elif isinstance(tensor_config, TensorConfig):
-                code_lines.append(f"# 关键字参数 {key}")
-                var_name = f"kwarg_{key}"
-                code_lines.append(
-                    _generate_random_tensor_code(tensor_config.shape, tensor_config.dtype, var_name)
+                    )
+                    tensor_var = f"{item_var}_tensor"
+                    code_lines.append(f"{tensor_var} = paddle.to_tensor({item_var})")
+                    tensor_list.append(tensor_var)
+                    all_inputs.append(tensor_var)
+            if tensor_list:
+                code_lines.append(f"kwarg_{key}_tensors = [{', '.join(tensor_list)}]")
+        elif isinstance(tensor_config, TensorConfig):
+            code_lines.append(f"# 关键字参数 {key}")
+            var_name = f"kwarg_{key}"
+            code_lines.append(
+                _generate_tensor_code_using_get_numpy_tensor(
+                    tensor_config, var_name, "api_config", key=key
                 )
-                tensor_var = f"{var_name}_tensor"
-                code_lines.append(f"{tensor_var} = paddle.to_tensor({var_name})")
-                tensor_vars[key] = tensor_var
-                all_inputs.append(tensor_var)
+            )
+            tensor_var = f"{var_name}_tensor"
+            code_lines.append(f"{tensor_var} = paddle.to_tensor({var_name})")
+            tensor_vars[key] = tensor_var
+            all_inputs.append(tensor_var)
 
     code_lines.append("")
     code_lines.append("# 构建API调用参数")
@@ -299,47 +238,21 @@ def _generate_test_code(
     code_lines.append("")
 
     arg_vars = []
-    # 如果使用实际数据，根据实际数据构建arg_vars
-    if use_actual_data and actual_args_data is not None:
-        for i, arg_data in enumerate(actual_args_data):
-            var_name = f"arg_{i}"
-            if hasattr(arg_data, 'numpy'):  # paddle.Tensor
-                arg_vars.append(tensor_vars.get(var_name, f"{var_name}_tensor"))
-            elif isinstance(arg_data, (list, tuple)):
-                # 检查是否是tensor列表
-                if any(hasattr(item, 'numpy') for item in arg_data if hasattr(item, 'numpy')):
-                    arg_vars.append(f"{var_name}_tensors")
-                else:
-                    # 非tensor列表，需要检查non_tensor_args
-                    non_tensor_indices = [idx for idx, _ in non_tensor_args]
-                    if i in non_tensor_indices:
-                        arg_vars.append(f"arg_{i}_non_tensor")
-                    else:
-                        arg_vars.append(f"{var_name}_tensors")
+    # 使用配置方式构建arg_vars
+    config_idx = 0
+    non_tensor_idx = 0
+    max_args = max(len(args_configs) + len(non_tensor_args), 0)
+    for i in range(max_args):
+        if config_idx < len(args_configs) and args_configs[config_idx][0] == f"arg_{i}":
+            var_name, tensor_config = args_configs[config_idx]
+            if isinstance(tensor_config, (list, tuple)):
+                arg_vars.append(f"{var_name}_tensors")
             else:
-                # 非tensor数据
-                non_tensor_indices = [idx for idx, _ in non_tensor_args]
-                if i in non_tensor_indices:
-                    arg_vars.append(f"arg_{i}_non_tensor")
-                else:
-                    # 尝试从tensor_vars中获取
-                    arg_vars.append(tensor_vars.get(var_name, f"arg_{i}_non_tensor"))
-    else:
-        # 使用配置方式构建arg_vars
-        config_idx = 0
-        non_tensor_idx = 0
-        max_args = max(len(args_configs) + len(non_tensor_args), 0)
-        for i in range(max_args):
-            if config_idx < len(args_configs) and args_configs[config_idx][0] == f"arg_{i}":
-                var_name, tensor_config = args_configs[config_idx]
-                if isinstance(tensor_config, (list, tuple)):
-                    arg_vars.append(f"{var_name}_tensors")
-                else:
-                    arg_vars.append(tensor_vars.get(var_name, var_name))
-                config_idx += 1
-            elif non_tensor_idx < len(non_tensor_args) and non_tensor_args[non_tensor_idx][0] == i:
-                arg_vars.append(f"arg_{i}_non_tensor")
-                non_tensor_idx += 1
+                arg_vars.append(tensor_vars.get(var_name, var_name))
+            config_idx += 1
+        elif non_tensor_idx < len(non_tensor_args) and non_tensor_args[non_tensor_idx][0] == i:
+            arg_vars.append(f"arg_{i}_non_tensor")
+            non_tensor_idx += 1
 
     kwarg_vars = {}
     for key, tensor_config in kwargs_configs.items():
@@ -472,55 +385,8 @@ def generate_reproducible_test_file(
                         if not isinstance(kwarg_config, TensorConfig):
                             non_tensor_kwargs[key] = kwarg_config
 
-        # 尝试从test_instance中提取实际使用的数据
-        use_actual_data = False
-        actual_args_data = None
-        actual_kwargs_data = None
-        
-        if test_instance is not None:
-            if hasattr(test_instance, "paddle_args") and hasattr(test_instance, "paddle_kwargs"):
-                try:
-                    # 提取实际的numpy数据
-                    actual_args_data = []
-                    for i, arg in enumerate(test_instance.paddle_args):
-                        if hasattr(arg, 'numpy'):
-                            actual_args_data.append(arg)
-                        elif isinstance(arg, (list, tuple)):
-                            actual_args_data.append(arg)
-                        else:
-                            # 非tensor数据，添加到non_tensor_args（如果还没有）
-                            if (i, arg) not in non_tensor_args:
-                                non_tensor_args.append((i, arg))
-                            actual_args_data.append(arg)
-                    
-                    actual_kwargs_data = {}
-                    for key, kwarg in test_instance.paddle_kwargs.items():
-                        if hasattr(kwarg, 'numpy'):
-                            actual_kwargs_data[key] = kwarg
-                        elif isinstance(kwarg, (list, tuple)):
-                            actual_kwargs_data[key] = kwarg
-                        else:
-                            # 非tensor数据，添加到non_tensor_kwargs（如果还没有）
-                            if key not in non_tensor_kwargs:
-                                non_tensor_kwargs[key] = kwarg
-                            actual_kwargs_data[key] = kwarg
-                    
-                    # 检查是否有实际的tensor数据
-                    has_tensor_data = False
-                    for arg in actual_args_data:
-                        if hasattr(arg, 'numpy') or (isinstance(arg, (list, tuple)) and any(hasattr(item, 'numpy') for item in arg if hasattr(item, 'numpy'))):
-                            has_tensor_data = True
-                            break
-                    for kwarg in actual_kwargs_data.values():
-                        if hasattr(kwarg, 'numpy') or (isinstance(kwarg, (list, tuple)) and any(hasattr(item, 'numpy') for item in kwarg if hasattr(item, 'numpy'))):
-                            has_tensor_data = True
-                            break
-                    
-                    if has_tensor_data:
-                        use_actual_data = True
-                except Exception as e:
-                    print(f"[Warning] Failed to extract actual data from test_instance: {e}", flush=True)
-                    use_actual_data = False
+        # 不再提取实际数据，而是使用TensorConfig配置来生成数据
+        # 这样可以确保使用和paddle_device_vs_cpu.py中相同的生成逻辑
 
         if not args_configs and not kwargs_configs:
             args_configs, kwargs_configs = _extract_tensor_configs(
@@ -547,9 +413,6 @@ def generate_reproducible_test_file(
             device_id=device_id,
             non_tensor_args=non_tensor_args,
             non_tensor_kwargs=non_tensor_kwargs,
-            use_actual_data=use_actual_data,
-            actual_args_data=actual_args_data,
-            actual_kwargs_data=actual_kwargs_data,
         )
 
         with open(filepath, "w", encoding="utf-8") as f:
