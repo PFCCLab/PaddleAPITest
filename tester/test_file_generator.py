@@ -10,13 +10,17 @@ from typing import Any
 
 
 def _generate_tensor_code_using_get_numpy_tensor(
-    tensor_config, var_name: str, api_config_var: str, index: int = None, key: str = None
+    tensor_config,
+    var_name: str,
+    api_config_var: str,
+    index: int = None,
+    key: str = None,
 ) -> str:
     """生成使用TensorConfig.get_numpy_tensor()的Python代码，与paddle_device_vs_cpu.py中的逻辑一致"""
     shape_str = str(tensor_config.shape)
     dtype_str = tensor_config.dtype
     original_dtype_str = dtype_str
-    
+
     if index is not None:
         return (
             f"# 生成tensor: shape={shape_str}, dtype={dtype_str}\n"
@@ -130,7 +134,7 @@ def _generate_test_code(
         "",
         f"# 设置目标设备",
     ]
-    
+
     # 修复CPU设备设置：如果是cpu，不要加:0
     if target_device == "cpu":
         code_lines.append('paddle.set_device("cpu")')
@@ -168,10 +172,16 @@ def _generate_test_code(
                     tensor_var = f"{item_var}_tensor"
                     # 对于bfloat16，需要先用float32创建，然后cast
                     if item.dtype == "bfloat16":
-                        code_lines.append(f"{tensor_var} = paddle.to_tensor({item_var}, dtype='float32')")
-                        code_lines.append(f"{tensor_var} = paddle.cast({tensor_var}, dtype='bfloat16')")
+                        code_lines.append(
+                            f"{tensor_var} = paddle.to_tensor({item_var}, dtype='float32')"
+                        )
+                        code_lines.append(
+                            f"{tensor_var} = paddle.cast({tensor_var}, dtype='bfloat16')"
+                        )
                     else:
-                        code_lines.append(f"{tensor_var} = paddle.to_tensor({item_var}, dtype='{item.dtype}')")
+                        code_lines.append(
+                            f"{tensor_var} = paddle.to_tensor({item_var}, dtype='{item.dtype}')"
+                        )
                     tensor_list.append(tensor_var)
                     all_inputs.append(tensor_var)
             if tensor_list:
@@ -189,7 +199,9 @@ def _generate_test_code(
                 code_lines.append(f"{tensor_var} = paddle.to_tensor({var_name}, dtype='float32')")
                 code_lines.append(f"{tensor_var} = paddle.cast({tensor_var}, dtype='bfloat16')")
             else:
-                code_lines.append(f"{tensor_var} = paddle.to_tensor({var_name}, dtype='{tensor_config.dtype}')")
+                code_lines.append(
+                    f"{tensor_var} = paddle.to_tensor({var_name}, dtype='{tensor_config.dtype}')"
+                )
             tensor_vars[var_name] = tensor_var
             all_inputs.append(tensor_var)
 
@@ -209,10 +221,16 @@ def _generate_test_code(
                     tensor_var = f"{item_var}_tensor"
                     # 对于bfloat16，需要先用float32创建，然后cast
                     if item.dtype == "bfloat16":
-                        code_lines.append(f"{tensor_var} = paddle.to_tensor({item_var}, dtype='float32')")
-                        code_lines.append(f"{tensor_var} = paddle.cast({tensor_var}, dtype='bfloat16')")
+                        code_lines.append(
+                            f"{tensor_var} = paddle.to_tensor({item_var}, dtype='float32')"
+                        )
+                        code_lines.append(
+                            f"{tensor_var} = paddle.cast({tensor_var}, dtype='bfloat16')"
+                        )
                     else:
-                        code_lines.append(f"{tensor_var} = paddle.to_tensor({item_var}, dtype='{item.dtype}')")
+                        code_lines.append(
+                            f"{tensor_var} = paddle.to_tensor({item_var}, dtype='{item.dtype}')"
+                        )
                     tensor_list.append(tensor_var)
                     all_inputs.append(tensor_var)
             if tensor_list:
@@ -231,7 +249,9 @@ def _generate_test_code(
                 code_lines.append(f"{tensor_var} = paddle.to_tensor({var_name}, dtype='float32')")
                 code_lines.append(f"{tensor_var} = paddle.cast({tensor_var}, dtype='bfloat16')")
             else:
-                code_lines.append(f"{tensor_var} = paddle.to_tensor({var_name}, dtype='{tensor_config.dtype}')")
+                code_lines.append(
+                    f"{tensor_var} = paddle.to_tensor({var_name}, dtype='{tensor_config.dtype}')"
+                )
             tensor_vars[key] = tensor_var
             all_inputs.append(tensor_var)
 
