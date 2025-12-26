@@ -1,6 +1,7 @@
 name: Actions Runner Controller Demo
 on:
-  workflow_dispatch:
+  branch_protection_rule:
+    types: [created, edited]
 
 jobs:
   Explore-GitHub-Actions:
