@@ -9,4 +9,5 @@ jobs:
       image: ccr-2vdh3abv-pub.cnc.bj.baidubce.com/device/paddle-ixuca:latest
     steps:
     - run: echo "🎉 This job uses runner scale set runners!"
-    - run: pwd
+    - run: sleep 3600
+    - run: echo 'pwd'
