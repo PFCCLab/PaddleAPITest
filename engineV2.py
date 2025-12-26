@@ -53,6 +53,8 @@ VALID_TEST_ARGS = {
     "random_seed",
     "bos_conf_path",
     "bcecmd_path",
+    "bitwise_alignment",
+    "exit_on_error",
 }
 
 DEVICE_TYPE = None
@@ -496,6 +498,8 @@ def run_test_case(api_config_str, options):
             os._exit(99)
         if "CUDA out of memory" in str(err) or "Out of memory error" in str(err):
             os._exit(98)
+        if "AssertionError" in str(err) or "Tensor-likes are not equal" in str(err):
+            os._exit(1)
         # if not fatal error, subprocess will be alive and report error
         print(f"[test error] {api_config_str}: {err}", flush=True)
         raise
@@ -680,6 +684,12 @@ def main():
         default=False,
         help="Whether to using bitwise alignment when run accuracy test",
     )
+    parser.add_argument(
+        "--exit_on_error",
+        type=parse_bool,
+        default=False,
+        help="Whether to exit the process when a paddle_error occurs.",
+    )
 
     options = parser.parse_args()
     print(f"Options: {vars(options)}", flush=True)
@@ -821,12 +831,19 @@ def main():
                 rtol=options.rtol,
                 test_tol=options.test_tol,
                 bitwise_alignment=options.bitwise_alignment,
+                exit_on_error=options.exit_on_error,
             )
         else:
             case = test_class(api_config, test_amp=options.test_amp)
         try:
             case.test()
         except Exception as err:
+            if (
+                "Tensor-likes are not equal" in str(err)
+                or "Mismatched elements" in str(err)
+                or "Tensor-likes are not equal" in str(err)
+            ):
+                exit(1)
             print(f"[test error] {options.api_config}: {err}", flush=True)
         finally:
             case.clear_tensor()
