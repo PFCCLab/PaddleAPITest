@@ -1,7 +1,5 @@
 name: Actions Runner Controller Demo
-on:
-  branch_protection_rule:
-    types: [created, edited]
+on: [push]
 
 jobs:
   Explore-GitHub-Actions:
