@@ -5,8 +5,8 @@
 bos_path: "xly-devops/liujingzong/"
 
 # BOS 配置文件路径（bcecmd 使用的配置文件路径）
-bos_conf_path: "./conf"
+bos_conf_path: "home/conf/credentials"
 
 # bcecmd 命令行工具路径
-bcecmd_path: "./bcecmd"
+bcecmd_path: "home/bcecmd"
 
