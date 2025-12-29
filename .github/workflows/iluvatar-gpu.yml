@@ -7,7 +7,7 @@ on:
 jobs:
   upload_on_gpu:
     name: Upload on bj-gpu-03 runner
-    runs-on: [self-hosted, bj-gpu-03]
+    runs-on: [bj-gpu-03]
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -54,7 +54,7 @@ jobs:
 
   download_on_iluvatar:
     name: Download on iluvatar-gpu-2-1 runner
-    runs-on: [self-hosted, iluvatar-gpu-2-1]
+    runs-on: [iluvatar-gpu-2-1]
     needs: upload_on_gpu
     steps:
       - name: Checkout code
