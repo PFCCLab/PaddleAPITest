@@ -8,6 +8,8 @@ jobs:
   upload_on_gpu:
     name: Upload on bj-gpu-03 runner
     runs-on: [bj-gpu-03]
+    container:
+      image: ccr-2vdh3abv-pub.cnc.bj.baidubce.com/paddlepaddle/paddle:3.2.1-gpu-cuda11.8-cudnn8.9
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -55,6 +57,8 @@ jobs:
   download_on_iluvatar:
     name: Download on iluvatar-gpu-2-1 runner
     runs-on: [iluvatar-gpu-2-1]
+    container:
+      image: ccr-2vdh3abv-pub.cnc.bj.baidubce.com/device/paddle-ixuca:latest
     needs: upload_on_gpu
     steps:
       - name: Checkout code
