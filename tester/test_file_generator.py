@@ -107,6 +107,9 @@ def _generate_test_code(
     non_tensor_kwargs: dict[str, Any] = None,
 ) -> str:
     """生成单测文件代码"""
+    # 判断是否为accuracy_error，需要生成CPU和目标设备的对比测试
+    is_accuracy_error = error_info.get("error_type") == "accuracy_error"
+    
     code_lines = [
         "import sys",
         "import os",
@@ -132,15 +135,17 @@ def _generate_test_code(
         f"# 创建API配置对象",
         f"api_config = APIConfig({repr(api_config_str)})",
         "",
-        f"# 设置目标设备",
     ]
-
-    # 修复CPU设备设置：如果是cpu，不要加:0
-    if target_device == "cpu":
-        code_lines.append('paddle.set_device("cpu")')
-    else:
-        code_lines.append(f'paddle.set_device("{target_device}:{device_id}")')
-    code_lines.append("")
+    
+    # 如果是accuracy_error，需要生成对比测试，先不设置设备
+    if not is_accuracy_error:
+        code_lines.append(f"# 设置目标设备")
+        # 修复CPU设备设置：如果是cpu，不要加:0
+        if target_device == "cpu":
+            code_lines.append('paddle.set_device("cpu")')
+        else:
+            code_lines.append(f'paddle.set_device("{target_device}:{device_id}")')
+        code_lines.append("")
 
     is_tensor_method = api_name.startswith("paddle.Tensor.")
     if is_tensor_method and not args_configs and kwargs_configs:
@@ -149,6 +154,9 @@ def _generate_test_code(
         args_configs.insert(0, (first_key, first_value))
 
     code_lines.append("# 生成输入数据")
+    if is_accuracy_error:
+        code_lines.append("# 注意：当使用APITestCustomDeviceVSCPU时，这些变量不会被直接使用，")
+        code_lines.append("# 因为测试类会自己生成输入数据。但保留它们有助于调试和理解配置。")
     code_lines.append("numpy.random.seed(0)")
     code_lines.append("")
     all_inputs = []
@@ -307,80 +315,113 @@ def _generate_test_code(
         kwarg_vars[key] = f"kwarg_{key}_non_tensor"
 
     code_lines.append("")
-    code_lines.append("# 执行API调用")
-    code_lines.append("try:")
+    
+    # 如果是accuracy_error，直接使用测试类来运行对比测试
+    if is_accuracy_error:
+        code_lines.append("# 使用APITestCustomDeviceVSCPU类来运行CPU与目标设备的对比测试")
+        code_lines.append("from tester.paddle_device_vs_cpu import APITestCustomDeviceVSCPU")
+        code_lines.append("")
+        code_lines.append("# 创建测试实例，会自动检测可用设备（优先XPU，然后是CustomDevice）")
+        code_lines.append("test_instance = APITestCustomDeviceVSCPU(")
+        code_lines.append("    api_config,")
+        code_lines.append(f"    test_amp={test_amp},")
+        # 根据目标设备类型传递相应的参数
+        if target_device == "xpu":
+            code_lines.append(f"    xpu_device_id={device_id},")
+        elif target_device != "cpu":
+            # 对于自定义设备，需要传递 custom_device_type 和 custom_device_id
+            # 但 APITestCustomDeviceVSCPU 会自动检测，所以这里只传递 xpu_device_id（如果存在）
+            # 注意：自定义设备的 device_id 目前固定为 0，如果需要支持其他值，需要修改 APITestCustomDeviceVSCPU
+            pass
+        code_lines.append("    generate_failed_tests=False,")  # 避免递归生成测试文件
+        code_lines.append(")")
+        code_lines.append("")
+        code_lines.append("try:")
+        code_lines.append("    # 运行对比测试：会在CPU和目标设备上分别执行，并对比结果")
+        code_lines.append("    test_instance.test()")
+        code_lines.append("    print('[Test completed]', flush=True)")
+        code_lines.append("except Exception as e:")
+        code_lines.append("    print(f'[Test error] {e}', flush=True)")
+        code_lines.append("    import traceback")
+        code_lines.append("    traceback.print_exc()")
+        code_lines.append("    raise")
+    
+    else:
+        # 原有的单设备测试代码
+        code_lines.append("# 执行API调用")
+        code_lines.append("try:")
 
-    is_tensor_method = api_name.startswith("paddle.Tensor.")
-    if is_tensor_method:
-        method_name = api_name.split(".")[-1]
-        if arg_vars:
-            tensor_var = arg_vars[0]
-            remaining_args = arg_vars[1:] if len(arg_vars) > 1 else []
+        is_tensor_method = api_name.startswith("paddle.Tensor.")
+        if is_tensor_method:
+            method_name = api_name.split(".")[-1]
+            if arg_vars:
+                tensor_var = arg_vars[0]
+                remaining_args = arg_vars[1:] if len(arg_vars) > 1 else []
+            else:
+                tensor_var = None
+                remaining_args = []
         else:
             tensor_var = None
-            remaining_args = []
-    else:
-        tensor_var = None
-        remaining_args = arg_vars
+            remaining_args = arg_vars
 
-    api_call_parts = []
-    if not is_tensor_method:
-        if remaining_args:
-            api_call_parts.extend(remaining_args)
-    else:
-        if remaining_args:
-            api_call_parts.extend(remaining_args)
-
-    if kwarg_vars:
-        kwarg_str = ", ".join([f"{k}={v}" for k, v in kwarg_vars.items()])
-        api_call_parts.append(kwarg_str)
-
-    if is_tensor_method and tensor_var:
-        if api_call_parts:
-            api_call = f"    output = {tensor_var}.{method_name}(" + ", ".join(api_call_parts) + ")"
+        api_call_parts = []
+        if not is_tensor_method:
+            if remaining_args:
+                api_call_parts.extend(remaining_args)
         else:
-            api_call = f"    output = {tensor_var}.{method_name}()"
-    else:
-        if api_call_parts:
-            api_call = f"    output = {api_name}(" + ", ".join(api_call_parts) + ")"
+            if remaining_args:
+                api_call_parts.extend(remaining_args)
+
+        if kwarg_vars:
+            kwarg_str = ", ".join([f"{k}={v}" for k, v in kwarg_vars.items()])
+            api_call_parts.append(kwarg_str)
+
+        if is_tensor_method and tensor_var:
+            if api_call_parts:
+                api_call = f"    output = {tensor_var}.{method_name}(" + ", ".join(api_call_parts) + ")"
+            else:
+                api_call = f"    output = {tensor_var}.{method_name}()"
         else:
-            api_call = f"    output = {api_name}()"
+            if api_call_parts:
+                api_call = f"    output = {api_name}(" + ", ".join(api_call_parts) + ")"
+            else:
+                api_call = f"    output = {api_name}()"
 
-    if test_amp:
-        code_lines.append("    with paddle.amp.auto_cast():")
-        code_lines.append("        " + api_call)
-    else:
-        code_lines.append(api_call)
+        if test_amp:
+            code_lines.append("    with paddle.amp.auto_cast():")
+            code_lines.append("        " + api_call)
+        else:
+            code_lines.append(api_call)
 
-    code_lines.append('    print("Forward pass succeeded")')
-    code_lines.append('    print(f"Output type: {type(output)}")')
-    code_lines.append("    if isinstance(output, paddle.Tensor):")
-    code_lines.append('        print(f"Output shape: {output.shape}, dtype: {output.dtype}")')
-    code_lines.append("    elif isinstance(output, (list, tuple)):")
-    code_lines.append('        print(f"Output length: {len(output)}")')
-    code_lines.append("        for i, item in enumerate(output):")
-    code_lines.append("            if isinstance(item, paddle.Tensor):")
-    code_lines.append(
-        '                print(f"  Output[{i}]: shape={item.shape}, dtype={item.dtype}")'
-    )
-    code_lines.append("")
-
-    if error_info.get("stage") == "backward" or error_info.get("need_backward", False):
-        code_lines.append("")
-        code_lines.append("    # Backward测试")
+        code_lines.append('    print("Forward pass succeeded")')
+        code_lines.append('    print(f"Output type: {type(output)}")')
         code_lines.append("    if isinstance(output, paddle.Tensor):")
-        code_lines.append("        output.backward()")
+        code_lines.append('        print(f"Output shape: {output.shape}, dtype={output.dtype}")')
         code_lines.append("    elif isinstance(output, (list, tuple)):")
-        code_lines.append("        for item in output:")
+        code_lines.append('        print(f"Output length: {len(output)}")')
+        code_lines.append("        for i, item in enumerate(output):")
         code_lines.append("            if isinstance(item, paddle.Tensor):")
-        code_lines.append("                item.backward()")
-        code_lines.append('    print("Backward pass succeeded")')
+        code_lines.append(
+            '                print(f"  Output[{i}]: shape={item.shape}, dtype={item.dtype}")'
+        )
+        code_lines.append("")
 
-    code_lines.append("except Exception as e:")
-    code_lines.append('    print(f"Error occurred: {e}")')
-    code_lines.append("    import traceback")
-    code_lines.append("    traceback.print_exc()")
-    code_lines.append("    raise")
+        if error_info.get("stage") == "backward" or error_info.get("need_backward", False):
+            code_lines.append("")
+            code_lines.append("    # Backward测试")
+            code_lines.append("    if isinstance(output, paddle.Tensor):")
+            code_lines.append("        output.backward()")
+            code_lines.append("    elif isinstance(output, (list, tuple)):")
+            code_lines.append("        for item in output:")
+            code_lines.append("            if isinstance(item, paddle.Tensor):")
+            code_lines.append("                item.backward()")
+            code_lines.append('    print("Backward pass succeeded")')
+
+        code_lines.append("except Exception as e:")
+        code_lines.append('    print(f"Error occurred: {e}")')
+        code_lines.append("    import traceback")
+        code_lines.append("    traceback.print_exc()")
+        code_lines.append("    raise")
 
     return "\n".join(code_lines)
 
