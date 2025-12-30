@@ -6,7 +6,7 @@ jobs:
     name: Upload on bj-gpu-03 runner
     runs-on: [bj-gpu-03]
     container:
-      image: ccr-2vdh3abv-pub.cnc.bj.baidubce.com/device/paddle-ixuca:latest
+      image: ccr-2vdh3abv-pub.cnc.bj.baidubce.com/paddlepaddle/paddle:3.2.1-gpu-cuda11.8-cudnn8.9
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
