@@ -6,7 +6,7 @@ jobs:
     # You need to use the INSTALLATION_NAME from the previous step
     runs-on:  bj-gpu-03
     container:
-      image: ccr-2vdh3abv-pub.cnc.bj.baidubce.com/device/paddle-ixuca:latest
+      image: ccr-2vdh3abv-pub.cnc.bj.baidubce.com/paddlepaddle/paddle:3.2.1-gpu-cuda11.8-cudnn8.9
     steps:
     - run: echo "🎉 This job uses runner scale set runners!"
     - run: sleep 3600
