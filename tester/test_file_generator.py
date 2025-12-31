@@ -109,7 +109,7 @@ def _generate_test_code(
     """生成单测文件代码"""
     # 判断是否为accuracy_error，需要生成CPU和目标设备的对比测试
     is_accuracy_error = error_info.get("error_type") == "accuracy_error"
-    
+
     code_lines = [
         "import sys",
         "import os",
@@ -136,7 +136,7 @@ def _generate_test_code(
         f"api_config = APIConfig({repr(api_config_str)})",
         "",
     ]
-    
+
     # 如果是accuracy_error，需要生成对比测试，先不设置设备
     if not is_accuracy_error:
         code_lines.append(f"# 设置目标设备")
@@ -315,7 +315,7 @@ def _generate_test_code(
         kwarg_vars[key] = f"kwarg_{key}_non_tensor"
 
     code_lines.append("")
-    
+
     # 如果是accuracy_error，直接使用测试类来运行对比测试
     if is_accuracy_error:
         code_lines.append("# 使用APITestCustomDeviceVSCPU类来运行CPU与目标设备的对比测试")
@@ -345,7 +345,7 @@ def _generate_test_code(
         code_lines.append("    import traceback")
         code_lines.append("    traceback.print_exc()")
         code_lines.append("    raise")
-    
+
     else:
         # 原有的单设备测试代码
         code_lines.append("# 执行API调用")
@@ -378,7 +378,9 @@ def _generate_test_code(
 
         if is_tensor_method and tensor_var:
             if api_call_parts:
-                api_call = f"    output = {tensor_var}.{method_name}(" + ", ".join(api_call_parts) + ")"
+                api_call = (
+                    f"    output = {tensor_var}.{method_name}(" + ", ".join(api_call_parts) + ")"
+                )
             else:
                 api_call = f"    output = {tensor_var}.{method_name}()"
         else:
