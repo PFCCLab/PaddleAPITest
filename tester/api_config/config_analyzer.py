@@ -2809,6 +2809,12 @@ class APIConfig:
         self.config = config
         self.args = []
         self.kwargs = collections.OrderedDict()
+        # 兼容 paddle.Size([...]) 格式：将其替换为 [...]
+        def replace_paddle_size(match):
+            shape_list = match.group(1)  # 提取 [...] 部分
+            return shape_list
+        
+        config = re.sub(r"paddle\.Size\(\s*(\[[^\]]*\])\s*\)", replace_paddle_size, config)
         config = config.replace("Tensor(", "TensorConfig(")
 
         self.api_name, offset = self.get_api(config)
