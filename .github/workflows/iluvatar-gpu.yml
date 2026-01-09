@@ -79,8 +79,8 @@ jobs:
         run: |
           set -euxo pipefail
           pip install func_timeout pandas pebble pynvml pyyaml
-          python -m pip install paddlepaddle==3.2.1 -i https://www.paddlepaddle.org.cn/packages/stable/cpu/
-          python -m pip install paddle-iluvatar-gpu==3.2.1 -i https://www.paddlepaddle.org.cn/packages/stable/ixuca/
+          python -m pip install paddlepaddle==3.2.0 -i https://www.paddlepaddle.org.cn/packages/stable/cpu/
+          python -m pip install paddle-iluvatar-gpu==3.2.0 -i https://www.paddlepaddle.org.cn/packages/stable/ixuca/
           pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cpu
 
       - name: Run EngineV2 (download on iluvatar-gpu-2-1)
