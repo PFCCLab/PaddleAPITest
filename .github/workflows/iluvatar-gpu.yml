@@ -61,6 +61,11 @@ jobs:
       image: ccr-2vdh3abv-pub.cnc.bj.baidubce.com/device/paddle-ixuca:latest
     # needs: upload_on_gpu
     steps:
+      - name: Set up Proxy
+        run: |
+          export http_proxy=http://agent.baidu.com:8891
+          export https_proxy=$http_proxy
+
       - name: Checkout code
         uses: actions/checkout@v4
 
