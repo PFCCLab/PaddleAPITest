@@ -82,7 +82,7 @@ class APITestBase:
             return True
         for i in range(len(self.api_config.args)):
             if isinstance(self.api_config.args[i], TensorConfig):
-                if self.api_config.args[i].dtype in ["float8_e5m2", "float8_e4m3fn"]:
+                if self.api_config.args[i].dtype in ["float8_e5m2"]:
                     return True
             elif isinstance(self.api_config.args[i], list) or isinstance(
                 self.api_config.args[i], tuple
@@ -91,31 +91,26 @@ class APITestBase:
                     if isinstance(self.api_config.args[i][j], TensorConfig):
                         if self.api_config.args[i][j].dtype in [
                             "float8_e5m2",
-                            "float8_e4m3fn",
                         ]:
                             return True
             elif self.api_config.args[i] in [
-                paddle.base.core.DataType.FLOAT8_E4M3FN,
                 paddle.base.core.DataType.FLOAT8_E5M2,
                 "float8_e5m2",
-                "float8_e4m3fn",
             ]:
                 return True
 
         for _key, arg_config in self.api_config.kwargs.items():
             if isinstance(arg_config, TensorConfig):
-                if arg_config.dtype in ["float8_e5m2", "float8_e4m3fn"]:
+                if arg_config.dtype in ["float8_e5m2"]:
                     return True
             elif isinstance(arg_config, (list, tuple)):
                 for i in range(len(arg_config)):
                     if isinstance(arg_config[i], TensorConfig):
-                        if arg_config[i].dtype in ["float8_e5m2", "float8_e4m3fn"]:
+                        if arg_config[i].dtype in ["float8_e5m2"]:
                             return True
             elif arg_config in [
-                paddle.base.core.DataType.FLOAT8_E4M3FN,
                 paddle.base.core.DataType.FLOAT8_E5M2,
                 "float8_e5m2",
-                "float8_e4m3fn",
             ]:
                 return True
 
@@ -617,7 +612,11 @@ class APITestBase:
             for output in result_outputs:
                 dtype = str(output.dtype).split(".")[-1]
                 if USE_CACHED_NUMPY:
-                    dtype = "float32" if dtype == "bfloat16" else dtype
+                    dtype = (
+                        "float32"
+                        if dtype in ["bfloat16", "float8_e4m3fn", "float8_e5m2"]
+                        else dtype
+                    )
                     numpy_tensor = self.get_cached_numpy(dtype, output.shape)
                 else:
                     if "int" in dtype:
@@ -625,18 +624,27 @@ class APITestBase:
                             numpy.random.randint(-65535, 65535, size=output.shape)
                         ).astype(dtype)
                     else:
-                        dtype = "float32" if dtype == "bfloat16" else dtype
+                        dtype = (
+                            "float32"
+                            if dtype in ["bfloat16", "float8_e4m3fn", "float8_e5m2"]
+                            else dtype
+                        )
                         numpy_tensor = (numpy.random.random(output.shape) - 0.5).astype(dtype)
                 self.outputs_grad_numpy.append(numpy_tensor)
         for i, numpy_tensor in enumerate(self.outputs_grad_numpy):
             dtype = str(result_outputs[i].dtype).split(".")[-1]
             result_output_grad = paddle.to_tensor(
                 numpy_tensor,
-                dtype=dtype if dtype != "bfloat16" else "float32",
+                dtype=dtype
+                if dtype not in ["bfloat16", "float8_e4m3fn", "float8_e5m2"]
+                else "float32",
             )
             result_output_grad.stop_gradient = False
             if dtype == "bfloat16":
                 result_output_grad = paddle.cast(result_output_grad, dtype="bfloat16")
+            elif dtype == "float8_e4m3fn":
+                result_output_grad = paddle.cast(result_output_grad, dtype="float8_e4m3fn")
+                #print(f"[DEBUG] Backward Paddle Grad Tensor (float8_e4m3fn): {result_output_grad}\n[DEBUG] dtype check: {result_output_grad.dtype}", flush=True)
             result_outputs_grads.append(result_output_grad)
         return result_outputs, result_outputs_grads
 
@@ -662,7 +670,11 @@ class APITestBase:
             for output in result_outputs:
                 dtype = str(output.dtype).split(".")[-1]
                 if USE_CACHED_NUMPY:
-                    dtype = "float32" if dtype == "bfloat16" else dtype
+                    dtype = (
+                        "float32"
+                        if dtype in ["bfloat16", "float8_e4m3fn"]
+                        else dtype
+                    )
                     numpy_tensor = self.get_cached_numpy(dtype, output.shape)
                 else:
                     if "int" in dtype:
@@ -670,19 +682,31 @@ class APITestBase:
                             numpy.random.randint(-65535, 65535, size=output.shape)
                         ).astype(dtype)
                     else:
-                        dtype = "float32" if dtype == "bfloat16" else dtype
+                        dtype = (
+                            "float32"
+                            if dtype in ["bfloat16", "float8_e4m3fn"]
+                            else dtype
+                        )
                         numpy_tensor = (numpy.random.random(output.shape) - 0.5).astype(dtype)
                 self.outputs_grad_numpy.append(numpy_tensor)
         for i, numpy_tensor in enumerate(self.outputs_grad_numpy):
             dtype = str(result_outputs[i].dtype).split(".")[1]
+            dtype_to_use = (
+                torch.float32
+                if dtype in ["bfloat16", "float8_e4m3fn"]
+                else self.convert_dtype_to_torch_type(dtype)
+            )
             result_output_grad = torch.tensor(
                 numpy_tensor,
-                dtype=self.convert_dtype_to_torch_type(dtype)
-                if dtype != "bfloat16"
-                else torch.float32,
+                dtype=dtype_to_use,
             )
             if dtype == "bfloat16":
                 result_output_grad = result_output_grad.to(dtype=torch.bfloat16)
+            elif dtype == "float8_e4m3fn":
+                if hasattr(torch, "float8_e4m3fn"):
+                    result_output_grad = result_output_grad.to(dtype=torch.float8_e4m3fn)
+                else:
+                    result_output_grad = result_output_grad.to(dtype=torch.float16)
             result_outputs_grads.append(result_output_grad)
         return result_outputs, result_outputs_grads
 
@@ -780,8 +804,14 @@ class APITestBase:
             complex,
         ]:
             return torch.complex128
-        elif dtype is None:
-            return None
+        elif dtype in ["float8_e4m3fn"]:
+            if hasattr(torch, "float8_e4m3fn"):
+                return torch.float8_e4m3fn
+            return torch.float32
+        elif dtype in ["float8_e5m2"]:
+            if hasattr(torch, "float8_e5m2"):
+                return torch.float8_e5m2
+            return torch.float32
         else:
             raise ValueError(f"Unsupport dtype: {dtype}")
 
@@ -1033,6 +1063,15 @@ class APITestBase:
         is_backward = getattr(self, "is_backward", False)
         if test_tol:
             atol, rtol = 0.0, 0.0
+        
+        # [DEBUG] Print tensors before assertion
+        if str(torch_tensor.dtype).endswith("float8_e4m3fn"):
+            print(f"\n[DEBUG] Comparing Float8 Tensors:", flush=True)
+            print(f"[DEBUG] Converted Paddle Tensor: {converted_paddle_tensor}", flush=True)
+            print(f"[DEBUG] Paddle dtype: {converted_paddle_tensor.dtype}", flush=True)
+            print(f"[DEBUG] Benchmark Torch Tensor: {torch_tensor}", flush=True)
+            print(f"[DEBUG] Torch dtype: {torch_tensor.dtype}", flush=True)
+
         try:
             torch.testing.assert_close(
                 converted_paddle_tensor,
