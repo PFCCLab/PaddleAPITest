@@ -869,11 +869,9 @@ def to_big_tensor_config(api_config):
 
 if __name__ == "__main__":
     config_big_tensor = set()
-    api_configs = analyse_configs(
-        "/host_home/wanghuan29/APItest/PaddleAPITest/tester/api_config/5_accuracy/17.txt"
-    )
+    api_configs = analyse_configs("tester/api_config/9_getset_item/api_config_from_PaddleText.txt")
     with open(
-        "/host_home/wanghuan29/APItest/PaddleAPITest/tester/api_config/8_big_tensor/big_tensor_17.txt",
+        "tester/api_config/8_big_tensor/slice/big_tensor_1223.txt",
         "w",
     ) as f:
         for api_config in tqdm(api_configs):

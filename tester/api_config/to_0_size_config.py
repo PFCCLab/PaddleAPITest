@@ -45,11 +45,6 @@ def get_tensor_configs(api_config):
 
 
 def to_0_size_config(api_config):
-    if api_config.api_name in [
-        "paddle.Tensor.__getitem__",
-        "paddle.Tensor.__setitem__",
-    ]:
-        return []
     if api_config.api_name not in apis_map:
         apis_map[api_config.api_name] = {}
 
@@ -277,21 +272,20 @@ def to_big_tensor_config(api_config):
 
 if __name__ == "__main__":
     config_0_size = set()
-    api_configs = analyse_configs(
-        "/host_home/wanghuan29/APItest/PaddleAPITest/tester/api_config/5_accuracy/accuracy_2.txt"
-    )
+    for i in range(1, 7):
+        api_configs = analyse_configs(
+            f"tester/api_config/9_getset_item/api_config_merged_getset_item_{i}.txt"
+        )
+        config_0_size_chunk = []
+        for api_config in tqdm(api_configs):
+            config_0_size_chunk.extend(set(to_0_size_config(api_config)))
+        config_0_size = config_0_size.union(set(config_0_size_chunk))
 
     with open(
-        "/host_home/wanghuan29/APItest/PaddleAPITest/tester/api_config/7_0_size/0_size_tensor_2.txt",
+        "tester/api_config/9_getset_item/slice/api_config_merged_getset_item.txt",
         "w",
     ) as f:
-        for api_config in tqdm(api_configs):
-            # print(api_config.config)
-            # config_0_size = config_0_size.union(set(to_0_size_config(api_config)))
-
-            for api_config in to_0_size_config(api_config):
-                f.write(str(api_config) + "\n")
-        f.close()
+        f.write("\n".join(config_0_size))
 
 # if __name__ == '__main__':
 #     config_big_tensor = set()

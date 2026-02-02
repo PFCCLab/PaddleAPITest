@@ -2491,15 +2491,18 @@ class TensorConfig:
                     arr = self.get_arg(api_config, 0, "arr")
                     value = self.get_arg(api_config, 2, "value")
                     min_dim = min(arr.shape)
-                    if value is not None and hasattr(value, "shape"):
-                        indices = numpy.zeros(self.numel(), dtype="int64")
-                        num_true = min(value.shape[0], self.numel())
-                        true_indices = numpy.random.choice(
-                            self.numel(), size=num_true, replace=False
-                        )
-                        indices[true_indices] = 1
+                    if self.dtype == "bool":
+                        if value is not None and hasattr(value, "shape"):
+                            indices = numpy.zeros(self.numel(), dtype="int64")
+                            num_true = min(value.shape[0], self.numel())
+                            true_indices = numpy.random.choice(
+                                self.numel(), size=num_true, replace=False
+                            )
+                            indices[true_indices] = 1
+                        else:
+                            indices = numpy.random.choice([0, 1], size=self.numel())
                     else:
-                        indices = numpy.random.choice([0, 1], size=self.numel())
+                        indices = numpy.random.randint(0, min_dim, size=self.numel())
                     self.numpy_tensor = indices.reshape(self.shape).astype(self.dtype)
 
             elif api_config.api_name == "paddle.poisson":
@@ -2863,6 +2866,13 @@ class APIConfig:
         self.config = config
         self.args = []
         self.kwargs = collections.OrderedDict()
+
+        # 兼容 paddle.Size([...]) 格式：将其替换为 [...]
+        def replace_paddle_size(match):
+            shape_list = match.group(1)  # 提取 [...] 部分
+            return shape_list
+
+        config = re.sub(r"paddle\.Size\(\s*(\[[^\]]*\])\s*\)", replace_paddle_size, config)
         config = config.replace("Tensor(", "TensorConfig(")
 
         self.api_name, offset = self.get_api(config)
