@@ -644,7 +644,6 @@ class APITestBase:
                 result_output_grad = paddle.cast(result_output_grad, dtype="bfloat16")
             elif dtype == "float8_e4m3fn":
                 result_output_grad = paddle.cast(result_output_grad, dtype="float8_e4m3fn")
-                # print(f"[DEBUG] Backward Paddle Grad Tensor (float8_e4m3fn): {result_output_grad}\n[DEBUG] dtype check: {result_output_grad.dtype}", flush=True)
             result_outputs_grads.append(result_output_grad)
         return result_outputs, result_outputs_grads
 
@@ -1055,14 +1054,6 @@ class APITestBase:
         is_backward = getattr(self, "is_backward", False)
         if test_tol:
             atol, rtol = 0.0, 0.0
-
-        # [DEBUG] Print tensors before assertion
-        if str(torch_tensor.dtype).endswith("float8_e4m3fn"):
-            print(f"\n[DEBUG] Comparing Float8 Tensors:", flush=True)
-            print(f"[DEBUG] Converted Paddle Tensor: {converted_paddle_tensor}", flush=True)
-            print(f"[DEBUG] Paddle dtype: {converted_paddle_tensor.dtype}", flush=True)
-            print(f"[DEBUG] Benchmark Torch Tensor: {torch_tensor}", flush=True)
-            print(f"[DEBUG] Torch dtype: {torch_tensor.dtype}", flush=True)
 
         try:
             torch.testing.assert_close(
