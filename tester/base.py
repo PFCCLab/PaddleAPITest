@@ -644,7 +644,7 @@ class APITestBase:
                 result_output_grad = paddle.cast(result_output_grad, dtype="bfloat16")
             elif dtype == "float8_e4m3fn":
                 result_output_grad = paddle.cast(result_output_grad, dtype="float8_e4m3fn")
-                #print(f"[DEBUG] Backward Paddle Grad Tensor (float8_e4m3fn): {result_output_grad}\n[DEBUG] dtype check: {result_output_grad.dtype}", flush=True)
+                # print(f"[DEBUG] Backward Paddle Grad Tensor (float8_e4m3fn): {result_output_grad}\n[DEBUG] dtype check: {result_output_grad.dtype}", flush=True)
             result_outputs_grads.append(result_output_grad)
         return result_outputs, result_outputs_grads
 
@@ -670,11 +670,7 @@ class APITestBase:
             for output in result_outputs:
                 dtype = str(output.dtype).split(".")[-1]
                 if USE_CACHED_NUMPY:
-                    dtype = (
-                        "float32"
-                        if dtype in ["bfloat16", "float8_e4m3fn"]
-                        else dtype
-                    )
+                    dtype = "float32" if dtype in ["bfloat16", "float8_e4m3fn"] else dtype
                     numpy_tensor = self.get_cached_numpy(dtype, output.shape)
                 else:
                     if "int" in dtype:
@@ -682,11 +678,7 @@ class APITestBase:
                             numpy.random.randint(-65535, 65535, size=output.shape)
                         ).astype(dtype)
                     else:
-                        dtype = (
-                            "float32"
-                            if dtype in ["bfloat16", "float8_e4m3fn"]
-                            else dtype
-                        )
+                        dtype = "float32" if dtype in ["bfloat16", "float8_e4m3fn"] else dtype
                         numpy_tensor = (numpy.random.random(output.shape) - 0.5).astype(dtype)
                 self.outputs_grad_numpy.append(numpy_tensor)
         for i, numpy_tensor in enumerate(self.outputs_grad_numpy):
@@ -1063,7 +1055,7 @@ class APITestBase:
         is_backward = getattr(self, "is_backward", False)
         if test_tol:
             atol, rtol = 0.0, 0.0
-        
+
         # [DEBUG] Print tensors before assertion
         if str(torch_tensor.dtype).endswith("float8_e4m3fn"):
             print(f"\n[DEBUG] Comparing Float8 Tensors:", flush=True)

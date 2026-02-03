@@ -2650,8 +2650,8 @@ class TensorConfig:
 
         if self.paddle_tensor is None:
             np_tensor = self.get_numpy_tensor(api_config)
-            #print(f"[DEBUG] Numpy Tensor for {self.dtype}: {np_tensor} dtype={np_tensor.dtype}")
-            
+            # print(f"[DEBUG] Numpy Tensor for {self.dtype}: {np_tensor} dtype={np_tensor.dtype}")
+
             # Use float32 as intermediate for float8
             intermediate_dtype = self.dtype
             if self.dtype == "bfloat16":
@@ -2669,13 +2669,13 @@ class TensorConfig:
             if self.dtype == "bfloat16":
                 self.paddle_tensor = paddle.cast(self.paddle_tensor, dtype="bfloat16")
             elif self.dtype == "float8_e4m3fn":
-                #print(f"[DEBUG] Before Paddle Cast (float8_e4m3fn): {self.paddle_tensor}\n[DEBUG] dtype check: {self.paddle_tensor.dtype}", flush=True)
+                # print(f"[DEBUG] Before Paddle Cast (float8_e4m3fn): {self.paddle_tensor}\n[DEBUG] dtype check: {self.paddle_tensor.dtype}", flush=True)
                 self.paddle_tensor = paddle.cast(self.paddle_tensor, dtype="float8_e4m3fn")
-                #print(f"[DEBUG] Forward Paddle Input Tensor (float8_e4m3fn): {self.paddle_tensor}\n[DEBUG] dtype check: {self.paddle_tensor.dtype}", flush=True)
+                # print(f"[DEBUG] Forward Paddle Input Tensor (float8_e4m3fn): {self.paddle_tensor}\n[DEBUG] dtype check: {self.paddle_tensor.dtype}", flush=True)
             elif self.dtype == "float8_e5m2":
-                #print(f"[DEBUG] Before Paddle Cast (float8_e5m2): {self.paddle_tensor}\n[DEBUG] dtype check: {self.paddle_tensor.dtype}", flush=True)
+                # print(f"[DEBUG] Before Paddle Cast (float8_e5m2): {self.paddle_tensor}\n[DEBUG] dtype check: {self.paddle_tensor.dtype}", flush=True)
                 self.paddle_tensor = paddle.cast(self.paddle_tensor, dtype="float8_e5m2")
-                #print(f"[DEBUG] Forward Paddle Input Tensor (float8_e5m2): {self.paddle_tensor}\n[DEBUG] dtype check: {self.paddle_tensor.dtype}", flush=True)
+                # print(f"[DEBUG] Forward Paddle Input Tensor (float8_e5m2): {self.paddle_tensor}\n[DEBUG] dtype check: {self.paddle_tensor.dtype}", flush=True)
         return self.paddle_tensor
 
     def get_torch_tensor(self, api_config):
@@ -2691,8 +2691,8 @@ class TensorConfig:
             else:
                 dtype_to_use = self.convert_dtype_to_torch_type(self.dtype)
 
-            #print(f"[DEBUG] Preparing Torch Tensor for {self.dtype}, using initial dtype {dtype_to_use}")
-            
+            # print(f"[DEBUG] Preparing Torch Tensor for {self.dtype}, using initial dtype {dtype_to_use}")
+
             self.torch_tensor = torch.tensor(
                 self.get_numpy_tensor(api_config),
                 dtype=dtype_to_use,
@@ -2710,18 +2710,24 @@ class TensorConfig:
                 self.torch_tensor = self.torch_tensor.to(dtype=torch.bfloat16)
             elif self.dtype == "float8_e4m3fn":
                 if hasattr(torch, "float8_e4m3fn"):
-                    #print(f"[DEBUG] Before Torch Cast (float8_e4m3fn): {self.torch_tensor.dtype} data={self.torch_tensor}", flush=True)
+                    # print(f"[DEBUG] Before Torch Cast (float8_e4m3fn): {self.torch_tensor.dtype} data={self.torch_tensor}", flush=True)
                     self.torch_tensor = self.torch_tensor.to(dtype=torch.float8_e4m3fn)
-                   # print(f"[DEBUG] Forward Torch Input Tensor (float8_e4m3fn): {self.torch_tensor}\n[DEBUG] dtype check: {self.torch_tensor.dtype}", flush=True)
+                # print(f"[DEBUG] Forward Torch Input Tensor (float8_e4m3fn): {self.torch_tensor}\n[DEBUG] dtype check: {self.torch_tensor.dtype}", flush=True)
                 else:
-                    print("[DEBUG] Warning: Current torch version does not support float8_e4m3fn, keep float32/float16.", flush=True)
+                    print(
+                        "[DEBUG] Warning: Current torch version does not support float8_e4m3fn, keep float32/float16.",
+                        flush=True,
+                    )
             elif self.dtype == "float8_e5m2":
                 if hasattr(torch, "float8_e5m2"):
-                    #print(f"[DEBUG] Before Torch Cast (float8_e5m2): {self.torch_tensor.dtype} data={self.torch_tensor}", flush=True)
+                    # print(f"[DEBUG] Before Torch Cast (float8_e5m2): {self.torch_tensor.dtype} data={self.torch_tensor}", flush=True)
                     self.torch_tensor = self.torch_tensor.to(dtype=torch.float8_e5m2)
-                   # print(f"[DEBUG] Forward Torch Input Tensor (float8_e5m2): {self.torch_tensor}\n[DEBUG] dtype check: {self.torch_tensor.dtype}", flush=True)
+                # print(f"[DEBUG] Forward Torch Input Tensor (float8_e5m2): {self.torch_tensor}\n[DEBUG] dtype check: {self.torch_tensor.dtype}", flush=True)
                 else:
-                    print("[DEBUG] Warning: Current torch version does not support float8_e5m2, keep float32/float16.", flush=True)
+                    print(
+                        "[DEBUG] Warning: Current torch version does not support float8_e5m2, keep float32/float16.",
+                        flush=True,
+                    )
 
         return self.torch_tensor
 
