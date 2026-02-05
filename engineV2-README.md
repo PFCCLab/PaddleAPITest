@@ -89,6 +89,7 @@
 | `--custom_device_vs_gpu`        | bool  | 启用自定义设备与GPU的精度对比测试模式（默认 False）                                   |
 | `--custom_device_vs_gpu_mode`   | str   | 自定义设备与GPU对比的模式：`upload` 或 `download`（默认 `upload`）                    |
 | `--bitwise_alignment`            | bool  | 是否进行诸位对齐对比，开启后所有的api的精度对比都按照atol=0.0,rtol = 0.0的精度对比结果(默认False)|
+| `--generate_failed_tests`        | bool  | 是否为失败的测试用例生成可复现的测试文件。开启后，当测试失败时，会在`failed_tests`目录下生成独立的Python测试文件，便于后续复现和调试（默认False）|
 | `--exit_on_error`                | bool  | 是否在精度测试出现`paddle_error`或者 `accuracy_error`  错误时立即退出测试进程(exit code 为1)。默认为False，测试进程会继续执行 |
 
 ### 示例命令
