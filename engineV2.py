@@ -842,6 +842,7 @@ def main():
                 "Tensor-likes are not equal" in str(err)
                 or "Mismatched elements" in str(err)
                 or "Tensor-likes are not equal" in str(err)
+                or "Error Message Summary" in str(err)
             ):
                 exit(1)
             print(f"[test error] {options.api_config}: {err}", flush=True)
