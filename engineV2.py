@@ -39,7 +39,7 @@ if TYPE_CHECKING:
 
 from tester.api_config.log_writer import *
 
-os.environ["FLAGS_USE_SYSTEM_ALLOCATOR"] = "1"
+os.environ["FLAGS_use_system_allocator"] = "1"
 os.environ["NVIDIA_TF32_OVERRIDE"] = "0"
 
 VALID_TEST_ARGS = {

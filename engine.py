@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import os
 
-os.environ["FLAGS_USE_SYSTEM_ALLOCATOR"] = "1"
+os.environ["FLAGS_use_system_allocator"] = "1"
 os.environ["NVIDIA_TF32_OVERRIDE"] = "0"
 
 import argparse
