@@ -1653,7 +1653,7 @@ paddle.nn.functional.log_softmax(x=Tensor([2, 536870913, 4],"float16"), axis=1, 
 paddle.nn.functional.log_softmax(x=Tensor([2147483649, 2, 1],"float16"), axis=0, )
 paddle.nn.functional.log_softmax(x=Tensor([357913942, 3, 4],"float16"), axis=0, )
 paddle.nn.functional.log_softmax(x=Tensor([357913942, 3, 4],"float16"), axis=1, )
-paddle.nn.functional.max_pool1d(Tensor([2, 3, 715827883],"float16"), 2, 1, list[1,1,], False, False, None, )
+paddle.nn.functional.max_pool1d(Tensor([2, 3, 715827883],"float16"), 2, 1, list[1,1,], False, False, )
 paddle.nn.functional.max_pool1d(x=Tensor([2, 3, 715827883],"float16"), kernel_size=2, stride=1, padding=list[1,1,], )
 paddle.nn.functional.max_pool2d(Tensor([1, 15474, 384, 384],"float32"), kernel_size=2, stride=1, padding="SAME", return_mask=False, ceil_mode=True, data_format="NCHW", name=None, )
 paddle.nn.functional.max_pool2d(Tensor([1, 16849, 368, 368],"float32"), kernel_size=2, stride=1, padding="SAME", return_mask=False, ceil_mode=True, data_format="NCHW", name=None, )
