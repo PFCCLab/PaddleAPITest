@@ -1,40 +1,69 @@
+from __future__ import annotations
+
 import argparse
 import errno
 import gc
-import math
 import os
+import re
+import shutil
 import signal
+import subprocess
 import sys
 import time
 from concurrent.futures import TimeoutError, as_completed
 from datetime import datetime
 from multiprocessing import Lock, Manager, cpu_count, set_start_method
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 import numpy as np
 import pynvml
+import yaml
 from pebble import ProcessExpired, ProcessPool
 
 if TYPE_CHECKING:
+    import paddle
+    import torch
     from tester import (
         APIConfig,
         APITestAccuracy,
-        APITestCINNVSDygraph,
-        APITestPaddleOnly,
-        APITestPaddleGPUPerformance,
-        APITestTorchGPUPerformance,
-        APITestPaddleTorchGPUPerformance,
         APITestAccuracyStable,
+        APITestCINNVSDygraph,
+        APITestCustomDeviceVSCPU,
+        APITestPaddleDeviceVSGPU,
+        APITestPaddleGPUPerformance,
+        APITestPaddleOnly,
+        APITestPaddleTorchGPUPerformance,
+        APITestTorchGPUPerformance,
     )
-    import torch
-    import paddle
 
 from tester.api_config.log_writer import *
 
 os.environ["FLAGS_use_system_allocator"] = "1"
 os.environ["NVIDIA_TF32_OVERRIDE"] = "0"
 
-VALID_TEST_ARGS = {"test_amp", "test_backward", "atol", "rtol", "test_tol"}
+VALID_TEST_ARGS = {
+    "test_amp",
+    "test_backward",
+    "atol",
+    "rtol",
+    "test_tol",
+    "operation_mode",
+    "bos_path",
+    "random_seed",
+    "bos_conf_path",
+    "bcecmd_path",
+    "generate_failed_tests",
+    "bitwise_alignment",
+    "exit_on_error",
+}
+
+DEVICE_TYPE = None
+DEVICE_TYPE_DETECTED = False
+DEVICE_COUNT = None  # total number of devices
+_MEM_SNAPSHOT = None  # dict: gpu_id -> (total_gb, used_gb)
+_MEM_SNAPSHOT_TS = 0.0
+_MEM_SNAPSHOT_TTL = 2.0  # seconds — snapshot cache ttl
 
 
 def cleanup(pool):
@@ -77,13 +106,171 @@ def estimate_timeout(api_config) -> float:
     return 1800
 
 
+def detect_device_type() -> str:
+    global DEVICE_TYPE, DEVICE_TYPE_DETECTED
+    if DEVICE_TYPE_DETECTED:
+        return DEVICE_TYPE
+
+    # 优先尝试 NVML（NVIDIA GPU）
+    try:
+        pynvml.nvmlInit()
+        count = pynvml.nvmlDeviceGetCount()
+        pynvml.nvmlShutdown()
+        if count > 0:
+            DEVICE_TYPE = "gpu"
+            DEVICE_TYPE_DETECTED = True
+            return DEVICE_TYPE
+    except Exception:
+        # 没有 NVML 或不是 NVIDIA，忽略错误，继续往下探测
+        pass
+
+    # 再尝试 XPU
+    if shutil.which("xpu-smi"):
+        try:
+            out = subprocess.check_output(["xpu-smi"], text=True, stderr=subprocess.STDOUT)
+            if any(re.match(r"^\|\s*\d+\s+\S", line) for line in out.splitlines()):
+                DEVICE_TYPE = "xpu"
+                DEVICE_TYPE_DETECTED = True
+                return DEVICE_TYPE
+        except Exception:
+            pass
+
+    # 再尝试 Iluvatar
+    if shutil.which("ixsmi"):
+        try:
+            out = subprocess.check_output(["ixsmi"], text=True, stderr=subprocess.STDOUT)
+            if any(re.match(r"^\|\s*\d+\s+Iluvatar", line) for line in out.splitlines()):
+                DEVICE_TYPE = "iluvatar_gpu"
+                DEVICE_TYPE_DETECTED = True
+                return DEVICE_TYPE
+        except Exception:
+            pass
+
+    # 都没有就是 CPU
+    DEVICE_TYPE = "cpu"
+    DEVICE_TYPE_DETECTED = True
+    return DEVICE_TYPE
+
+
+def get_device_count() -> int:
+    """Get the number of available devices (accelerators)."""
+    global DEVICE_COUNT
+    if DEVICE_COUNT is not None:
+        return DEVICE_COUNT
+
+    device_type = detect_device_type()
+
+    if device_type == "gpu":
+        pynvml.nvmlInit()
+        try:
+            count = pynvml.nvmlDeviceGetCount()
+        finally:
+            pynvml.nvmlShutdown()
+        DEVICE_COUNT = count
+        return count
+
+    if device_type == "xpu":
+        out = subprocess.check_output(["xpu-smi"], text=True, stderr=subprocess.STDOUT)
+        ids = set()
+        for line in out.splitlines():
+            if "Processes:" in line:
+                break
+            m = re.match(r"^\|\s*(\d+)\s+\S", line)
+            if m:
+                ids.add(int(m.group(1)))
+        DEVICE_COUNT = len(ids)
+        return DEVICE_COUNT
+
+    if device_type == "iluvatar_gpu":
+        out = subprocess.check_output(["ixsmi"], text=True, stderr=subprocess.STDOUT)
+        ids = set()
+        for line in out.splitlines():
+            m = re.match(r"^\|\s*(\d+)\s+Iluvatar", line)
+            if m:
+                ids.add(int(m.group(1)))
+        DEVICE_COUNT = len(ids)
+        return DEVICE_COUNT
+
+    # CPU case／no accelerator
+    DEVICE_COUNT = 0
+    return 0
+
+
+def _refresh_snapshot(device_type):
+    global _MEM_SNAPSHOT, _MEM_SNAPSHOT_TS
+
+    now = time.time()
+    if now - _MEM_SNAPSHOT_TS < _MEM_SNAPSHOT_TTL and _MEM_SNAPSHOT is not None:
+        return
+
+    snapshot = {}
+    if device_type == "xpu":
+        out = subprocess.check_output(["xpu-smi"], text=True, stderr=subprocess.STDOUT)
+        lines = out.splitlines()
+        for i, line in enumerate(lines):
+            m = re.match(r"^\|\s*(\d+)\s+\S", line)
+            if m:
+                dev_id = int(m.group(1))
+                for j in range(i + 1, min(i + 8, len(lines))):
+                    mm = re.search(r"(\d+)\s*MiB\s*/\s*(\d+)\s*MiB", lines[j])
+                    if mm:
+                        used_mib = int(mm.group(1))
+                        total_mib = int(mm.group(2))
+                        snapshot[dev_id] = (total_mib / 1024.0, used_mib / 1024.0)
+                        break
+
+    elif device_type == "iluvatar_gpu":
+        out = subprocess.check_output(["ixsmi"], text=True, stderr=subprocess.STDOUT)
+        lines = out.splitlines()
+        for i, line in enumerate(lines):
+            m = re.match(r"^\|\s*(\d+)\s+Iluvatar", line)
+            if m:
+                dev_id = int(m.group(1))
+                for j in range(i + 1, min(i + 8, len(lines))):
+                    mm = re.search(r"(\d+)\s*MiB\s*/\s*(\d+)\s*MiB", lines[j])
+                    if mm:
+                        used_mib = int(mm.group(1))
+                        total_mib = int(mm.group(2))
+                        snapshot[dev_id] = (total_mib / 1024.0, used_mib / 1024.0)
+                        break
+
+    else:
+        # GPU (NVIDIA) case does not use snapshot (use NVML directly)
+        _MEM_SNAPSHOT = None
+        _MEM_SNAPSHOT_TS = now
+        return
+
+    _MEM_SNAPSHOT = snapshot
+    _MEM_SNAPSHOT_TS = now
+
+
+def get_memory_info(gpu_id):
+    """Return (total_memory, used_memory) in GB for accelerator device."""
+    device_type = detect_device_type()
+
+    if device_type == "gpu":
+        pynvml.nvmlInit()
+        try:
+            handle = pynvml.nvmlDeviceGetHandleByIndex(gpu_id)
+            mem_info = pynvml.nvmlDeviceGetMemoryInfo(handle)
+            return int(mem_info.total) / (1024**3), int(mem_info.used) / (1024**3)
+        finally:
+            pynvml.nvmlShutdown()
+
+    if device_type in ("xpu", "iluvatar_gpu"):
+        _refresh_snapshot(device_type)
+        if _MEM_SNAPSHOT is None or gpu_id not in _MEM_SNAPSHOT:
+            raise RuntimeError(f"Failed to get memory info for {device_type} device {gpu_id}")
+        return _MEM_SNAPSHOT[gpu_id]
+
+    raise RuntimeError("No supported accelerator (GPU / XPU / Iluvatar) detected.")
+
+
 def validate_gpu_options(options) -> tuple:
     """Validate and normalize GPU-related options."""
-    pynvml.nvmlInit()
-    device_count = pynvml.nvmlDeviceGetCount()
-    pynvml.nvmlShutdown()
+    device_count = get_device_count()
     if device_count == 0:
-        raise ValueError("No GPUs found")
+        raise ValueError("No devices found")
     if options.gpu_ids:
         try:
             gpu_ids = []
@@ -106,7 +293,7 @@ def validate_gpu_options(options) -> tuple:
             ) from None
         if len(gpu_ids) != len(set(gpu_ids)):
             raise ValueError(f"Invalid gpu_ids: {options.gpu_ids} (duplicates)")
-        gpu_ids = sorted(list(set(gpu_ids)))
+        gpu_ids = sorted(set(gpu_ids))
         if len(gpu_ids) > 1 and -1 in gpu_ids:
             raise ValueError(f"Invalid gpu_ids: {options.gpu_ids} (-1 allowed only)")
         if gpu_ids != [-1] and not all(0 <= id < device_count for id in gpu_ids):
@@ -115,11 +302,7 @@ def validate_gpu_options(options) -> tuple:
             )
     else:
         gpu_ids = [-1]
-    if (
-        options.num_gpus < -1
-        or options.num_gpus == 0
-        or options.num_gpus > device_count
-    ):
+    if options.num_gpus < -1 or options.num_gpus == 0 or options.num_gpus > device_count:
         raise ValueError(f"Invalid num_gpus: {options.num_gpus}")
     if options.num_gpus == -1:
         options.num_gpus = device_count if gpu_ids == [-1] else len(gpu_ids)
@@ -145,45 +328,31 @@ def parse_bool(value):
         raise ValueError(f"Invalid boolean value: {value} parsed from command line")
 
 
-def check_gpu_memory(
-    gpu_ids, num_workers_per_gpu, required_memory
-):  # required_memory in GB
+def check_gpu_memory(gpu_ids, num_workers_per_gpu, required_memory):  # required_memory in GB
     assert isinstance(gpu_ids, tuple) and len(gpu_ids) > 0
     available_gpus = []
     max_workers_per_gpu = {}
 
-    pynvml.nvmlInit()
-    try:
-        for gpu_id in gpu_ids:
-            try:
-                handle = pynvml.nvmlDeviceGetHandleByIndex(gpu_id)
-                mem_info = pynvml.nvmlDeviceGetMemoryInfo(handle)
-
-                total_memory = int(mem_info.total) / (1024**3)  # Bytes to GB
-                used_memory = int(mem_info.used) / (1024**3)  # Bytes to GB
-                free_memory = total_memory - used_memory
-
-                max_workers = int(free_memory // required_memory)
-                if max_workers >= 1:
-                    available_gpus.append(gpu_id)
-                    max_workers_per_gpu[gpu_id] = (
-                        max_workers
-                        if num_workers_per_gpu == -1
-                        else min(max_workers, num_workers_per_gpu)
-                    )
-            except pynvml.NVMLError as e:
-                print(f"[WARNING] Failed to check GPU {gpu_id}: {str(e)}", flush=True)
-                continue
-
-    finally:
-        pynvml.nvmlShutdown()
+    for gpu_id in gpu_ids:
+        try:
+            total_memory, used_memory = get_memory_info(gpu_id)
+            free_memory = total_memory - used_memory
+            max_workers = int(free_memory // required_memory)
+            if max_workers >= 1:
+                available_gpus.append(gpu_id)
+                max_workers_per_gpu[gpu_id] = (
+                    max_workers
+                    if num_workers_per_gpu == -1
+                    else min(max_workers, num_workers_per_gpu)
+                )
+        except pynvml.NVMLError as e:
+            print(f"[WARNING] Failed to check GPU {gpu_id}: {e!s}", flush=True)
+            continue
 
     return available_gpus, max_workers_per_gpu
 
 
-def init_worker_gpu(
-    gpu_worker_list, lock, available_gpus, max_workers_per_gpu, options
-):
+def init_worker_gpu(gpu_worker_list, lock, available_gpus, max_workers_per_gpu, options):
     if options.log_dir:
         set_test_log_path(options.log_dir)
     set_engineV2()
@@ -221,11 +390,18 @@ def init_worker_gpu(
         globals()["torch"] = torch
         globals()["paddle"] = paddle
 
-        from tester import (APIConfig, APITestAccuracy, APITestAccuracyStable,
-                            APITestCINNVSDygraph, APITestPaddleGPUPerformance,
-                            APITestPaddleOnly,
-                            APITestPaddleTorchGPUPerformance,
-                            APITestTorchGPUPerformance)
+        from tester import (
+            APIConfig,
+            APITestAccuracy,
+            APITestAccuracyStable,
+            APITestCINNVSDygraph,
+            APITestCustomDeviceVSCPU,
+            APITestPaddleDeviceVSGPU,
+            APITestPaddleGPUPerformance,
+            APITestPaddleOnly,
+            APITestPaddleTorchGPUPerformance,
+            APITestTorchGPUPerformance,
+        )
 
         test_classes = {
             "APIConfig": APIConfig,
@@ -236,6 +412,8 @@ def init_worker_gpu(
             "APITestTorchGPUPerformance": APITestTorchGPUPerformance,
             "APITestPaddleTorchGPUPerformance": APITestPaddleTorchGPUPerformance,
             "APITestAccuracyStable": APITestAccuracyStable,
+            "APITestCustomDeviceVSCPU": APITestCustomDeviceVSCPU,
+            "APITestPaddleDeviceVSGPU": APITestPaddleDeviceVSGPU,
         }
         globals().update(test_classes)
 
@@ -259,9 +437,7 @@ def init_worker_gpu(
             flush=True,
         )
     except Exception as e:
-        print(
-            f"{datetime.now()} Worker {my_pid} initialization failed: {e}", flush=True
-        )
+        print(f"{datetime.now()} Worker {my_pid} initialization failed: {e}", flush=True)
         raise
 
 
@@ -276,30 +452,25 @@ def run_test_case(api_config_str, options):
         flush=True,
     )
 
-    pynvml.nvmlInit()
-    try:
-        while True:
-            handle = pynvml.nvmlDeviceGetHandleByIndex(gpu_id)
-            mem_info = pynvml.nvmlDeviceGetMemoryInfo(handle)
-            free_memory = int(mem_info.free) / (1024**3)  # Bytes to GB
+    while True:
+        total_memory, used_memory = get_memory_info(gpu_id)
+        free_memory = total_memory - used_memory
 
-            if free_memory >= options.required_memory:
-                break
+        if free_memory >= options.required_memory:
+            break
 
-            print(
-                f"{datetime.now()} GPU {gpu_id} Free: {free_memory:.1f} GB, "
-                f"Required: {options.required_memory:.1f} GB. ",
-                "Waiting for available memory...",
-                flush=True,
-            )
-            time.sleep(60)
-    finally:
-        pynvml.nvmlShutdown()
+        print(
+            f"{datetime.now()} device {gpu_id} Free: {free_memory:.1f} GB, "
+            f"Required: {options.required_memory:.1f} GB. ",
+            "Waiting for available memory...",
+            flush=True,
+        )
+        time.sleep(60)
 
     try:
         api_config = APIConfig(api_config_str)
     except Exception as err:
-        print(f"[config parse error] {api_config_str} {str(err)}", flush=True)
+        print(f"[config parse error] {api_config_str} {err!s}", flush=True)
         return
 
     option_to_class = {
@@ -310,7 +481,10 @@ def run_test_case(api_config_str, options):
         "torch_gpu_performance": APITestTorchGPUPerformance,
         "paddle_torch_gpu_performance": APITestPaddleTorchGPUPerformance,
         "accuracy_stable": APITestAccuracyStable,
+        "paddle_custom_device": APITestCustomDeviceVSCPU,
+        "custom_device_vs_gpu": APITestPaddleDeviceVSGPU,
     }
+
     test_class = next(
         (cls for opt, cls in option_to_class.items() if getattr(options, opt, False)),
         APITestAccuracy,  # default fallback
@@ -325,6 +499,8 @@ def run_test_case(api_config_str, options):
             os._exit(99)
         if "CUDA out of memory" in str(err) or "Out of memory error" in str(err):
             os._exit(98)
+        if "AssertionError" in str(err) or "Tensor-likes are not equal" in str(err):
+            os._exit(1)
         # if not fatal error, subprocess will be alive and report error
         print(f"[test error] {api_config_str}: {err}", flush=True)
         raise
@@ -397,6 +573,12 @@ def main():
         type=parse_bool,
         default=False,
         help="test paddle api to corespoding torch api steadily",
+    )
+    parser.add_argument(
+        "--paddle_custom_device",
+        type=parse_bool,
+        default=False,
+        help="test paddle api on custom device vs CPU",
     )
     parser.add_argument(
         "--test_amp",
@@ -484,6 +666,37 @@ def main():
         default=0,
         help="The numpy random seed ",
     )
+    parser.add_argument(
+        "--custom_device_vs_gpu",
+        type=parse_bool,
+        default=False,
+        help="test paddle api on custom device vs GPU",
+    )
+    parser.add_argument(
+        "--custom_device_vs_gpu_mode",
+        type=str,
+        choices=["upload", "download"],
+        default="upload",
+        help="operation mode for custom_device_vs_gpu: 'upload' or 'download'",
+    )
+    parser.add_argument(
+        "--bitwise_alignment",
+        type=bool,
+        default=False,
+        help="Whether to using bitwise alignment when run accuracy test",
+    )
+    parser.add_argument(
+        "--generate_failed_tests",
+        type=parse_bool,
+        default=False,
+        help="Whether to generate reproducible test files for failed cases",
+    )
+    parser.add_argument(
+        "--exit_on_error",
+        type=parse_bool,
+        default=False,
+        help="Whether to exit the process when a paddle_error occurs.",
+    )
 
     options = parser.parse_args()
     print(f"Options: {vars(options)}", flush=True)
@@ -498,6 +711,8 @@ def main():
         options.torch_gpu_performance,
         options.paddle_torch_gpu_performance,
         options.accuracy_stable,
+        options.paddle_custom_device,
+        options.custom_device_vs_gpu,
     ]
     if len([m for m in mode if m is True]) != 1:
         print(
@@ -509,26 +724,71 @@ def main():
             "--torch_gpu_performance,"
             "--paddle_torch_gpu_performance"
             "--accuracy_stable"
-            " to True.",
+            "--paddle_custom_device"
+            "--custom_device_vs_gpu",
             flush=True,
         )
         return
-    if options.test_tol and not options.accuracy:
-        print(f"--test_tol takes effect when --accuracy is True.", flush=True)
-    if options.test_backward and not options.paddle_cinn:
-        print(f"--test_backward takes effect when --paddle_cinn is True.", flush=True)
-    os.environ["USE_CACHED_NUMPY"] = str(options.use_cached_numpy)
 
+    # 处理 custom_device_vs_gpu 模式的配置
+    bos_config_data = None
+    if options.custom_device_vs_gpu:
+        # 读取 BOS 配置文件（固定路径：tester/bos_config.yaml）
+        bos_config_path = Path("tester/bos_config.yaml")
+        if not bos_config_path.exists():
+            print(f"BOS config file not found: {bos_config_path}", flush=True)
+            return
+
+        try:
+            with open(bos_config_path, encoding="utf-8") as f:
+                bos_config_data = yaml.safe_load(f)
+
+            if not bos_config_data:
+                print(f"BOS config file is empty: {bos_config_path}", flush=True)
+                return
+
+            # 验证必需的配置项
+            required_keys = ["bos_path", "bos_conf_path", "bcecmd_path"]
+            missing_keys = [key for key in required_keys if key not in bos_config_data]
+            if missing_keys:
+                print(f"Missing required keys in BOS config: {missing_keys}", flush=True)
+                return
+
+            # 将配置添加到 options 中，以便传递给测试类
+            options.operation_mode = options.custom_device_vs_gpu_mode
+            options.bos_path = bos_config_data["bos_path"]
+            options.bos_conf_path = bos_config_data["bos_conf_path"]
+            options.bcecmd_path = bos_config_data["bcecmd_path"]
+
+        except Exception as e:
+            print(f"Failed to load BOS config file {bos_config_path}: {e}", flush=True)
+            return
+
+    if options.test_tol and not options.accuracy:
+        print("--test_tol takes effect when --accuracy is True.", flush=True)
+    if options.test_backward and not options.paddle_cinn:
+        print("--test_backward takes effect when --paddle_cinn is True.", flush=True)
+    os.environ["USE_CACHED_NUMPY"] = str(options.use_cached_numpy)
+    if options.bitwise_alignment:
+        options.atol = 0.0
+        options.rtol = 0.0
     if options.log_dir:
         set_test_log_path(options.log_dir)
 
     if options.api_config:
         # Single config execution
-        from tester import (APIConfig, APITestAccuracy, APITestAccuracyStable,
-                            APITestCINNVSDygraph, APITestPaddleGPUPerformance,
-                            APITestPaddleOnly,
-                            APITestPaddleTorchGPUPerformance,
-                            APITestTorchGPUPerformance)
+        from tester import (
+            APIConfig,
+            APITestAccuracy,
+            APITestAccuracyStable,
+            APITestCINNVSDygraph,
+            APITestCustomDeviceVSCPU,
+            APITestPaddleDeviceVSGPU,
+            APITestPaddleGPUPerformance,
+            APITestPaddleOnly,
+            APITestPaddleTorchGPUPerformance,
+            APITestTorchGPUPerformance,
+        )
 
         # set log_writer
         set_engineV2()
@@ -538,7 +798,7 @@ def main():
         try:
             api_config = APIConfig(options.api_config)
         except Exception as err:
-            print(f"[config parse error] {options.api_config} {str(err)}", flush=True)
+            print(f"[config parse error] {options.api_config} {err!s}", flush=True)
             return
 
         option_to_class = {
@@ -549,29 +809,49 @@ def main():
             "torch_gpu_performance": APITestTorchGPUPerformance,
             "paddle_torch_gpu_performance": APITestPaddleTorchGPUPerformance,
             "accuracy_stable": APITestAccuracyStable,
+            "paddle_custom_device": APITestCustomDeviceVSCPU,
+            "custom_device_vs_gpu": APITestPaddleDeviceVSGPU,
         }
+
         test_class = next(
-            (
-                cls
-                for opt, cls in option_to_class.items()
-                if getattr(options, opt, False)
-            ),
+            (cls for opt, cls in option_to_class.items() if getattr(options, opt, False)),
             APITestAccuracy,  # default fallback
         )
 
-        if options.accuracy:
+        if options.custom_device_vs_gpu:
+            # custom_device_vs_gpu 模式需要传递额外参数
+            case = test_class(
+                api_config,
+                operation_mode=options.operation_mode,
+                bos_path=options.bos_path,
+                bos_conf_path=options.bos_conf_path,
+                bcecmd_path=options.bcecmd_path,
+                random_seed=options.random_seed,
+                atol=options.atol,
+                rtol=options.rtol,
+            )
+        elif options.accuracy:
             case = test_class(
                 api_config,
                 test_amp=options.test_amp,
                 atol=options.atol,
                 rtol=options.rtol,
                 test_tol=options.test_tol,
+                bitwise_alignment=options.bitwise_alignment,
+                exit_on_error=options.exit_on_error,
             )
         else:
             case = test_class(api_config, test_amp=options.test_amp)
         try:
             case.test()
         except Exception as err:
+            if (
+                "Tensor-likes are not equal" in str(err)
+                or "Mismatched elements" in str(err)
+                or "Tensor-likes are not equal" in str(err)
+                or "Error Message Summary" in str(err)
+            ):
+                exit(1)
             print(f"[test error] {options.api_config}: {err}", flush=True)
         finally:
             case.clear_tensor()
@@ -616,7 +896,7 @@ def main():
         api_configs = set()
         for config_file in config_files:
             try:
-                with open(config_file, "r") as f:
+                with open(config_file) as f:
                     lines = [line.strip() for line in f if line.strip()]
                     api_config_count += len(lines)
                     api_configs.update(lines)
@@ -662,9 +942,7 @@ def main():
 
         # initialize process pool
         manager = Manager()
-        gpu_worker_list = manager.dict(
-            {gpu_id: manager.list() for gpu_id in available_gpus}
-        )
+        gpu_worker_list = manager.dict({gpu_id: manager.list() for gpu_id in available_gpus})
         lock = Lock()
 
         pool = ProcessPool(
@@ -707,16 +985,14 @@ def main():
                     config = futures[future]
                     try:
                         tested_case += 1
-                        if options.show_runtime_status:
+                        if options.show_runtime_status or tested_case % 10000 == 0:
                             print(
                                 f"[{tested_case}/{all_case}] Testing {config}",
                                 flush=True,
                             )
                         future.result()
-                        if options.show_runtime_status:
-                            print(
-                                f"[info] Test case succeeded for {config}", flush=True
-                            )
+                        if options.show_runtime_status or tested_case % 10000 == 0:
+                            print(f"[info] Test case succeeded for {config}", flush=True)
                     except TimeoutError as err:
                         write_to_log("timeout", config)
                         print(
@@ -757,14 +1033,14 @@ def main():
             print(f"Unexpected error: {e}", flush=True)
             cleanup(pool)
             total_time = time.time() - start_time
-            print(f"Test time: {round(total_time/60, 3)} minutes.", flush=True)
+            print(f"Test time: {round(total_time / 60, 3)} minutes.", flush=True)
         finally:
             print(f"{tested_case} cases have been tested.", flush=True)
             log_counts = aggregate_logs(end=True)
             print_log_info(all_case, log_counts)
             end_time = time.time()
             total_time = end_time - start_time
-            print(f"Test time: {round(total_time/60, 3)} minutes.", flush=True)
+            print(f"Test time: {round(total_time / 60, 3)} minutes.", flush=True)
     print("Done.")
 
 

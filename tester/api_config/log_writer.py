@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import csv
 import os
 import re
@@ -113,7 +115,7 @@ def read_log(log_type):
     file_path = TEST_LOG_PATH / filename
     try:
         with file_path.open("r") as f:
-            return set(line.strip() for line in f if line.strip())
+            return {line.strip() for line in f if line.strip()}
     except FileNotFoundError:
         return set()
     except Exception as err:
@@ -166,8 +168,8 @@ def aggregate_logs(end=False):
                     file_path.write_bytes(b"")
 
     log_success = True
-    log_file = TEST_LOG_PATH / f"log_inorder.log"
-    tmp_log_files = sorted(TMP_LOG_PATH.glob(f"log_*.log"))
+    log_file = TEST_LOG_PATH / "log_inorder.log"
+    tmp_log_files = sorted(TMP_LOG_PATH.glob("log_*.log"))
     BUFFER_SIZE = 4 * 1024 * 1024
     try:
         with log_file.open("ab") as out_f:
@@ -205,8 +207,8 @@ def aggregate_logs(end=False):
                 file_path.write_bytes(b"")
 
     tol_success = True
-    tol_file = TEST_LOG_PATH / f"tol.csv"
-    tmp_tol_files = sorted(TMP_LOG_PATH.glob(f"tol_*.csv"))
+    tol_file = TEST_LOG_PATH / "tol.csv"
+    tmp_tol_files = sorted(TMP_LOG_PATH.glob("tol_*.csv"))
     if tmp_tol_files:
         try:
             with tol_file.open("a", newline="") as out_f:
@@ -249,8 +251,8 @@ def aggregate_logs(end=False):
                     file_path.write_bytes(b"")
 
     stable_success = True
-    stable_file = TEST_LOG_PATH / f"stable.csv"
-    tmp_stable_files = sorted(TMP_LOG_PATH.glob(f"stable_*.csv"))
+    stable_file = TEST_LOG_PATH / "stable.csv"
+    tmp_stable_files = sorted(TMP_LOG_PATH.glob("stable_*.csv"))
     if tmp_stable_files:
         try:
             with stable_file.open("a", newline="") as out_f:
@@ -300,9 +302,7 @@ def aggregate_logs(end=False):
             try:
                 df = pd.read_csv(tol_file, on_bad_lines="warn")
                 # df = df.drop_duplicates(subset=["config", "mode"], keep="last")
-                df = df.sort_values(
-                    by=["API", "dtype", "config", "mode"], ignore_index=True
-                )
+                df = df.sort_values(by=["API", "dtype", "config", "mode"], ignore_index=True)
                 df.to_csv(tol_file, index=False, na_rep="nan")
             except Exception as err:
                 print(f"Error arranging {tol_file}: {err}", flush=True)
@@ -311,9 +311,7 @@ def aggregate_logs(end=False):
             try:
                 df = pd.read_csv(stable_file, on_bad_lines="warn")
                 # df = df.drop_duplicates(subset=["config", "comp"], keep="last")
-                df = df.sort_values(
-                    by=["API", "dtype", "config", "comp"], ignore_index=True
-                )
+                df = df.sort_values(by=["API", "dtype", "config", "comp"], ignore_index=True)
                 df.to_csv(stable_file, index=False, na_rep="nan")
             except Exception as err:
                 print(f"Error arranging {stable_file}: {err}", flush=True)
@@ -323,7 +321,7 @@ def aggregate_logs(end=False):
         api_configs = set()
         try:
             with checkpoint_file.open("r") as f:
-                api_configs = set(line.strip() for line in f if line.strip())
+                api_configs = {line.strip() for line in f if line.strip()}
                 log_counts["checkpoint"] = len(api_configs)
         except Exception as err:
             print(f"Error reading {checkpoint_file}: {err}", flush=True)
@@ -336,7 +334,7 @@ def aggregate_logs(end=False):
                 continue
             try:
                 with log_file.open("r") as f:
-                    lines = set(line.strip() for line in f if line.strip())
+                    lines = {line.strip() for line in f if line.strip()}
                     api_configs -= lines
                     log_counts[log_type] = len(lines)
             except Exception as err:
@@ -353,8 +351,10 @@ def aggregate_logs(end=False):
         return log_counts
 
 
-def print_log_info(all_case, log_counts={}):
+def print_log_info(all_case, log_counts=None):
     """打印日志统计信息"""
+    if log_counts is None:
+        log_counts = {}
     test_case = log_counts.get("checkpoint", 0)
     pass_case = log_counts.get("pass", 0)
     fail_case = sum(
@@ -447,8 +447,7 @@ def restore_stdio():
 
 
 def log_accuracy_tolerance(error_msg, api, config, dtype, is_backward=False):
-    """
-    从 torch.testing.assert_close 的异常消息中提取最大绝对误差和相对误差
+    """从 torch.testing.assert_close 的异常消息中提取最大绝对误差和相对误差
     将误差数据记录到 CSV 文件
     """
     output_file = TMP_LOG_PATH / f"tol_{os.getpid()}.csv"
@@ -463,8 +462,12 @@ def log_accuracy_tolerance(error_msg, api, config, dtype, is_backward=False):
         max_rel_diff = None
 
         # 使用正则表达式提取误差值
-        abs_pattern = r"(?:Absolute|Greatest absolute) difference: (\d+\.?\d*(?:[eE][+-]?\d+)?|nan|inf)\b"
-        rel_pattern = r"(?:Relative|Greatest relative) difference: (\d+\.?\d*(?:[eE][+-]?\d+)?|nan|inf)\b"
+        abs_pattern = (
+            r"(?:Absolute|Greatest absolute) difference: (\d+\.?\d*(?:[eE][+-]?\d+)?|nan|inf)\b"
+        )
+        rel_pattern = (
+            r"(?:Relative|Greatest relative) difference: (\d+\.?\d*(?:[eE][+-]?\d+)?|nan|inf)\b"
+        )
         abs_match = re.search(abs_pattern, error_msg)
         rel_match = re.search(rel_pattern, error_msg)
 

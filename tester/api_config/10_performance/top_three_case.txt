@@ -1715,7 +1715,7 @@ paddle.nn.functional.avg_pool1d(Tensor([16, 2, 120],"float32"), 25, 1, 0, True, 
 paddle.nn.functional.avg_pool1d(Tensor([16, 1, 120],"float32"), 25, 1, 0, True, False, None, )
 paddle.nn.functional.avg_pool1d(Tensor([13, 1, 120],"float32"), 25, 1, 0, True, False, None, )
 paddle.nn.functional.max_pool1d(Tensor([91, 32, 7],"float32"), 7, )
-paddle.nn.functional.max_pool1d(Tensor([2, 3, 32],"float32"), 2, None, 0, False, False, None, )
+paddle.nn.functional.max_pool1d(Tensor([2, 3, 32],"float32"), 2, None, 0, False, False, )
 paddle.nn.functional.max_pool1d(Tensor([2, 3, 32],"float32"), kernel_size=2, stride=2, padding="SAME", )
 paddle.Tensor.__getitem__(Tensor([8168, 8, 1280],"bfloat16"), slice(None,-6,None), )
 paddle.Tensor.__getitem__(Tensor([7712, 8, 1280],"bfloat16"), slice(None,-2,None), )

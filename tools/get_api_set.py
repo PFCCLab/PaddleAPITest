@@ -1,6 +1,7 @@
 # 获取 api 集合小工具
 # @author: cangtianhuang
 # @date: 2025-09-26
+from __future__ import annotations
 
 import argparse
 from pathlib import Path
@@ -87,9 +88,7 @@ def main():
         default=default_input,
         help="输入路径列表（支持文件或目录）",
     )
-    parser.add_argument(
-        "--output-dir", "-o", default=default_output, help="输出目录路径"
-    )
+    parser.add_argument("--output-dir", "-o", default=default_output, help="输出目录路径")
 
     args = parser.parse_args()
     extract_apis(args.input, args.output_dir)

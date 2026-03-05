@@ -122,7 +122,7 @@ PaddleAPITest 目前支持 `paddle_only`、`accuracy`、`paddle_cinn` 三种测�
 - **paddle_only**，用于单独将 Paddle 动态图跑一遍，验证 paddle 框架以及 PaddleAPITest 引擎**是否支持**该配置。
 - **accuracy**，用于将 Paddle API 的前反向与 **Torch** 的前反向做精度对比测试。
 - **paddle_cinn**，用于将 Paddle 动态图与 Paddle 静态图编译器做精度对比测试。
-
+- **paddle_custom_device**, 用于将Custom Device或者XPU的API与CPU做精度对比。
 当测试**单个配置**时，可使用下面的代码，`--api_config` 中输入待测试的配置内容：
 
 - 仅测试 paddle **是否支持**：
@@ -152,7 +152,9 @@ python engine.py --api_config_file=/host_home/wanghuan29/PaddleAPITest/tester/ap
 python engine.py --api_config_file=/host_home/wanghuan29/PaddleAPITest/tester/api_config/api_config.txt --paddle_cinn=True > tester/api_config/test_log/log.log 2>&1
 ```
 
-当测试配置中有**精度不统一**的情况，需要精度转换时，直接运行测试可能会报错，可加入`--test_amp=True`。
+当测试配置中有**精度不统一**的情况，需要精度转换时，直接运行测试可能会报错，可加入`--test_amp=True`。  
+
+如果希望在引发`paddle_error`或者`accuracy_error` 错误时退出测试，可加入`--exit_on_error=True`,此时测试进程`exit_code`为1。
 
 #### B. engineV2
 

@@ -1,22 +1,22 @@
-import torch
-import paddle
+from __future__ import annotations
+
 import numpy
+import paddle
+import torch
 
 device = torch.device("cuda:0")
 torch.set_default_device(device)
+
 
 def init_input(numpy_tensor):
     paddle_x = paddle.to_tensor(numpy_tensor)
     torch_x = torch.tensor(numpy_tensor)
 
     numpy.testing.assert_allclose(
-        paddle_x.numpy(),
-        torch_x.cpu().numpy(),
-        1e-10,
-        1e-10,
-        err_msg='intput diff'
+        paddle_x.numpy(), torch_x.cpu().numpy(), 1e-10, 1e-10, err_msg="intput diff"
     )
     return paddle_x, torch_x
+
 
 # # paddle.cumprod(x=Tensor([12],"int32"), dim=0, )
 # numpy_tensor = numpy.random.randint(1, 2, size=[1000], dtype="int32")
@@ -182,9 +182,5 @@ torch_out = torch.cumsum(torch_x, dim=-1)
 
 
 numpy.testing.assert_allclose(
-    paddle_out.numpy(),
-    torch_out.cpu().numpy(),
-    1e-2,
-    1e-2,
-    err_msg='output diff'
+    paddle_out.numpy(), torch_out.cpu().numpy(), 1e-2, 1e-2, err_msg="output diff"
 )

@@ -18,6 +18,7 @@ TEST_MODE_ARGS=(
 	--accuracy=True
     --atol=0.0
     --rtol=0.0
+    --bitwise_alignment=True
 	# --paddle_only=True
     # --paddle_cinn=True
 	# --test_amp=True
@@ -29,6 +30,9 @@ IN_OUT_ARGS=(
     # --api_config_file="$FILE_INPUT"
     --api_config_file_pattern="$FILE_PATTERN"
     --log_dir="$LOG_DIR"
+)
+SHOW_RUNTIME_STATUS_ARGS=(
+    --show_runtime_status=False
 )
 
 PARALLEL_ARGS=(
@@ -50,6 +54,7 @@ if [ "$backprocess" -eq 1 ]; then
             "${TEST_MODE_ARGS[@]}" \
             "${IN_OUT_ARGS[@]}" \
             "${PARALLEL_ARGS[@]}" \
+            "${SHOW_RUNTIME_STATUS_ARGS[@]}" \
             >> "$LOG_FILE" 2>&1 &
     PYTHON_PID=$!
 
@@ -70,6 +75,7 @@ else
             "${TEST_MODE_ARGS[@]}" \
             "${IN_OUT_ARGS[@]}" \
             "${PARALLEL_ARGS[@]}" \
+            "${SHOW_RUNTIME_STATUS_ARGS[@]}" \
             2>&1 | tee -a "$LOG_FILE"
 
     PYTHON_PID=$!

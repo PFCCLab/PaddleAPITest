@@ -1,14 +1,13 @@
+from __future__ import annotations
+
 import math
 import os
-from typing import Optional
 
 os.environ["HF_HOME"] = "tools/api_tracer/.huggingface"
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
 import traceback
-from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple, Union
 
 import numpy as np
 import torch
@@ -18,14 +17,18 @@ from decord import VideoReader, cpu
 from diffusers.pipelines.auto_pipeline import AutoPipelineForText2Image
 from PIL import Image
 from torch import nn
-from transformers import (AutoModelForCausalLM, AutoModelForImageTextToText,
-                          AutoProcessor, AutoTokenizer)
-from transformers.data.data_collator import (DataCollatorForLanguageModeling,
-                                             DataCollatorForSeq2Seq)
-from transformers.tokenization_utils_base import PreTrainedTokenizerBase
+from transformers import (
+    AutoModelForCausalLM,
+    AutoModelForImageTextToText,
+    AutoProcessor,
+    AutoTokenizer,
+)
+from transformers.data.data_collator import (
+    DataCollatorForLanguageModeling,
+    DataCollatorForSeq2Seq,
+)
 from transformers.trainer import Trainer
 from transformers.training_args import TrainingArguments
-from transformers.utils.generic import PaddingStrategy
 
 MODELS_DIR = Path("/root/paddlejob/workspace/env_run/models")
 # MODELS_DIR = Path("/root/paddlejob/workspace/env_run/bos/huggingface")
@@ -94,9 +97,7 @@ def run_training_test_tg(model_name: str):
     print(f"🚀 Running Text Generation Training Test for: {model_name})")
     model_path = MODELS_DIR / model_name
     output_path = f"tools/api_tracer/trace_output_test_train/{model_name}"
-    tracer = APITracer(
-        "torch", output_path=output_path, levels=[0, 1], merge_output=True
-    )
+    tracer = APITracer("torch", output_path=output_path, levels=[0, 1], merge_output=True)
     tracer.start()
 
     try:
@@ -140,7 +141,7 @@ def run_training_test_tg(model_name: str):
         def preprocess_function(examples):
             all_texts = []
             for conv_a, conv_b in zip(
-                examples["conversation_a"], examples["conversation_b"]
+                examples["conversation_a"], examples["conversation_b"], strict=False
             ):
                 if "mistralai" in model_name:
                     text_a = tokenizer.apply_chat_template(
@@ -169,7 +170,7 @@ def run_training_test_tg(model_name: str):
             remove_columns=next(iter(dataset)).keys(),
         )
 
-        gradient_checkpointing = False if "RWKV" in model_name else True
+        gradient_checkpointing = not "RWKV" in model_name
 
         output_dir = output_path + "/train_output"
         training_args = TrainingArguments(
@@ -221,9 +222,7 @@ def rotate_half(x):
     return torch.cat((-x2, x1), dim=-1)  # shape is the same as x
 
 
-def apply_rotary_pos_emb_vision(
-    tensor: torch.Tensor, freqs: torch.Tensor
-) -> torch.Tensor:
+def apply_rotary_pos_emb_vision(tensor: torch.Tensor, freqs: torch.Tensor) -> torch.Tensor:
     orig_dtype = tensor.dtype
 
     tensor = tensor.type(dtype=torch.float32)
@@ -250,23 +249,17 @@ class FixedVisionAttention(nn.Module):
         self,
         hidden_states: torch.Tensor,
         cu_seqlens: torch.Tensor,
-        rotary_pos_emb: Optional[torch.Tensor] = None,
+        rotary_pos_emb: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """forward function for vision attention"""
+        """Forward function for vision attention"""
         seq_length = hidden_states.shape[0]
         qkv = (
-            self.qkv(hidden_states)
-            .reshape([seq_length, 3, self.num_heads, -1])
-            .permute(1, 0, 2, 3)
+            self.qkv(hidden_states).reshape([seq_length, 3, self.num_heads, -1]).permute(1, 0, 2, 3)
         )
         q, k, v = qkv.unbind(axis=0)
 
-        q = apply_rotary_pos_emb_vision(q.unsqueeze(dim=0), rotary_pos_emb).squeeze(
-            dim=0
-        )
-        k = apply_rotary_pos_emb_vision(k.unsqueeze(dim=0), rotary_pos_emb).squeeze(
-            dim=0
-        )
+        q = apply_rotary_pos_emb_vision(q.unsqueeze(dim=0), rotary_pos_emb).squeeze(dim=0)
+        k = apply_rotary_pos_emb_vision(k.unsqueeze(dim=0), rotary_pos_emb).squeeze(dim=0)
 
         q = q.transpose(0, 1)
         k = k.transpose(0, 1)
@@ -281,19 +274,17 @@ class FixedVisionAttention(nn.Module):
         splits = [torch.split(tensor, lengths.tolist(), dim=1) for tensor in (q, k, v)]
 
         attn_output = []
-        for q, k, v in zip(*splits):
+        for q, k, v in zip(*splits, strict=False):
             attn_weights = torch.matmul(q, k.transpose(1, 2)) / math.sqrt(self.head_dim)
-            attn_weights = nn.functional.softmax(
-                attn_weights, dim=-1, dtype=torch.float32
-            ).to(q.dtype)
+            attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(
+                q.dtype
+            )
             attn_output_splited = torch.matmul(attn_weights, v)
             attn_output_splited = attn_output_splited.transpose(0, 1)
             attn_output.append(attn_output_splited)
         attn_output = torch.cat(attn_output, dim=0)
         # ---change: reshape(seq_length, -1) to reshape(-1, self.num_heads * self.head_dim)---
-        attn_output = attn_output.reshape(
-            -1, self.num_heads * self.head_dim
-        ).contiguous()
+        attn_output = attn_output.reshape(-1, self.num_heads * self.head_dim).contiguous()
         # ---end---
         attn_output = self.proj(attn_output)
         return attn_output
@@ -303,9 +294,7 @@ def run_training_test_i2t(model_name: str):
     print(f"🚀 Running Image2Text Training Test for: {model_name})")
     model_path = MODELS_DIR / model_name
     output_path = f"tools/api_tracer/trace_output_test_train/{model_name}"
-    tracer = APITracer(
-        "torch", output_path=output_path, levels=[0, 1], merge_output=True
-    )
+    tracer = APITracer("torch", output_path=output_path, levels=[0, 1], merge_output=True)
     tracer.start()
 
     try:
@@ -319,11 +308,7 @@ def run_training_test_i2t(model_name: str):
             for block in model.vision_model.blocks:
                 original_attn = block.attn
                 dim = original_attn.qkv.in_features
-                num_heads = (
-                    original_attn.num_heads
-                    if hasattr(original_attn, "num_heads")
-                    else 16
-                )
+                num_heads = original_attn.num_heads if hasattr(original_attn, "num_heads") else 16
                 fixed_attn = FixedVisionAttention(dim=dim, num_heads=num_heads)
                 fixed_attn.qkv.weight.data.copy_(original_attn.qkv.weight.data)
                 if original_attn.qkv.bias is not None:
@@ -410,20 +395,16 @@ def run_training_test_i2t(model_name: str):
                         ],
                     },
                 ]
-                full_conversation_messages = user_prompt_messages + [
-                    {
-                        "role": "assistant",
-                        "content": [{"type": "text", "text": groundtruth}],
-                    },
+                full_conversation_messages = [
+                    *user_prompt_messages,
+                    {"role": "assistant", "content": [{"type": "text", "text": groundtruth}]},
                 ]
 
                 if processor.tokenizer.chat_template is not None:
                     prompt_only_text = processor.tokenizer.apply_chat_template(
                         user_prompt_messages, tokenize=False, add_generation_prompt=True
                     )
-                    prompt_ids_len = len(
-                        processor.tokenizer(prompt_only_text).input_ids
-                    )
+                    prompt_ids_len = len(processor.tokenizer(prompt_only_text).input_ids)
                     full_prompt_text = processor.tokenizer.apply_chat_template(
                         full_conversation_messages,
                         tokenize=False,
@@ -456,9 +437,7 @@ def run_training_test_i2t(model_name: str):
                         add_generation_prompt=True,
                         chat_template=manual_chat_template,
                     )
-                    prompt_ids_len = len(
-                        processor.tokenizer(prompt_for_len_calc).input_ids
-                    )
+                    prompt_ids_len = len(processor.tokenizer(prompt_for_len_calc).input_ids)
 
                     full_prompt_text = processor.tokenizer.apply_chat_template(
                         full_conversation_messages,
@@ -553,9 +532,7 @@ def run_training_test_v2t(model_name: str):
     print(f"🚀 Running Video-Text-to-Text Training Test for: {model_name})")
     model_path = MODELS_DIR / model_name
     output_path = f"tools/api_tracer/trace_output_test_train/{model_name}"
-    tracer = APITracer(
-        "torch", output_path=output_path, levels=[0, 1], merge_output=True
-    )
+    tracer = APITracer("torch", output_path=output_path, levels=[0, 1], merge_output=True)
     tracer.start()
 
     try:
@@ -587,9 +564,7 @@ def run_training_test_v2t(model_name: str):
             for i in range(len(examples["text"])):
                 video_path = examples["video"][i]["path"]
                 caption = examples["text"][i]
-                frames = sample_frames_from_video(
-                    video_path, num_frames=num_frames_for_model
-                )
+                frames = sample_frames_from_video(video_path, num_frames=num_frames_for_model)
                 if frames is None:
                     continue
 
@@ -606,9 +581,7 @@ def run_training_test_v2t(model_name: str):
                 input_ids = inputs["input_ids"][0]
                 labels = input_ids.clone()
 
-                prompt_without_answer = (
-                    "User: Describe the following video.\nAssistant:"
-                )
+                prompt_without_answer = "User: Describe the following video.\nAssistant:"
                 prompt_only_inputs = processor(
                     text=prompt_without_answer, images=frames, return_tensors="pt"
                 )
@@ -672,9 +645,7 @@ def run_training_test_t2i(model_name: str):
     print(f"🚀 Running Text-to-Image Training Test for: {model_name})")
     model_path = MODELS_DIR / model_name
     output_path = f"tools/api_tracer/trace_output_test_train/{model_name}"
-    tracer = APITracer(
-        "torch", output_path=output_path, levels=[0, 1], merge_output=True
-    )
+    tracer = APITracer("torch", output_path=output_path, levels=[0, 1], merge_output=True)
     tracer.start()
 
     try:
@@ -715,7 +686,7 @@ def run_training_test_t2i(model_name: str):
             if global_step >= max_train_steps:
                 break
 
-            text_input = tokenizer(
+            tokenizer(
                 batch["text"],
                 padding="max_length",
                 max_length=tokenizer.model_max_length,
@@ -755,9 +726,7 @@ def run_training_test_t2i(model_name: str):
                 optimizer.step()
                 optimizer.zero_grad()
                 global_step += 1
-                print(
-                    f"Step: {global_step}, Loss: {loss.item() * gradient_accumulation_steps}"
-                )
+                print(f"Step: {global_step}, Loss: {loss.item() * gradient_accumulation_steps}")
 
         pipeline.save_pretrained(output_dir)
 
@@ -773,9 +742,7 @@ def run_training_test_t2v(model_name: str):
     print(f"🚀 Running Text-to-Video Training Test for: {model_name})")
     model_path = MODELS_DIR / model_name
     output_path = f"tools/api_tracer/trace_output_test_train/{model_name}"
-    tracer = APITracer(
-        "torch", output_path=output_path, levels=[0, 1], merge_output=True
-    )
+    tracer = APITracer("torch", output_path=output_path, levels=[0, 1], merge_output=True)
     tracer.start()
 
     try:
@@ -835,8 +802,7 @@ def run_training_test_t2v(model_name: str):
             with torch.no_grad():
                 prompt_embeds = text_encoder(prompt_ids)[0]
                 video_latents = (
-                    vae.encode(video_tensor).latent_dist.sample()
-                    * vae.config.scaling_factor
+                    vae.encode(video_tensor).latent_dist.sample() * vae.config.scaling_factor
                 )
 
             noise = torch.randn_like(video_latents)
@@ -845,9 +811,7 @@ def run_training_test_t2v(model_name: str):
             ).long()
             noisy_latents = noise_scheduler.add_noise(video_latents, noise, timesteps)
 
-            model_pred = unet(
-                noisy_latents, timesteps, encoder_hidden_states=prompt_embeds
-            ).sample
+            model_pred = unet(noisy_latents, timesteps, encoder_hidden_states=prompt_embeds).sample
             loss = F.mse_loss(model_pred.float(), noise.float(), reduction="mean")
             loss.backward()
             optimizer.step()
@@ -877,9 +841,7 @@ def run_training_test_a2a(model_name: str):
     print(f"🚀 Running Any-to-Any Training Test for: {model_name})")
     model_path = MODELS_DIR / model_name
     output_path = f"tools/api_tracer/trace_output_test_train/{model_name}"
-    tracer = APITracer(
-        "torch", output_path=output_path, levels=[0, 1], merge_output=True
-    )
+    tracer = APITracer("torch", output_path=output_path, levels=[0, 1], merge_output=True)
     tracer.start()
 
     try:
@@ -916,7 +878,7 @@ def run_training_test_a2a(model_name: str):
                     {"type": "image", "content": image},
                     {"type": "text", "content": f"\nQuestion: {question}\nAnswer: "},
                 ]
-                full_conversation = prompt + [{"type": "text", "content": groundtruth}]
+                full_conversation = [*prompt, {"type": "text", "content": groundtruth}]
 
                 inputs = processor(
                     full_conversation,

@@ -1,11 +1,14 @@
+from __future__ import annotations
+
+import time
 
 import torch
 
+from .api_config.config_analyzer import TensorConfig
 from .api_config.log_writer import write_to_log
 from .base import APITestBase
-import time
-from .api_config.config_analyzer import TensorConfig, APIConfig, analyse_configs
 from .paddle_to_torch import get_converter
+
 
 def tensor_numel(tensor_config):
     numel = 1
@@ -13,32 +16,26 @@ def tensor_numel(tensor_config):
         numel = numel * i
     return numel
 
+
 def get_tensor_configs(api_config):
     tensor_configs = []
     for arg_config in api_config.args:
         if isinstance(arg_config, TensorConfig):
             tensor_configs.append(arg_config)
-        elif isinstance(arg_config, list):
-            for j in range(len(arg_config)):
-                if isinstance(arg_config[j], TensorConfig):
-                    tensor_configs.append(arg_config[j])
-        elif isinstance(arg_config, tuple):
+        elif isinstance(arg_config, (list, tuple)):
             for j in range(len(arg_config)):
                 if isinstance(arg_config[j], TensorConfig):
                     tensor_configs.append(arg_config[j])
 
-    for key, arg_config in api_config.kwargs.items():
+    for _key, arg_config in api_config.kwargs.items():
         if isinstance(arg_config, TensorConfig):
             tensor_configs.append(arg_config)
-        elif isinstance(arg_config, list):
-            for j in range(len(arg_config)):
-                if isinstance(arg_config[j], TensorConfig):
-                    tensor_configs.append(arg_config[j])
-        elif isinstance(arg_config, tuple):
+        elif isinstance(arg_config, (list, tuple)):
             for j in range(len(arg_config)):
                 if isinstance(arg_config[j], TensorConfig):
                     tensor_configs.append(arg_config[j])
     return tensor_configs
+
 
 def total_numel(api_config):
     tensor_configs = get_tensor_configs(api_config)
@@ -53,9 +50,8 @@ class APITestTorchGPUPerformance(APITestBase):
         super().__init__(api_config)
         self.test_amp = kwargs.get("test_amp", False)
         self.converter = get_converter()
-    
+
     def test(self):
-        
         if self.need_skip(paddle_only=True):
             print("[Skip]", flush=True)
             return
@@ -67,15 +63,24 @@ class APITestTorchGPUPerformance(APITestBase):
         try:
             convert_result = self.converter.convert(self.api_config.api_name)
         except Exception as e:
-            print(f"[paddle_to_torch] Convertion failed for {self.api_config.config}: {str(e)}", flush=True)
+            print(
+                f"[paddle_to_torch] Convertion failed for {self.api_config.config}: {e!s}",
+                flush=True,
+            )
             write_to_log("paddle_to_torch_failed", self.api_config.config)
             return
         if not convert_result.is_supported:
-            print(f"[paddle_to_torch] Unsupported API {self.api_config.api_name}: {convert_result.error_message}", flush=True)
+            print(
+                f"[paddle_to_torch] Unsupported API {self.api_config.api_name}: {convert_result.error_message}",
+                flush=True,
+            )
             write_to_log("paddle_to_torch_failed", self.api_config.config)
             return
         if not convert_result.code or not convert_result.code.is_valid():
-            print(f"[paddle_to_torch] No code generated for {self.api_config.api_name}", flush=True)
+            print(
+                f"[paddle_to_torch] No code generated for {self.api_config.api_name}",
+                flush=True,
+            )
             write_to_log("paddle_to_torch_failed", self.api_config.config)
             return
 
@@ -146,7 +151,19 @@ class APITestTorchGPUPerformance(APITestBase):
                             torch.cuda.synchronize()
                             end = time.time()
                             timeused = end - start
-                            print(self.api_config.api_name, "\t", self.api_config.config, "\tforward\t", numel, "\t", test_loop, "\t", timeused, "\tTorch\t", combined)
+                            print(
+                                self.api_config.api_name,
+                                "\t",
+                                self.api_config.config,
+                                "\tforward\t",
+                                numel,
+                                "\t",
+                                test_loop,
+                                "\t",
+                                timeused,
+                                "\tTorch\t",
+                                combined,
+                            )
                     else:
                         torch.cuda.synchronize()
                         start = time.time()
@@ -155,11 +172,35 @@ class APITestTorchGPUPerformance(APITestBase):
                         torch.cuda.synchronize()
                         end = time.time()
                         timeused = end - start
-                        print(self.api_config.api_name, "\t", self.api_config.config, "\tforward\t", numel, "\t", test_loop, "\t", timeused, "\tTorch\t", combined)
+                        print(
+                            self.api_config.api_name,
+                            "\t",
+                            self.api_config.config,
+                            "\tforward\t",
+                            numel,
+                            "\t",
+                            test_loop,
+                            "\t",
+                            timeused,
+                            "\tTorch\t",
+                            combined,
+                        )
 
             del exec_globals, exec_locals, output_var, convert_result, code
         except Exception as err:
-            print(self.api_config.api_name, "\t", self.api_config.config, "\tforward\t", numel, "\t", test_loop, "\t", "faild", "\tTorch\t", combined)
+            print(
+                self.api_config.api_name,
+                "\t",
+                self.api_config.config,
+                "\tforward\t",
+                numel,
+                "\t",
+                test_loop,
+                "\t",
+                "faild",
+                "\tTorch\t",
+                combined,
+            )
             if "CUDA error" in str(err) or "memory corruption" in str(err):
                 raise err
             if "CUDA out of memory" in str(err) or "Out of memory error" in str(err):
@@ -169,27 +210,53 @@ class APITestTorchGPUPerformance(APITestBase):
         try:
             if self.need_check_grad():
                 inputs_list = self.get_torch_input_list()
-                result_outputs, result_outputs_grads = self.gen_torch_output_and_output_grad(torch_output)
+                result_outputs, result_outputs_grads = self.gen_torch_output_and_output_grad(
+                    torch_output
+                )
                 del self.torch_args, self.torch_kwargs
                 if inputs_list and result_outputs and result_outputs_grads:
                     torch.cuda.synchronize()
                     start = time.time()
-                    for i in range(test_loop):
+                    for _i in range(test_loop):
                         torch.autograd.grad(
                             outputs=result_outputs,
                             inputs=inputs_list,
                             grad_outputs=result_outputs_grads,
-                            retain_graph=True
+                            retain_graph=True,
                         )
                     torch.cuda.synchronize()
                     end = time.time()
                     timeused = end - start
-                    print(self.api_config.api_name, "\t", self.api_config.config, "\tbackward\t", numel, "\t", test_loop, "\t", timeused, "\tTorch\t", combined)
+                    print(
+                        self.api_config.api_name,
+                        "\t",
+                        self.api_config.config,
+                        "\tbackward\t",
+                        numel,
+                        "\t",
+                        test_loop,
+                        "\t",
+                        timeused,
+                        "\tTorch\t",
+                        combined,
+                    )
                 del inputs_list, result_outputs, result_outputs_grads, torch_output
             else:
                 del self.torch_args, self.torch_kwargs, torch_output
         except Exception as err:
-            print(self.api_config.api_name, "\t", self.api_config.config, "\tbackward\t", numel, "\t", test_loop, "\t", "faild", "\tTorch\t", combined)
+            print(
+                self.api_config.api_name,
+                "\t",
+                self.api_config.config,
+                "\tbackward\t",
+                numel,
+                "\t",
+                test_loop,
+                "\t",
+                "faild",
+                "\tTorch\t",
+                combined,
+            )
             print(str(err))
             if "CUDA error" in str(err) or "memory corruption" in str(err):
                 raise err

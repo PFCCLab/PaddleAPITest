@@ -9,3 +9,4 @@ tester/api_config/api_config*
 tester/api_config/output
 tools/api_tracer/.huggingface
 tools/api_tracer/trace_output*
+.api_config/

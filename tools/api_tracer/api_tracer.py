@@ -1,13 +1,15 @@
+from __future__ import annotations
+
 import os
 import signal
 import sys
 import warnings
-from typing import Dict, List, Literal, Optional, TypedDict, Union
+from typing import Literal, TypedDict
 
 try:
     from typing import Unpack
 except ImportError:
-    from typing_extensions import Unpack
+    from typing import Unpack
 
 from .config_serializer import ConfigSerializer
 from .framework_dialect import FrameworkDialect, TracingHook
@@ -21,16 +23,14 @@ class APITracerKwargs(TypedDict, total=False):
 
 
 class APITracer:
-
     def __init__(
         self,
         dialect: str,
         output_path: str = "trace_output",
-        levels: Union[int, List] = 0,
+        levels: int | list = 0,
         **kwargs: Unpack[APITracerKwargs],
     ):
-        """
-        初始化 API 追踪器
+        """初始化 API 追踪器
 
         Args:
         - dialect (str): 指定抓取的框架方言, 例如 "torch"
@@ -61,9 +61,7 @@ class APITracer:
 
         self.dialect = FrameworkDialect.get_dialect(dialect)
         self.serializer = ConfigSerializer(self.dialect, output_path, levels, **kwargs)
-        self.hooks: List[TracingHook] = self.dialect.get_hooks(
-            self.serializer, levels, **kwargs
-        )
+        self.hooks: list[TracingHook] = self.dialect.get_hooks(self.serializer, levels, **kwargs)
         self._is_tracing = False
 
         signal.signal(signal.SIGINT, self._signal_handler)
@@ -130,22 +128,16 @@ class APITracer:
         self.stop()
 
     @staticmethod
-    def parse_configs_from_trace(
-        input_path: str, output_path: str, output_suffix: str = ""
-    ):
-        """
-        从 api_trace.txt 文件中解析 API 配置和统计信息
+    def parse_configs_from_trace(input_path: str, output_path: str, output_suffix: str = ""):
+        """从 api_trace.txt 文件中解析 API 配置和统计信息
 
         等价于 ConfigSerializer.parse_trace_configs
         """
         ConfigSerializer.parse_trace_configs(input_path, output_path, output_suffix)
 
     @staticmethod
-    def parse_stacks_from_trace(
-        input_path: str, output_path: str, output_suffix: str = ""
-    ):
-        """
-        从 api_trace.yaml 文件中解析每个 API 的前 3 个调用堆栈
+    def parse_stacks_from_trace(input_path: str, output_path: str, output_suffix: str = ""):
+        """从 api_trace.yaml 文件中解析每个 API 的前 3 个调用堆栈
 
         等价于 ConfigSerializer.parse_trace_stacks
         """
@@ -156,8 +148,7 @@ class APITracer:
         input_path: str,
         yaml_path: str,
     ):
-        """
-        解析 api_apis.txt 文件, 生成 alias_api.txt 和 excluded_api.txt
+        """解析 api_apis.txt 文件, 生成 alias_api.txt 和 excluded_api.txt
 
         等价于 api_alias.get_alias_apis
         """
@@ -169,20 +160,17 @@ class APITracer:
     def get_merged_model_apis(
         input_path: str,
         output_path: str,
-        sheet_name: Optional[str] = None,
-        model_groups: Optional[Dict[str, List[str]]] = None,
-        yaml_paths: Optional[Dict[str, str]] = None,
+        sheet_name: str | None = None,
+        model_groups: dict[str, list[str]] | None = None,
+        yaml_paths: dict[str, str] | None = None,
     ):
-        """
-        从 XLSX 或 CSV 文件中读取 API 数据, 合并并分析 API
+        """从 XLSX 或 CSV 文件中读取 API 数据, 合并并分析 API
 
         等价于 api_merge.merge_model_apis
         """
         from .api_merge_tool import get_merged_model_apis
 
-        get_merged_model_apis(
-            input_path, output_path, sheet_name, model_groups, yaml_paths
-        )
+        get_merged_model_apis(input_path, output_path, sheet_name, model_groups, yaml_paths)
 
     @staticmethod
     def get_mapped_model_apis(
@@ -192,8 +180,7 @@ class APITracer:
         mapping_table_path: str,
         output_path: str,
     ):
-        """
-        根据给定的 API 列表和映射表文件, 生成详细的 API 映射报告
+        """根据给定的 API 列表和映射表文件, 生成详细的 API 映射报告
 
         等价于 api_map_tool.get_mapped_model_apis
         """

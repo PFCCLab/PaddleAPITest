@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -6,12 +8,10 @@ from api_tracer import APITracer
 
 class SimpleCNN(nn.Module):
     def __init__(self, num_classes=10):
-        super(SimpleCNN, self).__init__()
+        super().__init__()
         self.conv1 = nn.Conv2d(in_channels=1, out_channels=16, kernel_size=3, padding=1)
         self.bn1 = nn.BatchNorm2d(16)
-        self.conv2 = nn.Conv2d(
-            in_channels=16, out_channels=32, kernel_size=3, padding=1
-        )
+        self.conv2 = nn.Conv2d(in_channels=16, out_channels=32, kernel_size=3, padding=1)
         self.pool = nn.MaxPool2d(kernel_size=2, stride=2)
         self.dropout = nn.Dropout(p=0.5)
         self.fc1 = nn.Linear(32 * 7 * 7, 128)
