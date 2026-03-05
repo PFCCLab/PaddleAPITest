@@ -72,6 +72,20 @@ class APITestBase:
         # not support
         if "sparse" in self.api_config.api_name:
             return True
+
+        # Skip prod with multi-axis: torch.prod only supports single dim,
+        # so multi-axis (list/tuple/Tensor) cases cannot be compared.
+        if not paddle_only and self.api_config.api_name in ("paddle.prod", "paddle.Tensor.prod"):
+            # Check positional axis arg (2nd arg, index 1) or kwarg "axis"
+            axis = None
+            if len(self.api_config.args) > 1:
+                axis = self.api_config.args[1]
+            if "axis" in self.api_config.kwargs:
+                axis = self.api_config.kwargs["axis"]
+            if isinstance(axis, (list, tuple)) and len(axis) > 1:
+                return True
+            if isinstance(axis, TensorConfig) and axis.shape and axis.shape[0] > 1:
+                return True
         # if self.api_config.api_name in not_support_api:
         #     return True
         # if not paddle_only and self.api_config.api_name in rand_apis:
