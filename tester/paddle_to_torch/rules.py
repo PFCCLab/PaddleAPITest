@@ -3477,11 +3477,7 @@ class LinearRule(BaseRule):
     def apply(self, paddle_api: str) -> ConvertResult:
         _, map_code = self.apply_generic()
         pre = """
-weight = weight.T
-if weight.dtype == torch.bfloat16:
-    weight = weight.to(torch.float32)
-if 'bias' in locals() and bias is not None and bias.dtype == torch.bfloat16:
-    bias = bias.to(torch.float32)
+weight = weight.T.contiguous()
 """
         core = f"result = {self.torch_api}(**_kwargs)"
         code = Code(preprocess=pre.splitlines() + map_code, core=[core])
