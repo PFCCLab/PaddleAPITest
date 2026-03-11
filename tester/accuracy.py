@@ -72,7 +72,10 @@ class APITestAccuracy(APITestBase):
             return
 
         try:
-            device = torch.device("cuda:0")
+            if paddle.device.get_device() == "cpu":
+                device = torch.device("cpu")
+            else:
+                device = torch.device("cuda:0")
             torch.set_default_device(device)
             if not self.gen_torch_input():
                 print("gen_torch_input failed", flush=True)

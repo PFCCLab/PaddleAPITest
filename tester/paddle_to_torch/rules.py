@@ -697,17 +697,17 @@ class CrossEntropyRule(BaseRule):
         pre = """
 shp = label.shape
 if len(input.shape) > 2:
-    perm = [0] + [len(input.shape)-1]+ [i for i in range(1,len(input.shape)-1)]
+    perm = [0] + [len(input.shape)-1] + [i for i in range(1, len(input.shape)-1)]
     input = input.permute(*perm)
-axis = locals().get('axis',-1)
 label = label.squeeze(-1)
 if weight is not None:
     weight.requires_grad = False
 if label.dtype == torch.int32:
     label = label.long()
-if soft_label and weight is not None and shp == input.shape:
-    reduction_original = reduction
-    weight_original = weight
+_manual_weight = soft_label and weight is not None
+if _manual_weight:
+    _saved_reduction = reduction
+    _saved_weight = weight
     reduction = "none"
     weight = None
 """
@@ -715,23 +715,19 @@ if soft_label and weight is not None and shp == input.shape:
 result = {self.torch_api}(**_kwargs)
 """
         post = """
-if reduction_original is not None:
-    reduction = reduction_original
-    loss_weight = label@weight_original
-    sum_weight = loss_weight.sum()
-    result *= loss_weight
-else:
-    sum_weight = result.numel()
-
+if _manual_weight:
+    loss_weight = label @ _saved_weight
+    result = result * loss_weight
+    if _saved_reduction == "sum":
+        result = result.sum()
+    elif _saved_reduction == "mean":
+        result = result.sum() / loss_weight.sum()
+    reduction = _saved_reduction
 if reduction == "none":
     if soft_label:
         result = result.unsqueeze(-1)
     else:
         result = result.reshape(shp)
-elif reduction == "sum":
-    result = result.sum()
-else:
-    result = result.sum()/sum_weight
 """
         code = Code(
             preprocess=defaults_code + pre.splitlines() + map_code,
@@ -3210,7 +3206,11 @@ elif data_format == "NWC":
     result = result.permute(0, 2, 1)
 """
         code = Code(
-            preprocess=default_code + pre.splitlines() + map_code,
+            preprocess=default_code + pre.splitlines() + map_code + [
+                '# PyTorch rejects align_corners for nearest/area modes',
+                'if _kwargs.get("mode", "nearest") in ("nearest", "area"):',
+                '    _kwargs.pop("align_corners", None)',
+            ],
             core=[core],
             postprocess=post.splitlines(),
         )

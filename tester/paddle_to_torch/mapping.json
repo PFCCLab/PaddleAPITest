@@ -2739,8 +2739,7 @@
             "weight": "None",
             "reduction": "'mean'",
             "soft_label": "False",
-            "label_smoothing": "0.0",
-            "reduction_original": "None"
+            "label_smoothing": "0.0"
         },
         "paddle_torch_args_map": {
             "input": "input",
