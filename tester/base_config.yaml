@@ -35,22 +35,22 @@ paddle_error_dismiss:
   paddle.argsort: "(PreconditionNotMet) The dimension being sorted should be less than 2^31"
 
 # some accuracy error can be considered tolerable
-special_accuracy_atol_rtol:
-  # API: [atol, rtol]
-  paddle.cumsum: [2.0, 0.01]
-  paddle.Tensor.cumsum: [2.0, 0.01]
-  paddle.logcumsumexp: [2.0, 0.01]
-  paddle.Tensor.logcumsumexp: [2.0, 0.01]
-  paddle.tensordot: [1.0, 1.0]
-  paddle.incubate.nn.functional.fused_bias_act: [1, 0.01]
-  paddle.incubate.nn.functional.fused_rms_norm : [3, 0.5]
-  paddle.incubate.nn.functional.fused_layer_norm: [1, 0.01]
-  paddle.nn.functional.layer_norm : [0.2, 0.02]
-  paddle.incubate.nn.functional.fused_bias_dropout_residual_layer_norm: [1.0, 1.0]
-  paddle.nn.functional.softmax: [1, 0.01]
-  paddle.matmul: [2.0, 0.05]
-  paddle.nn.functional.bilinear: [2.0, 0.08]
-  paddle.nn.functional.normalize: [0.2, 0.01]
+# special_accuracy_atol_rtol:
+#   # API: [atol, rtol]
+#   paddle.cumsum: [2.0, 0.01]
+#   paddle.Tensor.cumsum: [2.0, 0.01]
+#   paddle.logcumsumexp: [2.0, 0.01]
+#   paddle.Tensor.logcumsumexp: [2.0, 0.01]
+#   paddle.tensordot: [1.0, 1.0]
+#   paddle.incubate.nn.functional.fused_bias_act: [1, 0.01]
+#   paddle.incubate.nn.functional.fused_rms_norm : [3, 0.5]
+#   paddle.incubate.nn.functional.fused_layer_norm: [1, 0.01]
+#   paddle.nn.functional.layer_norm : [0.2, 0.02]
+#   paddle.incubate.nn.functional.fused_bias_dropout_residual_layer_norm: [1.0, 1.0]
+#   paddle.nn.functional.softmax: [1, 0.01]
+#   paddle.matmul: [2.0, 0.05]
+#   paddle.nn.functional.bilinear: [2.0, 0.08]
+#   paddle.nn.functional.normalize: [0.2, 0.01]
 
 # All configs that report dtype diff when not in not_check_dtype list should be
 # copied to tester/api_config/5_accuracy/accuracy_gpu_error_dtype_diff.txt
