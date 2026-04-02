@@ -696,6 +696,12 @@ class CrossEntropyRule(BaseRule):
         defaults_code, map_code = self.apply_generic()
         pre = """
 shp = label.shape
+axis = locals().get('axis', -1)
+use_softmax = locals().get('use_softmax', True)
+if axis < 0:
+    axis += input.dim()
+if not use_softmax:
+    input = torch.nn.functional.softmax(input, dim=axis)
 if len(input.shape) > 2:
     perm = [0] + [len(input.shape)-1] + [i for i in range(1, len(input.shape)-1)]
     input = input.permute(*perm)
@@ -712,11 +718,20 @@ if _manual_weight:
     weight = None
 """
         core = f"""
-result = {self.torch_api}(**_kwargs)
+if not use_softmax and not soft_label and label_smoothing == 0.0:
+    result = torch.nn.functional.nll_loss(
+        input=torch.log(input),
+        target=label,
+        weight=weight,
+        ignore_index=ignore_index,
+        reduction=reduction,
+    )
+else:
+    result = {self.torch_api}(**_kwargs)
 """
         post = """
 if _manual_weight:
-    loss_weight = label @ _saved_weight
+    loss_weight = label.to(dtype=_saved_weight.dtype) @ _saved_weight
     result = result * loss_weight
     if _saved_reduction == "sum":
         result = result.sum()
