@@ -718,16 +718,9 @@ if _manual_weight:
     weight = None
 """
         core = f"""
-if not use_softmax and not soft_label and label_smoothing == 0.0:
-    result = torch.nn.functional.nll_loss(
-        input=torch.log(input),
-        target=label,
-        weight=weight,
-        ignore_index=ignore_index,
-        reduction=reduction,
-    )
-else:
-    result = {self.torch_api}(**_kwargs)
+if not use_softmax:
+    _kwargs["input"] = torch.log(_kwargs["input"])
+result = {self.torch_api}(**_kwargs)
 """
         post = """
 if _manual_weight:
