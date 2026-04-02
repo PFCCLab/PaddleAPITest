@@ -2,15 +2,30 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import subprocess
 import tempfile
 from pathlib import Path
 
 import numpy as np
 import paddle
+import yaml
 
 from .api_config.log_writer import write_to_log
 from .paddle_device_vs_cpu import APITestCustomDeviceVSCPU
+
+_DEVICE_VS_GPU_CONFIG_PATH = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "device_vs_gpu_config.yaml"
+)
+_device_vs_gpu_atol_rtol: dict = {}
+_device_vs_gpu_dtype_atol_rtol: dict = {}
+
+if os.path.exists(_DEVICE_VS_GPU_CONFIG_PATH):
+    with open(_DEVICE_VS_GPU_CONFIG_PATH, encoding="utf-8") as _f:
+        _cfg = yaml.safe_load(_f) or {}
+    _device_vs_gpu_atol_rtol = _cfg.get("atol_rtol", {})
+    _device_vs_gpu_dtype_atol_rtol = _cfg.get("dtype_atol_rtol", {})
+    del _cfg, _f
 
 
 class APITestPaddleDeviceVSGPU(APITestCustomDeviceVSCPU):
@@ -192,6 +207,19 @@ class APITestPaddleDeviceVSGPU(APITestCustomDeviceVSCPU):
             write_to_log("paddle_error", self.api_config.config)
             return None, None
 
+    def _resolve_atol_rtol(self, dtype_str: str) -> tuple[float, float]:
+        """按三级优先级解析容差：API+dtype > API default > 全局 dtype > 命令行值。"""
+        api_name = self.api_config.api_name
+        if api_name in _device_vs_gpu_atol_rtol:
+            api_cfg = _device_vs_gpu_atol_rtol[api_name]
+            if dtype_str in api_cfg:
+                return tuple(api_cfg[dtype_str])
+            if "default" in api_cfg:
+                return tuple(api_cfg["default"])
+        if dtype_str in _device_vs_gpu_dtype_atol_rtol:
+            return tuple(_device_vs_gpu_dtype_atol_rtol[dtype_str])
+        return self.atol, self.rtol
+
     def _compare_with_downloaded(self, local_output, local_grads, downloaded_tensor):
         """与下载的结果进行对比"""
         try:
@@ -207,11 +235,13 @@ class APITestPaddleDeviceVSGPU(APITestCustomDeviceVSCPU):
                     remote_output, paddle.Tensor
                 ):
                     # 使用Paddle的对比方法
+                    dtype_str = str(local_output.dtype).split(".")[-1]
+                    atol, rtol = self._resolve_atol_rtol(dtype_str)
                     np.testing.assert_allclose(
                         local_output.numpy(),
                         remote_output.numpy(),
-                        atol=self.atol,
-                        rtol=self.rtol,
+                        atol=atol,
+                        rtol=rtol,
                         equal_nan=True,
                     )
                 elif isinstance(local_output, (list, tuple)) and isinstance(
@@ -222,11 +252,13 @@ class APITestPaddleDeviceVSGPU(APITestCustomDeviceVSCPU):
                         if isinstance(local_item, paddle.Tensor) and isinstance(
                             remote_item, paddle.Tensor
                         ):
+                            dtype_str = str(local_item.dtype).split(".")[-1]
+                            atol, rtol = self._resolve_atol_rtol(dtype_str)
                             np.testing.assert_allclose(
                                 local_item.numpy(),
                                 remote_item.numpy(),
-                                atol=self.atol,
-                                rtol=self.rtol,
+                                atol=atol,
+                                rtol=rtol,
                                 equal_nan=True,
                             )
                             print(
@@ -279,11 +311,13 @@ class APITestPaddleDeviceVSGPU(APITestCustomDeviceVSCPU):
                             if isinstance(local_grad, paddle.Tensor) and isinstance(
                                 remote_grad, paddle.Tensor
                             ):
+                                dtype_str = str(local_grad.dtype).split(".")[-1]
+                                atol, rtol = self._resolve_atol_rtol(dtype_str)
                                 np.testing.assert_allclose(
                                     local_grad.numpy(),
                                     remote_grad.numpy(),
-                                    atol=self.atol,
-                                    rtol=self.rtol,
+                                    atol=atol,
+                                    rtol=rtol,
                                     equal_nan=True,
                                 )
                                 print(
@@ -293,11 +327,13 @@ class APITestPaddleDeviceVSGPU(APITestCustomDeviceVSCPU):
                     elif isinstance(local_grads, paddle.Tensor) and isinstance(
                         remote_grads, paddle.Tensor
                     ):
+                        dtype_str = str(local_grads.dtype).split(".")[-1]
+                        atol, rtol = self._resolve_atol_rtol(dtype_str)
                         np.testing.assert_allclose(
                             local_grads.numpy(),
                             remote_grads.numpy(),
-                            atol=self.atol,
-                            rtol=self.rtol,
+                            atol=atol,
+                            rtol=rtol,
                             equal_nan=True,
                         )
 
