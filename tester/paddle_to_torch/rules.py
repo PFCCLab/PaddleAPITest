@@ -700,9 +700,10 @@ axis = locals().get('axis', -1)
 use_softmax = locals().get('use_softmax', True)
 if axis < 0:
     axis += input.dim()
+_manual_soft_label_ce = soft_label and use_softmax and axis == input.dim() - 1
 if not use_softmax:
     input = torch.nn.functional.softmax(input, dim=axis)
-if len(input.shape) > 2:
+if len(input.shape) > 2 and not _manual_soft_label_ce:
     perm = [0] + [len(input.shape)-1] + [i for i in range(1, len(input.shape)-1)]
     input = input.permute(*perm)
 label = label.squeeze(-1)
@@ -711,6 +712,17 @@ if weight is not None:
 if label.dtype == torch.int32:
     label = label.long()
 _manual_weight = soft_label and weight is not None and torch.is_floating_point(label)
+if _manual_soft_label_ce:
+    _original_label = label
+    if label_smoothing > 0.0 and not torch.is_floating_point(label):
+        _original_label = torch.nn.functional.one_hot(label.long(), num_classes=input.shape[-1])
+        label = _original_label
+    if torch.is_floating_point(label):
+        label = label.to(dtype=input.dtype)
+        _original_label = _original_label.to(dtype=input.dtype)
+    if label_smoothing > 0.0:
+        label = label * (1.0 - label_smoothing) + label_smoothing / input.shape[-1]
+    _manual_weight = weight is not None
 if _manual_weight:
     _saved_reduction = reduction
     _saved_weight = weight
@@ -726,6 +738,9 @@ if not use_softmax and not soft_label and label_smoothing == 0.0:
         ignore_index=_kwargs.get("ignore_index", -100),
         reduction=_kwargs.get("reduction", "mean"),
     )
+elif _manual_soft_label_ce:
+    _log_prob = torch.nn.functional.log_softmax(input, dim=axis)
+    result = -(label * _log_prob).sum(dim=axis)
 else:
     if not use_softmax:
         _kwargs["input"] = torch.log(_kwargs["input"])
@@ -733,13 +748,21 @@ else:
 """
         post = """
 if _manual_weight:
-    loss_weight = label.to(dtype=_saved_weight.dtype) @ _saved_weight
+    if _manual_soft_label_ce:
+        loss_weight = (_original_label.to(dtype=_saved_weight.dtype) * _saved_weight).sum(dim=axis)
+    else:
+        loss_weight = label.to(dtype=_saved_weight.dtype) @ _saved_weight
     result = result * loss_weight
     if _saved_reduction == "sum":
         result = result.sum()
     elif _saved_reduction == "mean":
         result = result.sum() / loss_weight.sum()
     reduction = _saved_reduction
+elif _manual_soft_label_ce:
+    if reduction == "sum":
+        result = result.sum()
+    elif reduction == "mean":
+        result = result.mean()
 if reduction == "none":
     if soft_label:
         result = result.unsqueeze(-1)
