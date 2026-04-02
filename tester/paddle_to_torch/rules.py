@@ -722,6 +722,7 @@ if _manual_soft_label_ce:
         _original_label = _original_label.to(dtype=input.dtype)
     if label_smoothing > 0.0:
         label = label * (1.0 - label_smoothing) + label_smoothing / input.shape[-1]
+    _weighted_label = label
     _manual_weight = weight is not None
 if _manual_weight:
     _saved_reduction = reduction
@@ -749,7 +750,7 @@ else:
         post = """
 if _manual_weight:
     if _manual_soft_label_ce:
-        loss_weight = (_original_label.to(dtype=_saved_weight.dtype) * _saved_weight).sum(dim=axis)
+        loss_weight = (_weighted_label.to(dtype=_saved_weight.dtype) * _saved_weight).sum(dim=axis)
     else:
         loss_weight = label.to(dtype=_saved_weight.dtype) @ _saved_weight
     result = result * loss_weight
