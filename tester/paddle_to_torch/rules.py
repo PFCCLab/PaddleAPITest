@@ -714,14 +714,19 @@ if label.dtype == torch.int32:
 _manual_weight = soft_label and weight is not None and torch.is_floating_point(label)
 if _manual_soft_label_ce:
     _original_label = label
+    _did_onehot_from_int = False
     if label_smoothing > 0.0 and not torch.is_floating_point(label):
-        _original_label = torch.nn.functional.one_hot(label.long(), num_classes=input.shape[-1])
+        _original_label = torch.nn.functional.one_hot(label.long(), num_classes=input.shape[-1]).float()
         label = _original_label
-    if torch.is_floating_point(label):
+        _did_onehot_from_int = True
+    if torch.is_floating_point(label) and not _did_onehot_from_int:
         label = label.to(dtype=input.dtype)
         _original_label = _original_label.to(dtype=input.dtype)
     if label_smoothing > 0.0:
         label = label * (1.0 - label_smoothing) + label_smoothing / input.shape[-1]
+    if _did_onehot_from_int:
+        label = label.to(dtype=input.dtype)
+        _original_label = _original_label.to(dtype=input.dtype)
     _weighted_label = label
     _manual_weight = weight is not None
 if _manual_weight:
