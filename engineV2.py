@@ -855,10 +855,6 @@ def main():
             APITestAccuracy,  # default fallback
         )
 
-        if options.test_cpu:
-            import paddle
-
-            paddle.device.set_device("cpu")
         if options.custom_device_vs_gpu:
             # custom_device_vs_gpu 模式需要传递额外参数
             kwargs = {
@@ -868,17 +864,21 @@ def main():
                 "rtol": options.rtol,
             }
             if options.operation_mode == "http":
-                kwargs.update({
-                    "http_host": options.http_host,
-                    "http_port": options.http_port,
-                    "http_timeout": options.http_timeout,
-                })
+                kwargs.update(
+                    {
+                        "http_host": options.http_host,
+                        "http_port": options.http_port,
+                        "http_timeout": options.http_timeout,
+                    }
+                )
             else:
-                kwargs.update({
-                    "bos_path": options.bos_path,
-                    "bos_conf_path": options.bos_conf_path,
-                    "bcecmd_path": options.bcecmd_path,
-                })
+                kwargs.update(
+                    {
+                        "bos_path": options.bos_path,
+                        "bos_conf_path": options.bos_conf_path,
+                        "bcecmd_path": options.bcecmd_path,
+                    }
+                )
             case = test_class(api_config, **kwargs)
         elif options.accuracy:
             case = test_class(

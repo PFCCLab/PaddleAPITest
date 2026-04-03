@@ -6,6 +6,7 @@ process pool, and returns the pdtensor result bytes.
 
 Usage:
     python -m tester.http_server --host 0.0.0.0 --port 8089 --num_gpus=-1
+    python -m tester.http_server --host 0.0.0.0 --port 8089 --gpu_ids=6,7
 """
 
 from __future__ import annotations
@@ -195,11 +196,14 @@ class APITestHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         if self.path == "/health":
             device_type = detect_device_type()
-            self._send_json_response(200, {
-                "status": "ok",
-                "device_type": device_type,
-                "paddle_version": paddle.__version__,
-            })
+            self._send_json_response(
+                200,
+                {
+                    "status": "ok",
+                    "device_type": device_type,
+                    "paddle_version": paddle.__version__,
+                },
+            )
         else:
             self._send_json_response(404, {"error": "not_found"})
 
@@ -214,30 +218,39 @@ class APITestHandler(BaseHTTPRequestHandler):
             body = self.rfile.read(content_length)
             data = json.loads(body.decode("utf-8"))
         except Exception as e:
-            self._send_json_response(400, {
-                "error": "bad_request",
-                "detail": f"Invalid JSON: {e}",
-            })
+            self._send_json_response(
+                400,
+                {
+                    "error": "bad_request",
+                    "detail": f"Invalid JSON: {e}",
+                },
+            )
             return
 
         api_config_str = data.get("api_config")
         random_seed = data.get("random_seed", 0)
 
         if not api_config_str:
-            self._send_json_response(400, {
-                "error": "bad_request",
-                "detail": "Missing field: api_config",
-            })
+            self._send_json_response(
+                400,
+                {
+                    "error": "bad_request",
+                    "detail": "Missing field: api_config",
+                },
+            )
             return
 
         # Submit to process pool
         global _pool, _server_timeout, _concurrency_semaphore
         if _pool is None:
-            self._send_json_response(503, {
-                "error": "service_unavailable",
-                "detail": "Process pool not initialized",
-                "api_config": api_config_str,
-            })
+            self._send_json_response(
+                503,
+                {
+                    "error": "service_unavailable",
+                    "detail": "Process pool not initialized",
+                    "api_config": api_config_str,
+                },
+            )
             return
 
         # Block until a slot opens. The client's http_timeout is the ultimate
@@ -258,11 +271,14 @@ class APITestHandler(BaseHTTPRequestHandler):
             self._send_bytes_response(result_bytes, device_type)
 
         except TimeoutError:
-            self._send_json_response(504, {
-                "error": "timeout",
-                "detail": f"Execution timed out after {_server_timeout}s",
-                "api_config": api_config_str,
-            })
+            self._send_json_response(
+                504,
+                {
+                    "error": "timeout",
+                    "detail": f"Execution timed out after {_server_timeout}s",
+                    "api_config": api_config_str,
+                },
+            )
 
         except ProcessExpired as e:
             if e.exitcode == 99:
@@ -271,18 +287,24 @@ class APITestHandler(BaseHTTPRequestHandler):
                 error_type = "oom"
             else:
                 error_type = "crash"
-            self._send_json_response(500, {
-                "error": error_type,
-                "detail": str(e),
-                "api_config": api_config_str,
-            })
+            self._send_json_response(
+                500,
+                {
+                    "error": error_type,
+                    "detail": str(e),
+                    "api_config": api_config_str,
+                },
+            )
 
         except Exception as e:
-            self._send_json_response(500, {
-                "error": "paddle_error",
-                "detail": str(e),
-                "api_config": api_config_str,
-            })
+            self._send_json_response(
+                500,
+                {
+                    "error": "paddle_error",
+                    "detail": str(e),
+                    "api_config": api_config_str,
+                },
+            )
 
         finally:
             if _concurrency_semaphore is not None:
@@ -308,18 +330,12 @@ def main():
     parser.add_argument(
         "--num_gpus", type=int, default=-1, help="Number of GPUs to use, -1 for all"
     )
-    parser.add_argument(
-        "--num_workers_per_gpu", type=int, default=1, help="Workers per GPU"
-    )
+    parser.add_argument("--num_workers_per_gpu", type=int, default=1, help="Workers per GPU")
     parser.add_argument(
         "--required_memory", type=float, default=10.0, help="Required memory per worker in GB"
     )
-    parser.add_argument(
-        "--gpu_ids", type=str, default="", help="GPU IDs (e.g., '0,1,2' or '0-3')"
-    )
-    parser.add_argument(
-        "--timeout", type=int, default=1800, help="Per-task timeout in seconds"
-    )
+    parser.add_argument("--gpu_ids", type=str, default="", help="GPU IDs (e.g., '0,1,2' or '0-3')")
+    parser.add_argument("--timeout", type=int, default=1800, help="Per-task timeout in seconds")
 
     args = parser.parse_args()
 

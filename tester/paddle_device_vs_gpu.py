@@ -218,42 +218,12 @@ class APITestPaddleDeviceVSGPU(APITestCustomDeviceVSCPU):
         if api_name in _device_vs_gpu_atol_rtol:
             api_cfg = _device_vs_gpu_atol_rtol[api_name]
             if dtype_str in api_cfg:
-                return tuple(float(v) for v in api_cfg[dtype_str])
+                return tuple(api_cfg[dtype_str])
             if "default" in api_cfg:
-                return tuple(float(v) for v in api_cfg["default"])
+                return tuple(api_cfg["default"])
         if dtype_str in _device_vs_gpu_dtype_atol_rtol:
-            return tuple(float(v) for v in _device_vs_gpu_dtype_atol_rtol[dtype_str])
+            return tuple(_device_vs_gpu_dtype_atol_rtol[dtype_str])
         return self.atol, self.rtol
-
-    def _print_diff(self, label, local_np, remote_np):
-        """打印两个 numpy 数组之间的实际最大绝对误差和最大相对误差，返回 (max_abs, max_rel)"""
-        a = local_np.astype(np.float64)
-        b = remote_np.astype(np.float64)
-        abs_diff = np.abs(a - b)
-        max_abs = float(np.nanmax(abs_diff))
-        denom = np.abs(b)
-        with np.errstate(invalid="ignore", divide="ignore"):
-            rel_diff = np.where(denom == 0, abs_diff, abs_diff / denom)
-        max_rel = float(np.nanmax(rel_diff))
-        print(f"[compare] {label} max_abs_diff={max_abs:.6g}, max_rel_diff={max_rel:.6g}", flush=True)
-        return max_abs, max_rel
-
-    def _assert_close(self, local_np, remote_np, atol, rtol):
-        """手动实现 allclose 语义，避免 np.testing.assert_allclose 在 float16/bfloat16 下
-        因内部格式化引发 'Unknown format code g for object of type str' 的 bug。
-        判定条件：|actual - desired| <= atol + rtol * |desired|（element-wise，NaN==NaN 视为相等）
-        """
-        a = local_np.astype(np.float64)
-        b = remote_np.astype(np.float64)
-        nan_equal = np.isnan(a) == np.isnan(b)
-        abs_diff = np.abs(a - b)
-        tol = atol + rtol * np.abs(b)
-        mismatch = ~nan_equal | ((~np.isnan(a)) & (abs_diff > tol))
-        if np.any(mismatch):
-            max_abs = float(np.nanmax(abs_diff))
-            raise AssertionError(
-                f"Arrays not close: max_abs_diff={max_abs:.6g}, atol={atol:.6g}, rtol={rtol:.6g}"
-            )
 
     def _compare_with_downloaded(self, local_output, local_grads, downloaded_tensor):
         """与下载的结果进行对比"""
@@ -272,10 +242,13 @@ class APITestPaddleDeviceVSGPU(APITestCustomDeviceVSCPU):
                     # 使用Paddle的对比方法
                     dtype_str = str(local_output.dtype).split(".")[-1]
                     atol, rtol = self._resolve_atol_rtol(dtype_str)
-                    local_np = local_output.numpy()
-                    remote_np = remote_output.numpy()
-                    self._print_diff("Forward", local_np, remote_np)
-                    self._assert_close(local_np, remote_np, atol, rtol)
+                    np.testing.assert_allclose(
+                        local_output.numpy(),
+                        remote_output.numpy(),
+                        atol=atol,
+                        rtol=rtol,
+                        equal_nan=True,
+                    )
                 elif isinstance(local_output, (list, tuple)) and isinstance(
                     remote_output, (list, tuple)
                 ):
@@ -286,10 +259,13 @@ class APITestPaddleDeviceVSGPU(APITestCustomDeviceVSCPU):
                         ):
                             dtype_str = str(local_item.dtype).split(".")[-1]
                             atol, rtol = self._resolve_atol_rtol(dtype_str)
-                            local_np = local_item.numpy()
-                            remote_np = remote_item.numpy()
-                            self._print_diff(f"Forward output[{i}]", local_np, remote_np)
-                            self._assert_close(local_np, remote_np, atol, rtol)
+                            np.testing.assert_allclose(
+                                local_item.numpy(),
+                                remote_item.numpy(),
+                                atol=atol,
+                                rtol=rtol,
+                                equal_nan=True,
+                            )
                             print(
                                 f"[compare] Forward output[{i}] comparison passed",
                                 flush=True,
@@ -342,10 +318,13 @@ class APITestPaddleDeviceVSGPU(APITestCustomDeviceVSCPU):
                             ):
                                 dtype_str = str(local_grad.dtype).split(".")[-1]
                                 atol, rtol = self._resolve_atol_rtol(dtype_str)
-                                local_np = local_grad.numpy()
-                                remote_np = remote_grad.numpy()
-                                self._print_diff(f"Backward gradient[{i}]", local_np, remote_np)
-                                self._assert_close(local_np, remote_np, atol, rtol)
+                                np.testing.assert_allclose(
+                                    local_grad.numpy(),
+                                    remote_grad.numpy(),
+                                    atol=atol,
+                                    rtol=rtol,
+                                    equal_nan=True,
+                                )
                                 print(
                                     f"[compare] Backward gradient[{i}] comparison passed",
                                     flush=True,
@@ -355,10 +334,13 @@ class APITestPaddleDeviceVSGPU(APITestCustomDeviceVSCPU):
                     ):
                         dtype_str = str(local_grads.dtype).split(".")[-1]
                         atol, rtol = self._resolve_atol_rtol(dtype_str)
-                        local_np = local_grads.numpy()
-                        remote_np = remote_grads.numpy()
-                        self._print_diff("Backward", local_np, remote_np)
-                        self._assert_close(local_np, remote_np, atol, rtol)
+                        np.testing.assert_allclose(
+                            local_grads.numpy(),
+                            remote_grads.numpy(),
+                            atol=atol,
+                            rtol=rtol,
+                            equal_nan=True,
+                        )
 
                     print(
                         f"[compare] Backward gradient check passed for {self.api_config.config}",
@@ -468,10 +450,12 @@ class APITestPaddleDeviceVSGPU(APITestCustomDeviceVSCPU):
         import urllib.request
 
         url = f"http://{self.http_host}:{self.http_port}/run_api_test"
-        payload = json.dumps({
-            "api_config": self.api_config.config,
-            "random_seed": self.random_seed,
-        }).encode("utf-8")
+        payload = json.dumps(
+            {
+                "api_config": self.api_config.config,
+                "random_seed": self.random_seed,
+            }
+        ).encode("utf-8")
 
         req = urllib.request.Request(
             url,
