@@ -2323,20 +2323,16 @@ class TensorConfig:
                 if self.check_arg(api_config, 0, "x"):
                     x_numel = self.numel()
                     if self.dtype in {"bfloat16", "float32", "float64"}:
-                        self.numpy_tensor = numpy.linspace(
-                            -x_numel, x_numel, x_numel, dtype=self.dtype
-                        ).reshape(self.shape)
-                        if numpy.unique(self.numpy_tensor).size < x_numel:
-                            self.numpy_tensor = generate_unique_array(x_numel, self.dtype).reshape(
-                                self.shape
-                            )
+                        self.numpy_tensor = ((numpy.random.random(self.shape) - 0.5) * 1.2).astype(
+                            self.dtype
+                        )
                     elif self.dtype == "float16":
-                        self.numpy_tensor = generate_unique_array(x_numel, self.dtype).reshape(
-                            self.shape
+                        self.numpy_tensor = (
+                            numpy.random.randn(*self.shape).astype(self.dtype) * 1e-3
                         )
                     elif self.dtype in {"int32", "int64"}:
-                        self.numpy_tensor = self.get_random_numpy_tensor(
-                            self.shape, self.dtype, min=1
+                        self.numpy_tensor = (numpy.random.randint(-10, 10, size=self.shape)).astype(
+                            self.dtype
                         )
                     else:
                         raise ValueError(

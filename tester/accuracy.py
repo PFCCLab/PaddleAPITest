@@ -547,7 +547,6 @@ def process_output(api_config, paddle_output, torch_output):
         "paddle.incubate.nn.functional.fused_rms_norm",
         "paddle.kthvalue",
         "paddle.Tensor.kthvalue",
-        "paddle.topk",
     }:
         paddle_output = paddle_output[:1]
         torch_output = torch_output[:1]
