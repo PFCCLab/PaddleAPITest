@@ -42,6 +42,11 @@ class APITestPaddleDeviceVSGPU(APITestCustomDeviceVSCPU):
         self.bcecmd_path = Path(kwargs.get("bcecmd_path", "./bcecmd")).resolve()
         self.bos_conf_path = kwargs.get("bos_conf_path", "./conf")
 
+        # HTTP 模式参数
+        self.http_host = kwargs.get("http_host", "")
+        self.http_port = kwargs.get("http_port", 8089)
+        self.http_timeout = kwargs.get("http_timeout", 300)
+
         # 设置随机种子确保一致性
         if self.random_seed != 0:
             np.random.seed(self.random_seed)
@@ -213,12 +218,42 @@ class APITestPaddleDeviceVSGPU(APITestCustomDeviceVSCPU):
         if api_name in _device_vs_gpu_atol_rtol:
             api_cfg = _device_vs_gpu_atol_rtol[api_name]
             if dtype_str in api_cfg:
-                return tuple(api_cfg[dtype_str])
+                return tuple(float(v) for v in api_cfg[dtype_str])
             if "default" in api_cfg:
-                return tuple(api_cfg["default"])
+                return tuple(float(v) for v in api_cfg["default"])
         if dtype_str in _device_vs_gpu_dtype_atol_rtol:
-            return tuple(_device_vs_gpu_dtype_atol_rtol[dtype_str])
+            return tuple(float(v) for v in _device_vs_gpu_dtype_atol_rtol[dtype_str])
         return self.atol, self.rtol
+
+    def _print_diff(self, label, local_np, remote_np):
+        """打印两个 numpy 数组之间的实际最大绝对误差和最大相对误差，返回 (max_abs, max_rel)"""
+        a = local_np.astype(np.float64)
+        b = remote_np.astype(np.float64)
+        abs_diff = np.abs(a - b)
+        max_abs = float(np.nanmax(abs_diff))
+        denom = np.abs(b)
+        with np.errstate(invalid="ignore", divide="ignore"):
+            rel_diff = np.where(denom == 0, abs_diff, abs_diff / denom)
+        max_rel = float(np.nanmax(rel_diff))
+        print(f"[compare] {label} max_abs_diff={max_abs:.6g}, max_rel_diff={max_rel:.6g}", flush=True)
+        return max_abs, max_rel
+
+    def _assert_close(self, local_np, remote_np, atol, rtol):
+        """手动实现 allclose 语义，避免 np.testing.assert_allclose 在 float16/bfloat16 下
+        因内部格式化引发 'Unknown format code g for object of type str' 的 bug。
+        判定条件：|actual - desired| <= atol + rtol * |desired|（element-wise，NaN==NaN 视为相等）
+        """
+        a = local_np.astype(np.float64)
+        b = remote_np.astype(np.float64)
+        nan_equal = np.isnan(a) == np.isnan(b)
+        abs_diff = np.abs(a - b)
+        tol = atol + rtol * np.abs(b)
+        mismatch = ~nan_equal | ((~np.isnan(a)) & (abs_diff > tol))
+        if np.any(mismatch):
+            max_abs = float(np.nanmax(abs_diff))
+            raise AssertionError(
+                f"Arrays not close: max_abs_diff={max_abs:.6g}, atol={atol:.6g}, rtol={rtol:.6g}"
+            )
 
     def _compare_with_downloaded(self, local_output, local_grads, downloaded_tensor):
         """与下载的结果进行对比"""
@@ -237,13 +272,10 @@ class APITestPaddleDeviceVSGPU(APITestCustomDeviceVSCPU):
                     # 使用Paddle的对比方法
                     dtype_str = str(local_output.dtype).split(".")[-1]
                     atol, rtol = self._resolve_atol_rtol(dtype_str)
-                    np.testing.assert_allclose(
-                        local_output.numpy(),
-                        remote_output.numpy(),
-                        atol=atol,
-                        rtol=rtol,
-                        equal_nan=True,
-                    )
+                    local_np = local_output.numpy()
+                    remote_np = remote_output.numpy()
+                    self._print_diff("Forward", local_np, remote_np)
+                    self._assert_close(local_np, remote_np, atol, rtol)
                 elif isinstance(local_output, (list, tuple)) and isinstance(
                     remote_output, (list, tuple)
                 ):
@@ -254,13 +286,10 @@ class APITestPaddleDeviceVSGPU(APITestCustomDeviceVSCPU):
                         ):
                             dtype_str = str(local_item.dtype).split(".")[-1]
                             atol, rtol = self._resolve_atol_rtol(dtype_str)
-                            np.testing.assert_allclose(
-                                local_item.numpy(),
-                                remote_item.numpy(),
-                                atol=atol,
-                                rtol=rtol,
-                                equal_nan=True,
-                            )
+                            local_np = local_item.numpy()
+                            remote_np = remote_item.numpy()
+                            self._print_diff(f"Forward output[{i}]", local_np, remote_np)
+                            self._assert_close(local_np, remote_np, atol, rtol)
                             print(
                                 f"[compare] Forward output[{i}] comparison passed",
                                 flush=True,
@@ -313,13 +342,10 @@ class APITestPaddleDeviceVSGPU(APITestCustomDeviceVSCPU):
                             ):
                                 dtype_str = str(local_grad.dtype).split(".")[-1]
                                 atol, rtol = self._resolve_atol_rtol(dtype_str)
-                                np.testing.assert_allclose(
-                                    local_grad.numpy(),
-                                    remote_grad.numpy(),
-                                    atol=atol,
-                                    rtol=rtol,
-                                    equal_nan=True,
-                                )
+                                local_np = local_grad.numpy()
+                                remote_np = remote_grad.numpy()
+                                self._print_diff(f"Backward gradient[{i}]", local_np, remote_np)
+                                self._assert_close(local_np, remote_np, atol, rtol)
                                 print(
                                     f"[compare] Backward gradient[{i}] comparison passed",
                                     flush=True,
@@ -329,13 +355,10 @@ class APITestPaddleDeviceVSGPU(APITestCustomDeviceVSCPU):
                     ):
                         dtype_str = str(local_grads.dtype).split(".")[-1]
                         atol, rtol = self._resolve_atol_rtol(dtype_str)
-                        np.testing.assert_allclose(
-                            local_grads.numpy(),
-                            remote_grads.numpy(),
-                            atol=atol,
-                            rtol=rtol,
-                            equal_nan=True,
-                        )
+                        local_np = local_grads.numpy()
+                        remote_np = remote_grads.numpy()
+                        self._print_diff("Backward", local_np, remote_np)
+                        self._assert_close(local_np, remote_np, atol, rtol)
 
                     print(
                         f"[compare] Backward gradient check passed for {self.api_config.config}",
@@ -369,9 +392,11 @@ class APITestPaddleDeviceVSGPU(APITestCustomDeviceVSCPU):
             self._test_upload_mode()
         elif self.operation_mode == "download":
             self._test_download_mode()
+        elif self.operation_mode == "http":
+            self._test_http_mode()
         else:
             print(
-                "[error] operation_mode 不能为空，请指定 --operation_mode=upload 或 download",
+                "[error] operation_mode 不能为空，请指定 --operation_mode=upload 或 download 或 http",
                 flush=True,
             )
             return
@@ -435,3 +460,103 @@ class APITestPaddleDeviceVSGPU(APITestCustomDeviceVSCPU):
             f"[download] Download mode completed for {self.api_config.config}",
             flush=True,
         )
+
+    def _request_remote_execution(self):
+        """发送API配置到远程HTTP服务器执行并返回 (bytes, None) 或 (None, error_info)"""
+        import json
+        import urllib.error
+        import urllib.request
+
+        url = f"http://{self.http_host}:{self.http_port}/run_api_test"
+        payload = json.dumps({
+            "api_config": self.api_config.config,
+            "random_seed": self.random_seed,
+        }).encode("utf-8")
+
+        req = urllib.request.Request(
+            url,
+            data=payload,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=self.http_timeout) as resp:
+                if resp.status == 200:
+                    return resp.read(), None
+                body = resp.read().decode("utf-8", errors="replace")
+                print(f"[http] Remote returned status {resp.status}: {body}", flush=True)
+                return None, {"error": "unknown", "detail": body}
+        except urllib.error.HTTPError as e:
+            try:
+                body = e.read().decode("utf-8", errors="replace")
+                error_info = json.loads(body)
+            except Exception:
+                error_info = {"error": "unknown", "detail": str(e)}
+            status = e.code
+            error_type = error_info.get("error", "unknown")
+            detail = error_info.get("detail", "")
+            print(
+                f"[http] HTTP error {status} ({error_type}): {detail}",
+                flush=True,
+            )
+            return None, error_info
+        except urllib.error.URLError as e:
+            print(f"[http] Network error: {e.reason}", flush=True)
+            return None, {"error": "network_error", "detail": str(e.reason)}
+        except Exception as e:
+            print(f"[http] Request failed: {e}", flush=True)
+            return None, {"error": "network_error", "detail": str(e)}
+
+    def _save_bytes_to_temp(self, data_bytes):
+        """将接收到的字节数据保存到临时文件"""
+        temp_dir = tempfile.gettempdir()
+        filename = f"http_{self._get_filename()}"
+        local_path = Path(temp_dir) / filename
+        local_path.write_bytes(data_bytes)
+        return local_path
+
+    def _test_http_mode(self):
+        """HTTP模式：发送API配置到远程服务器，获取结果并本地对比"""
+        print(f"[http] Starting HTTP mode for {self.api_config.config}", flush=True)
+
+        # 1. 发送到远端执行
+        result_bytes, error_info = self._request_remote_execution()
+
+        if result_bytes is None:
+            # 根据错误类型写对应日志
+            if error_info:
+                error_type = error_info.get("error", "unknown")
+                if error_type in ("paddle_error", "cuda_error", "oom", "crash", "timeout"):
+                    write_to_log(error_type, self.api_config.config)
+                elif error_type == "network_error":
+                    # 网络错误不写日志，不写 checkpoint，下次可重试
+                    pass
+                else:
+                    print(
+                        f"[http] Unknown remote error for {self.api_config.config}",
+                        flush=True,
+                    )
+            return
+
+        # 2. 保存远端结果到临时文件
+        downloaded_tensor_path = self._save_bytes_to_temp(result_bytes)
+
+        # 3. 在本地设备上执行
+        local_device_type = self._get_local_device_type()
+        local_output, local_grads = self._run_paddle(local_device_type)
+
+        if local_output is None:
+            print(
+                f"[http] Local execution failed for {self.api_config.config}",
+                flush=True,
+            )
+            downloaded_tensor_path.unlink(missing_ok=True)
+            return
+
+        # 4. 用现有对比逻辑进行比较
+        self._compare_with_downloaded(local_output, local_grads, downloaded_tensor_path)
+
+        # 5. 清理临时文件
+        downloaded_tensor_path.unlink(missing_ok=True)
+
+        print(f"[http] HTTP mode completed for {self.api_config.config}", flush=True)
