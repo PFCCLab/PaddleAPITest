@@ -23,7 +23,7 @@
 5. 安装第三方库
 
    ```bash
-   pip install func_timeout pebble pynvml
+   pip install func_timeout pebble nvidia-ml-py
    ```
 
 ### 2. 准备测试集

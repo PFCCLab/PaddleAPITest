@@ -29,7 +29,7 @@
 4. 安装第三方库
 
    ```bash
-   pip install pandas pebble pynvml pyyaml
+   pip install pandas pebble nvidia-ml-py pyyaml
    ```
 
 ### 2. 准备测试集
