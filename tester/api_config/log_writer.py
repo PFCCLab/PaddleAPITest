@@ -30,6 +30,7 @@ LOG_PREFIXES = {
     "oom": "api_config_oom",
     "match_error": "api_config_match_error",
     "cuda_error": "api_config_cuda_error",
+    "skip": "api_config_skip",
 }
 
 _is_engineV2 = False
