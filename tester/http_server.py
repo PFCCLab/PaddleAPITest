@@ -26,7 +26,6 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from multiprocessing import Lock, Manager, set_start_method
 
 import numpy as np
-import paddle
 from pebble import ProcessExpired, ProcessPool
 
 # Add project root to path so we can import engineV2 utilities
@@ -81,6 +80,8 @@ def init_server_worker(gpu_worker_list, lock, available_gpus, max_workers_per_gp
 
         os.environ["CUDA_VISIBLE_DEVICES"] = str(assigned_gpu)
 
+        # Import paddle/torch AFTER setting CUDA_VISIBLE_DEVICES so that
+        # the CUDA context is created on the correct device, not GPU 0.
         import paddle
         import torch
 
@@ -201,7 +202,7 @@ class APITestHandler(BaseHTTPRequestHandler):
                 {
                     "status": "ok",
                     "device_type": device_type,
-                    "paddle_version": paddle.__version__,
+                    "paddle_version": __import__("paddle").__version__,
                 },
             )
         else:
