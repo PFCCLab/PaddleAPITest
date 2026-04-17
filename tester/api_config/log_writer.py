@@ -341,14 +341,19 @@ def aggregate_logs(end=False):
             except Exception as err:
                 print(f"Error reading {log_file}: {err}", flush=True)
 
+        # api_configs 现在是 checkpoint 中既不在 pass/error/crash 也不在
+        # write_to_log("skip",...) 里的条目（因为 skip 在上方循环中已被减掉）。
+        # api_config_skip.txt 里已有 write_to_log("skip",...) 写入的条目，
+        # 我们只需把差集（未分类的遗漏条目）追加进去，并更新计数。
+        skip_file = TEST_LOG_PATH / "api_config_skip.txt"
+        existing_skip_count = log_counts.get("skip", 0)
         if api_configs:
-            log_counts["skip"] = len(api_configs)
-            skip_file = TEST_LOG_PATH / "api_config_skip.txt"
             try:
-                with skip_file.open("w") as f:
+                with skip_file.open("a") as f:
                     f.writelines(f"{line}\n" for line in sorted(api_configs))
             except Exception as err:
                 print(f"Error writing to {skip_file}: {err}", flush=True)
+        log_counts["skip"] = existing_skip_count + len(api_configs)
         return log_counts
 
 
