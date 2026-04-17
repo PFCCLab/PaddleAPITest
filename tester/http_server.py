@@ -45,6 +45,10 @@ _server_timeout = 1800  # default timeout per task
 _concurrency_semaphore = None  # limits queued + in-flight requests
 
 
+class _SkippedError(Exception):
+    """Raised when _run_paddle skips a case (e.g. sparse, unsupported dtype)."""
+
+
 def init_server_worker(gpu_worker_list, lock, available_gpus, max_workers_per_gpu):
     """Initialize a worker process with GPU assignment.
 
@@ -144,7 +148,11 @@ def run_single_api(api_config_str, random_seed):
     output, grads = tester._run_paddle(device_type)
 
     if output is None:
-        raise RuntimeError(f"API execution returned None for {api_config_str}")
+        # Distinguish skip (need_skip returned True) from real errors.
+        # _run_paddle prints "[skip]" for skipped cases and returns (None, None)
+        # without writing to paddle_error log; raise a dedicated exception so
+        # the server returns 422 instead of 500.
+        raise _SkippedError(f"API skipped (not supported on this device): {api_config_str}")
 
     # Serialize to pdtensor bytes
     save_data = {"output": output}
@@ -292,6 +300,16 @@ class APITestHandler(BaseHTTPRequestHandler):
                 500,
                 {
                     "error": error_type,
+                    "detail": str(e),
+                    "api_config": api_config_str,
+                },
+            )
+
+        except _SkippedError as e:
+            self._send_json_response(
+                422,
+                {
+                    "error": "skip",
                     "detail": str(e),
                     "api_config": api_config_str,
                 },

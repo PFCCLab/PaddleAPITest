@@ -96,19 +96,22 @@ class APITestBase:
             return True
         for i in range(len(self.api_config.args)):
             if isinstance(self.api_config.args[i], TensorConfig):
-                if self.api_config.args[i].dtype in ["float8_e5m2", "float8_e4m3fn"]:
+                if not paddle_only and self.api_config.args[i].dtype in [
+                    "float8_e5m2",
+                    "float8_e4m3fn",
+                ]:
                     return True
             elif isinstance(self.api_config.args[i], list) or isinstance(
                 self.api_config.args[i], tuple
             ):
                 for j in range(len(self.api_config.args[i])):
                     if isinstance(self.api_config.args[i][j], TensorConfig):
-                        if self.api_config.args[i][j].dtype in [
+                        if not paddle_only and self.api_config.args[i][j].dtype in [
                             "float8_e5m2",
                             "float8_e4m3fn",
                         ]:
                             return True
-            elif self.api_config.args[i] in [
+            elif not paddle_only and self.api_config.args[i] in [
                 paddle.base.core.DataType.FLOAT8_E4M3FN,
                 paddle.base.core.DataType.FLOAT8_E5M2,
                 "float8_e5m2",
@@ -118,14 +121,17 @@ class APITestBase:
 
         for _key, arg_config in self.api_config.kwargs.items():
             if isinstance(arg_config, TensorConfig):
-                if arg_config.dtype in ["float8_e5m2", "float8_e4m3fn"]:
+                if not paddle_only and arg_config.dtype in ["float8_e5m2", "float8_e4m3fn"]:
                     return True
             elif isinstance(arg_config, (list, tuple)):
                 for i in range(len(arg_config)):
                     if isinstance(arg_config[i], TensorConfig):
-                        if arg_config[i].dtype in ["float8_e5m2", "float8_e4m3fn"]:
+                        if not paddle_only and arg_config[i].dtype in [
+                            "float8_e5m2",
+                            "float8_e4m3fn",
+                        ]:
                             return True
-            elif arg_config in [
+            elif not paddle_only and arg_config in [
                 paddle.base.core.DataType.FLOAT8_E4M3FN,
                 paddle.base.core.DataType.FLOAT8_E5M2,
                 "float8_e5m2",

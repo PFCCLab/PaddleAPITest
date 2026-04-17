@@ -11,6 +11,7 @@ import numpy as np
 import paddle
 import yaml
 
+from .api_config.config_analyzer import TensorConfig
 from .api_config.log_writer import write_to_log
 from .paddle_device_vs_cpu import APITestCustomDeviceVSCPU
 from .special_compare import SkipComparison, get_backward_compare, get_forward_compare
@@ -158,8 +159,54 @@ class APITestPaddleDeviceVSGPU(APITestCustomDeviceVSCPU):
             print(f"[download] Download failed: {e}", flush=True)
             return None
 
+    _FLOAT8_DTYPES = frozenset(["float8_e4m3fn", "float8_e5m2"])
+
+    def _fill_float8_paddle_inputs(self):
+        """Create float8 paddle tensors for args that get_paddle_tensor left as None.
+
+        config_analyzer.get_paddle_tensor() returns None for float8 dtypes
+        because the generic torch_vs_paddle mode doesn't support them.  In
+        device_vs_gpu mode paddle does support float8, so we patch up the
+        None entries here without touching any shared code.
+        """
+
+        def make_tensor(cfg: TensorConfig) -> paddle.Tensor:
+            # Generate float32 numpy data (numpy has no float8 dtype),
+            # create a paddle float32 tensor, then cast to float8.
+            numpy_data = (np.random.random(cfg.shape) - 0.5).astype("float32")
+            t = paddle.to_tensor(numpy_data, dtype="float32", place=cfg.place)
+            t = paddle.cast(t, dtype=cfg.dtype)
+            t.stop_gradient = False
+            return t
+
+        def fix_list(args: list, cfgs: list):
+            for i, (arg, cfg) in enumerate(zip(args, cfgs)):
+                if (
+                    arg is None
+                    and isinstance(cfg, TensorConfig)
+                    and cfg.dtype in self._FLOAT8_DTYPES
+                ):
+                    args[i] = make_tensor(cfg)
+                elif isinstance(arg, list) and isinstance(cfg, list):
+                    fix_list(arg, cfg)
+
+        fix_list(self.paddle_args, self.paddle_args_config)
+
+        for key, val in list(self.paddle_kwargs.items()):
+            cfg = self.paddle_kwargs_config.get(key)
+            if val is None and isinstance(cfg, TensorConfig) and cfg.dtype in self._FLOAT8_DTYPES:
+                self.paddle_kwargs[key] = make_tensor(cfg)
+
     def _run_paddle(self, device_type: str):
         """在指定设备上运行 Paddle（统一 GPU / XPU / 自定义设备逻辑）。"""
+        # Called directly by http_server (bypasses test()), so check paddle-only
+        # skips here (e.g. sparse APIs). float8 is intentionally NOT skipped
+        # because paddle supports it; need_skip(paddle_only=True) excludes the
+        # torch-incompatible float8 check.
+        if self.need_skip(paddle_only=True):
+            print(f"[skip] {self.api_config.config}", flush=True)
+            return None, None
+
         try:
             paddle_device_type = device_type
             if device_type == "gpu":
@@ -186,6 +233,11 @@ class APITestPaddleDeviceVSGPU(APITestCustomDeviceVSCPU):
             if not self.gen_paddle_input():
                 print("gen_paddle_input failed", flush=True)
                 return None, None
+
+            # device_vs_gpu supports float8 natively; gen_paddle_input() leaves
+            # None for float8 tensors (shared guard in config_analyzer). Fix them
+            # up here so that only this mode is affected.
+            self._fill_float8_paddle_inputs()
 
             paddle_output = self.paddle_api(*tuple(self.paddle_args), **self.paddle_kwargs)
 
@@ -232,7 +284,10 @@ class APITestPaddleDeviceVSGPU(APITestCustomDeviceVSCPU):
         b = remote_np.astype(np.float64)
         abs_diff = np.abs(a - b)
         if abs_diff.size == 0:
-            print(f"[compare] {label} max_abs_diff=0 (empty tensor), max_rel_diff=0 (empty tensor)", flush=True)
+            print(
+                f"[compare] {label} max_abs_diff=0 (empty tensor), max_rel_diff=0 (empty tensor)",
+                flush=True,
+            )
             return 0.0, 0.0
         max_abs = float(np.nanmax(abs_diff))
         denom = np.abs(b)
@@ -551,6 +606,8 @@ class APITestPaddleDeviceVSGPU(APITestCustomDeviceVSCPU):
                 error_type = error_info.get("error", "unknown")
                 if error_type in ("paddle_error", "cuda_error", "oom", "crash", "timeout"):
                     write_to_log(error_type, self.api_config.config)
+                elif error_type == "skip":
+                    write_to_log("skip", self.api_config.config)
                 elif error_type == "network_error":
                     # 网络错误不写日志，不写 checkpoint，下次可重试
                     pass
