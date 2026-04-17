@@ -45,10 +45,6 @@ _server_timeout = 1800  # default timeout per task
 _concurrency_semaphore = None  # limits queued + in-flight requests
 
 
-class _SkippedError(Exception):
-    """Raised when _run_paddle skips a case (e.g. sparse, unsupported dtype)."""
-
-
 def init_server_worker(gpu_worker_list, lock, available_gpus, max_workers_per_gpu):
     """Initialize a worker process with GPU assignment.
 
@@ -93,9 +89,11 @@ def init_server_worker(gpu_worker_list, lock, available_gpus, max_workers_per_gp
         globals()["paddle"] = paddle
 
         from tester import APIConfig, APITestPaddleDeviceVSGPU
+        from tester.paddle_device_vs_gpu import _PaddleSkipError
 
         globals()["APIConfig"] = APIConfig
         globals()["APITestPaddleDeviceVSGPU"] = APITestPaddleDeviceVSGPU
+        globals()["_PaddleSkipError"] = _PaddleSkipError
 
         print(
             f"{datetime.now()} Server worker PID: {my_pid}, Assigned GPU ID: {assigned_gpu}",
@@ -145,14 +143,15 @@ def run_single_api(api_config_str, random_seed):
     )
 
     device_type = detect_device_type()
-    output, grads = tester._run_paddle(device_type)
+    try:
+        output, grads = tester._run_paddle(device_type)
+    except _PaddleSkipError as e:
+        # Re-raise as a tagged RuntimeError so pebble can serialize it across
+        # the process boundary and the handler can detect it.
+        raise RuntimeError(f"__SKIP__:{e}") from None
 
     if output is None:
-        # Distinguish skip (need_skip returned True) from real errors.
-        # _run_paddle prints "[skip]" for skipped cases and returns (None, None)
-        # without writing to paddle_error log; raise a dedicated exception so
-        # the server returns 422 instead of 500.
-        raise _SkippedError(f"API skipped (not supported on this device): {api_config_str}")
+        raise RuntimeError(f"API execution returned None for {api_config_str}")
 
     # Serialize to pdtensor bytes
     save_data = {"output": output}
@@ -305,25 +304,26 @@ class APITestHandler(BaseHTTPRequestHandler):
                 },
             )
 
-        except _SkippedError as e:
-            self._send_json_response(
-                422,
-                {
-                    "error": "skip",
-                    "detail": str(e),
-                    "api_config": api_config_str,
-                },
-            )
-
         except Exception as e:
-            self._send_json_response(
-                500,
-                {
-                    "error": "paddle_error",
-                    "detail": str(e),
-                    "api_config": api_config_str,
-                },
-            )
+            detail = str(e)
+            if detail.startswith("__SKIP__:"):
+                self._send_json_response(
+                    422,
+                    {
+                        "error": "skip",
+                        "detail": detail[len("__SKIP__:") :],
+                        "api_config": api_config_str,
+                    },
+                )
+            else:
+                self._send_json_response(
+                    500,
+                    {
+                        "error": "paddle_error",
+                        "detail": detail,
+                        "api_config": api_config_str,
+                    },
+                )
 
         finally:
             if _concurrency_semaphore is not None:

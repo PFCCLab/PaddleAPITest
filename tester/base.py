@@ -637,7 +637,11 @@ class APITestBase:
             for output in result_outputs:
                 dtype = str(output.dtype).split(".")[-1]
                 if USE_CACHED_NUMPY:
-                    dtype = "float32" if dtype == "bfloat16" else dtype
+                    dtype = (
+                        "float32"
+                        if dtype in ["bfloat16", "float8_e4m3fn", "float8_e5m2"]
+                        else dtype
+                    )
                     numpy_tensor = self.get_cached_numpy(dtype, output.shape)
                 else:
                     if "int" in dtype:
@@ -645,18 +649,26 @@ class APITestBase:
                             numpy.random.randint(-65535, 65535, size=output.shape)
                         ).astype(dtype)
                     else:
-                        dtype = "float32" if dtype == "bfloat16" else dtype
+                        dtype = (
+                            "float32"
+                            if dtype in ["bfloat16", "float8_e4m3fn", "float8_e5m2"]
+                            else dtype
+                        )
                         numpy_tensor = (numpy.random.random(output.shape) - 0.5).astype(dtype)
                 self.outputs_grad_numpy.append(numpy_tensor)
         for i, numpy_tensor in enumerate(self.outputs_grad_numpy):
             dtype = str(result_outputs[i].dtype).split(".")[-1]
             result_output_grad = paddle.to_tensor(
                 numpy_tensor,
-                dtype=dtype if dtype != "bfloat16" else "float32",
+                dtype=dtype
+                if dtype not in ["bfloat16", "float8_e4m3fn", "float8_e5m2"]
+                else "float32",
             )
             result_output_grad.stop_gradient = False
             if dtype == "bfloat16":
                 result_output_grad = paddle.cast(result_output_grad, dtype="bfloat16")
+            elif dtype in ["float8_e4m3fn", "float8_e5m2"]:
+                result_output_grad = paddle.cast(result_output_grad, dtype=dtype)
             result_outputs_grads.append(result_output_grad)
         return result_outputs, result_outputs_grads
 

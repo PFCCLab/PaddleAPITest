@@ -16,6 +16,11 @@ from .api_config.log_writer import write_to_log
 from .paddle_device_vs_cpu import APITestCustomDeviceVSCPU
 from .special_compare import SkipComparison, get_backward_compare, get_forward_compare
 
+
+class _PaddleSkipError(Exception):
+    """Raised by _run_paddle when need_skip(paddle_only=True) is True."""
+
+
 _DEVICE_VS_GPU_CONFIG_PATH = os.path.join(
     os.path.dirname(os.path.abspath(__file__)), "device_vs_gpu_config.yaml"
 )
@@ -205,7 +210,7 @@ class APITestPaddleDeviceVSGPU(APITestCustomDeviceVSCPU):
         # torch-incompatible float8 check.
         if self.need_skip(paddle_only=True):
             print(f"[skip] {self.api_config.config}", flush=True)
-            return None, None
+            raise _PaddleSkipError(f"API not supported on this device: {self.api_config.config}")
 
         try:
             paddle_device_type = device_type
