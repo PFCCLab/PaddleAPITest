@@ -283,13 +283,22 @@ class APITestPaddleDeviceVSGPU(APITestCustomDeviceVSCPU):
                         grad_outputs=result_outputs_grads,
                         allow_unused=True,
                     )
-                    # sparse=True ops (e.g. embedding) produce SelectedRows / SparseCoo
-                    # gradients. paddle.save() cannot serialize sparse Tensors, so
-                    # convert them to dense here before returning.
+                    # sparse=True ops (e.g. embedding) produce SelectedRows gradients.
+                    # SelectedRows is NOT detected by is_sparse() / is_dense() — both
+                    # return False. Calling to_dense() on SelectedRows triggers a
+                    # Segfault in Paddle's C++ layer. Detection: a Tensor that is
+                    # neither dense nor any sparse variant is a SelectedRows.
+                    # Conversion: numpy() works correctly on SelectedRows; rebuild as
+                    # a plain dense Tensor so paddle.save() can serialize it.
                     if paddle_grads is not None:
                         paddle_grads = [
-                            g.to_dense()
-                            if g is not None and isinstance(g, paddle.Tensor) and g.is_sparse()
+                            paddle.to_tensor(g.numpy())
+                            if g is not None
+                            and isinstance(g, paddle.Tensor)
+                            and not g.is_dense()
+                            and not g.is_sparse()
+                            and not g.is_sparse_coo()
+                            and not g.is_sparse_csr()
                             else g
                             for g in paddle_grads
                         ]
