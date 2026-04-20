@@ -79,6 +79,7 @@ class APITestPaddleDeviceVSGPU(APITestCustomDeviceVSCPU):
 
     def _has_float8_dtype(self):
         """Return True if any arg/kwarg tensor uses a float8 dtype."""
+
         def _check(cfg):
             if isinstance(cfg, TensorConfig):
                 return cfg.dtype in self._FLOAT8_DTYPES
@@ -282,6 +283,16 @@ class APITestPaddleDeviceVSGPU(APITestCustomDeviceVSCPU):
                         grad_outputs=result_outputs_grads,
                         allow_unused=True,
                     )
+                    # sparse=True ops (e.g. embedding) produce SelectedRows / SparseCoo
+                    # gradients. paddle.save() cannot serialize sparse Tensors, so
+                    # convert them to dense here before returning.
+                    if paddle_grads is not None:
+                        paddle_grads = [
+                            g.to_dense()
+                            if g is not None and isinstance(g, paddle.Tensor) and g.is_sparse()
+                            else g
+                            for g in paddle_grads
+                        ]
 
             return paddle_output, paddle_grads
 
