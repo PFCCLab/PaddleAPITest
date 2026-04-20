@@ -77,6 +77,29 @@ class APITestPaddleDeviceVSGPU(APITestCustomDeviceVSCPU):
 
         return detect_device_type()
 
+    def _has_float8_dtype(self):
+        """Return True if any arg/kwarg tensor uses a float8 dtype."""
+        def _check(cfg):
+            if isinstance(cfg, TensorConfig):
+                return cfg.dtype in self._FLOAT8_DTYPES
+            if isinstance(cfg, (list, tuple)):
+                return any(_check(c) for c in cfg)
+            if isinstance(cfg, slice):
+                return False
+            return cfg in self._FLOAT8_DTYPES
+
+        return any(_check(c) for c in self.api_config.args) or any(
+            _check(c) for c in self.api_config.kwargs.values()
+        )
+
+    def need_skip(self, paddle_only=False):
+        if super().need_skip(paddle_only=paddle_only):
+            return True
+        # XPU cannot create float8 tensors via the float32->cast path
+        if self._get_local_device_type() == "xpu" and self._has_float8_dtype():
+            return True
+        return False
+
     def _get_filename(self):
         """生成PDTensor文件名（不再包含设备前缀，只依赖随机种子和配置哈希）"""
         return f"{self.random_seed}-{self._get_config_hash()}.pdtensor"
@@ -450,6 +473,7 @@ class APITestPaddleDeviceVSGPU(APITestCustomDeviceVSCPU):
                         f"[compare] Backward gradient check failed for {self.api_config.config}, error: {e}",
                         flush=True,
                     )
+                    write_to_log("accuracy_error", self.api_config.config)
                     return False
 
             print(
@@ -600,6 +624,11 @@ class APITestPaddleDeviceVSGPU(APITestCustomDeviceVSCPU):
 
     def _test_http_mode(self):
         """HTTP模式：发送API配置到远程服务器，获取结果并本地对比"""
+        # Skip before sending HTTP request (e.g. float8 on XPU)
+        if self.need_skip(paddle_only=True):
+            write_to_log("skip", self.api_config.config)
+            return
+
         print(f"[http] Starting HTTP mode for {self.api_config.config}", flush=True)
 
         # 1. 发送到远端执行
