@@ -2560,7 +2560,12 @@ class TensorConfig:
                         get_max = get_exponent_max
                         default_max = 5
                 if isinstance(const, (int, float, bool, numpy.number)):
-                    value_max = get_max(const, numpy.finfo(self.dtype).max, default_max)
+                    _dtype_max = (
+                        numpy.iinfo(self.dtype).max
+                        if "int" in self.dtype
+                        else numpy.finfo(self.dtype).max
+                    )
+                    value_max = get_max(const, _dtype_max, default_max)
                     if is_base_arg and int(const) != const:
                         # Avoid situations like (-2.3) ^ 0.5
                         self.numpy_tensor = self.get_random_numpy_tensor(
