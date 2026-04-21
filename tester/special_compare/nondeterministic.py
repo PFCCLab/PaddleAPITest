@@ -16,6 +16,7 @@ from . import register_skip
     "paddle.empty_like",
     "paddle.Tensor.empty_like",
     "paddle.multinomial",
+    "paddle.nn.functional.rrelu",
 )
 def _skip():
     ...
