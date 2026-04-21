@@ -153,6 +153,18 @@ def run_single_api(api_config_str, random_seed):
     if output is None:
         raise RuntimeError(f"API execution returned None for {api_config_str}")
 
+    # Normalize output: paddle.save does not support named tuples (e.g.
+    # CummaxRetType, TopKRetType). Convert them to plain tuple recursively.
+    def _normalize(obj):
+        if isinstance(obj, paddle.Tensor):
+            return obj
+        if isinstance(obj, (list, tuple)):
+            items = [_normalize(x) for x in obj]
+            return items if isinstance(obj, list) else tuple(items)
+        return obj
+
+    output = _normalize(output)
+
     # Serialize to pdtensor bytes
     save_data = {"output": output}
     if grads is not None:
