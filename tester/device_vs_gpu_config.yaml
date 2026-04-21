@@ -6,9 +6,13 @@
 
 # 全局 dtype 兜底容差（激活状态）
 dtype_atol_rtol:
-  float16: [5e-2, 5e-2]
-  bfloat16: [1e-1, 1e-1]
-  # float32 不配置，退化到命令行 --atol/--rtol（默认 1e-2）
+  float64:  [1e-6, 1e-6]
+  float32:  [1e-4, 1e-4]
+  float16:  [1e-2, 1e-2]
+  bfloat16: [1e-2, 1e-2]
+  int32:    [0,    0   ]
+  int64:    [0,    0   ]
+  bool:     [0,    0   ]
 
 # API 级细粒度容差（覆盖全局 dtype 兜底）
 # atol_rtol:
