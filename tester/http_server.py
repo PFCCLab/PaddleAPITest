@@ -151,7 +151,8 @@ def run_single_api(api_config_str, random_seed):
         raise RuntimeError(f"__SKIP__:{e}") from None
 
     if output is None:
-        raise RuntimeError(f"API execution returned None for {api_config_str}")
+        real_error = getattr(tester, "_last_error", None)
+        raise RuntimeError(real_error if real_error else f"API execution returned None for {api_config_str}")
 
     # Normalize output: paddle.save does not support named tuples (e.g.
     # CummaxRetType, TopKRetType). Convert them to plain tuple recursively.
@@ -331,7 +332,7 @@ class APITestHandler(BaseHTTPRequestHandler):
                 self._send_json_response(
                     500,
                     {
-                        "error": "paddle_error",
+                        "error": "remote_error",
                         "detail": detail,
                         "api_config": api_config_str,
                     },

@@ -311,6 +311,7 @@ class APITestPaddleDeviceVSGPU(APITestCustomDeviceVSCPU):
                 flush=True,
             )
             write_to_log("paddle_error", self.api_config.config)
+            self._last_error = str(e)
             return None, None
 
     def _resolve_atol_rtol(self, dtype_str: str) -> tuple[float, float]:
@@ -658,7 +659,7 @@ class APITestPaddleDeviceVSGPU(APITestCustomDeviceVSCPU):
             # 根据错误类型写对应日志
             if error_info:
                 error_type = error_info.get("error", "unknown")
-                if error_type in ("paddle_error", "cuda_error", "oom", "crash", "timeout"):
+                if error_type in ("remote_error", "cuda_error", "oom", "crash", "timeout"):
                     write_to_log(error_type, self.api_config.config)
                 elif error_type == "skip":
                     write_to_log("skip", self.api_config.config)

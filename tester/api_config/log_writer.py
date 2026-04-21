@@ -21,6 +21,7 @@ LOG_PREFIXES = {
     "pass": "api_config_pass",
     "numpy_error": "api_config_numpy_error",
     "paddle_error": "api_config_paddle_error",
+    "remote_error": "api_config_remote_error",
     "torch_error": "api_config_torch_error",
     "paddle_to_torch_failed": "api_config_paddle_to_torch_failed",
     "accuracy_error": "api_config_accuracy_error",
@@ -367,6 +368,7 @@ def print_log_info(all_case, log_counts=None):
         log_counts.get(log_type, 0)
         for log_type in [
             "paddle_error",
+            "remote_error",
             "accuracy_error",
             "accuracy_diff",
             "timeout",
