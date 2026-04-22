@@ -270,6 +270,14 @@ class APITestPaddleDeviceVSGPU(APITestCustomDeviceVSCPU):
 
             paddle_output = self.paddle_api(*tuple(self.paddle_args), **self.paddle_kwargs)
 
+            # 原地操作返回 None，用被修改的 tensor 替代，使后续对比逻辑不变
+            if paddle_output is None:
+                api_name = self.api_config.api_name
+                if api_name == "paddle.Tensor.__setitem__":
+                    paddle_output = self.paddle_args[0]
+                elif api_name == "paddle.nn.utils.vector_to_parameters":
+                    paddle_output = self.paddle_args[1]
+
             paddle_grads = None
             if self.need_check_grad():
                 inputs_list = self.get_paddle_input_list()
