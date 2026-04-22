@@ -193,6 +193,7 @@ python -m tester.http_server --host 0.0.0.0 --port 8089 --num_gpus=-1
 | `--required_memory` | `10.0` | 每个 worker 最低显存（GB） |
 | `--gpu_ids` | `""` | 指定 GPU，如 `6,7` 或 `0-3` |
 | `--timeout` | `1800` | 单个 API 执行超时（秒） |
+| `--admin_token` | `""` | 若非空，启用 `/admin/*` 管理接口（见下方"远程代码同步"）|
 
 可通过健康检查确认服务状态：
 
@@ -238,6 +239,44 @@ python engineV2.py --custom_device_vs_gpu=True \
 当客户端 worker 多于服务端 worker 时，多余的请求会排队等待，客户端的 `http_timeout` 作为最终兜底——超时后写入 `timeout` 日志，确保不会出现"没跑也没日志"的情况。
 
 > 详细的设计原理和异常处理说明见 [docs/http_cross_device_comparison.md](docs/http_cross_device_comparison.md)。
+
+#### 远程代码同步（sync_watch）
+
+在两台机器间 SSH 不通的情况下，可通过 `scripts/sync_watch.py` 将本地代码变更**自动同步**到远端服务器，并触发服务器重启，无需手动操作。
+
+**前提：远端启动时带上 `--admin_token`**
+
+```bash
+python -m tester.http_server --host 0.0.0.0 --port 8089 --gpu_ids=6 --admin_token=your_token
+```
+
+**本地安装依赖（一次性）**
+
+```bash
+pip install watchdog
+```
+
+**本地启动监听**
+
+```bash
+python scripts/sync_watch.py \
+  --host <远端IP> --port 8089 --token your_token
+```
+
+启动后，每当本地 `.py` 文件被保存，脚本会在约 1.5 秒防抖后：
+1. 将变更文件通过 `POST /admin/upload_file` 推送到远端
+2. 调用 `POST /admin/restart` 触发服务器原地重启
+3. 轮询 `/health` 直至服务器重新就绪
+
+可选参数：
+
+| 参数 | 默认值 | 说明 |
+|---|---|---|
+| `--host` | 必填 | 远端服务器 IP |
+| `--port` | `8089` | 远端服务端口 |
+| `--token` | 必填 | 与 `--admin_token` 一致 |
+| `--watch_dir` | 仓库根目录 | 本地监听目录 |
+| `--debounce` | `1.5` | 防抖时间（秒）|
 
 ## 监控方法
 
