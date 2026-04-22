@@ -93,6 +93,33 @@ class APITestPaddleDeviceVSGPU(APITestCustomDeviceVSCPU):
             _check(c) for c in self.api_config.kwargs.values()
         )
 
+    def _has_complex128(self):
+        """Return True if complex128 appears anywhere in the config.
+
+        XPU does not support complex128 in cast_kernel, tensor memory allocation,
+        or gradient accumulation. Skip all complex128 configs on XPU.
+        """
+        def _check(cfg):
+            if isinstance(cfg, TensorConfig):
+                return cfg.dtype == "complex128"
+            if isinstance(cfg, (list, tuple)):
+                return any(_check(c) for c in cfg)
+            if isinstance(cfg, str):
+                return cfg == "complex128"
+            if isinstance(cfg, complex):
+                return True
+            try:
+                import paddle
+                if isinstance(cfg, paddle.base.core.DataType):
+                    return str(cfg) == "paddle.complex128"
+            except Exception:
+                pass
+            return False
+
+        return any(_check(c) for c in self.api_config.args) or any(
+            _check(c) for c in self.api_config.kwargs.values()
+        )
+
     def need_skip(self, paddle_only=False):
         # Device vs GPU compares Paddle on XPU against Paddle on GPU — no Torch
         # involved. All conditions in base.need_skip() are Torch-specific (sparse,
@@ -108,6 +135,9 @@ class APITestPaddleDeviceVSGPU(APITestCustomDeviceVSCPU):
             "sparse" in self.api_config.api_name
             or self.api_config.api_name in _SPARSE_APIS
         ):
+            return True
+        # XPU does not support complex128 (cast_kernel, memory allocation, grad accumulation).
+        if self._get_local_device_type() == "xpu" and self._has_complex128():
             return True
         return False
 
