@@ -229,6 +229,20 @@ python engineV2.py --custom_device_vs_gpu=True \
   --num_gpus=-1
 ```
 
+**AMP（自动混合精度）模式**：
+
+加入 `--test_amp=True` 后，本地设备侧和远端 GPU server 侧会**同步**在 `paddle.amp.auto_cast()` 上下文下执行，确保两端精度对比处于相同的混合精度环境中：
+
+```bash
+python engineV2.py --custom_device_vs_gpu=True \
+  --custom_device_vs_gpu_mode=http \
+  --test_amp=True \
+  --random_seed=42 \
+  --api_config_file="tester/api_config/6_accuracy_amp/accuracy_amp.txt"
+```
+
+`test_amp` 标志会随请求 payload 一并发送到 server，因此无需在 server 启动命令中做任何额外配置。
+
 **并发机制**：
 
 服务端通过三层机制处理并发请求：
