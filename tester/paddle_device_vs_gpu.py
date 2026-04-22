@@ -97,9 +97,12 @@ class APITestPaddleDeviceVSGPU(APITestCustomDeviceVSCPU):
         # Device vs GPU compares Paddle on XPU against Paddle on GPU — no Torch
         # involved. All conditions in base.need_skip() are Torch-specific (sparse,
         # prod multi-axis, torch_error_skip, float8 dtype), so we do NOT call
-        # super() here. The only real hardware limitation in this mode is that XPU
-        # cannot create float8 tensors via the float32->cast path.
+        # super() here.
+        # XPU cannot create float8 tensors via the float32->cast path.
         if self._get_local_device_type() == "xpu" and self._has_float8_dtype():
+            return True
+        # XPU does not support sparse kernels.
+        if self._get_local_device_type() == "xpu" and "sparse" in self.api_config.api_name:
             return True
         return False
 
