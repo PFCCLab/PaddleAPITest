@@ -16,6 +16,7 @@ import gc
 import io
 import json
 import os
+import secrets
 import signal
 import sys
 import threading
@@ -24,6 +25,7 @@ from concurrent.futures import TimeoutError
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from multiprocessing import Lock, Manager, set_start_method
+from pathlib import Path
 
 import numpy as np
 from pebble import ProcessExpired, ProcessPool
@@ -43,6 +45,10 @@ from tester.api_config.log_writer import set_engineV2
 _pool = None
 _server_timeout = 1800  # default timeout per task
 _concurrency_semaphore = None  # limits queued + in-flight requests
+
+# Admin interface: set via --admin_token; empty string means disabled
+_admin_token: str = ""
+REPO_ROOT = Path(__file__).resolve().parent.parent
 
 
 def init_server_worker(gpu_worker_list, lock, available_gpus, max_workers_per_gpu):
@@ -230,10 +236,26 @@ class APITestHandler(BaseHTTPRequestHandler):
             self._send_json_response(404, {"error": "not_found"})
 
     def do_POST(self):
-        if self.path != "/run_api_test":
+        if self.path == "/run_api_test":
+            self._handle_run_api_test()
+        elif self.path == "/admin/upload_file":
+            self._handle_admin_upload_file()
+        elif self.path == "/admin/restart":
+            self._handle_admin_restart()
+        else:
             self._send_json_response(404, {"error": "not_found"})
-            return
 
+    def _check_admin_token(self) -> bool:
+        if not _admin_token:
+            self._send_json_response(503, {"error": "admin_disabled"})
+            return False
+        provided = self.headers.get("X-Admin-Token", "")
+        if not secrets.compare_digest(provided, _admin_token):
+            self._send_json_response(403, {"error": "forbidden"})
+            return False
+        return True
+
+    def _handle_run_api_test(self):
         # Parse request body
         try:
             content_length = int(self.headers.get("Content-Length", 0))
@@ -344,6 +366,41 @@ class APITestHandler(BaseHTTPRequestHandler):
             if _concurrency_semaphore is not None:
                 _concurrency_semaphore.release()
 
+    def _handle_admin_upload_file(self):
+        if not self._check_admin_token():
+            return
+        try:
+            content_length = int(self.headers.get("Content-Length", 0))
+            body = self.rfile.read(content_length)
+            data = json.loads(body.decode("utf-8"))
+            rel_path = data["path"]
+            content = data["content"]
+        except Exception as e:
+            self._send_json_response(400, {"error": "bad_request", "detail": str(e)})
+            return
+        # Security: reject path traversal
+        target = (REPO_ROOT / rel_path).resolve()
+        if not str(target).startswith(str(REPO_ROOT)):
+            self._send_json_response(403, {"error": "forbidden", "detail": "path traversal"})
+            return
+        try:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(content, encoding="utf-8")
+            self._send_json_response(200, {"status": "ok", "path": rel_path})
+        except Exception as e:
+            self._send_json_response(500, {"status": "error", "detail": str(e)})
+
+    def _handle_admin_restart(self):
+        if not self._check_admin_token():
+            return
+        self._send_json_response(200, {"status": "restarting"})
+
+        def do_restart():
+            time.sleep(0.5)
+            os.execv(sys.executable, [sys.executable] + sys.argv)
+
+        threading.Thread(target=do_restart, daemon=True).start()
+
 
 def parse_bool(value):
     if isinstance(value, str):
@@ -370,11 +427,18 @@ def main():
     )
     parser.add_argument("--gpu_ids", type=str, default="", help="GPU IDs (e.g., '0,1,2' or '0-3')")
     parser.add_argument("--timeout", type=int, default=1800, help="Per-task timeout in seconds")
+    parser.add_argument(
+        "--admin_token",
+        type=str,
+        default="",
+        help="If non-empty, enables /admin/* endpoints protected by X-Admin-Token header",
+    )
 
     args = parser.parse_args()
 
-    global _server_timeout
+    global _server_timeout, _admin_token
     _server_timeout = args.timeout
+    _admin_token = args.admin_token
 
     # Detect device
     device_type = detect_device_type()
