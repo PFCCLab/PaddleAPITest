@@ -278,7 +278,11 @@ class APITestPaddleDeviceVSGPU(APITestCustomDeviceVSCPU):
             # up here so that only this mode is affected.
             self._fill_float8_paddle_inputs()
 
-            paddle_output = self.paddle_api(*tuple(self.paddle_args), **self.paddle_kwargs)
+            if self.test_amp:
+                with paddle.amp.auto_cast():
+                    paddle_output = self.paddle_api(*tuple(self.paddle_args), **self.paddle_kwargs)
+            else:
+                paddle_output = self.paddle_api(*tuple(self.paddle_args), **self.paddle_kwargs)
 
             # 原地操作返回 None，用被修改的 tensor 替代，使后续对比逻辑不变
             if paddle_output is None:
@@ -616,6 +620,7 @@ class APITestPaddleDeviceVSGPU(APITestCustomDeviceVSCPU):
             {
                 "api_config": self.api_config.config,
                 "random_seed": self.random_seed,
+                "test_amp": self.test_amp,
             }
         ).encode("utf-8")
 

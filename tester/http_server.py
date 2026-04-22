@@ -104,7 +104,7 @@ def init_server_worker(gpu_worker_list, lock, available_gpus, max_workers_per_gp
         raise
 
 
-def run_single_api(api_config_str, random_seed):
+def run_single_api(api_config_str, random_seed, test_amp=False):
     """Execute a single API test and return the pdtensor bytes.
 
     Runs inside a worker process. Returns bytes on success, raises on failure.
@@ -140,6 +140,7 @@ def run_single_api(api_config_str, random_seed):
         api_config,
         operation_mode="upload",  # dummy, we won't call test()
         random_seed=random_seed,
+        test_amp=test_amp,
     )
 
     device_type = detect_device_type()
@@ -250,6 +251,7 @@ class APITestHandler(BaseHTTPRequestHandler):
 
         api_config_str = data.get("api_config")
         random_seed = data.get("random_seed", 0)
+        test_amp = data.get("test_amp", False)
 
         if not api_config_str:
             self._send_json_response(
@@ -284,7 +286,7 @@ class APITestHandler(BaseHTTPRequestHandler):
         try:
             future = _pool.schedule(
                 run_single_api,
-                [api_config_str, random_seed],
+                [api_config_str, random_seed, test_amp],
                 timeout=_server_timeout,
             )
             result_bytes = future.result()

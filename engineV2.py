@@ -862,6 +862,7 @@ def main():
                 "random_seed": options.random_seed,
                 "atol": options.atol,
                 "rtol": options.rtol,
+                "test_amp": options.test_amp,
             }
             if options.operation_mode == "http":
                 kwargs.update(
