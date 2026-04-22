@@ -102,7 +102,12 @@ class APITestPaddleDeviceVSGPU(APITestCustomDeviceVSCPU):
         if self._get_local_device_type() == "xpu" and self._has_float8_dtype():
             return True
         # XPU does not support sparse kernels.
-        if self._get_local_device_type() == "xpu" and "sparse" in self.api_config.api_name:
+        # Also covers sparse-related Tensor methods that don't carry "sparse" in their name.
+        _SPARSE_APIS = {"paddle.Tensor.coalesce", "paddle.Tensor.is_coalesced"}
+        if self._get_local_device_type() == "xpu" and (
+            "sparse" in self.api_config.api_name
+            or self.api_config.api_name in _SPARSE_APIS
+        ):
             return True
         return False
 
