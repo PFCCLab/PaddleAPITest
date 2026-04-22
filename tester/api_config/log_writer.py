@@ -381,6 +381,7 @@ def print_log_info(all_case, log_counts=None):
     skip_case = sum(
         log_counts.get(log_type, 0)
         for log_type in [
+            "skip",
             "numpy_error",
             "torch_error",
             "paddle_to_torch_failed",
