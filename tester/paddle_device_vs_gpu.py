@@ -94,9 +94,11 @@ class APITestPaddleDeviceVSGPU(APITestCustomDeviceVSCPU):
         )
 
     def need_skip(self, paddle_only=False):
-        if super().need_skip(paddle_only=paddle_only):
-            return True
-        # XPU cannot create float8 tensors via the float32->cast path
+        # Device vs GPU compares Paddle on XPU against Paddle on GPU — no Torch
+        # involved. All conditions in base.need_skip() are Torch-specific (sparse,
+        # prod multi-axis, torch_error_skip, float8 dtype), so we do NOT call
+        # super() here. The only real hardware limitation in this mode is that XPU
+        # cannot create float8 tensors via the float32->cast path.
         if self._get_local_device_type() == "xpu" and self._has_float8_dtype():
             return True
         return False
