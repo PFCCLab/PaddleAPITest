@@ -672,8 +672,7 @@ class APITestPaddleDeviceVSGPU(APITestCustomDeviceVSCPU):
                 elif error_type == "skip":
                     write_to_log("skip", self.api_config.config)
                 elif error_type == "network_error":
-                    # 网络错误不写日志，不写 checkpoint，下次可重试
-                    pass
+                    write_to_log("network_error", self.api_config.config)
                 else:
                     print(
                         f"[http] Unknown remote error for {self.api_config.config}",

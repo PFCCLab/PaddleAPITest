@@ -31,6 +31,7 @@ LOG_PREFIXES = {
     "oom": "api_config_oom",
     "match_error": "api_config_match_error",
     "cuda_error": "api_config_cuda_error",
+    "network_error": "api_config_network_error",
     "skip": "api_config_skip",
 }
 
