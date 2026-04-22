@@ -64,6 +64,24 @@ class SyncHandler(FileSystemEventHandler):
     def on_created(self, event):
         self._enqueue(event)
 
+    def on_moved(self, event):
+        # Editors like Claude Code use atomic writes: write to a temp file then
+        # rename() to the target. This generates a "moved" event on the dest
+        # path, not a "modified" event. We enqueue the destination file.
+        if event.is_directory:
+            return
+        dest: str = event.dest_path
+        if not dest.endswith(".py"):
+            return
+        if any(p in dest for p in SKIP_PATTERNS):
+            return
+        with self._lock:
+            self._pending.add(dest)
+            if self._timer is not None:
+                self._timer.cancel()
+            self._timer = threading.Timer(self.args.debounce, self._flush)
+            self._timer.start()
+
     def _enqueue(self, event):
         if event.is_directory:
             return
