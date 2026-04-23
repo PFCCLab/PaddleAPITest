@@ -249,6 +249,8 @@ class APITestHandler(BaseHTTPRequestHandler):
             self._handle_run_api_test()
         elif self.path == "/admin/upload_file":
             self._handle_admin_upload_file()
+        elif self.path == "/admin/delete_file":
+            self._handle_admin_delete_file()
         elif self.path == "/admin/restart":
             self._handle_admin_restart()
         else:
@@ -395,6 +397,33 @@ class APITestHandler(BaseHTTPRequestHandler):
         try:
             target.parent.mkdir(parents=True, exist_ok=True)
             target.write_text(content, encoding="utf-8")
+            self._send_json_response(200, {"status": "ok", "path": rel_path})
+        except Exception as e:
+            self._send_json_response(500, {"status": "error", "detail": str(e)})
+
+    def _handle_admin_delete_file(self):
+        if not self._check_admin_token():
+            return
+        try:
+            content_length = int(self.headers.get("Content-Length", 0))
+            body = self.rfile.read(content_length)
+            data = json.loads(body.decode("utf-8"))
+            rel_path = data["path"]
+        except Exception as e:
+            self._send_json_response(400, {"error": "bad_request", "detail": str(e)})
+            return
+        # Security: reject path traversal
+        target = (REPO_ROOT / rel_path).resolve()
+        if not str(target).startswith(str(REPO_ROOT)):
+            self._send_json_response(403, {"error": "forbidden", "detail": "path traversal"})
+            return
+        try:
+            if target.exists():
+                target.unlink()
+                # Also remove the corresponding .pyc from __pycache__ if it exists
+                pyc = target.parent / "__pycache__" / (target.stem + ".cpython-310.pyc")
+                if pyc.exists():
+                    pyc.unlink()
             self._send_json_response(200, {"status": "ok", "path": rel_path})
         except Exception as e:
             self._send_json_response(500, {"status": "error", "detail": str(e)})

@@ -141,6 +141,31 @@ class APITestPaddleDeviceVSGPU(APITestCustomDeviceVSCPU):
             return True
         return False
 
+    def need_check_grad(self):
+        if not super().need_check_grad():
+            return False
+        # dropout 推理模式（training=False）在 XPU 上不注册 GradOp，强行触发 backward 会报
+        # (InvalidArgument) GradOp is only callable when is_test is false
+        # 仅在 XPU 本地设备时跳过，其他设备/模式不影响。
+        # 签名：dropout(x, p, axis, training, ...)         training 在 args[3]
+        #       fused_dropout_add(x, y, p, training, ...)  training 在 args[3]
+        _DROPOUT_INFERENCE_APIS = {
+            "paddle.nn.functional.dropout",
+            "paddle.incubate.nn.functional.fused_dropout_add",
+        }
+        if (
+            self._get_local_device_type() == "xpu"
+            and self.api_config.api_name in _DROPOUT_INFERENCE_APIS
+        ):
+            training = self.api_config.kwargs.get("training", None)
+            if training is None and len(self.api_config.args) > 3:
+                training = self.api_config.args[3]
+            if training is None:
+                training = True  # 默认值
+            if not training:
+                return False
+        return True
+
     def _get_filename(self):
         """生成PDTensor文件名（不再包含设备前缀，只依赖随机种子和配置哈希）"""
         return f"{self.random_seed}-{self._get_config_hash()}.pdtensor"

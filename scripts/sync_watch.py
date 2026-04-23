@@ -51,6 +51,7 @@ class SyncHandler(FileSystemEventHandler):
         self.args = args
         self.watch_dir = watch_dir
         self._pending: set[str] = set()
+        self._pending_deletes: set[str] = set()
         self._timer: threading.Timer | None = None
         self._lock = threading.Lock()
 
@@ -82,6 +83,23 @@ class SyncHandler(FileSystemEventHandler):
             self._timer = threading.Timer(self.args.debounce, self._flush)
             self._timer.start()
 
+    def on_deleted(self, event):
+        if event.is_directory:
+            return
+        path: str = event.src_path
+        if not path.endswith(".py"):
+            return
+        if any(p in path for p in SKIP_PATTERNS):
+            return
+        with self._lock:
+            self._pending_deletes.add(path)
+            # Remove from pending uploads if it was queued
+            self._pending.discard(path)
+            if self._timer is not None:
+                self._timer.cancel()
+            self._timer = threading.Timer(self.args.debounce, self._flush)
+            self._timer.start()
+
     def _enqueue(self, event):
         if event.is_directory:
             return
@@ -104,8 +122,16 @@ class SyncHandler(FileSystemEventHandler):
     def _flush(self):
         with self._lock:
             paths = list(self._pending)
+            deletes = list(self._pending_deletes)
             self._pending.clear()
+            self._pending_deletes.clear()
             self._timer = None
+
+        deleted = []
+        for path in deletes:
+            if self._delete_file(path):
+                rel = os.path.relpath(path, self.watch_dir)
+                deleted.append(rel)
 
         uploaded = []
         for path in paths:
@@ -113,9 +139,39 @@ class SyncHandler(FileSystemEventHandler):
                 rel = os.path.relpath(path, self.watch_dir)
                 uploaded.append(rel)
 
+        if deleted:
+            print(f"[sync] Deleted {len(deleted)} file(s): {', '.join(deleted)}", flush=True)
         if uploaded:
             print(f"[sync] Uploaded {len(uploaded)} file(s): {', '.join(uploaded)}", flush=True)
+        if deleted or uploaded:
             self._trigger_restart()
+
+    def _delete_file(self, abs_path: str) -> bool:
+        rel = os.path.relpath(abs_path, self.watch_dir)
+        body = json.dumps({"path": rel}).encode("utf-8")
+        req = urllib.request.Request(
+            f"http://{self.args.host}:{self.args.port}/admin/delete_file",
+            data=body,
+            headers={
+                "Content-Type": "application/json",
+                "X-Admin-Token": self.args.token,
+            },
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                result = json.loads(resp.read().decode())
+                if result.get("status") != "ok":
+                    print(f"[sync] Delete failed for {rel}: {result}", flush=True)
+                    return False
+            return True
+        except urllib.error.HTTPError as e:
+            body_text = e.read().decode(errors="replace")
+            print(f"[sync] Delete HTTP error {e.code} for {rel}: {body_text}", flush=True)
+            return False
+        except Exception as e:
+            print(f"[sync] Delete error for {rel}: {e}", flush=True)
+            return False
 
     def _upload_file(self, abs_path: str) -> bool:
         rel = os.path.relpath(abs_path, self.watch_dir)
