@@ -163,9 +163,18 @@ def run_single_api(api_config_str, random_seed, test_amp=False):
 
     # Normalize output: paddle.save does not support named tuples (e.g.
     # CummaxRetType, TopKRetType). Convert them to plain tuple recursively.
+    # Also eagerly evaluate lazy Jacobian/Hessian objects so that paddle.save
+    # can serialize the result as a plain Tensor.
     def _normalize(obj):
         if isinstance(obj, paddle.Tensor):
             return obj
+        # Evaluate lazy Jacobian/Hessian objects (Hessian inherits Jacobian)
+        try:
+            from paddle.autograd.autograd import Jacobian
+            if isinstance(obj, Jacobian):
+                return obj[:]  # triggers full evaluation, returns Tensor
+        except ImportError:
+            pass
         if isinstance(obj, (list, tuple)):
             items = [_normalize(x) for x in obj]
             return items if isinstance(obj, list) else tuple(items)

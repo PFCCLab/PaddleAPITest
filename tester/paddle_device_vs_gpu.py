@@ -230,6 +230,27 @@ class APITestPaddleDeviceVSGPU(APITestCustomDeviceVSCPU):
 
     _FLOAT8_DTYPES = frozenset(["float8_e4m3fn", "float8_e5m2"])
 
+    @staticmethod
+    def _normalize_output(obj):
+        """Recursively normalize output for comparison.
+
+        Eagerly evaluates lazy Jacobian/Hessian objects so that the result is
+        a plain Tensor (or nested list/tuple of Tensors) that paddle.save and
+        the comparison logic can handle.
+        """
+        if isinstance(obj, paddle.Tensor):
+            return obj
+        try:
+            from paddle.autograd.autograd import Jacobian
+            if isinstance(obj, Jacobian):
+                return obj[:]  # triggers full evaluation, returns Tensor
+        except ImportError:
+            pass
+        if isinstance(obj, (list, tuple)):
+            items = [APITestPaddleDeviceVSGPU._normalize_output(x) for x in obj]
+            return items if isinstance(obj, list) else tuple(items)
+        return obj
+
     def _fill_float8_paddle_inputs(self):
         """Create float8 paddle tensors for args that get_paddle_tensor left as None.
 
@@ -741,6 +762,11 @@ class APITestPaddleDeviceVSGPU(APITestCustomDeviceVSCPU):
             )
             downloaded_tensor_path.unlink(missing_ok=True)
             return
+
+        # Normalize lazy Jacobian/Hessian objects on the local side
+        local_output = self._normalize_output(local_output)
+        if local_grads is not None:
+            local_grads = self._normalize_output(local_grads)
 
         # 4. 用现有对比逻辑进行比较
         self._compare_with_downloaded(local_output, local_grads, downloaded_tensor_path)
