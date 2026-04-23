@@ -27,12 +27,17 @@ def compare_argsort_forward(local_output, remote_output, api_config, tester):
     由于两侧使用相同 random_seed 生成输入，GPU 侧与 XPU 侧输入数据完全相同，
     因此可用 XPU 侧的输入张量作为两边 gather 的数据源。
     """
-    if not tester.paddle_args:
+    # Bug 1 fix: 先从 paddle_args 取，若为空再 fallback 到 paddle_kwargs["x"]
+    if tester.paddle_args:
+        input_tensor = tester.paddle_args[0]
+    elif "x" in tester.paddle_kwargs:
+        input_tensor = tester.paddle_kwargs["x"]
+    else:
         raise AssertionError(
-            "compare_argsort_forward: tester.paddle_args 为空，无法获取原始输入张量"
+            "compare_argsort_forward: paddle_args 为空且 paddle_kwargs 中没有 'x'，无法获取原始输入张量"
         )
 
-    input_np = tester.paddle_args[0].cpu().numpy()
+    input_np = input_tensor.cpu().numpy()
 
     # 提取 axis 参数
     # paddle.argsort 签名：argsort(x, axis=-1, descending=False, stable=False)
@@ -46,6 +51,17 @@ def compare_argsort_forward(local_output, remote_output, api_config, tester):
 
     local_indices_np = local_output.numpy()    # int64，形状与输入相同
     remote_indices_np = remote_output.numpy()  # int64，形状与输入相同
+
+    # Bug 2 fix: 0-dim tensor（ndim==0）时 axis 无意义，直接比较索引本身
+    if input_np.ndim == 0:
+        np.testing.assert_array_equal(
+            local_indices_np,
+            remote_indices_np,
+            err_msg=(
+                f"argsort 特殊对比失败（0-dim tensor，索引不一致）：{api_config.config}"
+            ),
+        )
+        return
 
     # 用各自的索引 gather 原始输入值
     local_vals = np.take_along_axis(input_np, local_indices_np, axis=axis)

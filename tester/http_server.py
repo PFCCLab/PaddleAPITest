@@ -431,7 +431,8 @@ def main():
         "--admin_token",
         type=str,
         default="",
-        help="If non-empty, enables /admin/* endpoints protected by X-Admin-Token header",
+        help="If non-empty, enables /admin/upload_file and /admin/restart endpoints "
+             "protected by X-Admin-Token header",
     )
 
     args = parser.parse_args()
