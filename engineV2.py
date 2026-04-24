@@ -815,6 +815,10 @@ def main():
     if options.custom_device_vs_gpu and options.enable_api_kernel_fallback:
         os.environ["FLAGS_enable_api_kernel_fallback"] = "1"
         print("[device_vs_gpu] FLAGS_enable_api_kernel_fallback=1 (local only)", flush=True)
+    if options.gpu_ids and options.gpu_ids != "-1":
+        first_gpu = options.gpu_ids.split(",")[0].strip()
+        os.environ["CUDA_VISIBLE_DEVICES"] = first_gpu
+        print(f"CUDA_VISIBLE_DEVICES={first_gpu}", flush=True)
     os.environ["USE_CACHED_NUMPY"] = str(options.use_cached_numpy)
     if options.bitwise_alignment:
         options.atol = 0.0
