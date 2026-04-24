@@ -405,12 +405,12 @@ class TensorConfig:
                 ):
                     if step_val.numpy_tensor.item() > 0:
                         step_val.numpy_tensor = numpy.random.uniform(
-                            1.0, 5.0, step_config.shape
-                        ).astype(step_config.dtype)
+                            1.0, 5.0, step_val.shape
+                        ).astype(step_val.dtype)
                     else:
                         step_val.numpy_tensor = numpy.random.uniform(
-                            -5.0, -1.0, step_config.shape
-                        ).astype(step_config.dtype)
+                            -5.0, -1.0, step_val.shape
+                        ).astype(step_val.dtype)
 
             elif api_config.api_name in {
                 "paddle.argmax",
@@ -2518,6 +2518,9 @@ class TensorConfig:
                         # value**(-max) < MAX => (1/value)**max < MAX
                         value = 1 / value
                     ln_value = math.log(value)
+                    if ln_value == 0:
+                        # value == 1: x^1 = x, gradient has no overflow constraint
+                        return default_max
                     # dy/dx = y*ln(value) < MAX, y < MAX => y*max(ln(value), 1) < MAX
                     output_max = dtype_max / max(1, ln_value)
                     value_max = math.log(output_max) / ln_value
