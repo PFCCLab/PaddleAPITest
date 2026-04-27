@@ -94,20 +94,25 @@ class APITestPaddleDeviceVSGPU(APITestCustomDeviceVSCPU):
         )
 
     def _has_complex128(self):
-        """Return True if complex128 appears anywhere in the config.
+        """Return True if the config will result in complex128 computation on XPU.
 
         XPU does not support complex128 in cast_kernel, tensor memory allocation,
-        or gradient accumulation. Skip all complex128 configs on XPU.
+        or gradient accumulation. Two cases trigger complex128:
+          1. A tensor explicitly has dtype complex128.
+          2. A Python complex scalar is combined with a float64 tensor — Paddle
+             promotes the result to complex128, which XPU cannot handle.
+             (complex scalar + float32/bfloat16/int* tensor promotes to complex64,
+             which XPU does support.)
         """
-        def _check(cfg):
+        all_args = list(self.api_config.args) + list(self.api_config.kwargs.values())
+
+        def _has_complex128_dtype(cfg):
             if isinstance(cfg, TensorConfig):
                 return cfg.dtype == "complex128"
             if isinstance(cfg, (list, tuple)):
-                return any(_check(c) for c in cfg)
+                return any(_has_complex128_dtype(c) for c in cfg)
             if isinstance(cfg, str):
                 return cfg == "complex128"
-            if isinstance(cfg, complex):
-                return True
             try:
                 import paddle
                 if isinstance(cfg, paddle.base.core.DataType):
@@ -116,9 +121,31 @@ class APITestPaddleDeviceVSGPU(APITestCustomDeviceVSCPU):
                 pass
             return False
 
-        return any(_check(c) for c in self.api_config.args) or any(
-            _check(c) for c in self.api_config.kwargs.values()
-        )
+        def _has_float64_tensor(cfg):
+            if isinstance(cfg, TensorConfig):
+                return cfg.dtype == "float64"
+            if isinstance(cfg, (list, tuple)):
+                return any(_has_float64_tensor(c) for c in cfg)
+            return False
+
+        def _has_complex_scalar(cfg):
+            if isinstance(cfg, complex):
+                return True
+            if isinstance(cfg, (list, tuple)):
+                return any(_has_complex_scalar(c) for c in cfg)
+            return False
+
+        # Case 1: explicit complex128 dtype anywhere
+        if any(_has_complex128_dtype(c) for c in all_args):
+            return True
+
+        # Case 2: complex scalar + float64 tensor → promotes to complex128
+        if any(_has_complex_scalar(c) for c in all_args) and any(
+            _has_float64_tensor(c) for c in all_args
+        ):
+            return True
+
+        return False
 
     def need_skip(self, paddle_only=False):
         # Device vs GPU compares Paddle on XPU against Paddle on GPU — no Torch
