@@ -152,6 +152,12 @@ class TensorConfig:
                     -65535, 65535, size=4300000000, dtype="int64"
                 ).astype(dtype)
                 tensor = cached_numpy[dtype][:numel].reshape(shape)
+            elif dtype.startswith("complex"):
+                real_dtype = "float32" if dtype == "complex64" else "float64"
+                real_part = (numpy.random.random([4300000000]) - 0.5).astype(real_dtype)
+                imag_part = (numpy.random.random([4300000000]) - 0.5).astype(real_dtype)
+                cached_numpy[dtype] = (real_part + 1j * imag_part).astype(dtype)
+                tensor = cached_numpy[dtype][:numel].reshape(shape)
             else:
                 cached_numpy[dtype] = (numpy.random.random([4300000000]) - 0.5).astype(dtype)
                 tensor = cached_numpy[dtype][:numel].reshape(shape)
@@ -233,7 +239,15 @@ class TensorConfig:
                             numpy.random.randint(1, 65535, size=self.shape)
                         ).astype(self.dtype)
                 else:
-                    self.numpy_tensor = (numpy.random.random(self.shape) + 0.5).astype(self.dtype)
+                    if self.dtype.startswith("complex"):
+                        real_dtype = "float32" if self.dtype == "complex64" else "float64"
+                        real_part = (numpy.random.random(self.shape) + 0.5).astype(real_dtype)
+                        imag_part = (numpy.random.random(self.shape) + 0.5).astype(real_dtype)
+                        self.numpy_tensor = (real_part + 1j * imag_part).astype(self.dtype)
+                    else:
+                        self.numpy_tensor = (numpy.random.random(self.shape) + 0.5).astype(
+                            self.dtype
+                        )
             elif api_config.api_name == "paddle.arange":
                 start_val = self.get_arg(api_config, 0, "start", 0)
                 end_val = self.get_arg(api_config, 1, "end", None)
@@ -1081,11 +1095,28 @@ class TensorConfig:
                         assert len(self.shape) >= 2, "Input must be at least 2D."
                         assert self.shape[-1] == self.shape[-2], "Input must be square matrices."
                         n = self.shape[-1]
-                        A = numpy.random.uniform(low=0.5, high=1.0, size=self.shape).astype(
-                            self.dtype
+                        is_complex = self.dtype.startswith("complex")
+                        if is_complex:
+                            real_dtype = (
+                                numpy.float32 if self.dtype == "complex64" else numpy.float64
+                            )
+                            A_real = numpy.random.uniform(0.5, 1.0, size=self.shape).astype(
+                                real_dtype
+                            )
+                            A_imag = numpy.random.uniform(0.5, 1.0, size=self.shape).astype(
+                                real_dtype
+                            )
+                            A = (A_real + 1j * A_imag).astype(self.dtype)
+                        else:
+                            A = numpy.random.uniform(low=0.5, high=1.0, size=self.shape).astype(
+                                self.dtype
+                            )
+                        A_H = (
+                            numpy.conj(A).swapaxes(-1, -2)
+                            if is_complex
+                            else numpy.swapaxes(A, -1, -2)
                         )
-                        A_T = numpy.swapaxes(A, -1, -2)
-                        self.numpy_tensor = numpy.matmul(A, A_T) + numpy.eye(n, dtype=self.dtype)
+                        self.numpy_tensor = numpy.matmul(A, A_H) + numpy.eye(n, dtype=self.dtype)
                 elif api_config.api_name.endswith("pinv"):
                     if self.check_arg(api_config, 0, "x") and self.get_arg(
                         api_config, 2, " hermitian"
@@ -1188,7 +1219,15 @@ class TensorConfig:
             elif api_config.api_name == "paddle.multiply":
                 if self.dtype == "bfloat16":
                     self.dtype = "float32"
-                self.numpy_tensor = numpy.random.random(self.shape).astype(self.dtype)
+
+                if self.dtype in ["complex64", "complex128"]:
+                    real_dtype = "float32" if self.dtype == "complex64" else "float64"
+                    real_part = numpy.random.random(self.shape).astype(real_dtype)
+                    imag_part = numpy.random.random(self.shape).astype(real_dtype)
+                    self.numpy_tensor = (real_part + 1j * imag_part).astype(self.dtype)
+
+                else:
+                    self.numpy_tensor = numpy.random.random(self.shape).astype(self.dtype)
 
             elif api_config.api_name in {
                 "paddle.nn.functional.max_unpool1d",
@@ -1396,7 +1435,13 @@ class TensorConfig:
                         self.dtype
                     )
                 elif self.check_arg(api_config, 1, "weight"):
-                    self.numpy_tensor = numpy.random.random(self.shape).astype(self.dtype)
+                    if self.dtype.startswith("complex"):
+                        real_dtype = "float32" if self.dtype == "complex64" else "float64"
+                        real_part = numpy.random.random(self.shape).astype(real_dtype)
+                        imag_part = numpy.random.random(self.shape).astype(real_dtype)
+                        self.numpy_tensor = (real_part + 1j * imag_part).astype(self.dtype)
+                    else:
+                        self.numpy_tensor = numpy.random.random(self.shape).astype(self.dtype)
 
             elif api_config.api_name == "paddle.nn.functional.margin_cross_entropy":
                 if index == 1 or key == "label":
@@ -2609,8 +2654,15 @@ class TensorConfig:
                         scalar_val = numpy.random.randint(-65535, 65535)
                         self.numpy_tensor = numpy.array(scalar_val, dtype=self.dtype)
                     else:
-                        scalar_val = (numpy.random.random() - 0.5) * 1.2
-                        self.numpy_tensor = numpy.array(scalar_val, dtype=self.dtype)
+                        if self.dtype.startswith("complex"):
+                            real_val = (numpy.random.random() - 0.5) * 1.2
+                            imag_val = (numpy.random.random() - 0.5) * 1.2
+                            self.numpy_tensor = numpy.array(
+                                real_val + 1j * imag_val, dtype=self.dtype
+                            )
+                        else:
+                            scalar_val = (numpy.random.random() - 0.5) * 1.2
+                            self.numpy_tensor = numpy.array(scalar_val, dtype=self.dtype)
                 elif USE_CACHED_NUMPY and self.dtype not in ["int64", "float64"]:
                     self.numpy_tensor = self.get_cached_numpy(self.dtype, self.shape)
                 else:
@@ -2619,9 +2671,19 @@ class TensorConfig:
                             numpy.random.randint(-65535, 65535, size=self.shape)
                         ).astype(self.dtype)
                     else:
-                        self.numpy_tensor = ((numpy.random.random(self.shape) - 0.5) * 1.2).astype(
-                            self.dtype
-                        )
+                        if self.dtype.startswith("complex"):
+                            real_dtype = "float32" if self.dtype == "complex64" else "float64"
+                            real_part = ((numpy.random.random(self.shape) - 0.5) * 1.2).astype(
+                                real_dtype
+                            )
+                            imag_part = ((numpy.random.random(self.shape) - 0.5) * 1.2).astype(
+                                real_dtype
+                            )
+                            self.numpy_tensor = (real_part + 1j * imag_part).astype(self.dtype)
+                        else:
+                            self.numpy_tensor = (
+                                (numpy.random.random(self.shape) - 0.5) * 1.2
+                            ).astype(self.dtype)
 
         self.dtype = original_dtype
         return self.numpy_tensor
@@ -2802,6 +2864,13 @@ class TensorConfig:
             min = min if min is not None else -65535
             max = max if max is not None else 65535
             numpy_tensor = (numpy.random.randint(min, max, size=shape)).astype(data_type)
+        elif data_type.startswith("complex"):
+            real_dtype = "float32" if data_type == "complex64" else "float64"
+            real_min = min if min is not None else numpy.finfo(real_dtype).min / 2
+            real_max = max if max is not None else numpy.finfo(real_dtype).max / 2
+            real_part = numpy.random.uniform(real_min, real_max, size=shape).astype(real_dtype)
+            imag_part = numpy.random.uniform(real_min, real_max, size=shape).astype(real_dtype)
+            numpy_tensor = (real_part + 1j * imag_part).astype(data_type)
         else:
             dtype = "float32" if data_type == "bfloat16" else data_type
             min = min if min is not None else numpy.finfo(dtype).min / 2
