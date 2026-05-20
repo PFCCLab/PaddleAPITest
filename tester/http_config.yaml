@@ -1,0 +1,11 @@
+# HTTP 配置文件
+# 用于自定义设备与 GPU 精度对比测试的 HTTP 传输配置
+
+# 远程 HTTP 服务器地址
+remote_host: "10.78.119.13"
+
+# 远程 HTTP 服务器端口
+remote_port: 8089
+
+# HTTP 请求超时（秒）
+timeout: 300

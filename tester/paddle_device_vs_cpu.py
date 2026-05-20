@@ -1,10 +1,26 @@
 from __future__ import annotations
 
+import os
+
 import paddle
 import torch
+import yaml
 
 from .api_config.log_writer import write_to_log
 from .base import APITestBase
+
+_DEVICE_VS_CPU_CONFIG_PATH = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "device_vs_cpu_config.yaml"
+)
+_device_vs_cpu_atol_rtol: dict = {}
+_device_vs_cpu_dtype_atol_rtol: dict = {}
+
+if os.path.exists(_DEVICE_VS_CPU_CONFIG_PATH):
+    with open(_DEVICE_VS_CPU_CONFIG_PATH, encoding="utf-8") as _f:
+        _cfg = yaml.safe_load(_f) or {}
+    _device_vs_cpu_atol_rtol = _cfg.get("atol_rtol", {})
+    _device_vs_cpu_dtype_atol_rtol = _cfg.get("dtype_atol_rtol", {})
+    del _cfg, _f
 
 
 class APITestCustomDeviceVSCPU(APITestBase):
@@ -103,8 +119,25 @@ class APITestCustomDeviceVSCPU(APITestBase):
             )
             return None, None
 
+    def _resolve_atol_rtol(self, dtype_str: str) -> tuple[float, float]:
+        """按三级优先级解析容差：API+dtype > API default > 全局 dtype > 默认 1e-2。"""
+        api_name = self.api_config.api_name
+        if api_name in _device_vs_cpu_atol_rtol:
+            api_cfg = _device_vs_cpu_atol_rtol[api_name]
+            if dtype_str in api_cfg:
+                return tuple(float(x) for x in api_cfg[dtype_str])
+            if "default" in api_cfg:
+                return tuple(float(x) for x in api_cfg["default"])
+        if dtype_str in _device_vs_cpu_dtype_atol_rtol:
+            return tuple(float(x) for x in _device_vs_cpu_dtype_atol_rtol[dtype_str])
+        return 1e-2, 1e-2
+
     def _compare_single_tensor(self, cpu_tensor, custom_tensor, tensor_name=""):
         try:
+            # 在 cast 之前提取原始 dtype
+            dtype_str = str(cpu_tensor.dtype).split(".")[-1]
+            atol, rtol = self._resolve_atol_rtol(dtype_str)
+
             # bfloat16
             if cpu_tensor.dtype == paddle.bfloat16:
                 cpu_tensor = paddle.cast(cpu_tensor, dtype="float32")
@@ -114,12 +147,14 @@ class APITestCustomDeviceVSCPU(APITestBase):
             # Convert CustomDevice tensor to CPU
             custom_tensor_cpu = custom_tensor.cpu()
 
-            cpu_torch = torch.from_numpy(cpu_tensor.numpy())
-            custom_torch = torch.from_numpy(custom_tensor_cpu.numpy())
+            # .copy() 确保得到可写副本，避免 requires_grad tensor 的只读内存
+            # 导致 torch.testing.assert_close 内部抛 unexpected exception
+            cpu_torch = torch.from_numpy(cpu_tensor.numpy().copy())
+            custom_torch = torch.from_numpy(custom_tensor_cpu.numpy().copy())
 
             # 使用 torch.testing.assert_close 来替代 numpy.testing.assert_allclose
             torch.testing.assert_close(
-                cpu_torch, custom_torch, rtol=1e-2, atol=1e-2, equal_nan=True
+                cpu_torch, custom_torch, rtol=rtol, atol=atol, equal_nan=True
             )
 
             return True
@@ -231,11 +266,13 @@ class APITestCustomDeviceVSCPU(APITestBase):
             print("[Skip]", flush=True)
             return
 
-        # 2. Determine target device: prioritize XPU, fallback to CustomDevice
+        # 2. Determine target device: prioritize XPU, fallback to CustomDevice, then GPU
         if self.check_xpu_available():
             target_device, device_id = "xpu", self.xpu_device_id
         elif self.check_custom_device_available():
             target_device, device_id = self.custom_device_type, self.custom_device_id
+        elif paddle.is_compiled_with_cuda() and paddle.device.cuda.device_count() > 0:
+            target_device, device_id = "gpu", 0
         else:
             print("[no available device]", self.api_config.config, flush=True)
             write_to_log("crash", self.api_config.config)
@@ -367,6 +404,9 @@ class APITestCustomDeviceVSCPU(APITestBase):
                     elif self.check_custom_device_available():
                         target_device = self.custom_device_type
                         device_id = self.custom_device_id
+                    elif paddle.is_compiled_with_cuda() and paddle.device.cuda.device_count() > 0:
+                        target_device = "gpu"
+                        device_id = 0
                     else:
                         target_device = "cpu"
                         device_id = 0

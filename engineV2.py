@@ -56,6 +56,9 @@ VALID_TEST_ARGS = {
     "generate_failed_tests",
     "bitwise_alignment",
     "exit_on_error",
+    "http_host",
+    "http_port",
+    "http_timeout",
 }
 
 DEVICE_TYPE = None
@@ -675,9 +678,9 @@ def main():
     parser.add_argument(
         "--custom_device_vs_gpu_mode",
         type=str,
-        choices=["upload", "download"],
+        choices=["upload", "download", "http"],
         default="upload",
-        help="operation mode for custom_device_vs_gpu: 'upload' or 'download'",
+        help="operation mode for custom_device_vs_gpu: 'upload', 'download', or 'http'",
     )
     parser.add_argument(
         "--bitwise_alignment",
@@ -696,6 +699,13 @@ def main():
         type=parse_bool,
         default=False,
         help="Whether to exit the process when a paddle_error occurs.",
+    )
+    parser.add_argument(
+        "--enable_api_kernel_fallback",
+        type=parse_bool,
+        default=False,
+        help="(device_vs_gpu only) Set FLAGS_enable_api_kernel_fallback=1 on the local device. "
+             "Has no effect on the remote GPU server.",
     )
 
     options = parser.parse_args()
@@ -733,41 +743,82 @@ def main():
     # 处理 custom_device_vs_gpu 模式的配置
     bos_config_data = None
     if options.custom_device_vs_gpu:
-        # 读取 BOS 配置文件（固定路径：tester/bos_config.yaml）
-        bos_config_path = Path("tester/bos_config.yaml")
-        if not bos_config_path.exists():
-            print(f"BOS config file not found: {bos_config_path}", flush=True)
-            return
-
-        try:
-            with open(bos_config_path, encoding="utf-8") as f:
-                bos_config_data = yaml.safe_load(f)
-
-            if not bos_config_data:
-                print(f"BOS config file is empty: {bos_config_path}", flush=True)
+        if options.custom_device_vs_gpu_mode == "http":
+            # 读取 HTTP 配置文件
+            http_config_path = Path("tester/http_config.yaml")
+            if not http_config_path.exists():
+                print(f"HTTP config file not found: {http_config_path}", flush=True)
                 return
 
-            # 验证必需的配置项
-            required_keys = ["bos_path", "bos_conf_path", "bcecmd_path"]
-            missing_keys = [key for key in required_keys if key not in bos_config_data]
-            if missing_keys:
-                print(f"Missing required keys in BOS config: {missing_keys}", flush=True)
+            try:
+                with open(http_config_path, encoding="utf-8") as f:
+                    http_config_data = yaml.safe_load(f)
+
+                if not http_config_data:
+                    print(f"HTTP config file is empty: {http_config_path}", flush=True)
+                    return
+
+                required_keys = ["remote_host", "remote_port"]
+                missing_keys = [key for key in required_keys if key not in http_config_data]
+                if missing_keys:
+                    print(f"Missing required keys in HTTP config: {missing_keys}", flush=True)
+                    return
+
+                options.operation_mode = "http"
+                options.http_host = http_config_data["remote_host"]
+                options.http_port = http_config_data.get("remote_port", 8089)
+                options.http_timeout = http_config_data.get("timeout", 300)
+                # BOS config not needed in HTTP mode
+                options.bos_path = ""
+                options.bos_conf_path = ""
+                options.bcecmd_path = ""
+
+            except Exception as e:
+                print(f"Failed to load HTTP config file {http_config_path}: {e}", flush=True)
+                return
+        else:
+            # 读取 BOS 配置文件（固定路径：tester/bos_config.yaml）
+            bos_config_path = Path("tester/bos_config.yaml")
+            if not bos_config_path.exists():
+                print(f"BOS config file not found: {bos_config_path}", flush=True)
                 return
 
-            # 将配置添加到 options 中，以便传递给测试类
-            options.operation_mode = options.custom_device_vs_gpu_mode
-            options.bos_path = bos_config_data["bos_path"]
-            options.bos_conf_path = bos_config_data["bos_conf_path"]
-            options.bcecmd_path = bos_config_data["bcecmd_path"]
+            try:
+                with open(bos_config_path, encoding="utf-8") as f:
+                    bos_config_data = yaml.safe_load(f)
 
-        except Exception as e:
-            print(f"Failed to load BOS config file {bos_config_path}: {e}", flush=True)
-            return
+                if not bos_config_data:
+                    print(f"BOS config file is empty: {bos_config_path}", flush=True)
+                    return
+
+                # 验证必需的配置项
+                required_keys = ["bos_path", "bos_conf_path", "bcecmd_path"]
+                missing_keys = [key for key in required_keys if key not in bos_config_data]
+                if missing_keys:
+                    print(f"Missing required keys in BOS config: {missing_keys}", flush=True)
+                    return
+
+                # 将配置添加到 options 中，以便传递给测试类
+                options.operation_mode = options.custom_device_vs_gpu_mode
+                options.bos_path = bos_config_data["bos_path"]
+                options.bos_conf_path = bos_config_data["bos_conf_path"]
+                options.bcecmd_path = bos_config_data["bcecmd_path"]
+
+            except Exception as e:
+                print(f"Failed to load BOS config file {bos_config_path}: {e}", flush=True)
+                return
 
     if options.test_tol and not options.accuracy:
         print("--test_tol takes effect when --accuracy is True.", flush=True)
     if options.test_backward and not options.paddle_cinn:
         print("--test_backward takes effect when --paddle_cinn is True.", flush=True)
+    if options.custom_device_vs_gpu and options.enable_api_kernel_fallback:
+        os.environ["FLAGS_enable_api_kernel_fallback"] = "1"
+        print("[device_vs_gpu] FLAGS_enable_api_kernel_fallback=1 (local only)", flush=True)
+    if options.gpu_ids and options.gpu_ids != "-1":
+        first_gpu = options.gpu_ids.split(",")[0].strip()
+        os.environ["CUDA_VISIBLE_DEVICES"] = first_gpu
+        print(f"CUDA_VISIBLE_DEVICES={first_gpu}", flush=True)
     os.environ["USE_CACHED_NUMPY"] = str(options.use_cached_numpy)
     if options.bitwise_alignment:
         options.atol = 0.0
@@ -818,22 +869,32 @@ def main():
             APITestAccuracy,  # default fallback
         )
 
-        if options.test_cpu:
-            import paddle
-
-            paddle.device.set_device("cpu")
         if options.custom_device_vs_gpu:
             # custom_device_vs_gpu 模式需要传递额外参数
-            case = test_class(
-                api_config,
-                operation_mode=options.operation_mode,
-                bos_path=options.bos_path,
-                bos_conf_path=options.bos_conf_path,
-                bcecmd_path=options.bcecmd_path,
-                random_seed=options.random_seed,
-                atol=options.atol,
-                rtol=options.rtol,
-            )
+            kwargs = {
+                "operation_mode": options.operation_mode,
+                "random_seed": options.random_seed,
+                "atol": options.atol,
+                "rtol": options.rtol,
+                "test_amp": options.test_amp,
+            }
+            if options.operation_mode == "http":
+                kwargs.update(
+                    {
+                        "http_host": options.http_host,
+                        "http_port": options.http_port,
+                        "http_timeout": options.http_timeout,
+                    }
+                )
+            else:
+                kwargs.update(
+                    {
+                        "bos_path": options.bos_path,
+                        "bos_conf_path": options.bos_conf_path,
+                        "bcecmd_path": options.bcecmd_path,
+                    }
+                )
+            case = test_class(api_config, **kwargs)
         elif options.accuracy:
             case = test_class(
                 api_config,

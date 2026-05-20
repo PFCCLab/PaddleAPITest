@@ -1,0 +1,24 @@
+# 自定义设备与 GPU 精度对比测试的容差配置
+# 仅用于 device_vs_gpu 模式（APITestPaddleDeviceVSGPU）
+# 与 base_config.yaml 中的 special_accuracy_atol_rtol（用于 Paddle-vs-PyTorch）职责不同
+#
+# 优先级：API+dtype > API default > 全局 dtype > 命令行 --atol/--rtol
+
+# 全局 dtype 兜底容差（激活状态）
+dtype_atol_rtol:
+  float64:  [1e-6, 1e-6]
+  float32:  [1e-4, 1e-4]
+  float16:  [1e-2, 1e-2]
+  bfloat16: [1e-2, 1e-2]
+  int32:    [0,    0   ]
+  int64:    [0,    0   ]
+  bool:     [0,    0   ]
+
+# API 级细粒度容差（覆盖全局 dtype 兜底）
+# atol_rtol:
+#   paddle.matmul:
+#     default: [1e-2, 1e-2]
+#     float16: [8e-2, 8e-2]
+#   paddle.nn.functional.layer_norm:
+#     default: [2e-2, 2e-2]
+#     float16: [1e-1, 1e-1]

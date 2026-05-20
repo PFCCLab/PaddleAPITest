@@ -419,12 +419,12 @@ class TensorConfig:
                 ):
                     if step_val.numpy_tensor.item() > 0:
                         step_val.numpy_tensor = numpy.random.uniform(
-                            1.0, 5.0, step_config.shape
-                        ).astype(step_config.dtype)
+                            1.0, 5.0, step_val.shape
+                        ).astype(step_val.dtype)
                     else:
                         step_val.numpy_tensor = numpy.random.uniform(
-                            -5.0, -1.0, step_config.shape
-                        ).astype(step_config.dtype)
+                            -5.0, -1.0, step_val.shape
+                        ).astype(step_val.dtype)
 
             elif api_config.api_name in {
                 "paddle.argmax",
@@ -1650,10 +1650,13 @@ class TensorConfig:
             elif api_config.api_name == "paddle.nn.functional.pad":
                 if self.check_arg(api_config, 1, "pad"):
                     x_shape = self.get_arg(api_config, 0, "x").shape
-                    min_dim_len = min(x_shape)
-                    self.numpy_tensor = self.get_random_numpy_tensor(
-                        shape=self.shape, data_type=self.dtype, min=0, max=min_dim_len
-                    )
+                    min_dim_len = min(x_shape) if x_shape else 1
+                    if min_dim_len <= 0:
+                        self.numpy_tensor = numpy.zeros(self.shape, dtype=self.dtype)
+                    else:
+                        self.numpy_tensor = self.get_random_numpy_tensor(
+                            shape=self.shape, data_type=self.dtype, min=0, max=min_dim_len
+                        )
             elif api_config.api_name == "paddle.nn.functional.class_center_sample":
                 if self.check_arg(api_config, 0, "label"):
                     num_classes = self.get_arg(api_config, 1, "num_classes")
@@ -2279,9 +2282,12 @@ class TensorConfig:
                 if self.check_arg(api_config, 1, "index"):
                     x = self.get_arg(api_config, 0, "x")
                     dim_size = numpy.prod(x.shape)
-                    self.numpy_tensor = numpy.random.randint(0, dim_size, size=self.shape).astype(
-                        self.dtype
-                    )
+                    if dim_size <= 0:
+                        self.numpy_tensor = numpy.zeros(self.shape, dtype=self.dtype)
+                    else:
+                        self.numpy_tensor = numpy.random.randint(
+                            0, dim_size, size=self.shape
+                        ).astype(self.dtype)
 
             elif api_config.api_name in {"paddle.Tensor.gather", "paddle.gather"}:
                 if key == "index" or index == 1:
@@ -2557,6 +2563,9 @@ class TensorConfig:
                         # value**(-max) < MAX => (1/value)**max < MAX
                         value = 1 / value
                     ln_value = math.log(value)
+                    if ln_value == 0:
+                        # value == 1: x^1 = x, gradient has no overflow constraint
+                        return default_max
                     # dy/dx = y*ln(value) < MAX, y < MAX => y*max(ln(value), 1) < MAX
                     output_max = dtype_max / max(1, ln_value)
                     value_max = math.log(output_max) / ln_value
@@ -2599,7 +2608,12 @@ class TensorConfig:
                         get_max = get_exponent_max
                         default_max = 5
                 if isinstance(const, (int, float, bool, numpy.number)):
-                    value_max = get_max(const, numpy.finfo(self.dtype).max, default_max)
+                    _dtype_max = (
+                        numpy.iinfo(self.dtype).max
+                        if "int" in self.dtype
+                        else numpy.finfo(self.dtype).max
+                    )
+                    value_max = get_max(const, _dtype_max, default_max)
                     if is_base_arg and int(const) != const:
                         # Avoid situations like (-2.3) ^ 0.5
                         self.numpy_tensor = self.get_random_numpy_tensor(

@@ -87,7 +87,7 @@
 | `--show_runtime_status`          | bool  | 是否实时显示当前的测试进度（默认 True）                                               |
 | `--random_seed`                  | int   | numpy random的随机种子(默认为0，此时不会显式设置numpy random的seed)                   |
 | `--custom_device_vs_gpu`        | bool  | 启用自定义设备与GPU的精度对比测试模式（默认 False）                                   |
-| `--custom_device_vs_gpu_mode`   | str   | 自定义设备与GPU对比的模式：`upload` 或 `download`（默认 `upload`）                    |
+| `--custom_device_vs_gpu_mode`   | str   | 自定义设备与GPU对比的模式：`upload`、`download` 或 `http`（默认 `upload`）             |
 | `--bitwise_alignment`            | bool  | 是否进行诸位对齐对比，开启后所有的api的精度对比都按照atol=0.0,rtol = 0.0的精度对比结果(默认False)|
 | `--generate_failed_tests`        | bool  | 是否为失败的测试用例生成可复现的测试文件。开启后，当测试失败时，会在`failed_tests`目录下生成独立的Python测试文件，便于后续复现和调试（默认False）|
 | `--exit_on_error`                | bool  | 是否在精度测试出现`paddle_error`或者 `accuracy_error`  错误时立即退出测试进程(exit code 为1)。默认为False，测试进程会继续执行 |
@@ -128,64 +128,169 @@ python engineV2.py --accuracy=True --api_config_file="tester/api_config/api_conf
 
 ### 自定义设备与 GPU 精度对比测试
 
-#### 功能说明
+该功能支持跨设备的精度对比测试，提供两种数据传输方式：**BOS 云存储中转**和 **HTTP 直连**。
 
-`APITestPaddleDeviceVSGPU` 类支持跨设备的精度对比测试，目前主要面向 **GPU 上传 + XPU（或其他设备）下载对比** 这一典型场景。该功能分为两个模式：
+#### 方式一：BOS 云存储中转（upload/download 模式）
 
-- **Upload 模式（GPU 侧）**：在 GPU 上执行测试，保存结果到本地，然后上传到 BOS 云存储
-- **Download 模式（XPU/其他设备侧）**：在 XPU 或其他设备上执行测试，从 BOS 下载 GPU 侧的参考数据进行精度对比
+分为两步操作：先在一台机器上 upload，再在另一台机器上 download 对比。
 
-#### 工作流程
+**工作流程**：
 
-1. **Upload 模式工作流（GPU 侧）**：
-   - 在 GPU 设备上执行 Paddle API 测试
-   - 保存 Forward 输出和 Backward 梯度到本地 PDTensor 文件
-   - 文件名依赖随机种子与配置哈希（如 `1210-xxx.pdtensor`）
-   - 使用 bcecmd 工具将文件上传到 BOS 云存储
+1. **Upload 模式（GPU 侧）**：在 GPU 上执行 Paddle API，保存 Forward 输出和 Backward 梯度为 PDTensor 文件，上传到 BOS
+2. **Download 模式（XPU/其他设备侧）**：在目标设备上执行相同 API，从 BOS 下载 GPU 参考数据，进行精度对比
 
-2. **Download 模式工作流（XPU/其他设备侧）**：
-   - 在 XPU 或其他设备上执行相同的 Paddle API 测试
-   - 使用与 GPU 侧上传时一致的随机种子和配置，构造同名 PDTensor 文件名
-   - 从 BOS 云存储下载对应的 GPU 参考数据
-   - 对比 Forward 输出和 Backward 梯度，验证与 GPU 的精度一致性
-
-#### 配置文件设置
-
-首先，编辑 `tester/bos_config.yaml` 配置文件：
+**配置文件**：编辑 `tester/bos_config.yaml`
 
 ```yaml
-# BOS 配置文件
-# 用于自定义设备与 GPU 精度对比测试的云存储配置
-
-# BOS 存储路径（如：xly-devops/liujingzong/）
 bos_path: "xly-devops/liujingzong/"
-
-# BOS 配置文件路径（bcecmd 使用的配置文件路径）
 bos_conf_path: "./conf"
-
-# bcecmd 命令行工具路径
 bcecmd_path: "./bcecmd"
 ```
 
-#### 命令示例
-**在 GPU 上执行测试并上传结果**
+**命令示例**：
+
 ```bash
-# 在 GPU 设备上执行，生成1210-xxx.pdtensor 文件并上传到 BOS
+# GPU 侧：执行并上传
 python engineV2.py --custom_device_vs_gpu=True \
   --custom_device_vs_gpu_mode=upload \
   --random_seed=1210 \
   --api_config_file="./test1.txt" \
   --gpu_ids=7
-```
 
-**在 XPU 上下载 GPU 的参考数据并进行精度对比**
-```bash
+# XPU 侧：下载并对比
 python engineV2.py --custom_device_vs_gpu=True \
   --custom_device_vs_gpu_mode=download \
   --random_seed=1210 \
   --api_config_file="./test1.txt" \
   --gpu_ids=7
 ```
+
+#### 方式二：HTTP 直连（http 模式）
+
+只需在本地执行一条命令，自动触发远端执行并拉取结果对比，无需 BOS 服务。
+
+**工作流程**：
+
+1. 在远端机器启动 HTTP 服务器（带多 GPU 进程池）
+2. 本地发送 API 配置到远端，远端执行后返回 PDTensor 结果
+3. 本地执行同一 API，与远端结果进行精度对比
+
+**第一步：在远端机器启动服务器**
+
+```bash
+cd /path/to/PaddleAPITest
+python -m tester.http_server --host 0.0.0.0 --port 8089 --num_gpus=-1
+```
+
+服务器参数：
+
+| 参数 | 默认值 | 说明 |
+|---|---|---|
+| `--host` | `0.0.0.0` | 监听地址 |
+| `--port` | `8089` | 监听端口 |
+| `--num_gpus` | `-1` | GPU 数量，`-1` 表示全部 |
+| `--num_workers_per_gpu` | `1` | 每张 GPU 的 worker 数 |
+| `--required_memory` | `10.0` | 每个 worker 最低显存（GB） |
+| `--gpu_ids` | `""` | 指定 GPU，如 `6,7` 或 `0-3` |
+| `--timeout` | `1800` | 单个 API 执行超时（秒） |
+| `--admin_token` | `""` | 若非空，启用 `/admin/*` 管理接口（见下方"远程代码同步"）|
+
+可通过健康检查确认服务状态：
+
+```bash
+curl http://<远端IP>:8089/health
+# {"status": "ok", "device_type": "gpu", "paddle_version": "3.0.0"}
+```
+
+**第二步：在本地配置远端地址**
+
+编辑 `tester/http_config.yaml`：
+
+```yaml
+remote_host: "10.78.119.13"   # 远端机器 IP
+remote_port: 8089               # 远端服务端口
+timeout: 300                    # 单次请求超时（秒）
+```
+
+**第三步：在本地执行对比**
+
+```bash
+# 单个 API 测试
+python engineV2.py --custom_device_vs_gpu=True \
+  --custom_device_vs_gpu_mode=http \
+  --random_seed=42 \
+  --api_config='paddle.abs(Tensor([2, 3], "float32"))'
+
+# 批量测试
+python engineV2.py --custom_device_vs_gpu=True \
+  --custom_device_vs_gpu_mode=http \
+  --random_seed=42 \
+  --api_config_file_pattern="tester/api_config/5_accuracy/*.txt" \
+  --num_gpus=-1
+```
+
+**AMP（自动混合精度）模式**：
+
+加入 `--test_amp=True` 后，本地设备侧和远端 GPU server 侧会**同步**在 `paddle.amp.auto_cast()` 上下文下执行，确保两端精度对比处于相同的混合精度环境中：
+
+```bash
+python engineV2.py --custom_device_vs_gpu=True \
+  --custom_device_vs_gpu_mode=http \
+  --test_amp=True \
+  --random_seed=42 \
+  --api_config_file="tester/api_config/6_accuracy_amp/accuracy_amp.txt"
+```
+
+`test_amp` 标志会随请求 payload 一并发送到 server，因此无需在 server 启动命令中做任何额外配置。
+
+**并发机制**：
+
+服务端通过三层机制处理并发请求：
+- **ThreadingHTTPServer**：每个请求一个线程，并行接收
+- **Semaphore**：限制同时排队+执行的请求数为 `worker数 × 2`，超出则阻塞等待
+- **ProcessPool**：实际执行进程数由 GPU 数和 workers_per_gpu 决定
+
+当客户端 worker 多于服务端 worker 时，多余的请求会排队等待，客户端的 `http_timeout` 作为最终兜底——超时后写入 `timeout` 日志，确保不会出现"没跑也没日志"的情况。
+
+> 详细的设计原理和异常处理说明见 [docs/http_cross_device_comparison.md](docs/http_cross_device_comparison.md)。
+
+#### 远程代码同步（sync_watch）
+
+在两台机器间 SSH 不通的情况下，可通过 `scripts/sync_watch.py` 将本地代码变更**自动同步**到远端服务器，并触发服务器重启，无需手动操作。
+
+**前提：远端启动时带上 `--admin_token`**
+
+```bash
+python -m tester.http_server --host 0.0.0.0 --port 8089 --gpu_ids=6 --admin_token=your_token
+```
+
+**本地安装依赖（一次性）**
+
+```bash
+pip install watchdog
+```
+
+**本地启动监听**
+
+```bash
+python scripts/sync_watch.py \
+  --host <远端IP> --port 8089 --token your_token
+```
+
+启动后，每当本地 `.py` 文件被保存，脚本会在约 1.5 秒防抖后：
+1. 将变更文件通过 `POST /admin/upload_file` 推送到远端
+2. 调用 `POST /admin/restart` 触发服务器原地重启
+3. 轮询 `/health` 直至服务器重新就绪
+
+可选参数：
+
+| 参数 | 默认值 | 说明 |
+|---|---|---|
+| `--host` | 必填 | 远端服务器 IP |
+| `--port` | `8089` | 远端服务端口 |
+| `--token` | 必填 | 与 `--admin_token` 一致 |
+| `--watch_dir` | 仓库根目录 | 本地监听目录 |
+| `--debounce` | `1.5` | 防抖时间（秒）|
 
 ## 监控方法
 
