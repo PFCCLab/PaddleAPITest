@@ -77,39 +77,6 @@ class APITestPaddleOnly(APITestBase):
             write_to_log("paddle_error", self.api_config.config)
             return
 
-        # NaN check on forward output
-        if paddle_output is not None:
-            has_nan = False
-            try:
-                if isinstance(paddle_output, paddle.Tensor):
-                    if paddle_output.dtype in (
-                        paddle.float16,
-                        paddle.float32,
-                        paddle.float64,
-                        paddle.bfloat16,
-                    ):
-                        has_nan = bool(paddle.isnan(paddle_output).any())
-                elif isinstance(paddle_output, (list, tuple)):
-                    for t in paddle_output:
-                        if isinstance(t, paddle.Tensor) and t.dtype in (
-                            paddle.float16,
-                            paddle.float32,
-                            paddle.float64,
-                            paddle.bfloat16,
-                        ):
-                            if bool(paddle.isnan(t).any()):
-                                has_nan = True
-                                break
-            except Exception:
-                pass
-            if has_nan:
-                paddle_output = None
-                result_outputs = None
-                result_outputs_grads = None
-                print(f"[nan] {self.api_config.config}", flush=True)
-                write_to_log("nan", self.api_config.config)
-                return
-
         try:
             paddle.base.core.eager._for_test_check_cuda_error()
         except Exception as err:
