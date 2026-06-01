@@ -2636,6 +2636,11 @@ class TensorConfig:
                         self.numpy_tensor = numpy.tril(
                             self.get_random_numpy_tensor(self.shape, self.dtype)
                         )
+            elif api_config.api_name in {"paddle.sqrt", "paddle.Tensor.sqrt"}:
+                if self.check_arg(api_config, 0, "x"):
+                    self.numpy_tensor = self.get_random_numpy_tensor(
+                        self.shape, self.dtype, min=0, max=1000
+                    )
             elif api_config.api_name in {"paddle.rsqrt", "paddle.Tensor.rsqrt"}:
                 if self.check_arg(api_config, 0, "x"):
                     self.numpy_tensor = self.get_random_numpy_tensor(

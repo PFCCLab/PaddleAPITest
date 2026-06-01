@@ -19,7 +19,7 @@ def collect_input_files(input_paths):
     return files
 
 
-def process_api_configs(input_paths, output_dir, max_configs_per_file=500000):
+def process_api_configs(input_paths, output_dir, max_configs_per_file=500000, inplace=False):
     input_files = collect_input_files(input_paths)
     if not input_files:
         print("No valid input files found")
@@ -48,6 +48,17 @@ def process_api_configs(input_paths, output_dir, max_configs_per_file=500000):
     print(f"Total configs: {total_read}, Unique configs: {len(api_configs)}")
 
     sorted_configs = sorted(api_configs)
+
+    if inplace:
+        merged_content = "\n".join(sorted_configs) + "\n"
+        for input_file in input_files:
+            try:
+                input_file.write_text(merged_content, encoding="utf-8")
+                print(f"Inplace wrote {len(sorted_configs)} configs to {input_file}")
+            except Exception as err:
+                print(f"Error writing {input_file}: {err}")
+        return
+
     output_path = Path(output_dir)
     output_path.mkdir(parents=True, exist_ok=True)
 
@@ -76,6 +87,8 @@ def main():
   python %(prog)s -i file.txt                    # 处理单个文件
   python %(prog)s -i dir/                        # 处理目录下所有.txt文件
   python %(prog)s -i . -o output/ --max-configs 100000  # 当前目录，限制10万条/文件
+  python %(prog)s -i file.txt -I                        # 原地去重排序，覆盖原文件
+  python %(prog)s -i dir/ -I                            # 原地处理目录下所有.txt文件
         """,
     )
     parser.add_argument(
@@ -87,9 +100,16 @@ def main():
     )
     parser.add_argument("--output-dir", "-o", default=default_output, help="输出目录路径")
     parser.add_argument("--max-configs", type=int, default=500000, help="单个输出文件最大配置数量")
+    parser.add_argument(
+        "--inplace",
+        "-I",
+        action="store_true",
+        default=False,
+        help="原地修改：将合并去重排序后的结果写回所有输入文件（忽略 --output-dir）",
+    )
 
     args = parser.parse_args()
-    process_api_configs(args.input, args.output_dir, args.max_configs)
+    process_api_configs(args.input, args.output_dir, args.max_configs, args.inplace)
 
 
 if __name__ == "__main__":

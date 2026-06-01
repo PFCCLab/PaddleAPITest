@@ -21,6 +21,7 @@ LOG_PREFIXES = {
     "match_error": "api_config_match_error",
     "numpy_error": "api_config_numpy_error",
     "cuda_error": "api_config_cuda_error",
+    "skip": "api_config_skip",
 }
 
 
@@ -79,7 +80,10 @@ def remove_configs(log_path, to_remove):
     else:
         print("No retest configs found", flush=True)
 
-    for prefix in LOG_PREFIXES.values():
+    for log_type in to_remove:
+        if log_type not in LOG_PREFIXES:
+            continue
+        prefix = LOG_PREFIXES[log_type]
         log_file = log_path / f"{prefix}.txt"
         if not log_file.exists():
             continue
@@ -112,6 +116,7 @@ def main():
   crash             -   api_config_crash
   oom               -   api_config_oom
   match_error       -   api_config_match_error
+  skip              -   api_config_skip
         """,
     )
     parser.add_argument(

@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import argparse
 import re
+import shutil
 from pathlib import Path
 
 SKIP_ERROR_INFO = [
@@ -17,6 +18,7 @@ SKIP_ERROR_INFO = [
     "CUDA out of memory",
     "Out of memory error",
     "[Skip]",
+    "[config parse error]",
     "[match error]",
     "[numpy error]",
     "[paddle_to_torch]",
@@ -150,6 +152,14 @@ def write_logs_and_meta(output_path, logs_dict, prefix):
 
 
 def error_state(input_path, output_path, split_errors=False):
+    # 写入目标目录下的独立子文件夹，避免与原始日志文件混在同级目录
+    output_path = Path(output_path) / "error_stat_result"
+    if output_path.exists():
+        shutil.rmtree(output_path)
+        print(f"Cleared existing directory: {output_path}", flush=True)
+    output_path.mkdir(parents=True, exist_ok=True)
+    output_path = str(output_path)
+
     # 读取配置文件
     config_sets = load_config_sets(input_path)
     # 解析日志
