@@ -10,6 +10,17 @@ from datetime import datetime
 
 import paddle
 import torch
+
+# Load custom ops from paddlefleet to register _run_custom_op operators
+try:
+    import paddlefleet_ops
+except ImportError:
+    pass
+try:
+    import FusedQuantOps
+except ImportError:
+    pass
+
 from tester import (
     APIConfig,
     APITestAccuracy,

@@ -15,6 +15,15 @@ USE_CACHED_NUMPY = os.getenv("USE_CACHED_NUMPY", "False").lower() == "true"
 TEST_NON_CONTIGUOUS = os.getenv("TEST_NON_CONTIGUOUS", "0").lower() in ("true", "1")
 cached_numpy = {}
 
+# Optimizer APIs that need special tensor initialization to avoid NaN
+# Format: {api_name: {arg_index: init_method}}
+# init_method: "zeros" = fill with 0, "small_positive" = fill with small positive value
+optimizer_apis = {
+    "paddle._C_ops.adamw_": {3: "zeros", 4: "zeros"},  # moment1, moment2
+    "paddle._C_ops.adam_": {3: "zeros", 4: "zeros"},
+    "paddle._C_ops.merged_adam_": {3: "zeros", 4: "zeros"},
+}
+
 not_zero_apis = frozenset(
     [
         "paddle.Tensor.__div__",
@@ -79,10 +88,12 @@ def generate_unique_array(num_items, float_dtype):
 
 
 class TensorConfig:
-    def __init__(self, shape, dtype, place=None):
+    def __init__(self, shape, dtype, place=None, is_contiguous=True, strides=None):
         self.shape = shape
         self.dtype = dtype
         self.place = place
+        self.is_contiguous = is_contiguous
+        self.strides = strides
         self.numpy_tensor = None
         self.paddle_tensor = None
         self.torch_tensor = None
@@ -95,6 +106,8 @@ class TensorConfig:
         result.shape = copy.deepcopy(self.shape)
         result.dtype = copy.deepcopy(self.dtype)
         result.place = copy.deepcopy(self.place)
+        result.is_contiguous = self.is_contiguous
+        result.strides = copy.deepcopy(self.strides)
         return result
 
     def __str__(self):
@@ -128,6 +141,10 @@ class TensorConfig:
             return torch.complex64
         elif dtype in ["complex128", numpy.complex128]:
             return torch.complex128
+        elif dtype == "float8_e4m3fn":
+            return torch.float8_e4m3fn
+        elif dtype == "float8_e5m2":
+            return torch.float8_e5m2
         else:
             raise ValueError(f"Unsupport dtype: {dtype}")
 
@@ -215,15 +232,21 @@ class TensorConfig:
         if key is not None:
             self.key = key
 
-        if self.dtype in ["float8_e5m2", "float8_e4m3fn"]:
-            print("Warning ", self.dtype, "not supported")
-            return
-
         original_dtype = self.dtype
-        self.dtype = "float32" if self.dtype == "bfloat16" else self.dtype
+        if self.dtype in ["float8_e5m2", "float8_e4m3fn"]:
+            # numpy doesn't support float8, use float16 as intermediate
+            self.dtype = "float16"
+        elif self.dtype == "bfloat16":
+            self.dtype = "float32"
 
         if self.numpy_tensor is None:
-            if api_config.api_name in not_zero_apis:
+            # Special handling for optimizer APIs: use zeros for moment tensors
+            if (
+                api_config.api_name in optimizer_apis
+                and self.index in optimizer_apis[api_config.api_name]
+            ):
+                self.numpy_tensor = numpy.zeros(self.shape).astype(self.dtype)
+            elif api_config.api_name in not_zero_apis:
                 if "int" in self.dtype:
                     if self.dtype == "int8":
                         arr = numpy.random.randint(1, 256, size=self.shape, dtype=numpy.int32)
@@ -1707,6 +1730,12 @@ class TensorConfig:
             elif api_config.api_name in {
                 "paddle.put_along_axis",
                 "paddle.Tensor.put_along_axis",
+                "paddle.put_along_axis_",
+                "paddle.Tensor.put_along_axis_",
+                "paddle._C_ops.put_along_axis",
+                "paddle._C_ops.Tensor.put_along_axis",
+                "paddle._C_ops.put_along_axis_",
+                "paddle._C_ops.Tensor.put_along_axis_",
             }:
                 if self.check_arg(api_config, 1, "indices"):
                     x_tensor = self.get_arg(api_config, 0, "x")
@@ -2653,6 +2682,140 @@ class TensorConfig:
                             self.shape, self.dtype, min=1
                         )
 
+            elif api_config.api_name in {
+                "paddle.nn.functional.moe_permute",
+                "paddle.nn.functional.moe_unpermute",
+            }:
+                if api_config.api_name == "paddle.nn.functional.moe_permute":
+                    # moe_permute(hidden_states, scale, expert_routemap_topk, expert_prob_topk,
+                    #             num_experts, tokens_per_expert, padding_alignment, ...)
+                    # expert_routemap_topk (arg2): int32, shape [seqlen, topk], value in [-1, num_experts)
+                    if self.check_arg(api_config, 2, "expert_routemap_topk"):
+                        num_experts = self.get_arg(api_config, 4, "num_experts", 32)
+                        if isinstance(num_experts, TensorConfig):
+                            num_experts = 32
+                        seqlen, topk = self.shape[0], self.shape[1]
+                        # Generate valid routemap vectorized for large seqlen
+                        routemap = numpy.full(self.shape, -1, dtype="int32")
+                        # Each row randomly assigns 1~topk experts to random positions
+                        n_assigned = numpy.random.randint(1, topk + 1, size=seqlen)
+                        # For each possible n_assigned value, batch process all rows with that count
+                        for n in range(1, topk + 1):
+                            mask = n_assigned == n
+                            count = int(mask.sum())
+                            if count == 0:
+                                continue
+                            # Generate random expert indices for these rows
+                            expert_indices = numpy.array(
+                                [
+                                    numpy.random.choice(num_experts, size=n, replace=False)
+                                    for _ in range(count)
+                                ],
+                                dtype="int32",
+                            )
+                            # Generate random positions for these rows
+                            position_indices = numpy.array(
+                                [
+                                    numpy.random.choice(topk, size=n, replace=False)
+                                    for _ in range(count)
+                                ],
+                                dtype="int32",
+                            )
+                            row_indices = numpy.where(mask)[0]
+                            for j in range(n):
+                                routemap[row_indices, position_indices[:, j]] = expert_indices[:, j]
+                        self.numpy_tensor = routemap
+                        # Update tokens_per_expert to match the generated routemap
+                        tokens_count = [int(numpy.sum(routemap == e)) for e in range(num_experts)]
+                        if "tokens_per_expert" in api_config.kwargs:
+                            api_config.kwargs["tokens_per_expert"] = tokens_count
+                        elif len(api_config.args) > 5:
+                            api_config.args[5] = tokens_count
+                    # expert_prob_topk (arg3): float32, shape [seqlen, topk], value in [0, 1]
+                    elif self.check_arg(api_config, 3, "expert_prob_topk"):
+                        routemap_config = self.get_arg(api_config, 2, "expert_routemap_topk")
+                        probs = numpy.zeros(self.shape, dtype="float32")
+                        if (
+                            isinstance(routemap_config, TensorConfig)
+                            and routemap_config.numpy_tensor is not None
+                        ):
+                            mask = routemap_config.numpy_tensor >= 0
+                            raw = numpy.random.random(self.shape).astype("float32") * mask
+                            row_sums = raw.sum(axis=1, keepdims=True)
+                            row_sums[row_sums == 0] = 1.0
+                            probs = raw / row_sums
+                        else:
+                            probs = numpy.random.random(self.shape).astype("float32")
+                            row_sums = probs.sum(axis=1, keepdims=True)
+                            row_sums[row_sums == 0] = 1.0
+                            probs = probs / row_sums
+                        self.numpy_tensor = probs
+                    # tokens_per_expert (arg5): list[int], length = num_experts
+                    # This is a list not a TensorConfig, handled by APIConfig parser
+
+                elif api_config.api_name == "paddle.nn.functional.moe_unpermute":
+                    # moe_unpermute(hidden_states_unzipped, zipped_expertwise_rowmap,
+                    #               expert_routemap_topk, token_prob_unzipped,
+                    #               total_zipped_tokens, num_experts, ...)
+                    # expert_routemap_topk (arg2): int32, shape [seqlen, topk], value in [-1, num_experts)
+                    if self.check_arg(api_config, 2, "expert_routemap_topk"):
+                        num_experts = self.get_arg(api_config, 5, "num_experts", 32)
+                        if isinstance(num_experts, TensorConfig):
+                            num_experts = 32
+                        seqlen, topk = self.shape[0], self.shape[1]
+                        # Generate valid routemap vectorized for large seqlen
+                        routemap = numpy.full(self.shape, -1, dtype="int32")
+                        n_assigned = numpy.random.randint(1, topk + 1, size=seqlen)
+                        for n in range(1, topk + 1):
+                            mask = n_assigned == n
+                            count = int(mask.sum())
+                            if count == 0:
+                                continue
+                            expert_indices = numpy.array(
+                                [
+                                    numpy.random.choice(num_experts, size=n, replace=False)
+                                    for _ in range(count)
+                                ],
+                                dtype="int32",
+                            )
+                            position_indices = numpy.array(
+                                [
+                                    numpy.random.choice(topk, size=n, replace=False)
+                                    for _ in range(count)
+                                ],
+                                dtype="int32",
+                            )
+                            row_indices = numpy.where(mask)[0]
+                            for j in range(n):
+                                routemap[row_indices, position_indices[:, j]] = expert_indices[:, j]
+                        self.numpy_tensor = routemap
+                    # zipped_expertwise_rowmap (arg1): int32, shape [seqlen, num_experts]
+                    # Needs to be valid rowmap based on routemap
+                    elif self.check_arg(api_config, 1, "zipped_expertwise_rowmap"):
+                        routemap_config = self.get_arg(api_config, 2, "expert_routemap_topk")
+                        num_experts = self.get_arg(api_config, 5, "num_experts", 32)
+                        if isinstance(num_experts, TensorConfig):
+                            num_experts = 32
+                        seqlen = self.shape[0]
+                        rowmap = numpy.zeros(self.shape, dtype="int32")
+                        if (
+                            isinstance(routemap_config, TensorConfig)
+                            and routemap_config.numpy_tensor is not None
+                        ):
+                            # Build rowmap: for each expert, assign row indices in order
+                            expert_counters = numpy.zeros(num_experts, dtype="int32")
+                            for i in range(seqlen):
+                                for e in range(num_experts):
+                                    if numpy.any(routemap_config.numpy_tensor[i] == e):
+                                        rowmap[i, e] = expert_counters[e]
+                                        expert_counters[e] += 1
+                                    else:
+                                        rowmap[i, e] = -1
+                        self.numpy_tensor = rowmap
+                    # token_prob_unzipped (arg3): float32, value in [0, 1]
+                    elif self.check_arg(api_config, 3, "token_prob_unzipped"):
+                        self.numpy_tensor = numpy.random.random(self.shape).astype("float32")
+
             if self.numpy_tensor is None:
                 if self.shape == []:
                     if "int" in self.dtype:
@@ -2694,20 +2857,35 @@ class TensorConfig:
         return self.numpy_tensor
 
     def get_paddle_tensor(self, api_config):
-        if self.dtype in ["float8_e5m2", "float8_e4m3fn"]:
-            print("Warning ", self.dtype, "not supported")
-            return
-
         if self.paddle_tensor is None:
-            self.paddle_tensor = paddle.to_tensor(
-                self.get_numpy_tensor(api_config),
-                dtype="float32" if self.dtype == "bfloat16" else self.dtype,
-                place=self.place,
-            )
+            if not self.is_contiguous and self.strides is not None:
+                self.paddle_tensor = self._create_strided_paddle_tensor(api_config)
+                print(
+                    f"[non-contiguous] target strides: {self.strides}, "
+                    f"actual strides: {self.paddle_tensor.strides}, "
+                    f"shape: {list(self.paddle_tensor.shape)}, "
+                    f"dtype: {self.paddle_tensor.dtype}, "
+                    f"is_contiguous: {self.paddle_tensor.is_contiguous()}"
+                )
+            else:
+                intermediate_dtype = (
+                    "float32"
+                    if self.dtype == "bfloat16"
+                    else (
+                        "float16" if self.dtype in ["float8_e5m2", "float8_e4m3fn"] else self.dtype
+                    )
+                )
+                self.paddle_tensor = paddle.to_tensor(
+                    self.get_numpy_tensor(api_config),
+                    dtype=intermediate_dtype,
+                    place=self.place,
+                )
 
-            self.paddle_tensor.stop_gradient = False
-            if self.dtype == "bfloat16":
-                self.paddle_tensor = paddle.cast(self.paddle_tensor, dtype="bfloat16")
+                self.paddle_tensor.stop_gradient = False
+                if self.dtype == "bfloat16":
+                    self.paddle_tensor = paddle.cast(self.paddle_tensor, dtype="bfloat16")
+                elif self.dtype in ["float8_e5m2", "float8_e4m3fn"]:
+                    self.paddle_tensor = paddle.cast(self.paddle_tensor, dtype=self.dtype)
         if TEST_NON_CONTIGUOUS:
             if not self.shuffle_dims:
                 ndim = self.paddle_tensor.dim()
@@ -2717,31 +2895,81 @@ class TensorConfig:
             return paddle.transpose(self.paddle_tensor, self.shuffle_dims)
         return self.paddle_tensor
 
-    def get_torch_tensor(self, api_config):
-        if self.dtype in ["float8_e5m2", "float8_e4m3fn"]:
-            print("Warning ", self.dtype, "not supported")
-            return
+    def _create_strided_paddle_tensor(self, api_config):
+        """Create a non-contiguous paddle tensor with specified strides by allocating
+        a larger contiguous buffer and slicing to achieve the desired strides."""
+        shape = self.shape
+        strides = self.strides
+        # Calculate the storage size needed: sum((shape[i]-1) * strides[i]) + 1 for all dims
+        storage_size = 1
+        for i in range(len(shape)):
+            if shape[i] > 0:
+                storage_size += (shape[i] - 1) * strides[i]
 
+        # Create a flat contiguous buffer
+        dtype = "float32" if self.dtype == "bfloat16" else self.dtype
+        numpy_dtype = dtype
+        if dtype == "bfloat16":
+            numpy_dtype = "float32"
+        flat_data = (numpy.random.random(storage_size).astype("float32") - 0.5) * 1.2
+        if numpy_dtype not in ["float32", "float64", "float16"]:
+            if numpy_dtype == "bool":
+                flat_data = numpy.random.randint(0, 2, size=storage_size).astype("bool")
+            elif numpy_dtype in ["int8", "int16", "int32", "int64", "uint8"]:
+                flat_data = numpy.random.randint(-10, 10, size=storage_size).astype(numpy_dtype)
+            elif numpy_dtype in ["complex64", "complex128"]:
+                flat_data = (
+                    (numpy.random.random(storage_size) - 0.5)
+                    + 1j * (numpy.random.random(storage_size) - 0.5)
+                ).astype(numpy_dtype)
+            else:
+                flat_data = flat_data.astype(numpy_dtype)
+        else:
+            flat_data = flat_data.astype(numpy_dtype)
+
+        flat_tensor = paddle.to_tensor(flat_data, dtype=dtype, place=self.place)
+        # For bfloat16: cast flat buffer first, then as_strided to preserve strides
+        if self.dtype == "bfloat16":
+            flat_tensor = paddle.cast(flat_tensor, dtype="bfloat16")
+
+        # Use paddle's as_strided to create the non-contiguous view
+        tensor = paddle.as_strided(flat_tensor, shape, strides)
+        tensor.stop_gradient = False
+        return tensor
+
+    def get_torch_tensor(self, api_config):
         device = torch.device("cuda:0") if torch.cuda.is_available() else torch.device("cpu")
         torch.set_default_device(device)
         if self.torch_tensor is None:
-            self.torch_tensor = torch.tensor(
-                self.get_numpy_tensor(api_config),
-                dtype=self.convert_dtype_to_torch_type(self.dtype)
-                if self.dtype != "bfloat16"
-                else torch.float32,
-                requires_grad=self.dtype
-                in [
-                    "float32",
-                    "float64",
-                    "float16",
-                    "complex64",
-                    "complex128",
-                    "bfloat16",
-                ],
-            )
-            if self.dtype == "bfloat16":
-                self.torch_tensor = self.torch_tensor.to(dtype=torch.bfloat16)
+            if not self.is_contiguous and self.strides is not None:
+                self.torch_tensor = self._create_strided_torch_tensor(api_config)
+            else:
+                needs_intermediate = self.dtype in ["bfloat16", "float8_e5m2", "float8_e4m3fn"]
+                if needs_intermediate:
+                    intermediate_torch_dtype = (
+                        torch.float32 if self.dtype == "bfloat16" else torch.float16
+                    )
+                else:
+                    intermediate_torch_dtype = self.convert_dtype_to_torch_type(self.dtype)
+                self.torch_tensor = torch.tensor(
+                    self.get_numpy_tensor(api_config),
+                    dtype=intermediate_torch_dtype,
+                    requires_grad=self.dtype
+                    in [
+                        "float32",
+                        "float64",
+                        "float16",
+                        "complex64",
+                        "complex128",
+                        "bfloat16",
+                    ],
+                )
+                if self.dtype == "bfloat16":
+                    self.torch_tensor = self.torch_tensor.to(dtype=torch.bfloat16)
+                elif self.dtype in ["float8_e5m2", "float8_e4m3fn"]:
+                    self.torch_tensor = self.torch_tensor.to(
+                        dtype=self.convert_dtype_to_torch_type(self.dtype)
+                    )
         if TEST_NON_CONTIGUOUS:
             if not self.shuffle_dims:
                 ndim = self.torch_tensor.dim()
@@ -2750,6 +2978,39 @@ class TensorConfig:
             print("torch shuffle:", self.shuffle_dims)
             return torch.permute(self.torch_tensor, self.shuffle_dims)
         return self.torch_tensor
+
+    def _create_strided_torch_tensor(self, api_config):
+        """Create a non-contiguous torch tensor with specified strides."""
+        shape = self.shape
+        strides = self.strides
+        device = torch.device("cuda:0") if torch.cuda.is_available() else torch.device("cpu")
+        # Calculate storage size: sum((shape[i]-1) * strides[i]) + 1 for all dims
+        storage_size = 1
+        for i in range(len(shape)):
+            if shape[i] > 0:
+                storage_size += (shape[i] - 1) * strides[i]
+
+        torch_dtype = (
+            self.convert_dtype_to_torch_type(self.dtype)
+            if self.dtype != "bfloat16"
+            else torch.float32
+        )
+        flat_tensor = torch.randn(storage_size, dtype=torch_dtype, device=device)
+        # For bfloat16: cast flat buffer first, then as_strided to preserve strides
+        if self.dtype == "bfloat16":
+            flat_tensor = flat_tensor.to(dtype=torch.bfloat16)
+        tensor = torch.as_strided(flat_tensor, shape, strides)
+        requires_grad = self.dtype in [
+            "float32",
+            "float64",
+            "float16",
+            "complex64",
+            "complex128",
+            "bfloat16",
+        ]
+        if requires_grad:
+            tensor = tensor.detach().requires_grad_(True)
+        return tensor
 
     def clear_tensor(self):
         self.torch_tensor = None
@@ -2920,14 +3181,33 @@ class APIConfig:
                 self.append_args(value)
 
         while True:
+            prev_offset = offset
             tocken, offset = self.get_tocken(config, offset)
             if offset is None:
+                # Check for empty string "" that get_tocken cannot match
+                remaining = config[prev_offset:]
+                idx = remaining.find('""')
+                if idx >= 0:
+                    offset = prev_offset + idx + 2
+                    self.append_args("")
+                    continue
                 return
 
             is_kwarg = config[offset] == "="
             if is_kwarg:
                 key = tocken
-                tocken, offset = self.get_tocken(config, offset + 1)
+                prev_offset2 = offset + 1
+                tocken, offset = self.get_tocken(config, prev_offset2)
+                # Handle kwarg with empty string value: key=""
+                if tocken is None:
+                    remaining = config[prev_offset2:]
+                    idx = remaining.find('""')
+                    if idx >= 0:
+                        offset = prev_offset2 + idx + 2
+                        self.append_kwargs(key, "")
+                        continue
+                    else:
+                        return
 
             value, offset = self.get_one_arg(tocken, config, offset)
 
@@ -3086,6 +3366,25 @@ class APIConfig:
         tocken, offset = self.get_tocken(config, offset)
         return paddle.pir.core.convert_np_dtype_to_dtype_(tocken), offset
 
+    def get_place(self, config, offset):
+        """Parse Place(gpu:0), Place(cpu), etc."""
+        config_slice = config[offset:]
+        place_str = config_slice[config_slice.index("(") + 1 : config_slice.index(")")]
+        end_offset = offset + config_slice.index(")") + 1
+        if place_str == "cpu":
+            return paddle.CPUPlace(), end_offset
+        elif place_str.startswith("gpu"):
+            if ":" in place_str:
+                device_id = int(place_str.split(":")[1])
+            else:
+                device_id = 0
+            gpu_count = paddle.device.cuda.device_count()
+            if gpu_count > 0:
+                device_id = device_id % gpu_count
+            return paddle.CUDAPlace(device_id), end_offset
+        else:
+            return paddle.CPUPlace(), end_offset
+
     def get_vartype(self, config, offset):
         tocken, offset = self.get_tocken(config, offset)
         return paddle.base.framework.convert_np_dtype_to_proto_type(tocken), offset
@@ -3178,6 +3477,8 @@ class APIConfig:
             value, offset = self.get_tensor(config, offset - len(tocken))
         elif tocken == "Dtype":
             value, offset = self.get_dtype(config, offset)
+        elif tocken == "Place":
+            value, offset = self.get_place(config, offset)
         elif tocken == "VarType":
             value, offset = self.get_vartype(config, offset)
         elif tocken == "list":

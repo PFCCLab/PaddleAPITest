@@ -387,6 +387,16 @@ def init_worker_gpu(gpu_worker_list, lock, available_gpus, max_workers_per_gpu, 
         import paddle
         import torch
 
+        # Load custom ops from paddlefleet to register _run_custom_op operators
+        try:
+            import paddlefleet_ops
+        except ImportError:
+            pass
+        try:
+            import FusedQuantOps
+        except ImportError:
+            pass
+
         globals()["torch"] = torch
         globals()["paddle"] = paddle
 
@@ -777,6 +787,16 @@ def main():
 
     if options.api_config:
         # Single config execution
+        # Load custom ops from paddlefleet to register _run_custom_op operators
+        try:
+            import paddlefleet_ops
+        except ImportError:
+            pass
+        try:
+            import FusedQuantOps
+        except ImportError:
+            pass
+
         from tester import (
             APIConfig,
             APITestAccuracy,
@@ -942,6 +962,8 @@ def main():
             print(f"Using {cpu_count()} CPU(s) for paddle in CPU mode.", flush=True)
 
         # set log_writer
+        if options.log_dir:
+            set_test_log_path(options.log_dir)
         set_engineV2()
 
         # initialize process pool
