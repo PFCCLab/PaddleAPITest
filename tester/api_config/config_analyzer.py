@@ -1730,6 +1730,12 @@ class TensorConfig:
             elif api_config.api_name in {
                 "paddle.put_along_axis",
                 "paddle.Tensor.put_along_axis",
+                "paddle.put_along_axis_",
+                "paddle.Tensor.put_along_axis_",
+                "paddle._C_ops.put_along_axis",
+                "paddle._C_ops.Tensor.put_along_axis",
+                "paddle._C_ops.put_along_axis_",
+                "paddle._C_ops.Tensor.put_along_axis_",
             }:
                 if self.check_arg(api_config, 1, "indices"):
                     x_tensor = self.get_arg(api_config, 0, "x")

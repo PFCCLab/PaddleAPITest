@@ -173,6 +173,7 @@ forward_only_apis:
   - moe_permute
   - moe_unpermute
   - fp8_quant_blockwise
+  - fused_act_dequant
   - __and__
   - __eq__
   - __floordiv__
