@@ -4975,24 +4975,6 @@ if isinstance(axis, tuple) and not keepdim:
         return ConvertResult.success(paddle_api, code)
 
 
-class RmsNormRule(BaseRule):
-    def apply(self, paddle_api: str) -> ConvertResult:
-        defaults_code, map_code = self.apply_generic()
-        core = [f"result = {self.torch_api}(**_kwargs)"]
-        post = """
-_ns = normalized_shape if isinstance(normalized_shape, (list, tuple)) else [normalized_shape]
-_norm_axes = tuple(range(input.ndim - len(_ns), input.ndim))
-_invvar = 1.0 / torch.sqrt(input.to(torch.float32).pow(2).mean(dim=_norm_axes) + eps)
-result = (result, _invvar)
-""".splitlines()
-        code = Code(
-            preprocess=defaults_code + map_code,
-            core=core,
-            postprocess=post,
-        )
-        return ConvertResult.success(paddle_api, code)
-
-
 class RnntLossRule(BaseRule):
     def apply(self, paddle_api: str) -> ConvertResult:
         core = """

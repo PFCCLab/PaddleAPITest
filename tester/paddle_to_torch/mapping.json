@@ -3355,7 +3355,6 @@
         }
     },
     "paddle.nn.functional.rms_norm": {
-        "Rule": "RmsNormRule",
         "torch_api": "torch.nn.functional.rms_norm",
         "set_defaults": {
             "eps": 1e-05

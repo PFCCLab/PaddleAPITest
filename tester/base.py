@@ -191,6 +191,22 @@ class APITestBase:
             self.torch_args_config = self.api_config.args
             return True
 
+        if api_name in ("paddle.Tensor.view", "paddle.view"):
+            # paddle.view supports variadic int args: view(-1, 4096) in addition to view([-1, 4096])
+            # inspect.bind incorrectly maps the second int to `name` param, so handle manually.
+            args = self.api_config.args
+            rest = args[1:]
+            if len(rest) > 1 and all(isinstance(a, int) for a in rest):
+                paddle_args_dict = {"x": args[0], "shape_or_dtype": list(rest)}
+            else:
+                paddle_sig = inspect.signature(self.paddle_api)
+                paddle_bound_args = paddle_sig.bind(*args, **self.api_config.kwargs)
+                paddle_args_dict = paddle_bound_args.arguments
+            self.paddle_merged_kwargs_config = paddle_args_dict
+            self.torch_kwargs_config.update(paddle_args_dict)
+            self.torch_kwargs_config.pop("name", None)
+            return True  # early return — skip generic bind below
+
         if api_name not in no_signature_api_mappings:
             # For APIs with signatures, use paddle_sig.bind to get arguments
             paddle_sig = inspect.signature(self.paddle_api)
