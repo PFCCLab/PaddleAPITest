@@ -591,6 +591,25 @@ distribution = torch.distributions.binomial.Binomial(total_count=total_count, pr
         return ConvertResult.success(paddle_api, code, is_torch_corresponding=False)
 
 
+class BmmRule(BaseRule):
+    def apply(self, paddle_api: str) -> ConvertResult:
+        defaults_code, map_code = self.apply_generic()
+        pre = """
+if x.dtype != y.dtype:
+    target = torch.promote_types(x.dtype, y.dtype)
+    x, y = x.to(target), y.to(target)
+"""
+        if paddle_api == "paddle.bmm":
+            core = "result = torch.bmm(**_kwargs)"
+        else:
+            core = "result = x.bmm(**_kwargs)"
+        code = Code(
+            preprocess=defaults_code + pre.splitlines() + map_code,
+            core=[core],
+        )
+        return ConvertResult.success(paddle_api, code)
+
+
 class BroadcastShapeRule(BaseRule):
     def apply(self, paddle_api: str) -> ConvertResult:
         pre = """

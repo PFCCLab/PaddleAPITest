@@ -370,6 +370,7 @@
         }
     },
     "paddle.bmm": {
+        "Rule": "BmmRule",
         "torch_api": "torch.bmm",
         "paddle_torch_args_map": {
             "x": "input",
@@ -377,6 +378,7 @@
         }
     },
     "paddle.Tensor.bmm": {
+        "Rule": "BmmRule",
         "torch_api": "torch.Tensor.bmm",
         "paddle_torch_args_map": {
             "y": "mat2"
