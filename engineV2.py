@@ -458,7 +458,7 @@ def run_test_case(api_config_str, options):
 
     write_to_log("checkpoint", api_config_str)
     print(
-        f"{datetime.now()} GPU {gpu_id} {os.getpid()} test begin: {api_config_str}",
+        f"{datetime.now()} GPU {gpu_id} {os.getpid()} [paddle {options.paddle_version}] test begin: {api_config_str}",
         flush=True,
     )
 
@@ -533,6 +533,14 @@ def main():
     start_time = time.time()
     print(f"Main process id: {os.getpid()}")
     set_start_method("spawn")
+
+    try:
+        import paddle as _paddle
+
+        paddle_version = _paddle.__version__
+        del _paddle
+    except Exception:
+        paddle_version = "unknown"
 
     parser = argparse.ArgumentParser(description="API Test")
     parser.add_argument("--api_config_file", default="")
@@ -709,7 +717,9 @@ def main():
     )
 
     options = parser.parse_args()
+    options.paddle_version = paddle_version
     print(f"Options: {vars(options)}", flush=True)
+    print(f"PaddlePaddle version: {paddle_version}", flush=True)
     if options.random_seed != parser.get_default("random_seed"):
         np.random.seed(options.random_seed)
 
@@ -814,7 +824,10 @@ def main():
         set_engineV2()
 
         options.api_config = options.api_config.strip()
-        print(f"{datetime.now()} test begin: {options.api_config}", flush=True)
+        print(
+            f"{datetime.now()} [paddle {paddle_version}] test begin: {options.api_config}",
+            flush=True,
+        )
         try:
             api_config = APIConfig(options.api_config)
         except Exception as err:
