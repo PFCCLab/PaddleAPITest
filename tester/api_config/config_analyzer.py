@@ -2727,10 +2727,8 @@ class TensorConfig:
                         self.numpy_tensor = routemap
                         # Update tokens_per_expert to match the generated routemap
                         tokens_count = [int(numpy.sum(routemap == e)) for e in range(num_experts)]
-                        if "tokens_per_expert" in api_config.kwargs:
-                            api_config.kwargs["tokens_per_expert"] = tokens_count
-                        elif len(api_config.args) > 5:
-                            api_config.args[5] = tokens_count
+                        tokens_per_expert = self.get_arg(api_config, 5, "tokens_per_expert")
+                        tokens_per_expert[:] = tokens_count
                     # expert_prob_topk (arg3): float32, shape [seqlen, topk], value in [0, 1]
                     elif self.check_arg(api_config, 3, "expert_prob_topk"):
                         routemap_config = self.get_arg(api_config, 2, "expert_routemap_topk")
@@ -2797,20 +2795,18 @@ class TensorConfig:
                         if isinstance(num_experts, TensorConfig):
                             num_experts = 32
                         seqlen = self.shape[0]
-                        rowmap = numpy.zeros(self.shape, dtype="int32")
-                        if (
-                            isinstance(routemap_config, TensorConfig)
-                            and routemap_config.numpy_tensor is not None
-                        ):
-                            # Build rowmap: for each expert, assign row indices in order
-                            expert_counters = numpy.zeros(num_experts, dtype="int32")
-                            for i in range(seqlen):
-                                for e in range(num_experts):
-                                    if numpy.any(routemap_config.numpy_tensor[i] == e):
-                                        rowmap[i, e] = expert_counters[e]
-                                        expert_counters[e] += 1
-                                    else:
-                                        rowmap[i, e] = -1
+                        rowmap = numpy.full(self.shape, -1, dtype="int32")
+                        if isinstance(routemap_config, TensorConfig):
+                            if routemap_config.numpy_tensor is None:
+                                routemap_config.get_numpy_tensor(api_config, index=2)
+                            if routemap_config.numpy_tensor is not None:
+                                # Build rowmap: for each expert, assign row indices in order
+                                expert_counters = numpy.zeros(num_experts, dtype="int32")
+                                for i in range(seqlen):
+                                    for e in range(num_experts):
+                                        if numpy.any(routemap_config.numpy_tensor[i] == e):
+                                            rowmap[i, e] = expert_counters[e]
+                                            expert_counters[e] += 1
                         self.numpy_tensor = rowmap
                     # token_prob_unzipped (arg3): float32, value in [0, 1]
                     elif self.check_arg(api_config, 3, "token_prob_unzipped"):

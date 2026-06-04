@@ -3957,6 +3957,127 @@ if mat2.dtype == torch.float16 and input.dtype != torch.float16:
         return ConvertResult.success(paddle_api, code)
 
 
+class MoePermuteRule(BaseRule):
+    def apply(self, paddle_api: str) -> ConvertResult:
+        core = """
+import math
+hidden_states = hidden_states.to(torch.bfloat16) if hidden_states.dtype not in (torch.bfloat16, torch.float32, torch.float16) else hidden_states
+do_gather = locals().get('do_gather', True)
+using_ue8m0_scale = locals().get('using_ue8m0_scale', False)
+return_expert_indices = locals().get('return_expert_indices', False)
+seqlen, token_dim = hidden_states.shape
+topk = expert_routemap_topk.shape[1]
+# padded slots per expert: identical to kernel's InferMeta formula
+padded_per_expert = [(t + padding_alignment - 1) // padding_alignment * padding_alignment for t in tokens_per_expert]
+total_rows = sum(padded_per_expert)
+offsets_e = [0] * num_experts
+for e in range(1, num_experts):
+    offsets_e[e] = offsets_e[e - 1] + padded_per_expert[e - 1]
+rowmap = torch.full((seqlen, num_experts), -1, dtype=torch.int32, device=hidden_states.device)
+gather_src = [-1] * total_rows
+gather_prob = [0.0] * total_rows
+gather_expert_id = [-1] * total_rows
+# build per-expert token lists in row-major order (capped at tokens_per_expert[e])
+routemap_np = expert_routemap_topk.detach().cpu().numpy()
+prob_np = expert_prob_topk.detach().cpu().numpy()
+expert_counters = [0] * num_experts
+for i in range(seqlen):
+    for k in range(topk):
+        e = int(routemap_np[i, k])
+        if e < 0:
+            continue
+        if rowmap[i, e] != -1:
+            continue  # token i already assigned to expert e (duplicate topk column)
+        slot = expert_counters[e]
+        if slot >= tokens_per_expert[e]:
+            continue  # excess beyond tpe
+        row = offsets_e[e] + slot
+        rowmap[i, e] = row
+        gather_src[row] = i
+        gather_prob[row] = float(prob_np[i, k])
+        gather_expert_id[row] = e
+        expert_counters[e] += 1
+# build prob_unzipped (1D, length=total_rows)
+token_prob_unzipped = torch.tensor(gather_prob, dtype=torch.float32, device=hidden_states.device)
+# scale_unzipped: empty if scale is None
+scale = locals().get('scale')
+if scale is None:
+    scale_unzipped = torch.empty(0, dtype=torch.float32, device=hidden_states.device)
+else:
+    scale_fp = scale.float() if using_ue8m0_scale else scale
+    gather_scale_idx = [r for r in gather_src if r >= 0]
+    scale_unzipped = torch.zeros(total_rows, scale_fp.shape[1], dtype=scale_fp.dtype, device=hidden_states.device)
+    for row in range(total_rows):
+        if gather_src[row] >= 0:
+            scale_unzipped[row] = scale_fp[gather_src[row]]
+# build hidden_states_unzipped
+if do_gather:
+    hs_f = hidden_states.float()
+    hidden_states_unzipped = torch.zeros(total_rows, token_dim, dtype=hidden_states.dtype, device=hidden_states.device)
+    for row in range(total_rows):
+        if gather_src[row] >= 0:
+            hidden_states_unzipped[row] = hidden_states[gather_src[row]]
+else:
+    hidden_states_unzipped = torch.empty(0, token_dim, dtype=hidden_states.dtype, device=hidden_states.device)
+if return_expert_indices:
+    expert_indices_out = torch.tensor(gather_expert_id, dtype=torch.int32, device=hidden_states.device)
+    result = (hidden_states_unzipped, rowmap, token_prob_unzipped, scale_unzipped, expert_indices_out)
+else:
+    result = (hidden_states_unzipped, rowmap, token_prob_unzipped, scale_unzipped)
+"""
+        code = Code(core=core.splitlines())
+        return ConvertResult.success(paddle_api, code, is_torch_corresponding=False)
+
+
+class MoeUnpermuteRule(BaseRule):
+    def apply(self, paddle_api: str) -> ConvertResult:
+        core = """
+using_weighted_combine = locals().get('using_weighted_combine', False)
+seqlen = expert_routemap_topk.shape[0]
+topk = expert_routemap_topk.shape[1]
+token_dim = hidden_states_unzipped.shape[1] if hidden_states_unzipped.dim() > 1 else 1
+out_dtype = hidden_states_unzipped.dtype
+acc_dtype = torch.float32
+zipped_tokens = torch.zeros(seqlen, token_dim, dtype=acc_dtype, device=hidden_states_unzipped.device)
+zipped_probs = torch.zeros(seqlen, topk, dtype=torch.float32, device=hidden_states_unzipped.device)
+rowmap_np = zipped_expertwise_rowmap.detach().cpu().numpy()
+routemap_np = expert_routemap_topk.detach().cpu().numpy()
+hs_f = hidden_states_unzipped.detach().to(acc_dtype)
+prob_np = token_prob_unzipped.detach().cpu().float().numpy().reshape(-1)
+# zipped_tokens: Paddle kernel accumulates all valid expert columns in rowmap.
+# If only one row is aggregated, kernel writes the raw bf16 value (no weighting).
+for i in range(seqlen):
+    aggreg_cnt = 0
+    raw_row = -1
+    for e in range(num_experts):
+        row = int(rowmap_np[i, e])
+        if row < 0:
+            continue
+        aggreg_cnt += 1
+        raw_row = row
+        if using_weighted_combine:
+            zipped_tokens[i] += float(prob_np[row]) * hs_f[row]
+        else:
+            zipped_tokens[i] += hs_f[row]
+    if aggreg_cnt == 1:
+        zipped_tokens[i] = hs_f[raw_row]
+# zipped_probs: Paddle kernel fills only topk entries according to expert_routemap_topk
+for i in range(seqlen):
+    for k in range(topk):
+        e = int(routemap_np[i, k])
+        if e < 0:
+            continue
+        row = int(rowmap_np[i, e])
+        if row < 0:
+            continue
+        zipped_probs[i, k] = float(prob_np[row])
+zipped_tokens = zipped_tokens.to(out_dtype)
+result = (zipped_tokens, zipped_probs)
+"""
+        code = Code(core=core.splitlines())
+        return ConvertResult.success(paddle_api, code, is_torch_corresponding=False)
+
+
 # n
 class NanmedianRule(BaseRule):
     def apply(self, paddle_api: str) -> ConvertResult:

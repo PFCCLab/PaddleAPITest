@@ -3210,6 +3210,12 @@
             "inplace": "inplace"
         }
     },
+    "paddle.nn.functional.moe_permute": {
+        "Rule": "MoePermuteRule"
+    },
+    "paddle.nn.functional.moe_unpermute": {
+        "Rule": "MoeUnpermuteRule"
+    },
     "paddle.nn.functional.mse_loss": {
         "torch_api": "torch.nn.functional.mse_loss",
         "paddle_torch_args_map": {
