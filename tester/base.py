@@ -279,6 +279,19 @@ class APITestBase:
             self.torch_kwargs_config.pop("name", None)
             return True
 
+        signature_cache = getattr(APITestBase.ana_torch_api_info, "_signature_cache", None)
+        if signature_cache is None:
+            signature_cache = {}
+            APITestBase.ana_torch_api_info._signature_cache = signature_cache
+
+        def get_signature(cache_key, api):
+            if cache_key not in signature_cache:
+                try:
+                    signature_cache[cache_key] = inspect.signature(api)
+                except ValueError:
+                    signature_cache[cache_key] = None
+            return signature_cache[cache_key]
+
         api_name = self.api_config.api_name
         if api_name in ("paddle.Tensor.__getitem__", "paddle.Tensor.__setitem__"):
             self.torch_args_config = self.api_config.args
@@ -292,9 +305,10 @@ class APITestBase:
             if len(rest) > 1 and all(isinstance(arg, int) for arg in rest):
                 return finish({"x": args[0], "shape_or_dtype": list(rest)})
 
-            paddle_bound_args = inspect.signature(self.paddle_api).bind(
-                *args, **self.api_config.kwargs
-            )
+            paddle_sig = get_signature(api_name, self.paddle_api)
+            if paddle_sig is None:
+                raise ValueError(f"API {api_name} has no inspectable signature")
+            paddle_bound_args = paddle_sig.bind(*args, **self.api_config.kwargs)
             return finish(paddle_bound_args.arguments)
 
         if api_name in no_signature_api_mappings:
@@ -305,9 +319,8 @@ class APITestBase:
             )
 
         # For APIs with signatures, use paddle_sig.bind to get arguments.
-        try:
-            paddle_sig = inspect.signature(self.paddle_api)
-        except ValueError:
+        paddle_sig = get_signature(api_name, self.paddle_api)
+        if paddle_sig is None:
             # _C_ops builtins have no inspectable signature. If the op has a public
             # API counterpart with the same params, use its signature.
             public_api_name = _COPS_API_PUBLIC_ALIAS.get(api_name)
@@ -315,7 +328,9 @@ class APITestBase:
                 # No alias and no manual mapping — forward-only, skip torch comparison.
                 return True
 
-            paddle_sig = inspect.signature(eval(public_api_name))
+            paddle_sig = get_signature(public_api_name, eval(public_api_name))
+            if paddle_sig is None:
+                raise ValueError(f"API {public_api_name} has no inspectable signature")
             positional_count = sum(
                 1
                 for param in paddle_sig.parameters.values()
