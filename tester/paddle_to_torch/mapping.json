@@ -4925,5 +4925,65 @@
     },
     "paddle.Tensor.zero_": {
         "torch_api": "torch.Tensor.zero_"
+    },
+    "paddle._C_ops.adamw_": {
+        "Rule": "CopsAdamwRule"
+    },
+    "paddle._C_ops.add_": {
+        "Rule": "CopsAdd_Rule"
+    },
+    "paddle._C_ops.bitwise_not": {
+        "Rule": "CopsBitwiseNotRule"
+    },
+    "paddle._C_ops.clip": {
+        "Rule": "CopsClipRule"
+    },
+    "paddle._C_ops.concat": {
+        "Rule": "CopsConcatRule"
+    },
+    "paddle._C_ops.flatten_": {
+        "Rule": "CopsFlatten_Rule"
+    },
+    "paddle._C_ops.full_": {
+        "Rule": "CopsFull_Rule"
+    },
+    "paddle._C_ops.fused_linear_param_grad_add": {
+        "Rule": "CopsFusedLinearParamGradAddRule"
+    },
+    "paddle._C_ops.gaussian": {
+        "Rule": "CopsGaussianRule"
+    },
+    "paddle._C_ops.matmul_grad": {
+        "Rule": "CopsMatmulGradRule"
+    },
+    "paddle._C_ops.multiply_": {
+        "Rule": "CopsMultiply_Rule"
+    },
+    "paddle._C_ops.numel": {
+        "Rule": "CopsNumelRule"
+    },
+    "paddle._C_ops.put_along_axis_": {
+        "Rule": "CopsPutAlongAxis_Rule"
+    },
+    "paddle._C_ops.reshape_": {
+        "Rule": "CopsReshape_Rule"
+    },
+    "paddle._C_ops.scale_": {
+        "Rule": "CopsScale_Rule"
+    },
+    "paddle._C_ops.squared_l2_norm": {
+        "Rule": "CopsSquaredL2NormRule"
+    },
+    "paddle._C_ops.subtract_": {
+        "Rule": "CopsSubtract_Rule"
+    },
+    "paddle._C_ops.transpose": {
+        "Rule": "CopsTransposeRule"
+    },
+    "paddle._C_ops.uniform": {
+        "Rule": "CopsUniformRule"
+    },
+    "paddle._C_ops._run_custom_op": {
+        "Rule": "CopsRunCustomOpRule"
     }
 }

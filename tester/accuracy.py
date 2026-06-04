@@ -579,6 +579,13 @@ def process_output(api_config, paddle_output, torch_output):
             one = torch.tensor(1.0, dtype=torch.float64)
             paddle_output.append([coef_vector, abs_coef])
             torch_output.append([coef_vector_approx, one])
+    elif api_config.api_name == "paddle._C_ops.fused_linear_param_grad_add":
+        # When has_bias=False, Paddle returns an uninitialized tensor for dbias (2nd output).
+        # Only compare the first output (dweight).
+        if isinstance(paddle_output, (list, tuple)) and len(paddle_output) > 1:
+            paddle_output = paddle_output[:1]
+        if isinstance(torch_output, (list, tuple)) and len(torch_output) > 1:
+            torch_output = torch_output[:1]
     return paddle_output, torch_output
 
 
