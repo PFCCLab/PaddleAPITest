@@ -3360,6 +3360,9 @@ class APIConfig:
 
     def get_dtype(self, config, offset):
         tocken, offset = self.get_tocken(config, offset)
+        if hasattr(paddle.framework, "convert_nptype_to_datatype_or_vartype"):
+            return paddle.framework.convert_nptype_to_datatype_or_vartype(tocken), offset
+        # fallback for older Paddle versions
         return paddle.pir.core.convert_np_dtype_to_dtype_(tocken), offset
 
     def get_place(self, config, offset):

@@ -1005,6 +1005,11 @@ if min is None and max is None:
 else:
     result = x.clamp(**_kwargs)
 """
+        elif paddle_api == "paddle._C_ops.clip":
+            # _C_ops.clip always has explicit min/max (no None guard needed)
+            core = """
+result = torch.clamp(**_kwargs)
+"""
         else:
             return ConvertResult.error(paddle_api, f"Unsupported clip api: {paddle_api}")
         code = Code(
@@ -2586,12 +2591,21 @@ index = locals().get('index')
 axis = locals().get('axis', 0)
 if isinstance(axis,torch.Tensor):
     axis = axis.item()
+axis = int(axis)
 if len(index.shape) == 0:
     result = torch.squeeze(torch.narrow(x, axis, index, 1),axis)
 elif index.numel()==0:
     s = list(x.shape)
     s[axis] = 0
     result = torch.zeros(s).to(dtype=x.dtype)
+elif index.dim() > 1:
+    # Multi-dim index: paddle.gather with multi-dim index is equivalent to torch.gather
+    # when index.ndim == x.ndim (values are gathered along `axis`, all other dims align).
+    if index.dim() != x.dim():
+        # Broadcast index to match x.ndim by expanding missing leading dims
+        for _ in range(x.dim() - index.dim()):
+            index = index.unsqueeze(0)
+    result = torch.gather(x, axis, index)
 else:
     ans = []
     for i in index:
@@ -6669,6 +6683,563 @@ else:
     result = logical_right_shift(tensor, other)
 """
         code = Code(preprocess=pre.splitlines(), core=core.splitlines())
+        return ConvertResult.success(paddle_api, code, is_torch_corresponding=False)
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# paddle._C_ops Rules
+# These rules implement torch-side equivalents for _C_ops builtins that have no
+# public API counterpart or whose signature differs materially from any public API.
+# Parameter names must match the keys in no_signature_api_mappings in base.py.
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+class CopsFlatten_Rule(BaseRule):
+    """paddle._C_ops.flatten_(x, start_axis, stop_axis) -> torch.flatten in-place.
+
+    Unlike torch.flatten, Paddle clamps stop_axis to x.ndim-1 when it exceeds
+    the tensor's actual number of dimensions.
+    """
+
+    def apply(self, paddle_api: str) -> ConvertResult:
+        core = """
+x           = locals().get("x")
+start_axis  = locals().get("start_axis", 0)
+stop_axis   = locals().get("stop_axis", -1)
+# Clamp stop_axis to valid range (Paddle accepts out-of-range, PyTorch does not)
+stop_axis = min(int(stop_axis), x.ndim - 1)
+result = torch.flatten(x, start_dim=start_axis, end_dim=stop_axis)
+x.set_(result)
+result = x
+"""
+        code = Code(core=core.splitlines())
+        return ConvertResult.success(paddle_api, code, is_torch_corresponding=False)
+
+
+class CopsSubtract_Rule(BaseRule):
+    """paddle._C_ops.subtract_(x, y) -> in-place x -= y.
+
+    Uses torch.no_grad() to avoid leaf-variable in-place errors.
+    is_torch_corresponding=False because Paddle's in-place op does not propagate
+    gradients, so the backward comparison is skipped.
+    """
+
+    def apply(self, paddle_api: str) -> ConvertResult:
+        core = """
+x = locals().get("x")
+y = locals().get("y")
+with torch.no_grad():
+    x.sub_(y)
+result = x
+"""
+        code = Code(core=core.splitlines())
+        return ConvertResult.success(paddle_api, code, is_torch_corresponding=False)
+
+
+class CopsAdd_Rule(BaseRule):
+    """paddle._C_ops.add_(x, y) -> in-place x += y.
+
+    Paddle's add_ modifies x in-place (possibly with mixed float32/bfloat16 types).
+    Using out-of-place torch.add produces a different result because the framework
+    hands Paddle's already-modified x to the comparator while Torch holds an
+    untouched tensor.  Replicate the in-place semantics with torch.no_grad().
+    """
+
+    def apply(self, paddle_api: str) -> ConvertResult:
+        core = """
+x = locals().get("x")
+y = locals().get("y")
+with torch.no_grad():
+    x.add_(y.to(x.dtype))
+result = x
+"""
+        code = Code(core=core.splitlines())
+        return ConvertResult.success(paddle_api, code, is_torch_corresponding=False)
+
+
+class CopsMultiply_Rule(BaseRule):
+    """paddle._C_ops.multiply_(x, y) -> in-place x *= y.
+
+    Same rationale as CopsAdd_Rule: the comparator sees Paddle's post-mutation x,
+    so we must mirror the in-place mutation on the Torch side.
+    """
+
+    def apply(self, paddle_api: str) -> ConvertResult:
+        core = """
+x = locals().get("x")
+y = locals().get("y")
+with torch.no_grad():
+    x.mul_(y.to(x.dtype))
+result = x
+"""
+        code = Code(core=core.splitlines())
+        return ConvertResult.success(paddle_api, code, is_torch_corresponding=False)
+
+
+class CopsBitwiseNotRule(BaseRule):
+    """paddle._C_ops.bitwise_not(x) → torch.bitwise_not(x)"""
+
+    def apply(self, paddle_api: str) -> ConvertResult:
+        core = """
+x = locals().get("x")
+result = torch.bitwise_not(x)
+"""
+        code = Code(core=core.splitlines())
+        return ConvertResult.success(paddle_api, code)
+
+
+class CopsClipRule(BaseRule):
+    """paddle._C_ops.clip(x, min, max) → torch.clamp(x, min, max)
+
+    _C_ops.clip always receives explicit min/max (no None guard needed).
+    """
+
+    def apply(self, paddle_api: str) -> ConvertResult:
+        core = """
+x   = locals().get("x")
+mn  = locals().get("min")
+mx  = locals().get("max")
+if isinstance(mn, torch.Tensor):
+    mn = mn.item()
+if isinstance(mx, torch.Tensor):
+    mx = mx.item()
+result = torch.clamp(x, min=mn, max=mx)
+"""
+        code = Code(core=core.splitlines())
+        return ConvertResult.success(paddle_api, code)
+
+
+class CopsConcatRule(BaseRule):
+    """paddle._C_ops.concat(x, axis) → torch.cat(x, dim=axis)"""
+
+    def apply(self, paddle_api: str) -> ConvertResult:
+        core = """
+x    = locals().get("x")
+axis = locals().get("axis", 0)
+result = torch.cat(x, dim=int(axis))
+"""
+        code = Code(core=core.splitlines())
+        return ConvertResult.success(paddle_api, code)
+
+
+class CopsNumelRule(BaseRule):
+    """paddle._C_ops.numel(x) → scalar int64 tensor of x.numel()"""
+
+    def apply(self, paddle_api: str) -> ConvertResult:
+        core = """
+x = locals().get("x")
+result = torch.tensor(x.numel(), dtype=torch.int64)
+"""
+        code = Code(core=core.splitlines())
+        return ConvertResult.success(paddle_api, code)
+
+
+class CopsPutAlongAxis_Rule(BaseRule):
+    """paddle._C_ops.put_along_axis_(arr, indices, values, axis, reduce, include_self, broadcast)
+    → torch.scatter / torch.scatter_reduce (in-place on arr)
+    """
+
+    def apply(self, paddle_api: str) -> ConvertResult:
+        core = """
+arr          = locals().get("arr")
+indices      = locals().get("indices")
+values       = locals().get("values")
+axis         = locals().get("axis")
+reduce       = locals().get("reduce", "assign")
+include_self = locals().get("include_self", True)
+broadcast    = locals().get("broadcast", True)
+if reduce == "add":
+    reduce = "sum"
+if reduce == "mul":
+    reduce = "prod"
+
+def _infer_broadcast_shape(inp, idx, dim):
+    shape = list(inp.shape)
+    shape[dim] = list(idx.shape)[dim]
+    for i in range(len(inp.shape)):
+        if inp.shape[i] < idx.shape[i]:
+            return None
+    return tuple(shape)
+
+index = indices
+src   = values
+dim   = axis
+if broadcast:
+    bshape = _infer_broadcast_shape(arr, indices, axis)
+    if bshape:
+        index = torch.broadcast_to(index, bshape)
+        src   = torch.broadcast_to(src, bshape)
+index = index.to(dtype=torch.int64)
+with torch.no_grad():
+    if reduce == "assign":
+        arr.scatter_(dim, index, src)
+    else:
+        arr.scatter_reduce_(dim, index, src, reduce, include_self=include_self)
+result = arr
+"""
+        code = Code(core=core.splitlines())
+        return ConvertResult.success(paddle_api, code, is_torch_corresponding=False)
+
+
+class CopsReshape_Rule(BaseRule):
+    """paddle._C_ops.reshape_(x, shape) → torch.reshape (in-place via set_)"""
+
+    def apply(self, paddle_api: str) -> ConvertResult:
+        core = """
+x     = locals().get("x")
+shape = locals().get("shape")
+if isinstance(shape, torch.Tensor):
+    shape = shape.tolist()
+elif isinstance(shape, tuple):
+    shape = list(shape)
+elements = x.numel()
+for i, s in enumerate(shape):
+    if s == 0 and elements != 0:
+        shape[i] = x.shape[i]
+        elements = elements // x.shape[i]
+    elif s != -1 and s != 0:
+        elements = elements // s
+for i, s in enumerate(shape):
+    if s == -1:
+        shape[i] = elements
+result = torch.reshape(x, shape)
+"""
+        code = Code(core=core.splitlines())
+        return ConvertResult.success(paddle_api, code)
+
+
+class CopsScale_Rule(BaseRule):
+    """paddle._C_ops.scale_(x, scale, bias, bias_after_scale) → in-place scale+bias on x
+
+    forward: if bias_after_scale: result = scale*x + bias  else: result = scale*(x+bias)
+    Wrapped in torch.no_grad() to avoid leaf-variable in-place errors.
+    backward not comparable (Paddle in-place op doesn't propagate correctly);
+    listed in forward_only_apis.
+    """
+
+    def apply(self, paddle_api: str) -> ConvertResult:
+        core = """
+x               = locals().get("x")
+scale           = float(locals().get("scale", 1.0))
+bias            = float(locals().get("bias", 0.0))
+bias_after_scale = locals().get("bias_after_scale", True)
+with torch.no_grad():
+    if bias_after_scale:
+        x.mul_(scale).add_(bias)
+    else:
+        x.add_(bias).mul_(scale)
+result = x
+"""
+        code = Code(core=core.splitlines())
+        return ConvertResult.success(paddle_api, code, is_torch_corresponding=False)
+
+
+class CopsTransposeRule(BaseRule):
+    """paddle._C_ops.transpose(x, perm) → torch.permute(x, dims)
+
+    Trailing dimensions not listed in perm are kept in order (same as Paddle).
+    """
+
+    def apply(self, paddle_api: str) -> ConvertResult:
+        core = """
+x    = locals().get("x")
+perm = locals().get("perm")
+dims = tuple(perm) + tuple(range(len(perm), x.ndim))
+result = torch.permute(x, dims)
+"""
+        code = Code(core=core.splitlines())
+        return ConvertResult.success(paddle_api, code)
+
+
+class CopsAdamwRule(BaseRule):
+    """paddle._C_ops.adamw_ → torch.optim.AdamW single-step simulation.
+
+    Performs one AdamW update in-place on param using moment1/moment2/beta1_pow/
+    beta2_pow tensors, mirroring the Paddle kernel semantics.
+    multi_precision=True means param is fp16/bf16 while moments are fp32.
+    """
+
+    def apply(self, paddle_api: str) -> ConvertResult:
+        core = """
+param       = locals().get("param")
+grad        = locals().get("grad")
+lr_t        = locals().get("learning_rate")
+moment1     = locals().get("moment1")
+moment2     = locals().get("moment2")
+beta1_pow_t = locals().get("beta1_pow")
+beta2_pow_t = locals().get("beta2_pow")
+master_param = locals().get("master_param")
+beta1       = locals().get("beta1", 0.9)
+beta2       = locals().get("beta2", 0.999)
+epsilon     = locals().get("epsilon", 1e-8)
+lr_ratio    = locals().get("lr_ratio", 1.0)
+coeff       = locals().get("coeff", 0.0)
+with_decay  = locals().get("with_decay", True)
+multi_precision = locals().get("multi_precision", False)
+
+lr = lr_t.item() if torch.is_tensor(lr_t) else float(lr_t)
+lr = lr * lr_ratio
+b1 = beta1.item() if torch.is_tensor(beta1) else float(beta1)
+b2 = beta2.item() if torch.is_tensor(beta2) else float(beta2)
+eps = epsilon.item() if torch.is_tensor(epsilon) else float(epsilon)
+wd = coeff.item() if torch.is_tensor(coeff) else float(coeff)
+
+# Use master param (fp32) when multi_precision is enabled
+work_param = master_param if (multi_precision and master_param is not None) else param
+grad_fp32 = grad.float() if grad is not None else None
+
+if grad_fp32 is None:
+    result = param
+else:
+    with torch.no_grad():
+        # Weight decay on work_param
+        if with_decay and wd > 0:
+            work_param.add_(work_param, alpha=-(lr * wd))
+
+        b1_pow = beta1_pow_t.item() if torch.is_tensor(beta1_pow_t) else float(beta1_pow_t)
+        b2_pow = beta2_pow_t.item() if torch.is_tensor(beta2_pow_t) else float(beta2_pow_t)
+
+        moment1.mul_(b1).add_(grad_fp32, alpha=1.0 - b1)
+        moment2.mul_(b2).addcmul_(grad_fp32, grad_fp32, value=1.0 - b2)
+
+        bias_correction1 = 1.0 - b1_pow
+        bias_correction2 = 1.0 - b2_pow
+
+        denom = moment2.sqrt() / (bias_correction2 ** 0.5) + eps
+        update = moment1 / denom
+        work_param.add_(update, alpha=-(lr / bias_correction1))
+
+        if multi_precision and master_param is not None:
+            param.copy_(work_param.to(param.dtype))
+    result = param
+"""
+        code = Code(core=core.splitlines())
+        return ConvertResult.success(paddle_api, code, is_torch_corresponding=False)
+
+
+class CopsFull_Rule(BaseRule):
+    """paddle._C_ops.full_(x, shape, value, dtype) → x.fill_(value) in-place"""
+
+    def apply(self, paddle_api: str) -> ConvertResult:
+        core = """
+x     = locals().get("x")
+value = locals().get("value", 0.0)
+with torch.no_grad():
+    x.fill_(float(value))
+result = x
+"""
+        code = Code(core=core.splitlines())
+        return ConvertResult.success(paddle_api, code, is_torch_corresponding=False)
+
+
+class CopsFusedLinearParamGradAddRule(BaseRule):
+    """paddle._C_ops.fused_linear_param_grad_add(x, dout, dweight, dbias, multi_prec, has_bias)
+
+    Computes dweight += x.T @ dout  (and optionally dbias += dout.sum(0)).
+    Mirrors the fused_linear_param_grad_add kernel.
+    """
+
+    def apply(self, paddle_api: str) -> ConvertResult:
+        core = """
+x               = locals().get("x")
+dout            = locals().get("dout")
+dweight         = locals().get("dweight")
+dbias           = locals().get("dbias")
+multi_precision = locals().get("multi_precision", False)
+has_bias        = locals().get("has_bias", False)
+
+# Compute dweight gradient: dweight = x.T @ dout
+x_f = x.float() if multi_precision else x
+dout_f = dout.float() if multi_precision else dout
+new_dweight = x_f.t().mm(dout_f)
+
+if dweight is not None:
+    new_dweight = new_dweight + dweight.float() if multi_precision else new_dweight + dweight
+    dweight_out = new_dweight.to(dweight.dtype).detach()
+else:
+    dweight_out = new_dweight.detach()
+
+if has_bias and dbias is not None:
+    new_dbias = dout_f.sum(0)
+    dbias_out = ((new_dbias + dbias.float()).to(dbias.dtype) if multi_precision else new_dbias + dbias).detach()
+elif has_bias:
+    dbias_out = dout_f.sum(0).detach()
+else:
+    # Paddle returns a zero tensor for dbias even when has_bias=False
+    dbias_out = torch.zeros(dout_f.shape[-1], dtype=dout_f.dtype, device=dout_f.device)
+
+result = [dweight_out, dbias_out]
+"""
+        code = Code(core=core.splitlines())
+        return ConvertResult.success(paddle_api, code, is_torch_corresponding=False)
+
+
+class CopsGaussianRule(BaseRule):
+    """paddle._C_ops.gaussian(shape, mean, std, seed, dtype) → torch.normal"""
+
+    def apply(self, paddle_api: str) -> ConvertResult:
+        core = """
+shape = locals().get("shape")
+mean  = locals().get("mean", 0.0)
+std   = locals().get("std", 1.0)
+dtype_map = {
+    "float32": torch.float32, "float64": torch.float64,
+    "float16": torch.float16, "bfloat16": torch.bfloat16,
+}
+dtype_val = locals().get("dtype")
+torch_dtype = dtype_map.get(str(dtype_val).split(".")[-1], torch.float32)
+result = torch.normal(mean=float(mean), std=float(std), size=list(shape)).to(torch_dtype)
+"""
+        code = Code(core=core.splitlines())
+        return ConvertResult.success(paddle_api, code, is_torch_corresponding=False)
+
+
+class CopsMatmulGradRule(BaseRule):
+    """paddle._C_ops.matmul_grad(x, y, dout, transpose_x, transpose_y) → (dx, dy)"""
+
+    def apply(self, paddle_api: str) -> ConvertResult:
+        core = """
+x           = locals().get("x")
+y           = locals().get("y")
+dout        = locals().get("dout")
+transpose_x = locals().get("transpose_x", False)
+transpose_y = locals().get("transpose_y", False)
+
+def _t(t): return t.mT
+
+if not transpose_x and not transpose_y:
+    dx = torch.matmul(dout, _t(y))
+    dy = torch.matmul(_t(x), dout)
+elif transpose_x and not transpose_y:
+    dx = torch.matmul(y, _t(dout))
+    dy = torch.matmul(_t(x), dout)
+elif not transpose_x and transpose_y:
+    dx = torch.matmul(dout, y)
+    dy = torch.matmul(_t(dout), x)
+else:
+    dx = torch.matmul(_t(y), _t(dout))
+    dy = torch.matmul(_t(dout), _t(x))
+
+result = [dx, dy]
+"""
+        code = Code(core=core.splitlines())
+        return ConvertResult.success(paddle_api, code, is_torch_corresponding=False)
+
+
+class CopsSquaredL2NormRule(BaseRule):
+    """paddle._C_ops.squared_l2_norm(x) → (x * x).sum() with shape [1] to match Paddle output"""
+
+    def apply(self, paddle_api: str) -> ConvertResult:
+        core = """
+x = locals().get("x")
+result = (x.float() * x.float()).sum().reshape([1])
+"""
+        code = Code(core=core.splitlines())
+        return ConvertResult.success(paddle_api, code, is_torch_corresponding=False)
+
+
+class CopsUniformRule(BaseRule):
+    """paddle._C_ops.uniform(shape, dtype, min, max, seed) → torch.empty(...).uniform_"""
+
+    def apply(self, paddle_api: str) -> ConvertResult:
+        core = """
+shape = locals().get("shape")
+dtype_val = locals().get("dtype")
+mn    = locals().get("min", -1.0)
+mx    = locals().get("max", 1.0)
+dtype_map = {
+    "float32": torch.float32, "float64": torch.float64,
+    "float16": torch.float16, "bfloat16": torch.bfloat16,
+}
+torch_dtype = dtype_map.get(str(dtype_val).split(".")[-1], torch.float32)
+result = torch.empty(list(shape), dtype=torch_dtype).uniform_(float(mn), float(mx))
+"""
+        code = Code(core=core.splitlines())
+        return ConvertResult.success(paddle_api, code, is_torch_corresponding=False)
+
+
+class CopsRunCustomOpRule(BaseRule):
+    """paddle._C_ops._run_custom_op(op_name, *args) dispatcher.
+
+    Dispatches to per-op torch implementations based on op_name (first arg).
+    Currently supported:
+      - "fused_swiglu_bwd": dy, x → compute grad of swiglu
+      - "fused_swiglu_scale_clamp": x, scale, max_val → scaled+clamped swiglu fwd
+      - "fused_swiglu_scale_clamp_bwd": x, scale, dy, max_val → scaled+clamped swiglu bwd
+    Unsupported op_names will return an error result at runtime.
+    """
+
+    def apply(self, paddle_api: str) -> ConvertResult:
+        core = """
+op_name = locals().get("op_name")
+arg1    = locals().get("arg1")
+arg2    = locals().get("arg2")
+arg3    = locals().get("arg3")
+arg4    = locals().get("arg4")
+
+if op_name == "fused_swiglu_bwd":
+    # _run_custom_op("fused_swiglu_bwd", dy, x)
+    # fwd: out = silu(x1) * x2  where x is split into (x1, x2) along last dim
+    # bwd: given dy, need dx = [d_x1, d_x2] concatenated
+    dy = arg1   # shape [..., D]
+    x  = arg2   # shape [..., 2D]
+    x1, x2 = torch.chunk(x, 2, dim=-1)
+    sig_x1  = torch.sigmoid(x1)
+    silu_x1 = x1 * sig_x1
+    d_x2  = dy * silu_x1
+    d_silu = dy * x2
+    d_x1  = d_silu * sig_x1 * (1.0 + x1 * (1.0 - sig_x1))
+    result = [torch.cat([d_x1, d_x2], dim=-1)]
+
+elif op_name == "fused_swiglu_scale_clamp":
+    # _run_custom_op("fused_swiglu_scale_clamp", x, scale, max_val)
+    # fwd: split x -> (x1, x2); out = clamp(silu(x1) * x2 * scale, -max_val, max_val)
+    # Paddle custom op returns a list; we return [out] to match.
+    x       = arg1   # shape [..., 2D]
+    scale   = arg2   # scalar or tensor [..., 1] or [...,]
+    max_val = arg3   # scalar
+    x1, x2 = torch.chunk(x, 2, dim=-1)
+    silu_x1 = torch.nn.functional.silu(x1.float())
+    if torch.is_tensor(scale):
+        scale = scale.view(*scale.shape[:-1], 1) if scale.dim() > 1 else scale.unsqueeze(-1)
+    out = silu_x1 * x2.float() * scale
+    out = torch.clamp(out, min=-float(max_val), max=float(max_val))
+    result = [out.to(x.dtype)]
+
+elif op_name == "fused_swiglu_scale_clamp_bwd":
+    # _run_custom_op("fused_swiglu_scale_clamp_bwd", x, scale, dy, max_val)
+    # arg1=x (original fwd input [..., 2D]), arg2=scale, arg3=dy (grad of output [..., D]),
+    # arg4=max_val.  Returns [dx, d_scale] to match Paddle output.
+    x       = arg1   # shape [..., 2D] (original forward input)
+    scale   = arg2   # scalar or tensor [..., 1]
+    dy      = arg3   # shape [..., D] (gradient of forward output)
+    max_val = arg4   # scalar
+    x1, x2 = torch.chunk(x.float(), 2, dim=-1)
+    if torch.is_tensor(scale):
+        scale_v = scale.view(*scale.shape[:-1], 1) if scale.dim() > 1 else scale.unsqueeze(-1)
+    else:
+        scale_v = float(scale)
+    sig_x1  = torch.sigmoid(x1)
+    silu_x1 = x1 * sig_x1
+    # clamp mask: where |silu*x2*scale| was clamped in fwd, grad is 0
+    pre_clamp = silu_x1 * x2 * scale_v
+    clamp_mask = (pre_clamp.abs() < float(max_val)).float()
+    dy_f = dy.float()
+    dy_eff = dy_f * clamp_mask
+    d_x2   = dy_eff * silu_x1 * scale_v
+    d_silu = dy_eff * x2 * scale_v
+    d_x1   = d_silu * sig_x1 * (1.0 + x1 * (1.0 - sig_x1))
+    dx = torch.cat([d_x1, d_x2], dim=-1).to(x.dtype)
+    # d_scale: gradient w.r.t. scale; Paddle returns [dx, d_scale] (length 2)
+    d_scale = (dy_eff * silu_x1 * x2).sum(dim=-1, keepdim=True)
+    if torch.is_tensor(scale):
+        d_scale = d_scale.to(scale.dtype)
+    result = [dx, d_scale]
+
+else:
+    raise NotImplementedError(f"CopsRunCustomOpRule: unsupported op_name={op_name!r}")
+"""
+        code = Code(core=core.splitlines())
         return ConvertResult.success(paddle_api, code, is_torch_corresponding=False)
 
 
