@@ -82,7 +82,7 @@ paddle.concat(tuple(Tensor([31376, 768],"float32"),Tensor([1, 768],"float32"),),
        * to_0_size*.py 是篡改为 0-size 配置的工具
        * to_big_size\*.py 是篡改为大形状张量的配置的工具。 
 
-   * tester/paddle2torch/ 是转换能力的核心代码。介绍详见 [4. paddle2torch转换](#4-paddle2torch转换)
+   * tester/paddle_to_torch/ 是转换能力的核心代码。介绍详见 [4. paddle2torch转换](#4-paddle2torch转换)
 
 3. tools 文件夹中存放了一些实用的工具，例如 move_config.py 可以用来批量的移动配置，error_stat.py 可以一键解析错误日志等。
 

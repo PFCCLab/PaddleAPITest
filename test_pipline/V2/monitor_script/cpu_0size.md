@@ -34,7 +34,7 @@
 
 
 ### 4. 执行测试
-``` bash test_pipline/V2/monitor_script/run_gpu_0size_full.sh ```
+``` bash test_pipline/V2/monitor_script/run_cpu_0size_full.sh ```
 
 
 最终的所有测试结果会保存在测试脚本中```LOG_DIR```指定的目录下，比如 `tester/api_config/test_log_cpu_0size_full` 目录，包括：
