@@ -194,6 +194,18 @@ else
     PYTHON_PID=$!
     echo "$PYTHON_PID" > "$PID_FILE"
 
+    # 任务自然结束时清理 PID 文件；若已启动新任务，则不误删新 PID。
+    (
+        while kill -0 "$PYTHON_PID" 2>/dev/null; do
+            sleep 5
+        done
+
+        recorded_pid="$(cat "$PID_FILE" 2>/dev/null || true)"
+        if [[ "$recorded_pid" == "$PYTHON_PID" ]]; then
+            rm -f "$PID_FILE"
+        fi
+    ) >/dev/null 2>&1 &
+
     sleep 1
     if ! kill -0 "$PYTHON_PID" 2>/dev/null; then
         echo -e "\033[31m错误: $ENGINE 启动失败\033[0m"

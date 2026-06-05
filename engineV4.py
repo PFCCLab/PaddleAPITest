@@ -1278,6 +1278,8 @@ def main():
                 # Task completed (done/error/timeout/crashed)
                 slot_idx = msg[1]
                 config = msg[2]
+                if msg_type in ("done", "error"):
+                    pool.mark_idle(slot_idx)
                 active_tasks -= 1
                 tested_case += 1
 
@@ -1331,7 +1333,6 @@ def main():
                     pending_dispatch.append(next_config)
                 else:
                     # Worker is alive and ready for next task
-                    pool.mark_idle(slot_idx)
                     pool.dispatch(slot_idx, next_config)
                     active_tasks += 1
 
