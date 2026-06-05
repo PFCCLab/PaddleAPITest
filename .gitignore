@@ -5,7 +5,7 @@ __pycache__
 log.log
 run.sh
 run_*.sh
-.run.pid
+.run*.pid
 tester/api_config/**/test_log*
 tester/api_config/api_config*
 tester/api_config/output

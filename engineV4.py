@@ -76,11 +76,6 @@ def cleanup(pool):
             pool.shutdown(force=True)
         except Exception as e:
             print(f"{datetime.now()} Error shutting down pool: {e}", flush=True)
-    # Aggregate .tmp logs before exit so results are not lost
-    try:
-        aggregate_logs(end=True)
-    except Exception as e:
-        print(f"{datetime.now()} Error aggregating logs: {e}", flush=True)
     print(f"{datetime.now()} Cleanup completed", flush=True)
 
 

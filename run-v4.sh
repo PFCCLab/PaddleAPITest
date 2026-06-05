@@ -61,7 +61,9 @@ TEST_MODE_ARGS=(
 # ============================================================
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PID_FILE="${SCRIPT_DIR}/.run.pid"
+SCRIPT_NAME="${BASH_SOURCE[0]##*/}"
+SCRIPT_NAME="${SCRIPT_NAME%.sh}"
+PID_FILE="${SCRIPT_DIR}/.${SCRIPT_NAME}.pid"
 
 # ── 运维命令处理 ──
 case "${1:-}" in

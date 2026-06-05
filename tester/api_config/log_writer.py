@@ -295,7 +295,7 @@ def aggregate_logs(end=False):
                     file_path.write_bytes(b"")
 
     if end:
-        if all_success and not os.listdir(TMP_LOG_PATH):
+        if all_success and TMP_LOG_PATH.exists() and not os.listdir(TMP_LOG_PATH):
             shutil.rmtree(TMP_LOG_PATH)
 
         if tol_file.exists():
