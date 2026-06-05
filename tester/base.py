@@ -9,7 +9,7 @@ import torch
 import yaml
 
 from .api_config import USE_CACHED_NUMPY, TensorConfig, cached_numpy
-from .api_config.log_writer import log_accuracy_tolerance
+from .api_config.log_writer import log_accuracy_tolerance, write_to_log
 
 with open("tester/base_config.yaml", encoding="utf-8") as f:
     config = yaml.safe_load(f)
@@ -40,8 +40,32 @@ CUDA_OOM = frozenset(
     [
         "CUDA out of memory",
         "Out of memory error",
+        "ResourceExhaustedError",
+        "out of memory",
+        "OutOfMemoryError",
     ]
 )
+
+
+def classify_runtime_error(error_msg):
+    error_msg_lower = error_msg.lower()
+    oom_markers = tuple(marker.lower() for marker in CUDA_OOM) + (
+        "cannot allocate memory",
+        "std::bad_alloc",
+        "bad allocation",
+        "memoryerror",
+        "cublas_status_alloc_failed",
+    )
+    if any(marker in error_msg_lower for marker in oom_markers):
+        return "oom", True
+    cuda_markers = tuple(marker.lower() for marker in CUDA_ERROR) + (
+        "illegal memory access",
+        "invalid configuration argument",
+        "invalid resource handle",
+    )
+    if any(marker in error_msg_lower for marker in cuda_markers):
+        return "paddle_cuda", True
+    return None, False
 
 
 def get_arg(api_config, arg_pos, arg_name, default=None):
@@ -67,6 +91,25 @@ class APITestBase:
         self.outputs_grad_numpy = []
         torch.set_num_threads(8)
         torch.set_printoptions(threshold=100, linewidth=120)
+
+    def report_runtime_error(self, err, default_log_type, phase="", allow_ignore_paddle=False):
+        err_msg = str(err)
+        log_type, fatal = classify_runtime_error(err_msg)
+        if log_type is None and allow_ignore_paddle and self.should_ignore_paddle_error(err_msg):
+            print(f"[pass] {self.api_config.config}", flush=True)
+            write_to_log("pass", self.api_config.config)
+            return "pass", False
+        if log_type is None:
+            log_type = default_log_type
+        elif default_log_type == "torch_error" and log_type != "oom":
+            log_type = "torch_error"
+        phase_text = f" phase={phase}" if phase else ""
+        print(
+            f"[{log_type}]{phase_text} {self.api_config.config}\n{err_msg}",
+            flush=True,
+        )
+        write_to_log(log_type, self.api_config.config)
+        return log_type, fatal
 
     def need_skip(self, paddle_only=False):
         # not support

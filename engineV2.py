@@ -64,6 +64,11 @@ DEVICE_COUNT = None  # total number of devices
 _MEM_SNAPSHOT = None  # dict: gpu_id -> (total_gb, used_gb)
 _MEM_SNAPSHOT_TS = 0.0
 _MEM_SNAPSHOT_TTL = 2.0  # seconds — snapshot cache ttl
+FATAL_CUDA_EXIT_CODE = 99
+FATAL_OOM_EXIT_CODE = 98
+FATAL_TORCH_EXIT_CODE = 97
+MEMORY_WAIT_SECONDS = 10
+MEMORY_WAIT_LOG_INTERVAL = 60
 
 
 def cleanup(pool):
@@ -346,7 +351,7 @@ def check_gpu_memory(gpu_ids, num_workers_per_gpu, required_memory):  # required
                     else min(max_workers, num_workers_per_gpu)
                 )
         except pynvml.NVMLError as e:
-            print(f"[WARNING] Failed to check GPU {gpu_id}: {e!s}", flush=True)
+            print(f"[warn] Failed to check GPU {gpu_id}: {e!s}", flush=True)
             continue
 
     return available_gpus, max_workers_per_gpu
@@ -456,12 +461,12 @@ def run_test_case(api_config_str, options):
     cuda_visible = os.environ.get("CUDA_VISIBLE_DEVICES", "0")
     gpu_id = int(cuda_visible.split(",")[0])
 
-    write_to_log("checkpoint", api_config_str)
     print(
         f"{datetime.now()} GPU {gpu_id} {os.getpid()} [paddle {options.paddle_version}] test begin: {api_config_str}",
         flush=True,
     )
 
+    last_memory_log_time = 0
     while True:
         total_memory, used_memory = get_memory_info(gpu_id)
         free_memory = total_memory - used_memory
@@ -469,18 +474,30 @@ def run_test_case(api_config_str, options):
         if free_memory >= options.required_memory:
             break
 
+        now = time.time()
+        if now - last_memory_log_time >= MEMORY_WAIT_LOG_INTERVAL:
+            print(
+                f"{datetime.now()} device {gpu_id} Free: {free_memory:.1f} GB, "
+                f"Required: {options.required_memory:.1f} GB. ",
+                "Waiting for available memory...",
+                flush=True,
+            )
+            last_memory_log_time = now
+        time.sleep(MEMORY_WAIT_SECONDS)
+
+    if options.show_runtime_status:
+        total_memory, used_memory_before = get_memory_info(gpu_id)
         print(
-            f"{datetime.now()} device {gpu_id} Free: {free_memory:.1f} GB, "
-            f"Required: {options.required_memory:.1f} GB. ",
-            "Waiting for available memory...",
+            f"{datetime.now()} GPU {gpu_id} memory before: used={used_memory_before:.1f} GB, "
+            f"free={total_memory - used_memory_before:.1f} GB",
             flush=True,
         )
-        time.sleep(60)
 
     try:
         api_config = APIConfig(api_config_str)
     except Exception as err:
-        print(f"[config parse error] {api_config_str} {err!s}", flush=True)
+        print(f"[config_parse] {api_config_str} {err!s}", flush=True)
+        write_terminal_log("config_parse", api_config_str)
         return
 
     option_to_class = {
@@ -503,16 +520,54 @@ def run_test_case(api_config_str, options):
     case = test_class(api_config, **kwargs)
     try:
         case.test()
+        if has_terminal_log(api_config_str):
+            write_checkpoint(api_config_str)
     except Exception as err:
-        # if fatal error happens, subprocess need to exit with non-zero status
-        if "CUDA error" in str(err) or "memory corruption" in str(err):
-            os._exit(99)
-        if "CUDA out of memory" in str(err) or "Out of memory error" in str(err):
-            os._exit(98)
-        if "AssertionError" in str(err) or "Tensor-likes are not equal" in str(err):
-            os._exit(1)
+        err_msg = str(err).lower()
+        terminal_log_type = get_terminal_log_type(api_config_str)
+        oom_markers = (
+            "cuda out of memory",
+            "out of memory error",
+            "resourceexhaustederror",
+            "out of memory",
+            "outofmemoryerror",
+            "cannot allocate memory",
+            "std::bad_alloc",
+            "bad allocation",
+            "memoryerror",
+            "cublas_status_alloc_failed",
+        )
+        cuda_markers = (
+            "cuda error",
+            "memory corruption",
+            "illegal memory access",
+            "invalid configuration argument",
+            "invalid resource handle",
+        )
+        exit_code = None
+        if any(marker in err_msg for marker in oom_markers):
+            exit_code = FATAL_OOM_EXIT_CODE
+        elif terminal_log_type == "torch_error" and any(
+            marker in err_msg for marker in cuda_markers
+        ):
+            exit_code = FATAL_TORCH_EXIT_CODE
+        elif any(marker in err_msg for marker in cuda_markers):
+            exit_code = FATAL_CUDA_EXIT_CODE
+        if exit_code is not None:
+            if has_terminal_log(api_config_str):
+                write_checkpoint(api_config_str)
+            try:
+                close_process_files()
+            finally:
+                try:
+                    restore_stdio()
+                finally:
+                    os._exit(exit_code)
+        if has_terminal_log(api_config_str):
+            write_checkpoint(api_config_str)
+            return
         # if not fatal error, subprocess will be alive and report error
-        print(f"[test error] {api_config_str}: {err}", flush=True)
+        print(f"[error] {api_config_str}: {err}", flush=True)
         raise
     finally:
         del test_class, api_config, case
@@ -527,6 +582,19 @@ def run_test_case(api_config_str, options):
         ):
             torch.cuda.empty_cache()
             paddle.device.cuda.empty_cache()
+        if options.show_runtime_status:
+            try:
+                total_memory, used_memory_after = get_memory_info(gpu_id)
+                print(
+                    f"{datetime.now()} GPU {gpu_id} memory after cleanup: used={used_memory_after:.1f} GB, "
+                    f"free={total_memory - used_memory_after:.1f} GB",
+                    flush=True,
+                )
+            except Exception as err:
+                print(
+                    f"{datetime.now()} Failed to read GPU {gpu_id} memory after cleanup: {err}",
+                    flush=True,
+                )
 
 
 def main():
@@ -831,7 +899,7 @@ def main():
         try:
             api_config = APIConfig(options.api_config)
         except Exception as err:
-            print(f"[config parse error] {options.api_config} {err!s}", flush=True)
+            print(f"[config_parse] {options.api_config} {err!s}", flush=True)
             return
 
         option_to_class = {
@@ -889,7 +957,7 @@ def main():
                 or "Error Message Summary" in str(err)
             ):
                 exit(1)
-            print(f"[test error] {options.api_config}: {err}", flush=True)
+            print(f"[error] {options.api_config}: {err}", flush=True)
         finally:
             case.clear_tensor()
             del case
@@ -921,6 +989,11 @@ def main():
                 print(f"No config file found: {options.api_config_file}", flush=True)
                 return
             config_files = [options.api_config_file]
+
+        # set log_writer before resume/checkpoint handling
+        if options.log_dir:
+            set_test_log_path(options.log_dir)
+        set_engineV2()
 
         # when engineV2 was interrupted, resume from .tmp dir
         aggregate_logs()
@@ -973,11 +1046,6 @@ def main():
 
         if options.test_cpu:
             print(f"Using {cpu_count()} CPU(s) for paddle in CPU mode.", flush=True)
-
-        # set log_writer
-        if options.log_dir:
-            set_test_log_path(options.log_dir)
-        set_engineV2()
 
         # initialize process pool
         manager = Manager()
@@ -1033,31 +1101,34 @@ def main():
                         if options.show_runtime_status or tested_case % 10000 == 0:
                             print(f"[info] Test case succeeded for {config}", flush=True)
                     except TimeoutError as err:
-                        write_to_log("timeout", config)
+                        write_terminal_log("timeout", config)
                         print(
-                            f"[error] Test case timed out for {config}: {err}",
+                            f"[timeout] {config}: {err}",
                             flush=True,
                         )
                     except ProcessExpired as err:
-                        # we have catched 99 and 98 error in test class, so we only print info here
-                        # when any cuda error and oom happen, subprocess will crash too,
-                        # these case has been classified to oom and cuda_error and won't be classified to crash
-                        if err.exitcode == 99:
-                            # write_to_log("cuda_error", config)
+                        if err.exitcode == FATAL_CUDA_EXIT_CODE:
+                            write_terminal_log("paddle_cuda", config)
                             print(
-                                f"[error] CUDA error for {config}: {err}",
+                                f"[paddle_cuda] {config}: {err}",
                                 flush=True,
                             )
-                        elif err.exitcode == 98:
-                            # write_to_log("oom", config)
+                        elif err.exitcode == FATAL_OOM_EXIT_CODE:
+                            write_terminal_log("oom", config)
                             print(
-                                f"[error] CUDA out of memory for {config}",
+                                f"[oom] {config}: {err}",
+                                flush=True,
+                            )
+                        elif err.exitcode == FATAL_TORCH_EXIT_CODE:
+                            write_terminal_log("torch_error", config)
+                            print(
+                                f"[torch_error] {config}: {err}",
                                 flush=True,
                             )
                         else:
-                            write_to_log("crash", config)
+                            write_terminal_log("paddle_crash", config)
                             print(
-                                f"[fatal] Worker crashed for {config}: {err}",
+                                f"[paddle_crash] {config}: {err}",
                                 flush=True,
                             )
                     except Exception as err:
@@ -1065,7 +1136,6 @@ def main():
                             f"[warn] Test case failed for {config}: {err}",
                             flush=True,
                         )
-                aggregate_logs()
             pool.close()
             pool.join()
         except Exception as e:
