@@ -2891,45 +2891,35 @@ class TensorConfig:
             return paddle.transpose(self.paddle_tensor, self.shuffle_dims)
         return self.paddle_tensor
 
-    def _create_strided_paddle_tensor(self, api_config):
-        """Create a non-contiguous paddle tensor with specified strides by allocating
-        a larger contiguous buffer and slicing to achieve the desired strides."""
-        shape = self.shape
-        strides = self.strides
-        # Calculate the storage size needed: sum((shape[i]-1) * strides[i]) + 1 for all dims
+    def _strided_storage_size(self):
         storage_size = 1
-        for i in range(len(shape)):
-            if shape[i] > 0:
-                storage_size += (shape[i] - 1) * strides[i]
+        for i in range(len(self.shape)):
+            if self.shape[i] > 0:
+                storage_size += (self.shape[i] - 1) * self.strides[i]
+        return storage_size
 
-        # Create a flat contiguous buffer
-        dtype = "float32" if self.dtype == "bfloat16" else self.dtype
-        numpy_dtype = dtype
-        if dtype == "bfloat16":
-            numpy_dtype = "float32"
-        flat_data = (numpy.random.random(storage_size).astype("float32") - 0.5) * 1.2
-        if numpy_dtype not in ["float32", "float64", "float16"]:
-            if numpy_dtype == "bool":
-                flat_data = numpy.random.randint(0, 2, size=storage_size).astype("bool")
-            elif numpy_dtype in ["int8", "int16", "int32", "int64", "uint8"]:
-                flat_data = numpy.random.randint(-10, 10, size=storage_size).astype(numpy_dtype)
-            elif numpy_dtype in ["complex64", "complex128"]:
-                flat_data = (
-                    (numpy.random.random(storage_size) - 0.5)
-                    + 1j * (numpy.random.random(storage_size) - 0.5)
-                ).astype(numpy_dtype)
-            else:
-                flat_data = flat_data.astype(numpy_dtype)
-        else:
-            flat_data = flat_data.astype(numpy_dtype)
+    def _create_strided_paddle_tensor(self, api_config):
+        """Create a non-contiguous paddle tensor from the shared logical numpy input."""
+        intermediate_dtype = (
+            "float16" if self.dtype in ["float8_e5m2", "float8_e4m3fn"] else self.dtype
+        )
+        flat_tensor = paddle.empty(
+            [self._strided_storage_size()],
+            dtype=intermediate_dtype,
+            device=self.place,
+        )
+        tensor = paddle.as_strided(flat_tensor, self.shape, self.strides)
+        logical_tensor = self.get_numpy_tensor(api_config)
+        if logical_tensor.size > 0:
+            tensor[...] = paddle.to_tensor(
+                logical_tensor,
+                dtype=intermediate_dtype,
+                place=self.place,
+            )
+        if self.dtype in ["float8_e5m2", "float8_e4m3fn"]:
+            flat_tensor = paddle.cast(flat_tensor, dtype=self.dtype)
+            tensor = paddle.as_strided(flat_tensor, self.shape, self.strides)
 
-        flat_tensor = paddle.to_tensor(flat_data, dtype=dtype, place=self.place)
-        # For bfloat16: cast flat buffer first, then as_strided to preserve strides
-        if self.dtype == "bfloat16":
-            flat_tensor = paddle.cast(flat_tensor, dtype="bfloat16")
-
-        # Use paddle's as_strided to create the non-contiguous view
-        tensor = paddle.as_strided(flat_tensor, shape, strides)
         tensor.stop_gradient = False
         return tensor
 
@@ -2976,26 +2966,33 @@ class TensorConfig:
         return self.torch_tensor
 
     def _create_strided_torch_tensor(self, api_config):
-        """Create a non-contiguous torch tensor with specified strides."""
-        shape = self.shape
-        strides = self.strides
+        """Create a non-contiguous torch tensor from the shared logical numpy input."""
         device = torch.device("cuda:0") if torch.cuda.is_available() else torch.device("cpu")
-        # Calculate storage size: sum((shape[i]-1) * strides[i]) + 1 for all dims
-        storage_size = 1
-        for i in range(len(shape)):
-            if shape[i] > 0:
-                storage_size += (shape[i] - 1) * strides[i]
+        needs_intermediate = self.dtype in ["float8_e5m2", "float8_e4m3fn"]
+        if needs_intermediate:
+            intermediate_torch_dtype = torch.float16
+        else:
+            intermediate_torch_dtype = self.convert_dtype_to_torch_type(self.dtype)
 
-        torch_dtype = (
-            self.convert_dtype_to_torch_type(self.dtype)
-            if self.dtype != "bfloat16"
-            else torch.float32
+        flat_tensor = torch.empty(
+            self._strided_storage_size(),
+            dtype=intermediate_torch_dtype,
+            device=device,
         )
-        flat_tensor = torch.randn(storage_size, dtype=torch_dtype, device=device)
-        # For bfloat16: cast flat buffer first, then as_strided to preserve strides
-        if self.dtype == "bfloat16":
-            flat_tensor = flat_tensor.to(dtype=torch.bfloat16)
-        tensor = torch.as_strided(flat_tensor, shape, strides)
+        tensor = torch.as_strided(flat_tensor, self.shape, self.strides)
+        logical_tensor = self.get_numpy_tensor(api_config)
+        if logical_tensor.size > 0:
+            tensor.copy_(
+                torch.tensor(
+                    logical_tensor,
+                    dtype=intermediate_torch_dtype,
+                    device=device,
+                )
+            )
+        if self.dtype in ["float8_e5m2", "float8_e4m3fn"]:
+            flat_tensor = flat_tensor.to(dtype=self.convert_dtype_to_torch_type(self.dtype))
+            tensor = torch.as_strided(flat_tensor, self.shape, self.strides)
+
         requires_grad = self.dtype in [
             "float32",
             "float64",
