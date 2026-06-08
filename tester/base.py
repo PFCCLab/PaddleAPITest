@@ -84,17 +84,17 @@ _COPS_API_PUBLIC_ALIAS: dict[str, str] = {
 # differs materially from any public API.
 no_signature_api_mappings.update(
     {
-        # adamw_(param, grad, lr, moment1, moment2, master_param_opt,
+        # adamw_(param, grad, lr, moment1, moment2, moment2_max,
         #        beta1_pow, beta2_pow, master_param, skip_update,
         #        beta1, beta2, epsilon, lr_ratio, coeff, with_decay,
-        #        lazy_mode, min_row_size, multi_precision, use_global_beta_pow, find_inf)
+        #        lazy_mode, min_row_size, multi_precision, use_global_beta_pow, amsgrad)
         "paddle._C_ops.adamw_": {
             "param": lambda cfg: get_arg(cfg, 0, "param"),
             "grad": lambda cfg: get_arg(cfg, 1, "grad"),
             "learning_rate": lambda cfg: get_arg(cfg, 2, "learning_rate"),
             "moment1": lambda cfg: get_arg(cfg, 3, "moment1"),
             "moment2": lambda cfg: get_arg(cfg, 4, "moment2"),
-            "master_param_opt": lambda cfg: get_arg(cfg, 5, "master_param_opt"),
+            "moment2_max": lambda cfg: get_arg(cfg, 5, "moment2_max"),
             "beta1_pow": lambda cfg: get_arg(cfg, 6, "beta1_pow"),
             "beta2_pow": lambda cfg: get_arg(cfg, 7, "beta2_pow"),
             "master_param": lambda cfg: get_arg(cfg, 8, "master_param"),
@@ -111,7 +111,7 @@ no_signature_api_mappings.update(
             ),
             "multi_precision": lambda cfg: get_arg(cfg, 18, "multi_precision"),
             "use_global_beta_pow": lambda cfg: get_arg(cfg, 19, "use_global_beta_pow"),
-            "find_inf": lambda cfg: get_arg(cfg, 20, "find_inf"),
+            "amsgrad": lambda cfg: get_arg(cfg, 20, "amsgrad"),
         },
         # full_(x, shape, value, dtype, place) — fills x in-place; no public API equivalent
         "paddle._C_ops.full_": {

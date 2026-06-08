@@ -6952,62 +6952,151 @@ result = torch.permute(x, dims)
 
 
 class CopsAdamwRule(BaseRule):
-    """paddle._C_ops.adamw_ → torch.optim.AdamW single-step simulation.
+    """paddle._C_ops.adamw_ → torch.optim.adam._fused_adam single-step update.
 
-    Performs one AdamW update in-place on param using moment1/moment2/beta1_pow/
-    beta2_pow tensors, mirroring the Paddle kernel semantics.
-    multi_precision=True means param is fp16/bf16 while moments are fp32.
+    The Paddle kernel receives explicit beta*_pow tensors, while Torch fused Adam
+    derives bias correction from state_steps.  Use the fused Torch kernel when
+    beta2_pow can be represented as a step and adjust lr to preserve beta1_pow;
+    otherwise fall back to the direct Paddle formula.
     """
 
     def apply(self, paddle_api: str) -> ConvertResult:
         core = """
-param       = locals().get("param")
-grad        = locals().get("grad")
-lr_t        = locals().get("learning_rate")
-moment1     = locals().get("moment1")
-moment2     = locals().get("moment2")
-beta1_pow_t = locals().get("beta1_pow")
-beta2_pow_t = locals().get("beta2_pow")
+param        = locals().get("param")
+grad         = locals().get("grad")
+lr_t         = locals().get("learning_rate")
+moment1      = locals().get("moment1")
+moment2      = locals().get("moment2")
+moment2_max  = locals().get("moment2_max")
+beta1_pow_t  = locals().get("beta1_pow")
+beta2_pow_t  = locals().get("beta2_pow")
 master_param = locals().get("master_param")
-beta1       = locals().get("beta1", 0.9)
-beta2       = locals().get("beta2", 0.999)
-epsilon     = locals().get("epsilon", 1e-8)
-lr_ratio    = locals().get("lr_ratio", 1.0)
-coeff       = locals().get("coeff", 0.0)
-with_decay  = locals().get("with_decay", True)
+skip_update  = locals().get("skip_update")
+beta1        = locals().get("beta1", 0.9)
+beta2        = locals().get("beta2", 0.999)
+epsilon      = locals().get("epsilon", 1e-8)
+lr_ratio     = locals().get("lr_ratio", 1.0)
+coeff        = locals().get("coeff", 0.0)
+with_decay   = locals().get("with_decay", True)
 multi_precision = locals().get("multi_precision", False)
+amsgrad      = locals().get("amsgrad", False)
 
-lr = lr_t.item() if torch.is_tensor(lr_t) else float(lr_t)
-lr = lr * lr_ratio
-b1 = beta1.item() if torch.is_tensor(beta1) else float(beta1)
-b2 = beta2.item() if torch.is_tensor(beta2) else float(beta2)
-eps = epsilon.item() if torch.is_tensor(epsilon) else float(epsilon)
-wd = coeff.item() if torch.is_tensor(coeff) else float(coeff)
 
-# Use master param (fp32) when multi_precision is enabled
+def _adamw_scalar(value, default=0.0):
+    if value is None:
+        return default
+    return value.item() if torch.is_tensor(value) else float(value)
+
+
+def _adamw_bool(value):
+    if value is None:
+        return False
+    if torch.is_tensor(value):
+        return bool(value.detach().cpu().any().item())
+    return bool(value)
+
+
+lr = _adamw_scalar(lr_t) * _adamw_scalar(lr_ratio, 1.0)
+b1 = _adamw_scalar(beta1, 0.9)
+b2 = _adamw_scalar(beta2, 0.999)
+eps = _adamw_scalar(epsilon, 1e-8)
+wd = _adamw_scalar(coeff, 0.0)
+b1_pow = _adamw_scalar(beta1_pow_t)
+b2_pow = _adamw_scalar(beta2_pow_t)
+with_decay = _adamw_bool(with_decay)
+multi_precision = _adamw_bool(multi_precision)
+amsgrad = _adamw_bool(amsgrad)
 work_param = master_param if (multi_precision and master_param is not None) else param
-grad_fp32 = grad.float() if grad is not None else None
 
-if grad_fp32 is None:
+
+if grad is None or _adamw_bool(skip_update):
     result = param
 else:
     with torch.no_grad():
-        # Weight decay on work_param
-        if with_decay and wd > 0:
-            work_param.add_(work_param, alpha=-(lr * wd))
+        fused_success = False
+        try:
+            from torch.optim.adam import _fused_adam
+        except (ImportError, AttributeError):
+            _fused_adam = None
 
-        b1_pow = beta1_pow_t.item() if torch.is_tensor(beta1_pow_t) else float(beta1_pow_t)
-        b2_pow = beta2_pow_t.item() if torch.is_tensor(beta2_pow_t) else float(beta2_pow_t)
+        can_try_fused = _fused_adam is not None
+        can_try_fused = can_try_fused and not torch.is_complex(work_param)
+        can_try_fused = can_try_fused and not torch.is_complex(grad)
+        can_try_fused = can_try_fused and 0.0 < b1 < 1.0 and 0.0 < b2 < 1.0
+        can_try_fused = can_try_fused and 0.0 < b1_pow < 1.0 and 0.0 < b2_pow < 1.0
+        can_try_fused = can_try_fused and work_param.dtype == grad.dtype
+        can_try_fused = can_try_fused and moment1.dtype == work_param.dtype
+        can_try_fused = can_try_fused and moment2.dtype == work_param.dtype
+        can_try_fused = can_try_fused and (
+            not amsgrad or (moment2_max is not None and moment2_max.dtype == work_param.dtype)
+        )
 
-        moment1.mul_(b1).add_(grad_fp32, alpha=1.0 - b1)
-        moment2.mul_(b2).addcmul_(grad_fp32, grad_fp32, value=1.0 - b2)
+        if can_try_fused:
+            import math
 
-        bias_correction1 = 1.0 - b1_pow
-        bias_correction2 = 1.0 - b2_pow
+            step = math.log(b2_pow) / math.log(b2)
+            if math.isfinite(step) and step > 0.0:
+                b1_pow_from_step = b1**step
+                bias_correction1 = 1.0 - b1_pow
+                fused_bias_correction1 = 1.0 - b1_pow_from_step
+                beta1_pow_matches_step = math.isclose(
+                    b1_pow_from_step,
+                    b1_pow,
+                    rel_tol=1e-4,
+                    abs_tol=1e-7,
+                )
+                can_try_fused = bias_correction1 != 0.0 and fused_bias_correction1 != 0.0
+                can_try_fused = can_try_fused and (not with_decay or beta1_pow_matches_step)
+                if can_try_fused:
+                    state_step = torch.tensor(
+                        step - 1.0,
+                        dtype=torch.float32,
+                        device=work_param.device,
+                    )
+                    fused_lr = lr
+                    if not beta1_pow_matches_step:
+                        fused_lr = lr * fused_bias_correction1 / bias_correction1
+                    try:
+                        _fused_adam(
+                            [work_param],
+                            [grad],
+                            [moment1],
+                            [moment2],
+                            [moment2_max] if amsgrad else [],
+                            [state_step],
+                            None,
+                            None,
+                            amsgrad=amsgrad,
+                            has_complex=False,
+                            beta1=b1,
+                            beta2=b2,
+                            lr=fused_lr,
+                            weight_decay=wd if with_decay else 0.0,
+                            eps=eps,
+                            maximize=False,
+                            capturable=False,
+                            differentiable=False,
+                            decoupled_weight_decay=True,
+                        )
+                        fused_success = True
+                    except (RuntimeError, TypeError, ValueError) as err:
+                        err_msg = str(err)
+                        if "out of memory" in err_msg or "CUDA error" in err_msg:
+                            raise
 
-        denom = moment2.sqrt() / (bias_correction2 ** 0.5) + eps
-        update = moment1 / denom
-        work_param.add_(update, alpha=-(lr / bias_correction1))
+        if not fused_success:
+            grad_update = grad.to(moment1.dtype)
+            if with_decay:
+                work_param.add_(work_param, alpha=-(lr * wd))
+            moment1.mul_(b1).add_(grad_update, alpha=1.0 - b1)
+            moment2.mul_(b2).addcmul_(grad_update, grad_update, value=1.0 - b2)
+            if amsgrad and moment2_max is not None:
+                torch.maximum(moment2_max, moment2, out=moment2_max)
+                denom_state = moment2_max
+            else:
+                denom_state = moment2
+            denom = denom_state.sqrt() / ((1.0 - b2_pow) ** 0.5) + eps
+            work_param.addcdiv_(moment1, denom, value=-(lr / (1.0 - b1_pow)))
 
         if multi_precision and master_param is not None:
             param.copy_(work_param.to(param.dtype))
@@ -7036,7 +7125,8 @@ class CopsFusedLinearParamGradAddRule(BaseRule):
     """paddle._C_ops.fused_linear_param_grad_add(x, dout, dweight, dbias, multi_prec, has_bias)
 
     Computes dweight += x.T @ dout  (and optionally dbias += dout.sum(0)).
-    Mirrors the fused_linear_param_grad_add kernel.
+    Prefer Torch's linear backward op for the raw param gradients, then apply the
+    Paddle fused-add and dtype semantics.
     """
 
     def apply(self, paddle_api: str) -> ConvertResult:
@@ -7048,10 +7138,36 @@ dbias           = locals().get("dbias")
 multi_precision = locals().get("multi_precision", False)
 has_bias        = locals().get("has_bias", False)
 
-# Compute dweight gradient: dweight = x.T @ dout
 x_f = x.float() if multi_precision else x
 dout_f = dout.float() if multi_precision else dout
-new_dweight = x_f.t().mm(dout_f)
+linear_backward_success = False
+try:
+    weight = torch.empty(
+        (dout_f.shape[-1], x_f.shape[-1]),
+        dtype=x_f.dtype,
+        device=x_f.device,
+    )
+    _grad_input, grad_weight, grad_bias = torch.ops.aten.linear_backward(
+        x_f,
+        dout_f,
+        weight,
+        [False, True, bool(has_bias)],
+    )
+    # Torch linear weight layout is [out_features, in_features], while this
+    # Paddle fused op accumulates x.T @ dout with shape [in_features, out_features].
+    new_dweight = grad_weight.mT
+    new_dbias = grad_bias if has_bias else None
+    linear_backward_success = True
+except (RuntimeError, TypeError, ValueError, AttributeError) as err:
+    err_msg = str(err)
+    if "out of memory" in err_msg or "CUDA error" in err_msg:
+        raise
+
+if not linear_backward_success:
+    x_f_2d = x_f.reshape(-1, x_f.shape[-1])
+    dout_f_2d = dout_f.reshape(-1, dout_f.shape[-1])
+    new_dweight = x_f_2d.t().mm(dout_f_2d)
+    new_dbias = dout_f_2d.sum(0) if has_bias else None
 
 if dweight is not None:
     new_dweight = new_dweight + dweight.float() if multi_precision else new_dweight + dweight
@@ -7060,10 +7176,10 @@ else:
     dweight_out = new_dweight.detach()
 
 if has_bias and dbias is not None:
-    new_dbias = dout_f.sum(0)
-    dbias_out = ((new_dbias + dbias.float()).to(dbias.dtype) if multi_precision else new_dbias + dbias).detach()
+    dbias_sum = new_dbias + dbias.float() if multi_precision else new_dbias + dbias
+    dbias_out = dbias_sum.to(dbias.dtype).detach()
 elif has_bias:
-    dbias_out = dout_f.sum(0).detach()
+    dbias_out = new_dbias.detach()
 else:
     # Paddle returns a zero tensor for dbias even when has_bias=False
     dbias_out = torch.zeros(dout_f.shape[-1], dtype=dout_f.dtype, device=dout_f.device)
@@ -7105,20 +7221,24 @@ dout        = locals().get("dout")
 transpose_x = locals().get("transpose_x", False)
 transpose_y = locals().get("transpose_y", False)
 
-def _t(t): return t.mT
+x_mat = x.mT if transpose_x else x
+y_mat = y.mT if transpose_y else y
+matmul_backward_success = False
+try:
+    dx_mat, dy_mat = torch.ops.aten.matmul_backward(dout, x_mat, y_mat, [True, True])
+    dx = dx_mat.mT if transpose_x else dx_mat
+    dy = dy_mat.mT if transpose_y else dy_mat
+    matmul_backward_success = True
+except (RuntimeError, TypeError, ValueError, AttributeError) as err:
+    err_msg = str(err)
+    if "out of memory" in err_msg or "CUDA error" in err_msg:
+        raise
 
-if not transpose_x and not transpose_y:
-    dx = torch.matmul(dout, _t(y))
-    dy = torch.matmul(_t(x), dout)
-elif transpose_x and not transpose_y:
-    dx = torch.matmul(y, _t(dout))
-    dy = torch.matmul(_t(x), dout)
-elif not transpose_x and transpose_y:
-    dx = torch.matmul(dout, y)
-    dy = torch.matmul(_t(dout), x)
-else:
-    dx = torch.matmul(_t(y), _t(dout))
-    dy = torch.matmul(_t(dout), _t(x))
+if not matmul_backward_success:
+    dx_mat = torch.matmul(dout, y_mat.mT)
+    dy_mat = torch.matmul(x_mat.mT, dout)
+    dx = dx_mat.mT if transpose_x else dx_mat
+    dy = dy_mat.mT if transpose_y else dy_mat
 
 result = [dx, dy]
 """
@@ -7184,11 +7304,17 @@ if op_name == "fused_swiglu_bwd":
     dy = arg1   # shape [..., D]
     x  = arg2   # shape [..., 2D]
     x1, x2 = torch.chunk(x, 2, dim=-1)
-    sig_x1  = torch.sigmoid(x1)
-    silu_x1 = x1 * sig_x1
+    silu_x1 = torch.nn.functional.silu(x1)
     d_x2  = dy * silu_x1
     d_silu = dy * x2
-    d_x1  = d_silu * sig_x1 * (1.0 + x1 * (1.0 - sig_x1))
+    try:
+        d_x1 = torch.ops.aten.silu_backward(d_silu, x1)
+    except (RuntimeError, TypeError, ValueError, AttributeError) as err:
+        err_msg = str(err)
+        if "out of memory" in err_msg or "CUDA error" in err_msg:
+            raise
+        sig_x1 = torch.sigmoid(x1)
+        d_x1 = d_silu * sig_x1 * (1.0 + x1 * (1.0 - sig_x1))
     result = [torch.cat([d_x1, d_x2], dim=-1)]
 
 elif op_name == "fused_swiglu_scale_clamp":
@@ -7219,8 +7345,7 @@ elif op_name == "fused_swiglu_scale_clamp_bwd":
         scale_v = scale.view(*scale.shape[:-1], 1) if scale.dim() > 1 else scale.unsqueeze(-1)
     else:
         scale_v = float(scale)
-    sig_x1  = torch.sigmoid(x1)
-    silu_x1 = x1 * sig_x1
+    silu_x1 = torch.nn.functional.silu(x1)
     # clamp mask: where |silu*x2*scale| was clamped in fwd, grad is 0
     pre_clamp = silu_x1 * x2 * scale_v
     clamp_mask = (pre_clamp.abs() < float(max_val)).float()
@@ -7228,7 +7353,14 @@ elif op_name == "fused_swiglu_scale_clamp_bwd":
     dy_eff = dy_f * clamp_mask
     d_x2   = dy_eff * silu_x1 * scale_v
     d_silu = dy_eff * x2 * scale_v
-    d_x1   = d_silu * sig_x1 * (1.0 + x1 * (1.0 - sig_x1))
+    try:
+        d_x1 = torch.ops.aten.silu_backward(d_silu, x1)
+    except (RuntimeError, TypeError, ValueError, AttributeError) as err:
+        err_msg = str(err)
+        if "out of memory" in err_msg or "CUDA error" in err_msg:
+            raise
+        sig_x1 = torch.sigmoid(x1)
+        d_x1 = d_silu * sig_x1 * (1.0 + x1 * (1.0 - sig_x1))
     dx = torch.cat([d_x1, d_x2], dim=-1).to(x.dtype)
     # d_scale: gradient w.r.t. scale; Paddle returns [dx, d_scale] (length 2)
     d_scale = (dy_eff * silu_x1 * x2).sum(dim=-1, keepdim=True)
