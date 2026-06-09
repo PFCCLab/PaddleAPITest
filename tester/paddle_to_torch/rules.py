@@ -7106,6 +7106,30 @@ else:
         return ConvertResult.success(paddle_api, code, is_torch_corresponding=False)
 
 
+class CopsMatmulRule(BaseRule):
+    """paddle._C_ops.matmul(x, y, transpose_x, transpose_y) → torch.matmul with optional transpose
+
+    Paddle's primitive matmul supports:
+      - N-D tensors with broadcasting (like torch.matmul)
+      - per-operand transpose flags applied to the last two dims
+      - 1-D operands (treated as vectors, matching torch.matmul semantics)
+    """
+
+    def apply(self, paddle_api: str) -> ConvertResult:
+        core = """
+x           = locals().get("x")
+y           = locals().get("y")
+transpose_x = locals().get("transpose_x", False)
+transpose_y = locals().get("transpose_y", False)
+
+x_mat = x.mT if (transpose_x and x.dim() >= 2) else x
+y_mat = y.mT if (transpose_y and y.dim() >= 2) else y
+result = torch.matmul(x_mat, y_mat)
+"""
+        code = Code(core=core.splitlines())
+        return ConvertResult.success(paddle_api, code, is_torch_corresponding=False)
+        
+        
 class CopsFull_Rule(BaseRule):
     """paddle._C_ops.full_(x, shape, value, dtype) → x.fill_(value) in-place"""
 

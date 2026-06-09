@@ -70,6 +70,7 @@ _COPS_API_PUBLIC_ALIAS: dict[str, str] = {
     "paddle._C_ops.clip": "paddle.clip",
     "paddle._C_ops.concat": "paddle.concat",
     "paddle._C_ops.flatten_": "paddle.flatten",
+    "paddle._C_ops.matmul": "paddle.matmul",
     "paddle._C_ops.multiply_": "paddle.multiply",
     "paddle._C_ops.numel": "paddle.numel",
     "paddle._C_ops.put_along_axis_": "paddle.put_along_axis",
