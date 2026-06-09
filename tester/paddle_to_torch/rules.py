@@ -7282,6 +7282,60 @@ result = (x.float() * x.float()).sum().reshape([1])
         return ConvertResult.success(paddle_api, code, is_torch_corresponding=False)
 
 
+class CopsSwigluGradRule(BaseRule):
+    """paddle._C_ops.swiglu_grad(x, y, dout) -> (dx, dy)
+
+    Two forward semantics depending on whether y is provided:
+        y is not None:  out = silu(x) * y          # x, y share the same shape
+        y is None:      out = silu(x[..., :C]) * x[..., C:]   where C = x.size(-1)//2
+
+    Backward derivatives (y given):
+        dy = dout * silu(x)
+        dx = dout * y * sigmoid(x) * (1 + x * (1 - sigmoid(x)))
+
+    Backward derivatives (y is None — split last dim):
+        let a = x[..., :C], b = x[..., C:]
+        da = dout * b * sigmoid(a) * (1 + a * (1 - sigmoid(a)))
+        db = dout * silu(a)
+        dx = concat([da, db], dim=-1); dy is returned as None to match
+        Paddle's uninitialized second output (the framework comparator
+        accepts `paddle uninitialized + torch None` as a pass).
+
+    Use only analytical sigmoid arithmetic so the autograd engine can
+    compute a second-order derivative when the framework runs
+    `torch.autograd.grad` on the rule's outputs — `aten::silu_backward`
+    has no registered derivative and would crash that path.
+    """
+
+    def apply(self, paddle_api: str) -> ConvertResult:
+        core = """
+x    = locals().get("x")
+y    = locals().get("y")
+
+dout = locals().get("dout")
+
+if y is None:
+    C = x.shape[-1] // 2
+    a = x[..., :C]
+    b = x[..., C:]
+    sig_a = torch.sigmoid(a)
+    silu_a = a * sig_a
+    da = (dout * b) * sig_a * (1.0 + a * (1.0 - sig_a))
+    db = dout * silu_a
+    dx = torch.cat([da, db], dim=-1)
+    dy = None
+else:
+    sig_x = torch.sigmoid(x)
+    silu_x = x * sig_x
+    dy = dout * silu_x
+    dx = (dout * y) * sig_x * (1.0 + x * (1.0 - sig_x))
+
+result = [dx, dy]
+"""
+        code = Code(core=core.splitlines())
+        return ConvertResult.success(paddle_api, code, is_torch_corresponding=False)
+
+
 class CopsUniformRule(BaseRule):
     """paddle._C_ops.uniform(shape, dtype, min, max, seed) → torch.empty(...).uniform_"""
 
@@ -7355,6 +7409,91 @@ elif op_name == "fused_swiglu_scale_clamp":
     out = silu_x1 * x2.float() * scale
     out = torch.clamp(out, min=-float(max_val), max=float(max_val))
     result = [out.to(x.dtype)]
+
+elif op_name in ("fuse_stack_transpose_fp8_quant", "fuse_stack_fp8_quant"):
+    # PaddleFleet custom op: per 128x128 block FP8(e4m3) blockwise quantization,
+    # optionally transposing each block (M<->K) and emitting scale in various layouts.
+    #   args: (X_list, using_pow2_scaling, using_ue8m0_scale, output_scale_transpose)
+    #   X_list: list of N bf16 tensors [M, K]; M, K must be multiples of 128, N <= 65535
+    # Returns [out, scale]:
+    #   transpose=True : out [N*K, M] fp8_e4m3fn
+    #   transpose=False: out [N*M, K] fp8_e4m3fn
+    #   scale dtype: int32 when ue8m0 (4 packed uint8 exponents) else float32
+    _do_transpose = (op_name == "fuse_stack_transpose_fp8_quant")
+    X_list = arg1
+    using_pow2_scaling   = bool(arg2) if arg2 is not None else False
+    using_ue8m0_scale    = bool(arg3) if arg3 is not None else False
+    output_scale_transpose = bool(arg4) if arg4 is not None else False
+
+    if not isinstance(X_list, (list, tuple)):
+        X_list = [X_list]
+    X_stack = torch.stack([t.to(torch.bfloat16) for t in X_list], dim=0).contiguous()
+    N, M, K = X_stack.shape
+    assert M % 128 == 0 and K % 128 == 0, "M and K must be multiples of 128"
+    fp8_max = 448.0
+    eps = 1e-10
+
+    # [N, M/128, 128, K/128, 128] in float for reduction precision
+    xb = X_stack.view(N, M // 128, 128, K // 128, 128).float()
+    amax = xb.abs().amax(dim=(2, 4)).clamp(min=eps)  # [N, M/128, K/128]
+    block_scale = fp8_max / amax  # ComputeScale (no pow2)
+    if using_pow2_scaling or using_ue8m0_scale:
+        # Round-down to nearest power of 2 by clearing mantissa bits
+        bs_bits = block_scale.contiguous().view(torch.int32)
+        exp_only = bs_bits & (0xFF << 23)
+        block_scale = exp_only.view(torch.float32)
+
+    # Quantize: x * block_scale -> fp8_e4m3fn
+    bs_b = block_scale.unsqueeze(2).unsqueeze(4)  # [N, M/128, 1, K/128, 1]
+    xq = (xb * bs_b).clamp(-fp8_max, fp8_max).to(torch.float8_e4m3fn)
+    # xq shape: [N, M/128, 128, K/128, 128]
+    if _do_transpose:
+        # transpose 128x128 block: swap axes (1,2) <-> (3,4) -> [N, K/128, 128, M/128, 128]
+        out = xq.permute(0, 3, 4, 1, 2).contiguous().view(N * K, M)
+    else:
+        out = xq.contiguous().view(N * M, K)
+
+    # Stored scale (dequant factor) = 1 / block_scale
+    stored_f32 = (1.0 / block_scale).contiguous()  # [N, M/128, K/128]
+
+    if not using_ue8m0_scale:
+        if _do_transpose:
+            # Reorder to [N, K/128, M/128] then [N*K/128, M/128]
+            s = stored_f32.permute(0, 2, 1).contiguous().view(N * K // 128, M // 128)
+        else:
+            s = stored_f32.view(N * M // 128, K // 128)
+        if output_scale_transpose:
+            s = s.t().contiguous()
+        scale_out = s
+    else:
+        # Extract exponent byte (top 8 bits of float bits)
+        s_bits = stored_f32.view(torch.int32)
+        exp_byte = ((s_bits >> 23) & 0xFF).to(torch.uint8)  # [N, M/128, K/128]
+        if _do_transpose:
+            # Need uint8 layout [N*K, M/128] (each block's 128 rows in K-dim share the scale)
+            # exp_byte: [N, M/128, K/128] -> [N, K/128, M/128]
+            e = exp_byte.permute(0, 2, 1).contiguous()
+            # broadcast K/128 -> K (replicate 128 per K-block row)
+            e = e.unsqueeze(2).expand(N, K // 128, 128, M // 128).contiguous()
+            e_u8 = e.view(N * K, M // 128)
+            pack_dim_size = M // 128
+        else:
+            # uint8 layout [N*M, K/128]; replicate 128 per M-block row
+            e = exp_byte.unsqueeze(2).expand(N, M // 128, 128, K // 128).contiguous()
+            e_u8 = e.view(N * M, K // 128)
+            pack_dim_size = K // 128
+        assert pack_dim_size % 4 == 0, "scale packing requires last-dim divisible by 4"
+        # Pack 4 consecutive uint8 along last dim into one int32 (little-endian)
+        e_grp = e_u8.view(e_u8.shape[0], pack_dim_size // 4, 4).to(torch.int32)
+        packed = (e_grp[..., 0]
+                  | (e_grp[..., 1] << 8)
+                  | (e_grp[..., 2] << 16)
+                  | (e_grp[..., 3] << 24))  # [rows, pack_dim_size/4]
+        if output_scale_transpose:
+            packed = packed.t().contiguous()
+        scale_out = packed
+
+    result = [out, scale_out]
 
 elif op_name == "fused_swiglu_scale_clamp_bwd":
     # _run_custom_op("fused_swiglu_scale_clamp_bwd", x, scale, dy, max_val)

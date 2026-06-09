@@ -150,6 +150,12 @@ no_signature_api_mappings.update(
         "paddle._C_ops.squared_l2_norm": {
             "x": lambda cfg: get_arg(cfg, 0, "x"),
         },
+        # swiglu_grad(x, y, dout) -> (dx, dy); y may be None (then x is split along last dim)
+        "paddle._C_ops.swiglu_grad": {
+            "x": lambda cfg: get_arg(cfg, 0, "x"),
+            "y": lambda cfg: get_arg(cfg, 1, "y"),
+            "dout": lambda cfg: get_arg(cfg, 2, "dout"),
+        },
         # _run_custom_op(op_name, *args) — op_name dispatches to per-op sub-rules
         "paddle._C_ops._run_custom_op": {
             "op_name": lambda cfg: get_arg(cfg, 0, "op_name"),

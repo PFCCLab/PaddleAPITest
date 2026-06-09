@@ -4986,6 +4986,9 @@
     "paddle._C_ops.subtract_": {
         "Rule": "CopsSubtract_Rule"
     },
+    "paddle._C_ops.swiglu_grad": {
+        "Rule": "CopsSwigluGradRule"
+    },
     "paddle._C_ops.transpose": {
         "Rule": "CopsTransposeRule"
     },
