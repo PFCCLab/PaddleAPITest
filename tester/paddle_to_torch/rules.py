@@ -7364,6 +7364,7 @@ class CopsRunCustomOpRule(BaseRule):
       - "fused_swiglu_bwd": dy, x → compute grad of swiglu
       - "fused_swiglu_scale_clamp": x, scale, max_val → scaled+clamped swiglu fwd
       - "fused_swiglu_scale_clamp_bwd": x, scale, dy, max_val → scaled+clamped swiglu bwd
+      - "fused_swiglu_probs_bwd": o1, do2_s, unzipped_probs, inplace → weighted swiglu bwd
     Unsupported op_names will return an error result at runtime.
     """
 
@@ -7446,6 +7447,87 @@ elif op_name == "fused_swiglu_scale_clamp_bwd":
     if torch.is_tensor(scale):
         d_scale = d_scale.to(scale.dtype)
     result = [dx, d_scale]
+
+elif op_name == "fused_swiglu_probs_bwd":
+    # _run_custom_op("fused_swiglu_probs_bwd", o1, do2_s, unzipped_probs, inplace)
+    # 输出 [do1, probs_grad, o2_s]，语义参考 paddlefleet 的 SwigluProbsGradKernel:
+    #   lhs, rhs = chunk(o1, 2, -1); sig = sigmoid(lhs); silu = sig*lhs
+    #   do1[..., :H] = (do2_s*probs) * rhs * sig * (1 + lhs - silu)
+    #   do1[..., H:] = (do2_s*probs) * silu
+    #   o2_s         = silu * rhs * probs
+    #   probs_grad   = sum_last_dim(do2_s * silu * rhs),shape [outer_dim],float32
+    # 注意：
+    #   1) 空输入 (numel==0) 时 Paddle 直接返回占位 tensor,不做 shape 一致性检查；
+    #   2) 大 shape + bf16 输入若整体 upcast 到 fp32 会爆显存，分块处理。
+    o1     = arg1
+    do2_s  = arg2
+    probs  = arg3
+    inplace_flag = bool(arg4) if arg4 is not None else False
+    H2 = o1.shape[-1]
+    H = H2 // 2
+    outer = 1
+    for _s in o1.shape[:-1]:
+        outer *= _s
+
+    # Paddle 的 SwigluProbsGradCUDABackward:
+    #   do1      = inplace ? o1    : empty_like(o1)
+    #   o2_s     = inplace ? do2_s : empty_like(do2_s)
+    #   probs_grad = empty({outer}, fp32)   # 始终新分配
+    # 当任一输入 numel==0 时，kernel 不执行，直接返回上述（已分配但未写入的）buffer。
+    # 因此 inplace=True 时 do1/o2_s 保留 o1/do2_s 的原值；非 inplace 时为未初始化值。
+    if o1.numel() == 0 or do2_s.numel() == 0 or probs.numel() == 0:
+        if inplace_flag:
+            do1_e  = o1.clone()
+            o2_s_e = do2_s.clone()
+        else:
+            do1_e  = torch.zeros_like(o1)
+            o2_s_e = torch.zeros_like(do2_s)
+        # probs_grad 始终是新分配的未初始化 buffer；用 0 占位
+        pg_e = torch.zeros([outer], dtype=torch.float32, device=o1.device)
+        result = [do1_e, pg_e, o2_s_e]
+    else:
+        o1_dtype  = o1.dtype
+        do2_dtype = do2_s.dtype
+        o1_2d  = o1.reshape(outer, H2)
+        do2_2d = do2_s.reshape(outer, H)
+        probs_flat = probs.reshape(-1).to(torch.float32)
+        # inplace=True 时 paddle 直接写入 o1/do2_s，复用同一存储以避免 OOM；
+        # inplace=False 时新分配输出 buffer。
+        if inplace_flag:
+            do1_out  = o1_2d
+            o2_s_out = do2_2d
+        else:
+            do1_out  = torch.empty_like(o1_2d)
+            o2_s_out = torch.empty_like(do2_2d)
+        pg_out   = torch.empty([outer], dtype=torch.float32, device=o1.device)
+        # 限制单块 fp32 中间张量总大小 ~1GB（约 10 个 [chunk, H] fp32）
+        bytes_budget = 1 << 30
+        per_row = max(1, H * 4 * 10)
+        chunk = max(1, min(outer, bytes_budget // per_row))
+        for s in range(0, outer, chunk):
+            e = min(outer, s + chunk)
+            # inplace 时 o1_2d 即将被写入，需先把 lhs/rhs 拷到 fp32 中间变量
+            lhs_c  = o1_2d[s:e, :H].float()
+            rhs_c  = o1_2d[s:e, H:].float()
+            do2_c  = do2_2d[s:e].float()
+            prob_c = probs_flat[s:e].unsqueeze(-1)
+            sig      = torch.sigmoid(lhs_c)
+            silu_lhs = sig * lhs_c
+            o2_val   = silu_lhs * rhs_c
+            do2_val  = do2_c * prob_c
+            x0g = do2_val * rhs_c * sig * (1.0 + lhs_c - silu_lhs)
+            x1g = do2_val * silu_lhs
+            pg_out[s:e] = (do2_c * o2_val).sum(dim=-1)
+            # o2_s 写入需在 do1 之前完成时使用 do2_2d 切片；这里 o2_s 与 do1
+            # 来自不同 buffer（即使 inplace 也是 do2_s vs o1），互不影响。
+            o2_s_out[s:e] = (o2_val * prob_c).to(do2_dtype)
+            do1_out[s:e, :H] = x0g.to(o1_dtype)
+            do1_out[s:e, H:] = x1g.to(o1_dtype)
+        result = [
+            do1_out.reshape(o1.shape),
+            pg_out,
+            o2_s_out.reshape(do2_s.shape),
+        ]
 
 else:
     raise NotImplementedError(f"CopsRunCustomOpRule: unsupported op_name={op_name!r}")
