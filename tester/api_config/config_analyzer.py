@@ -240,8 +240,20 @@ class TensorConfig:
             self.dtype = "float32"
 
         if self.numpy_tensor is None:
-            # Special handling for optimizer APIs: use zeros for moment tensors
-            if (
+            if api_config.api_name in {"paddle.Tensor.view", "paddle.view"}:
+                if (
+                    self.check_arg(api_config, 0, "x")
+                    and original_dtype == "uint8"
+                    and str(self.get_arg(api_config, 1, "shape_or_dtype", "")) == "paddle.bfloat16"
+                ):
+                    bf16_numel = math.prod(self.shape) // 2
+                    finite_float32 = ((numpy.random.random(bf16_numel) - 0.5) * 1.2).astype(
+                        "float32"
+                    )
+                    self.numpy_tensor = (
+                        (finite_float32.view("uint32") >> 16).astype("uint16").view("uint8")
+                    )
+            elif (
                 api_config.api_name in optimizer_apis
                 and self.index in optimizer_apis[api_config.api_name]
             ):
@@ -2900,28 +2912,34 @@ class TensorConfig:
 
     def _create_strided_paddle_tensor(self, api_config):
         """Create a non-contiguous paddle tensor from the shared logical numpy input."""
-        intermediate_dtype = (
-            "float16" if self.dtype in ["float8_e5m2", "float8_e4m3fn"] else self.dtype
-        )
-        flat_tensor = paddle.empty(
-            [self._strided_storage_size()],
-            dtype=intermediate_dtype,
-            device=self.place,
-        )
-        tensor = paddle.as_strided(flat_tensor, self.shape, self.strides)
-        logical_tensor = self.get_numpy_tensor(api_config)
-        if logical_tensor.size > 0:
-            tensor[...] = paddle.to_tensor(
-                logical_tensor,
-                dtype=intermediate_dtype,
-                place=self.place,
+        flag_name = "FLAGS_check_nan_inf"
+        original_flag = paddle.get_flags([flag_name])
+        paddle.set_flags({flag_name: False})
+        try:
+            intermediate_dtype = (
+                "float16" if self.dtype in ["float8_e5m2", "float8_e4m3fn"] else self.dtype
             )
-        if self.dtype in ["float8_e5m2", "float8_e4m3fn"]:
-            flat_tensor = paddle.cast(flat_tensor, dtype=self.dtype)
+            flat_tensor = paddle.empty(
+                [self._strided_storage_size()],
+                dtype=intermediate_dtype,
+                device=self.place,
+            )
             tensor = paddle.as_strided(flat_tensor, self.shape, self.strides)
+            logical_tensor = self.get_numpy_tensor(api_config)
+            if logical_tensor.size > 0:
+                tensor[...] = paddle.to_tensor(
+                    logical_tensor,
+                    dtype=intermediate_dtype,
+                    place=self.place,
+                )
+            if self.dtype in ["float8_e5m2", "float8_e4m3fn"]:
+                flat_tensor = paddle.cast(flat_tensor, dtype=self.dtype)
+                tensor = paddle.as_strided(flat_tensor, self.shape, self.strides)
 
-        tensor.stop_gradient = False
-        return tensor
+            tensor.stop_gradient = False
+            return tensor
+        finally:
+            paddle.set_flags(original_flag)
 
     def get_torch_tensor(self, api_config):
         device = torch.device("cuda:0") if torch.cuda.is_available() else torch.device("cpu")
