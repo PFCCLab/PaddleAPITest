@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import csv
+import io
 import os
 import re
 import shutil
@@ -35,6 +36,7 @@ LOG_PREFIXES = {
 _is_engineV2 = False
 
 _process_file_handlers = {}
+_aggregated_offsets = {}
 
 # Command line arguments configuration
 # Used in engine.py
@@ -123,24 +125,58 @@ def read_log(log_type):
         return set()
 
 
-def aggregate_logs(end=False):
+def _read_pending_bytes(file_path, end=False):
+    offset = _aggregated_offsets.get(file_path, 0)
+    file_size = file_path.stat().st_size
+    if file_size < offset:
+        offset = 0
+    if file_size == offset:
+        return b"", offset, offset
+    with file_path.open("rb") as f:
+        f.seek(offset)
+        data = f.read(file_size - offset)
+    if not end and data and not data.endswith(b"\n"):
+        last_newline = data.rfind(b"\n")
+        if last_newline < 0:
+            return b"", offset, offset
+        data = data[: last_newline + 1]
+        file_size = offset + last_newline + 1
+    return data, offset, file_size
+
+
+def _commit_aggregate_offset(file_path, offset, clear=False):
+    if clear:
+        _aggregated_offsets.pop(file_path, None)
+    else:
+        _aggregated_offsets[file_path] = offset
+
+
+def aggregate_logs(end=False, cleanup=False):
     """聚合所有相同类型的日志文件"""
-    if not TMP_LOG_PATH.exists() and not end:
+    should_cleanup_tmp = end or cleanup
+    tmp_exists = TMP_LOG_PATH.exists()
+    if not tmp_exists and not should_cleanup_tmp:
         TMP_LOG_PATH.mkdir(exist_ok=True)
         return
 
     all_success = True
     for prefix in LOG_PREFIXES.values():
-        log_files = list(TMP_LOG_PATH.glob(f"{prefix}_*.txt"))
+        log_files = list(TMP_LOG_PATH.glob(f"{prefix}_*.txt")) if tmp_exists else []
         if not log_files:
             continue
 
         prefix_success = True
         all_lines = set()
+        pending_offsets = {}
         for file_path in log_files:
             try:
-                with file_path.open("r") as f:
-                    all_lines.update(line.strip() for line in f if line.strip())
+                data, start_offset, end_offset = _read_pending_bytes(
+                    file_path, end=should_cleanup_tmp
+                )
+                pending_offsets[file_path] = end_offset
+                all_lines.update(
+                    line.strip() for line in data.decode().splitlines() if line.strip()
+                )
             except Exception as err:
                 print(f"Error reading {file_path}: {err}", flush=True)
                 prefix_success = False
@@ -151,8 +187,9 @@ def aggregate_logs(end=False):
 
         aggregated_file = TEST_LOG_PATH / f"{prefix}.txt"
         try:
-            with aggregated_file.open("a") as f:
-                f.writelines(f"{line}\n" for line in sorted(all_lines))
+            if all_lines:
+                with aggregated_file.open("a") as f:
+                    f.writelines(f"{line}\n" for line in sorted(all_lines))
         except Exception as err:
             print(f"Error writing to {aggregated_file}: {err}", flush=True)
             prefix_success = False
@@ -161,33 +198,37 @@ def aggregate_logs(end=False):
             aggregated_file.unlink(missing_ok=True)
             all_success = False
         else:
-            for file_path in log_files:
-                if end:
+            for file_path, offset in pending_offsets.items():
+                _commit_aggregate_offset(file_path, offset, clear=should_cleanup_tmp)
+                if should_cleanup_tmp:
                     file_path.unlink()
-                else:
-                    file_path.write_bytes(b"")
 
     log_success = True
     log_file = TEST_LOG_PATH / "log_inorder.log"
-    tmp_log_files = sorted(TMP_LOG_PATH.glob("log_*.log"))
+    tmp_log_files = sorted(TMP_LOG_PATH.glob("log_*.log")) if tmp_exists else []
     BUFFER_SIZE = 4 * 1024 * 1024
+    pending_log_offsets = {}
     try:
         with log_file.open("ab") as out_f:
             for file_path in tmp_log_files:
                 try:
-                    with file_path.open("rb") as in_f:
-                        while True:
-                            lines = in_f.readlines(BUFFER_SIZE)
-                            if not lines:
-                                break
-                            for line in lines:
-                                if len(line) > 200000:  # 如果行长度超过200000字节,截断
-                                    # print(
-                                    #     f"Truncating long line ({len(line)} bytes) in {file_path.name}"
-                                    # )
-                                    out_f.write(line[:200000] + b"\n")
-                                else:
-                                    out_f.write(line)
+                    data, start_offset, end_offset = _read_pending_bytes(
+                        file_path, end=should_cleanup_tmp
+                    )
+                    pending_log_offsets[file_path] = end_offset
+                    in_f = io.BytesIO(data)
+                    while True:
+                        lines = in_f.readlines(BUFFER_SIZE)
+                        if not lines:
+                            break
+                        for line in lines:
+                            if len(line) > 200000:  # 如果行长度超过200000字节,截断
+                                # print(
+                                #     f"Truncating long line ({len(line)} bytes) in {file_path.name}"
+                                # )
+                                out_f.write(line[:200000] + b"\n")
+                            else:
+                                out_f.write(line)
                 except Exception as err:
                     print(f"Error reading {file_path}: {err}", flush=True)
                     log_success = False
@@ -200,20 +241,21 @@ def aggregate_logs(end=False):
         log_file.unlink(missing_ok=True)
         all_success = False
     else:
-        for file_path in tmp_log_files:
-            if end:
+        for file_path, offset in pending_log_offsets.items():
+            _commit_aggregate_offset(file_path, offset, clear=should_cleanup_tmp)
+            if should_cleanup_tmp:
                 file_path.unlink()
-            else:
-                file_path.write_bytes(b"")
 
     tol_success = True
     tol_file = TEST_LOG_PATH / "tol.csv"
-    tmp_tol_files = sorted(TMP_LOG_PATH.glob("tol_*.csv"))
+    tmp_tol_files = sorted(TMP_LOG_PATH.glob("tol_*.csv")) if tmp_exists else []
     if tmp_tol_files:
+        pending_tol_offsets = {}
         try:
+            tol_is_new = not tol_file.exists() or tol_file.stat().st_size == 0
             with tol_file.open("a", newline="") as out_f:
                 writer = csv.writer(out_f)
-                if not tol_file.exists() or tol_file.stat().st_size == 0:
+                if tol_is_new:
                     writer.writerow(
                         [
                             "API",
@@ -226,12 +268,16 @@ def aggregate_logs(end=False):
                     )
                 for file_path in tmp_tol_files:
                     try:
-                        with file_path.open("r") as in_f:
-                            reader = csv.reader(in_f)
+                        data, start_offset, end_offset = _read_pending_bytes(
+                            file_path, end=should_cleanup_tmp
+                        )
+                        pending_tol_offsets[file_path] = end_offset
+                        reader = csv.reader(io.StringIO(data.decode()))
+                        if start_offset == 0:
                             next(reader, None)
-                            for row in reader:
-                                if row:  # 确保行不为空
-                                    writer.writerow(row)
+                        for row in reader:
+                            if row:  # 确保行不为空
+                                writer.writerow(row)
                     except Exception as err:
                         print(f"Error reading {file_path}: {err}", flush=True)
                         tol_success = False
@@ -244,20 +290,21 @@ def aggregate_logs(end=False):
             tol_file.unlink(missing_ok=True)
             all_success = False
         else:
-            for file_path in tmp_tol_files:
-                if end:
+            for file_path, offset in pending_tol_offsets.items():
+                _commit_aggregate_offset(file_path, offset, clear=should_cleanup_tmp)
+                if should_cleanup_tmp:
                     file_path.unlink()
-                else:
-                    file_path.write_bytes(b"")
 
     stable_success = True
     stable_file = TEST_LOG_PATH / "stable.csv"
-    tmp_stable_files = sorted(TMP_LOG_PATH.glob("stable_*.csv"))
+    tmp_stable_files = sorted(TMP_LOG_PATH.glob("stable_*.csv")) if tmp_exists else []
     if tmp_stable_files:
+        pending_stable_offsets = {}
         try:
+            stable_is_new = not stable_file.exists() or stable_file.stat().st_size == 0
             with stable_file.open("a", newline="") as out_f:
                 writer = csv.writer(out_f)
-                if not stable_file.exists() or stable_file.stat().st_size == 0:
+                if stable_is_new:
                     writer.writerow(
                         [
                             "API",
@@ -270,34 +317,42 @@ def aggregate_logs(end=False):
                     )
                 for file_path in tmp_stable_files:
                     try:
-                        with file_path.open("r") as in_f:
-                            reader = csv.reader(in_f)
+                        data, start_offset, end_offset = _read_pending_bytes(
+                            file_path, end=should_cleanup_tmp
+                        )
+                        pending_stable_offsets[file_path] = end_offset
+                        reader = csv.reader(io.StringIO(data.decode()))
+                        if start_offset == 0:
                             next(reader, None)
-                            for row in reader:
-                                if row:  # 确保行不为空
-                                    writer.writerow(row)
+                        for row in reader:
+                            if row:  # 确保行不为空
+                                writer.writerow(row)
                     except Exception as err:
                         print(f"Error reading {file_path}: {err}", flush=True)
                         stable_success = False
                         break
         except Exception as err:
-            print(f"Error writing to {tol_file}: {err}", flush=True)
+            print(f"Error writing to {stable_file}: {err}", flush=True)
             stable_success = False
 
         if not stable_success:
             stable_file.unlink(missing_ok=True)
             all_success = False
         else:
-            for file_path in tmp_stable_files:
-                if end:
+            for file_path, offset in pending_stable_offsets.items():
+                _commit_aggregate_offset(file_path, offset, clear=should_cleanup_tmp)
+                if should_cleanup_tmp:
                     file_path.unlink()
-                else:
-                    file_path.write_bytes(b"")
+
+    if (
+        should_cleanup_tmp
+        and all_success
+        and TMP_LOG_PATH.exists()
+        and not os.listdir(TMP_LOG_PATH)
+    ):
+        shutil.rmtree(TMP_LOG_PATH)
 
     if end:
-        if all_success and TMP_LOG_PATH.exists() and not os.listdir(TMP_LOG_PATH):
-            shutil.rmtree(TMP_LOG_PATH)
-
         if tol_file.exists():
             try:
                 df = pd.read_csv(tol_file, on_bad_lines="warn")
