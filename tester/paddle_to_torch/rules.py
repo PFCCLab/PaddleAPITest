@@ -7204,7 +7204,7 @@ dtype_map = {
 }
 dtype_val = locals().get("dtype")
 torch_dtype = dtype_map.get(str(dtype_val).split(".")[-1], torch.float32)
-result = torch.normal(mean=float(mean), std=float(std), size=list(shape)).to(torch_dtype)
+result = torch.empty(list(shape), dtype=torch_dtype).normal_(mean=float(mean), std=float(std))
 """
         code = Code(core=core.splitlines())
         return ConvertResult.success(paddle_api, code, is_torch_corresponding=False)
