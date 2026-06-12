@@ -4,30 +4,50 @@
 # Usage: ./run.sh
 
 # 配置参数
-# NUM_GPUS!=0 时，engineV2 不受外部 "CUDA_VISIBLE_DEVICES" 影响
 FILE_INPUT="tester/api_config/5_accuracy/accuracy_1.txt"
 # FILE_PATTERN="tester/api_config/5_accuracy/accuracy_*.txt"
 LOG_DIR="tester/api_config/test_log"
+
+# NUM_GPUS!=0 时，engineV2 不受外部 "CUDA_VISIBLE_DEVICES" 影响
 NUM_GPUS=-1
 NUM_WORKERS_PER_GPU=-1
 GPU_IDS="4-7"
 # REQUIRED_MEMORY=10
 TIME_OUT=600
 
+# 测试模式
 TEST_MODE_ARGS=(
+    # Paddle vs Torch 正确性对比
     --accuracy=True
+    # Paddle 单框架执行
     # --paddle_only=True
+    # Paddle 动态图 vs CINN；test_backward 仅此模式生效
     # --paddle_cinn=True
+    # 性能测试
     # --paddle_gpu_performance=True
     # --torch_gpu_performance=True
     # --paddle_torch_gpu_performance=True
+    # 稳定性测试
     # --accuracy_stable=True
+)
+
+# 测试参数
+TEST_PARAM_ARGS=(
+    # 混合精度
     # --test_amp=True
+    # CPU 路径
     # --test_cpu=True
+    # CPU numpy 缓存；gpu_cache_mode 下自动关闭
     # --use_cached_numpy=True
+    # GPU tensor 缓存 + GPU compare；增加显存驻留
+    # --use_gpu_cache_mode=True
+    # 对比阈值；bitwise_alignment 会将阈值置 0
     # --atol=1e-2
     # --rtol=1e-2
+    # --bitwise_alignment=True
+    # accuracy 容差诊断，保留 CPU compare
     # --test_tol=True
+    # 仅 paddle_cinn 生效
     # --test_backward=True
 )
 
@@ -55,6 +75,7 @@ mkdir -p "$LOG_DIR" || {
 LOG_FILE="$LOG_DIR/log_$(date +%Y%m%d_%H%M%S).log"
 nohup python engineV2.py \
         "${TEST_MODE_ARGS[@]}" \
+        "${TEST_PARAM_ARGS[@]}" \
         "${IN_OUT_ARGS[@]}" \
         "${PARALLEL_ARGS[@]}" \
         "${TIME_OUT_ARGS[@]}" \
