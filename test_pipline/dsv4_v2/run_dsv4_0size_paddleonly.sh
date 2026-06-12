@@ -5,9 +5,9 @@ set -euo pipefail
 # PaddleAPITest 运行脚本
 #
 # 使用方式:
-#   ./run.sh              正常启动（后台）
+#   ./run.sh              正常启动（前台）
 #   ./run.sh --stop       终止上次启动的后台进程
-#   ./run.sh --status     查看运行状态
+#   ./run.sh --status     查看后台运行状态
 #
 # 配置方法: 修改下方变量 / 注释切换即可
 # ============================================================
@@ -16,7 +16,7 @@ set -euo pipefail
 ENGINE=engineV4           # engineV2 | engineV4
 
 # ── 运行模式开关 ──────────────────────────────────────────────
-FOREGROUND=false          # true=前台运行(调试用，Ctrl+C终止)
+FOREGROUND=true           # true=前台运行(Ctrl+C终止)，false=后台 nohup 运行
 DRY_RUN=false             # true=只打印最终命令，不执行
 
 # ── compute-sanitizer ─────────────────────────────────────────

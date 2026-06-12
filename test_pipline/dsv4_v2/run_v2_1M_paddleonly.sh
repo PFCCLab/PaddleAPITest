@@ -16,7 +16,7 @@ set -euo pipefail
 ENGINE=engineV4           # engineV2 | engineV4
 
 # ── 运行模式开关 ──────────────────────────────────────────────
-FOREGROUND=false          # true=前台运行(调试用，Ctrl+C终止)
+FOREGROUND=true          # true=前台运行(调试用，Ctrl+C终止)
 DRY_RUN=false             # true=只打印最终命令，不执行
 
 # ── compute-sanitizer ─────────────────────────────────────────
