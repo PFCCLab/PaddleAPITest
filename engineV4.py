@@ -353,7 +353,9 @@ def _sanitizer_worker_loop(slot_index, gpu_id, input_queue, result_queue, option
                 result_queue.put(("error", slot_index, api_config_str, output_tail))
             else:
                 output_tail = "".join(output_lines)
-                result_queue.put(("crashed", slot_index, api_config_str, returncode, output_tail))
+                result_queue.put(
+                    ("crashed", slot_index, api_config_str, returncode, output_tail, "child")
+                )
     finally:
         if child_process is not None and child_process.poll() is None:
             try:
@@ -917,7 +919,6 @@ def run_test_case(api_config_str, options):
     cuda_visible = os.environ.get("CUDA_VISIBLE_DEVICES", "0")
     gpu_id = int(cuda_visible.split(",")[0])
 
-    write_to_log("checkpoint", api_config_str)
     print(
         f"{datetime.now()} GPU {gpu_id} {os.getpid()} [paddle {options.paddle_version}] test begin: {api_config_str}",
         flush=True,
@@ -1438,6 +1439,12 @@ def main():
 
         # when engineV2 was interrupted, resume from .tmp dir
         aggregate_logs(cleanup=True)
+        removed_stale_logs = cleanup_uncheckpointed_result_logs()
+        if removed_stale_logs:
+            print(
+                f"{removed_stale_logs} stale result log entries without checkpoint were removed.",
+                flush=True,
+            )
 
         # read checkpoint
         finish_configs = read_log("checkpoint")
@@ -1572,12 +1579,35 @@ def main():
                 # Task completed (done/error/timeout/crashed)
                 slot_idx = msg[1]
                 config = msg[2]
+                exitcode = msg[3] if msg_type == "crashed" and len(msg) > 3 else None
+                crash_source = msg[5] if msg_type == "crashed" and len(msg) > 5 else "worker"
                 worker_reusable = msg_type in ("done", "error") or (
-                    msg_type == "crashed" and options.use_compute_sanitizer
+                    msg_type == "crashed"
+                    and options.use_compute_sanitizer
+                    and crash_source == "child"
                 )
+                external_kill = msg_type == "crashed" and exitcode in (
+                    -signal.SIGKILL,
+                    -signal.SIGTERM,
+                )
+                active_tasks -= 1
+
+                if external_kill:
+                    print(
+                        f"[warn] Worker was externally killed for {config} "
+                        f"(exit={exitcode}); retry after worker restart.",
+                        flush=True,
+                    )
+                    if worker_reusable:
+                        pool.mark_idle(slot_idx)
+                        pool.dispatch(slot_idx, config)
+                        active_tasks += 1
+                    else:
+                        pending_dispatch.insert(0, config)
+                    continue
+
                 if worker_reusable:
                     pool.mark_idle(slot_idx)
-                active_tasks -= 1
                 tested_case += 1
 
                 if options.show_runtime_status or tested_case % 10000 == 0:
@@ -1596,7 +1626,6 @@ def main():
                         flush=True,
                     )
                 elif msg_type == "crashed":
-                    exitcode = msg[3] if len(msg) > 3 else None
                     if exitcode == 99:
                         print(
                             f"[error] CUDA error for {config}",
@@ -1628,6 +1657,8 @@ def main():
                         f"[warn] Test case failed for {config}: {error_msg}",
                         flush=True,
                     )
+
+                write_to_log("checkpoint", config)
 
                 # Get next config to dispatch
                 next_config = next(config_iter, None)

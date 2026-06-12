@@ -125,6 +125,38 @@ def read_log(log_type):
         return set()
 
 
+def cleanup_uncheckpointed_result_logs():
+    """Remove result rows that were written before checkpoint during an interrupted run."""
+    checkpoint_file = TEST_LOG_PATH / "checkpoint.txt"
+    try:
+        with checkpoint_file.open("r") as f:
+            checkpoints = {line.strip() for line in f if line.strip()}
+    except FileNotFoundError:
+        checkpoints = set()
+    except Exception as err:
+        print(f"Error reading {checkpoint_file}: {err}", flush=True)
+        return 0
+
+    removed = 0
+    for log_type, prefix in LOG_PREFIXES.items():
+        if log_type == "checkpoint":
+            continue
+        log_file = TEST_LOG_PATH / f"{prefix}.txt"
+        if not log_file.exists():
+            continue
+        try:
+            with log_file.open("r") as f:
+                lines = f.readlines()
+            new_lines = [line for line in lines if line.strip() in checkpoints]
+            removed += len(lines) - len(new_lines)
+            if len(new_lines) != len(lines):
+                with log_file.open("w") as f:
+                    f.writelines(new_lines)
+        except Exception as err:
+            print(f"Error cleaning {log_file}: {err}", flush=True)
+    return removed
+
+
 def _read_pending_bytes(file_path, end=False):
     offset = _aggregated_offsets.get(file_path, 0)
     file_size = file_path.stat().st_size
