@@ -7504,25 +7504,28 @@ elif op_name == "fused_swiglu_probs_bwd":
         bytes_budget = 1 << 30
         per_row = max(1, H * 4 * 10)
         chunk = max(1, min(outer, bytes_budget // per_row))
-        for s in range(0, outer, chunk):
-            e = min(outer, s + chunk)
-            # inplace 时 o1_2d 即将被写入，需先把 lhs/rhs 拷到 fp32 中间变量
-            lhs_c  = o1_2d[s:e, :H].float()
-            rhs_c  = o1_2d[s:e, H:].float()
-            do2_c  = do2_2d[s:e].float()
-            prob_c = probs_flat[s:e].unsqueeze(-1)
-            sig      = torch.sigmoid(lhs_c)
-            silu_lhs = sig * lhs_c
-            o2_val   = silu_lhs * rhs_c
-            do2_val  = do2_c * prob_c
-            x0g = do2_val * rhs_c * sig * (1.0 + lhs_c - silu_lhs)
-            x1g = do2_val * silu_lhs
-            pg_out[s:e] = (do2_c * o2_val).sum(dim=-1)
-            # o2_s 写入需在 do1 之前完成时使用 do2_2d 切片；这里 o2_s 与 do1
-            # 来自不同 buffer（即使 inplace 也是 do2_s vs o1），互不影响。
-            o2_s_out[s:e] = (o2_val * prob_c).to(do2_dtype)
-            do1_out[s:e, :H] = x0g.to(o1_dtype)
-            do1_out[s:e, H:] = x1g.to(o1_dtype)
+        # 切片原地写入会触发 autograd 对叶子张量的报错（尤其 fp32 叶子节点），
+        # 这里整体走 no_grad：本算子是 bwd kernel 的数值复刻，不需要再次求导。
+        with torch.no_grad():
+            for s in range(0, outer, chunk):
+                e = min(outer, s + chunk)
+                # inplace 时 o1_2d 即将被写入，需先把 lhs/rhs 拷到 fp32 中间变量
+                lhs_c  = o1_2d[s:e, :H].float()
+                rhs_c  = o1_2d[s:e, H:].float()
+                do2_c  = do2_2d[s:e].float()
+                prob_c = probs_flat[s:e].unsqueeze(-1)
+                sig      = torch.sigmoid(lhs_c)
+                silu_lhs = sig * lhs_c
+                o2_val   = silu_lhs * rhs_c
+                do2_val  = do2_c * prob_c
+                x0g = do2_val * rhs_c * sig * (1.0 + lhs_c - silu_lhs)
+                x1g = do2_val * silu_lhs
+                pg_out[s:e] = (do2_c * o2_val).sum(dim=-1)
+                # o2_s 写入需在 do1 之前完成时使用 do2_2d 切片；这里 o2_s 与 do1
+                # 来自不同 buffer（即使 inplace 也是 do2_s vs o1），互不影响。
+                o2_s_out[s:e] = (o2_val * prob_c).to(do2_dtype)
+                do1_out[s:e, :H] = x0g.to(o1_dtype)
+                do1_out[s:e, H:] = x1g.to(o1_dtype)
         result = [
             do1_out.reshape(o1.shape),
             pg_out,

@@ -377,7 +377,7 @@ class APITestAccuracy(APITestBase):
                     paddle_item is None
                     or (
                         isinstance(paddle_item, paddle.Tensor)
-                        and (not paddle_item._is_initialized() or paddle_item.numel() == 0)
+                        and not paddle_item._is_initialized()
                     )
                 ) and torch_item is None:
                     # paddle is None and torch is None
@@ -511,7 +511,7 @@ class APITestAccuracy(APITestBase):
                         paddle_item is None
                         or (
                             isinstance(paddle_item, paddle.Tensor)
-                            and (not paddle_item._is_initialized() or paddle_item.numel() == 0)
+                            and not paddle_item._is_initialized()
                         )
                     ) and torch_item is None:
                         # paddle is None and torch is None
