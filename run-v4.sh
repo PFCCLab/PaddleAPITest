@@ -19,6 +19,12 @@ ENGINE=engineV4           # engineV2 | engineV4
 FOREGROUND=false          # true=前台运行(调试用，Ctrl+C终止)
 DRY_RUN=false             # true=只打印最终命令，不执行
 
+# ── compute-sanitizer ─────────────────────────────────────────
+# true=由 engineV4 为每个 worker slot 单独启动 compute-sanitizer 子进程，保留多 GPU/多 worker 并发
+USE_COMPUTE_SANITIZER=false
+SANITIZER_COMMAND="compute-sanitizer --target-processes all --error-exitcode=86"
+SANITIZER_ERROR_EXITCODE=86
+
 # ── Paddle Flags ──────────────────────────────────────────────
 export FLAGS_use_system_allocator=true
 export FLAGS_check_cuda_error=true
@@ -152,11 +158,18 @@ TIME_OUT_ARGS=(
     --timeout="$TIME_OUT"
 )
 
+SANITIZER_ARGS=(
+    --use_compute_sanitizer="$USE_COMPUTE_SANITIZER"
+    --sanitizer_command="$SANITIZER_COMMAND"
+    --sanitizer_error_exitcode="$SANITIZER_ERROR_EXITCODE"
+)
+
 ALL_ARGS=(
     "${TEST_MODE_ARGS[@]}"
     "${IN_OUT_ARGS[@]}"
     "${PARALLEL_ARGS[@]}"
     "${TIME_OUT_ARGS[@]}"
+    "${SANITIZER_ARGS[@]}"
 )
 
 # ── 打印有效配置 ──
@@ -167,6 +180,7 @@ echo "  日志:    $LOG_DIR"
 echo "  GPU:     ids=$GPU_IDS  workers/gpu=$NUM_WORKERS_PER_GPU"
 echo "  超时:    ${TIME_OUT}s"
 echo "  模式:    ${TEST_MODE_ARGS[*]:-<无>}"
+echo "  Sanitizer: enabled=$USE_COMPUTE_SANITIZER exitcode=$SANITIZER_ERROR_EXITCODE command='$SANITIZER_COMMAND'"
 echo "────────────────────────────────────────────"
 
 # ── Dry-run 模式 ──
@@ -192,7 +206,7 @@ if [[ "$FOREGROUND" == "true" ]]; then
     echo ""
     python "$SCRIPT_DIR/$ENGINE.py" "${ALL_ARGS[@]}" 2>&1 | tee "$LOG_FILE"
 else
-    nohup python "$SCRIPT_DIR/$ENGINE.py" "${ALL_ARGS[@]}" >> "$LOG_FILE" 2>&1 &
+    nohup setsid python "$SCRIPT_DIR/$ENGINE.py" "${ALL_ARGS[@]}" >> "$LOG_FILE" 2>&1 &
     PYTHON_PID=$!
     echo "$PYTHON_PID" > "$PID_FILE"
 

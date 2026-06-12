@@ -6,13 +6,15 @@ import multiprocessing as mp
 import os
 import queue
 import re
+import shlex
 import shutil
 import signal
 import subprocess
 import sys
 import threading
 import time
-from dataclasses import dataclass, field
+from collections import deque
+from dataclasses import dataclass
 from datetime import datetime
 from multiprocessing import cpu_count, set_start_method
 from pathlib import Path
@@ -60,6 +62,33 @@ VALID_TEST_ARGS = {
     "exit_on_error",
 }
 
+SANITIZER_FORWARD_ARGS = {
+    "accuracy",
+    "paddle_only",
+    "paddle_cinn",
+    "paddle_gpu_performance",
+    "torch_gpu_performance",
+    "paddle_torch_gpu_performance",
+    "accuracy_stable",
+    "paddle_custom_device",
+    "custom_device_vs_gpu",
+    "custom_device_vs_gpu_mode",
+    "test_amp",
+    "test_cpu",
+    "use_cached_numpy",
+    "log_dir",
+    "required_memory",
+    "atol",
+    "rtol",
+    "test_tol",
+    "test_backward",
+    "show_runtime_status",
+    "random_seed",
+    "bitwise_alignment",
+    "generate_failed_tests",
+    "exit_on_error",
+}
+
 DEVICE_TYPE = None
 DEVICE_TYPE_DETECTED = False
 DEVICE_COUNT = None  # total number of devices
@@ -92,7 +121,71 @@ class WorkerSlot:
     input_queue: mp.Queue | None = None
     current_task: str | None = None
     task_start_time: float | None = None
+    child_pid: int | None = None
     state: str = "dead"  # dead, starting, idle, busy
+
+
+def _init_worker_runtime(slot_index, gpu_id, options, *, redirect_output):
+    if options.log_dir:
+        set_test_log_path(options.log_dir)
+    set_engineV2()
+
+    if gpu_id is not None:
+        os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
+
+    import paddle
+    import torch
+
+    try:
+        import paddlefleet_ops  # noqa: F401
+    except ImportError:
+        pass
+    try:
+        import FusedQuantOps  # noqa: F401
+    except ImportError:
+        pass
+
+    globals()["torch"] = torch
+    globals()["paddle"] = paddle
+
+    from tester import (
+        APIConfig,
+        APITestAccuracy,
+        APITestAccuracyStable,
+        APITestCINNVSDygraph,
+        APITestCustomDeviceVSCPU,
+        APITestPaddleDeviceVSGPU,
+        APITestPaddleGPUPerformance,
+        APITestPaddleOnly,
+        APITestPaddleTorchGPUPerformance,
+        APITestTorchGPUPerformance,
+    )
+
+    test_classes = {
+        "APIConfig": APIConfig,
+        "APITestAccuracy": APITestAccuracy,
+        "APITestCINNVSDygraph": APITestCINNVSDygraph,
+        "APITestPaddleOnly": APITestPaddleOnly,
+        "APITestPaddleGPUPerformance": APITestPaddleGPUPerformance,
+        "APITestTorchGPUPerformance": APITestTorchGPUPerformance,
+        "APITestPaddleTorchGPUPerformance": APITestPaddleTorchGPUPerformance,
+        "APITestAccuracyStable": APITestAccuracyStable,
+        "APITestCustomDeviceVSCPU": APITestCustomDeviceVSCPU,
+        "APITestPaddleDeviceVSGPU": APITestPaddleDeviceVSGPU,
+    }
+    globals().update(test_classes)
+
+    if options.test_cpu:
+        paddle.device.set_device("cpu")
+
+    if redirect_output:
+        redirect_stdio()
+
+    if slot_index is not None and gpu_id is not None:
+        print(
+            f"{datetime.now()} Worker PID: {os.getpid()}, Slot: {slot_index}, GPU: {gpu_id}",
+            flush=True,
+        )
 
 
 def _worker_loop(slot_index, gpu_id, input_queue, result_queue, options):
@@ -112,64 +205,8 @@ def _worker_loop(slot_index, gpu_id, input_queue, result_queue, options):
     "ready".
     """
     # ── GPU initialization (equivalent to init_worker_gpu) ──
-    if options.log_dir:
-        set_test_log_path(options.log_dir)
-    set_engineV2()
-
-    os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
-
     try:
-        import paddle
-        import torch
-
-        try:
-            import paddlefleet_ops  # noqa: F401
-        except ImportError:
-            pass
-        try:
-            import FusedQuantOps  # noqa: F401
-        except ImportError:
-            pass
-
-        globals()["torch"] = torch
-        globals()["paddle"] = paddle
-
-        from tester import (
-            APIConfig,
-            APITestAccuracy,
-            APITestAccuracyStable,
-            APITestCINNVSDygraph,
-            APITestCustomDeviceVSCPU,
-            APITestPaddleDeviceVSGPU,
-            APITestPaddleGPUPerformance,
-            APITestPaddleOnly,
-            APITestPaddleTorchGPUPerformance,
-            APITestTorchGPUPerformance,
-        )
-
-        test_classes = {
-            "APIConfig": APIConfig,
-            "APITestAccuracy": APITestAccuracy,
-            "APITestCINNVSDygraph": APITestCINNVSDygraph,
-            "APITestPaddleOnly": APITestPaddleOnly,
-            "APITestPaddleGPUPerformance": APITestPaddleGPUPerformance,
-            "APITestTorchGPUPerformance": APITestTorchGPUPerformance,
-            "APITestPaddleTorchGPUPerformance": APITestPaddleTorchGPUPerformance,
-            "APITestAccuracyStable": APITestAccuracyStable,
-            "APITestCustomDeviceVSCPU": APITestCustomDeviceVSCPU,
-            "APITestPaddleDeviceVSGPU": APITestPaddleDeviceVSGPU,
-        }
-        globals().update(test_classes)
-
-        if options.test_cpu:
-            paddle.device.set_device("cpu")
-
-        redirect_stdio()
-
-        print(
-            f"{datetime.now()} Worker PID: {os.getpid()}, Slot: {slot_index}, GPU: {gpu_id}",
-            flush=True,
-        )
+        _init_worker_runtime(slot_index, gpu_id, options, redirect_output=True)
     except Exception as e:
         print(f"{datetime.now()} Worker {os.getpid()} init failed: {e}", flush=True)
         result_queue.put(("init_failed", slot_index, str(e)))
@@ -208,6 +245,132 @@ def _worker_loop(slot_index, gpu_id, input_queue, result_queue, options):
         pass
 
 
+def _format_cli_value(value):
+    if isinstance(value, bool):
+        return "True" if value else "False"
+    return str(value)
+
+
+def _build_sanitizer_case_command(api_config_str, options):
+    cmd = [
+        *shlex.split(options.sanitizer_command),
+        sys.executable,
+        str(Path(__file__).resolve()),
+        f"--api_config={api_config_str}",
+        "--_sanitizer_child=True",
+    ]
+    for key in sorted(SANITIZER_FORWARD_ARGS):
+        value = getattr(options, key, None)
+        if value is None:
+            continue
+        if isinstance(value, str) and value == "":
+            continue
+        if isinstance(value, bool) and not value:
+            continue
+        cmd.append(f"--{key}={_format_cli_value(value)}")
+    return cmd
+
+
+def _sanitizer_worker_loop(slot_index, gpu_id, input_queue, result_queue, options):
+    if options.log_dir:
+        set_test_log_path(options.log_dir)
+    set_engineV2()
+    redirect_stdio()
+
+    child_process = None
+
+    def terminate_child(*args):
+        if child_process is not None and child_process.poll() is None:
+            try:
+                os.killpg(child_process.pid, signal.SIGKILL)
+            except (ProcessLookupError, OSError):
+                child_process.kill()
+        raise SystemExit(1)
+
+    signal.signal(signal.SIGINT, terminate_child)
+    signal.signal(signal.SIGTERM, terminate_child)
+
+    try:
+        print(
+            f"{datetime.now()} Sanitizer worker PID: {os.getpid()}, Slot: {slot_index}, GPU: {gpu_id}",
+            flush=True,
+        )
+        result_queue.put(("ready", slot_index))
+
+        while True:
+            try:
+                task = input_queue.get()
+            except (EOFError, OSError):
+                break
+            if task is None:
+                break
+
+            api_config_str = task
+            result_queue.put(("ack", slot_index, api_config_str))
+            try:
+                cmd = _build_sanitizer_case_command(api_config_str, options)
+            except ValueError as err:
+                result_queue.put(("error", slot_index, api_config_str, str(err)))
+                continue
+            env = os.environ.copy()
+            env["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
+
+            print(
+                f"{datetime.now()} Sanitizer slot {slot_index} launch: {' '.join(shlex.quote(part) for part in cmd)}",
+                flush=True,
+            )
+            try:
+                child_process = subprocess.Popen(
+                    cmd,
+                    env=env,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                    bufsize=1,
+                    start_new_session=True,
+                )
+            except OSError as err:
+                result_queue.put(("error", slot_index, api_config_str, str(err)))
+                continue
+            result_queue.put(("child", slot_index, child_process.pid))
+            output_lines = deque(maxlen=40)
+            try:
+                for line in child_process.stdout:
+                    output_lines.append(line)
+                    print(line, end="", flush=True)
+                returncode = child_process.wait()
+            finally:
+                if child_process.stdout is not None:
+                    child_process.stdout.close()
+
+            child_process = None
+            if returncode == 0:
+                result_queue.put(("done", slot_index, api_config_str))
+            elif returncode == 2:
+                output_tail = "".join(output_lines)
+                result_queue.put(("error", slot_index, api_config_str, output_tail))
+            else:
+                output_tail = "".join(output_lines)
+                result_queue.put(("crashed", slot_index, api_config_str, returncode, output_tail))
+    finally:
+        if child_process is not None and child_process.poll() is None:
+            try:
+                os.killpg(child_process.pid, signal.SIGKILL)
+            except (ProcessLookupError, OSError):
+                child_process.kill()
+            try:
+                child_process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                pass
+        try:
+            close_process_files()
+            restore_stdio()
+        except Exception:
+            pass
+
+
 class WorkerPool:
     """Custom process pool with per-worker queues for fair GPU scheduling."""
 
@@ -222,6 +385,7 @@ class WorkerPool:
         self._shutdown_event = threading.Event()
         self._watchdog_thread = None
         self._lock = threading.Lock()  # protects slot state modifications
+        self._closed = False
 
         # Build worker slots: deterministic GPU assignment
         idx = 0
@@ -244,11 +408,40 @@ class WorkerPool:
         )
         self._watchdog_thread.start()
 
+    def _close_queue(self, q, *, cancel_join=False):
+        """Close a multiprocessing queue without letting cleanup errors mask test results."""
+        if q is None:
+            return
+        try:
+            if cancel_join:
+                q.cancel_join_thread()
+        except Exception:
+            pass
+        try:
+            q.close()
+        except Exception:
+            pass
+        if not cancel_join:
+            try:
+                q.join_thread()
+            except Exception:
+                pass
+
     def _spawn_worker(self, slot):
         """Spawn a new worker process for the given slot."""
+        if self._closed or self._shutdown_event.is_set():
+            return False
+        if slot.process is not None and not slot.process.is_alive():
+            self._join_process(slot.process, timeout=1)
+        self._close_queue(slot.input_queue, cancel_join=True)
         slot.input_queue = mp.Queue()
+        worker_target = (
+            _sanitizer_worker_loop
+            if getattr(self.options, "use_compute_sanitizer", False)
+            else _worker_loop
+        )
         p = mp.Process(
-            target=_worker_loop,
+            target=worker_target,
             args=(slot.index, slot.gpu_id, slot.input_queue, self.result_queue, self.options),
             daemon=True,
         )
@@ -257,6 +450,8 @@ class WorkerPool:
         slot.state = "starting"
         slot.current_task = None
         slot.task_start_time = None
+        slot.child_pid = None
+        return True
 
     def warmup(self, timeout=180):
         """Wait for all workers to report ready."""
@@ -328,15 +523,21 @@ class WorkerPool:
             slot.state = "idle"
             slot.current_task = None
             slot.task_start_time = None
+            slot.child_pid = None
 
     def _watchdog_loop(self):
         """Periodically check for timeouts and unexpectedly dead workers."""
         while not self._shutdown_event.is_set():
-            time.sleep(1.0)
+            if self._shutdown_event.wait(1.0):
+                break
             now = time.time()
 
             for slot in self.slots:
+                if self._shutdown_event.is_set():
+                    break
                 with self._lock:
+                    if self._shutdown_event.is_set():
+                        break
                     # Check timeout
                     if (
                         slot.state == "busy"
@@ -345,6 +546,9 @@ class WorkerPool:
                     ):
                         self._handle_timeout(slot)
                         continue
+
+                    if self._shutdown_event.is_set():
+                        break
 
                     # Check unexpected death
                     if (
@@ -356,26 +560,49 @@ class WorkerPool:
 
     def _handle_timeout(self, slot):
         """Kill timed-out worker and enqueue timeout result."""
+        if self._closed or self._shutdown_event.is_set():
+            return
         config = slot.current_task
         print(
             f"{datetime.now()} Watchdog: slot {slot.index} timeout, killing PID {slot.process.pid}",
             flush=True,
         )
+        self._kill_slot_child(slot)
         self._kill_process(slot.process)
+        if self._closed or self._shutdown_event.is_set():
+            return
         self.result_queue.put(("timeout", slot.index, config))
         self._spawn_worker(slot)
 
     def _handle_crash(self, slot):
         """Handle unexpectedly dead worker."""
+        if self._closed or self._shutdown_event.is_set():
+            return
         exitcode = slot.process.exitcode if slot.process else None
         config = slot.current_task
         print(
             f"{datetime.now()} Watchdog: slot {slot.index} died (exit={exitcode})",
             flush=True,
         )
+        if self._closed or self._shutdown_event.is_set():
+            return
         if config is not None:
             self.result_queue.put(("crashed", slot.index, config, exitcode))
         self._spawn_worker(slot)
+
+    def _kill_process_group(self, pid):
+        try:
+            os.killpg(pid, signal.SIGKILL)
+        except (ProcessLookupError, OSError):
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except (ProcessLookupError, OSError):
+                pass
+
+    def _kill_slot_child(self, slot):
+        if slot.child_pid is not None:
+            self._kill_process_group(slot.child_pid)
+            slot.child_pid = None
 
     def _sigkill_process(self, process):
         """Send SIGKILL to a process without waiting for it to exit."""
@@ -398,34 +625,45 @@ class WorkerPool:
         self._join_process(process, timeout=5)
 
     def shutdown(self, force=False):
-        """Stop all workers."""
+        """Stop all workers and release multiprocessing queues."""
+        if self._closed:
+            return
+        self._closed = True
         self._shutdown_event.set()
-
-        if not force:
-            # Graceful: send poison pills
-            for slot in self.slots:
-                if slot.input_queue is not None:
-                    try:
-                        slot.input_queue.put(None)
-                    except (OSError, EOFError):
-                        pass
-            for slot in self.slots:
-                if slot.process is not None:
-                    slot.process.join(timeout=10)
-                    if slot.process.is_alive():
-                        self._kill_process(slot.process)
-        else:
-            # Force: send SIGKILL to all workers first, then join all.
-            # This avoids serial join latency when many CUDA-deadlocked workers exist.
-            for slot in self.slots:
-                if slot.process is not None:
-                    self._sigkill_process(slot.process)
-            for slot in self.slots:
-                if slot.process is not None:
-                    self._join_process(slot.process, timeout=3)
 
         if self._watchdog_thread and self._watchdog_thread.is_alive():
             self._watchdog_thread.join(timeout=3)
+
+        try:
+            if not force:
+                # Graceful: send poison pills
+                for slot in self.slots:
+                    if slot.input_queue is not None:
+                        try:
+                            slot.input_queue.put(None)
+                        except (OSError, EOFError, ValueError):
+                            pass
+                for slot in self.slots:
+                    if slot.process is not None:
+                        slot.process.join(timeout=10)
+                        if slot.process.is_alive():
+                            self._kill_process(slot.process)
+            else:
+                # Force: send SIGKILL to all workers first, then join all.
+                # This avoids serial join latency when many CUDA-deadlocked workers exist.
+                for slot in self.slots:
+                    self._kill_slot_child(slot)
+                    if slot.process is not None:
+                        self._sigkill_process(slot.process)
+                for slot in self.slots:
+                    if slot.process is not None:
+                        self._join_process(slot.process, timeout=3)
+
+        finally:
+            for slot in self.slots:
+                self._close_queue(slot.input_queue, cancel_join=force)
+                slot.input_queue = None
+            self._close_queue(self.result_queue, cancel_join=force)
 
 
 def detect_device_type() -> str:
@@ -950,6 +1188,30 @@ def main():
         default=False,
         help="Whether to exit the process when a paddle_error occurs.",
     )
+    parser.add_argument(
+        "--use_compute_sanitizer",
+        type=parse_bool,
+        default=False,
+        help="Run each worker case in a compute-sanitizer wrapped subprocess.",
+    )
+    parser.add_argument(
+        "--sanitizer_command",
+        type=str,
+        default="compute-sanitizer --target-processes all --error-exitcode=86",
+        help="Command prefix used when --use_compute_sanitizer=True.",
+    )
+    parser.add_argument(
+        "--sanitizer_error_exitcode",
+        type=int,
+        default=86,
+        help="Exit code used by compute-sanitizer when it reports errors.",
+    )
+    parser.add_argument(
+        "--_sanitizer_child",
+        type=parse_bool,
+        default=False,
+        help=argparse.SUPPRESS,
+    )
 
     options = parser.parse_args()
     options.paddle_version = paddle_version
@@ -1029,6 +1291,23 @@ def main():
         options.rtol = 0.0
     if options.log_dir:
         set_test_log_path(options.log_dir)
+
+    if options._sanitizer_child:
+        try:
+            _init_worker_runtime(None, None, options, redirect_output=False)
+            options.api_config = options.api_config.strip()
+            run_test_case(options.api_config, options)
+        except SystemExit:
+            raise
+        except Exception as err:
+            print(f"[test error] {options.api_config}: {err}", flush=True)
+            sys.exit(2)
+        finally:
+            try:
+                close_process_files()
+            except Exception:
+                pass
+        return
 
     if options.api_config:
         # Single config execution
@@ -1158,7 +1437,7 @@ def main():
             config_files = [options.api_config_file]
 
         # when engineV2 was interrupted, resume from .tmp dir
-        aggregate_logs()
+        aggregate_logs(cleanup=True)
 
         # read checkpoint
         finish_configs = read_log("checkpoint")
@@ -1199,6 +1478,19 @@ def main():
                 flush=True,
             )
             return
+
+        if options.use_compute_sanitizer:
+            try:
+                sanitizer_cmd = shlex.split(options.sanitizer_command)
+            except ValueError as err:
+                print(f"invalid sanitizer_command: {err}", flush=True)
+                return
+            if not sanitizer_cmd:
+                print("sanitizer_command cannot be empty", flush=True)
+                return
+            if shutil.which(sanitizer_cmd[0]) is None:
+                print(f"sanitizer command not found: {sanitizer_cmd[0]}", flush=True)
+                return
 
         total_workers = sum(max_workers_per_gpu.values())
         print(
@@ -1270,10 +1562,20 @@ def main():
                         active_tasks += 1
                     continue
 
+                if msg_type == "child":
+                    slot_idx = msg[1]
+                    child_pid = msg[2]
+                    with pool._lock:
+                        pool.slots[slot_idx].child_pid = child_pid
+                    continue
+
                 # Task completed (done/error/timeout/crashed)
                 slot_idx = msg[1]
                 config = msg[2]
-                if msg_type in ("done", "error"):
+                worker_reusable = msg_type in ("done", "error") or (
+                    msg_type == "crashed" and options.use_compute_sanitizer
+                )
+                if worker_reusable:
                     pool.mark_idle(slot_idx)
                 active_tasks -= 1
                 tested_case += 1
@@ -1305,6 +1607,15 @@ def main():
                             f"[error] CUDA out of memory for {config}",
                             flush=True,
                         )
+                    elif (
+                        options.use_compute_sanitizer
+                        and exitcode == options.sanitizer_error_exitcode
+                    ):
+                        write_to_log("cuda_error", config)
+                        print(
+                            f"[error] compute-sanitizer reported errors for {config} (exit={exitcode})",
+                            flush=True,
+                        )
                     else:
                         write_to_log("crash", config)
                         print(
@@ -1323,8 +1634,8 @@ def main():
                 if next_config is None:
                     continue
 
-                # For timeout/crashed: worker is restarting, queue for later dispatch
-                if msg_type in ("timeout", "crashed"):
+                # For timeout/non-sanitizer crashed: worker is restarting, queue for later dispatch
+                if not worker_reusable:
                     pending_dispatch.append(next_config)
                 else:
                     # Worker is alive and ready for next task
@@ -1335,7 +1646,6 @@ def main():
                 if tested_case % 1000 == 0:
                     aggregate_logs()
 
-            aggregate_logs()
             pool.shutdown()
         except Exception as e:
             print(f"Unexpected error: {e}", flush=True)
@@ -1343,6 +1653,7 @@ def main():
             total_time = time.time() - start_time
             print(f"Test time: {round(total_time / 60, 3)} minutes.", flush=True)
         finally:
+            pool.shutdown()
             print(f"{tested_case} cases have been tested.", flush=True)
             log_counts = aggregate_logs(end=True)
             print_log_info(all_case, log_counts)

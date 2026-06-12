@@ -923,7 +923,7 @@ def main():
             config_files = [options.api_config_file]
 
         # when engineV2 was interrupted, resume from .tmp dir
-        aggregate_logs()
+        aggregate_logs(cleanup=True)
 
         # read checkpoint
         finish_configs = read_log("checkpoint")
