@@ -23,6 +23,7 @@ class APITestAccuracy(APITestBase):
         self.test_tol = kwargs.get("test_tol", False)
         self.exit_on_error = kwargs.get("exit_on_error", False)
         self.bitwise_alignment = kwargs.get("bitwise_alignment", False)
+        self.use_gpu_cache_mode = kwargs.get("use_gpu_cache_mode", False)
         if self.test_tol:
             torch.set_printoptions(profile="short")
         self.converter = get_converter()
@@ -189,16 +190,22 @@ class APITestAccuracy(APITestBase):
         else:
             del self.torch_args, self.torch_kwargs
 
+        keep_torch_outputs_on_device = self.use_gpu_cache_mode
+
         def process_torch_outputs(obj):
             if isinstance(obj, (torch.return_types.max, torch.return_types.min)):
                 obj = obj.values
             if isinstance(obj, torch.Tensor):
-                obj = obj.cpu().detach()
+                obj = obj.detach() if keep_torch_outputs_on_device else obj.cpu().detach()
             elif isinstance(obj, (list, tuple)):
                 obj = list(obj)
                 for i in range(len(obj)):
                     if isinstance(obj[i], torch.Tensor):
-                        obj[i] = obj[i].cpu().detach()
+                        obj[i] = (
+                            obj[i].detach()
+                            if keep_torch_outputs_on_device
+                            else obj[i].cpu().detach()
+                        )
             return obj
 
         torch_output = process_torch_outputs(torch_output)
@@ -206,7 +213,8 @@ class APITestAccuracy(APITestBase):
             torch_out_grads = process_torch_outputs(torch_out_grads)
 
         gc.collect()
-        torch.cuda.empty_cache()
+        if not self.use_gpu_cache_mode:
+            torch.cuda.empty_cache()
 
         try:
             if not self.gen_paddle_input():
