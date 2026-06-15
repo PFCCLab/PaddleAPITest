@@ -3,6 +3,11 @@
 # Script to run engineV2.py
 # Usage: ./run.sh
 
+if [[ ! -f "engineV2.py" || ! -d "tester" ]]; then
+    echo "错误: 请在 PaddleAPITest 项目根目录执行此脚本"
+    exit 1
+fi
+
 # 配置参数
 FILE_INPUT="tester/api_config/5_accuracy/accuracy_1.txt"
 # FILE_PATTERN="tester/api_config/5_accuracy/accuracy_*.txt"

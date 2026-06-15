@@ -16,7 +16,7 @@ set -euo pipefail
 ENGINE=engineV4           # engineV2 | engineV4
 
 # ── 运行模式开关 ──────────────────────────────────────────────
-FOREGROUND=false          # true=前台运行(调试用，Ctrl+C终止)
+FOREGROUND=true          # true=前台运行(调试用，Ctrl+C终止)
 DRY_RUN=false             # true=只打印最终命令，不执行
 
 # ── compute-sanitizer ─────────────────────────────────────────
@@ -26,57 +26,39 @@ SANITIZER_COMMAND="compute-sanitizer --target-processes all --error-exitcode=86"
 SANITIZER_ERROR_EXITCODE=86
 
 # ── Paddle Flags ──────────────────────────────────────────────
-export FLAGS_use_system_allocator=true
-export FLAGS_check_cuda_error=true
-export FLAGS_alloc_fill_value=255
-export FLAGS_check_nan_inf=true
+# export FLAGS_use_system_allocator=true
+# export FLAGS_check_cuda_error=true
+# export FLAGS_alloc_fill_value=255
+# export FLAGS_check_nan_inf=true
 
 # ── 输入输出 ──────────────────────────────────────────────────
 # NUM_GPUS!=0 时，引擎不受外部 "CUDA_VISIBLE_DEVICES" 影响
-FILE_INPUT="tester/api_config/5_accuracy/accuracy_1.txt"
+FILE_INPUT="tester/api_config/monitor_config/dsv4_v2/v2_0size.txt"
 # FILE_PATTERN="tester/api_config/5_accuracy/accuracy_*.txt"
-LOG_DIR="tester/api_config/test_log"
+LOG_DIR="tester/api_config/test_log_v2_0size_accuracy"
 
 # ── GPU 调度 ──────────────────────────────────────────────────
 NUM_GPUS=-1
-NUM_WORKERS_PER_GPU=-1
-GPU_IDS="4-7"
+NUM_WORKERS_PER_GPU=4
+GPU_IDS="-1"
 # REQUIRED_MEMORY=10
 TIME_OUT=600
 
-# ── 测试模式 ──────────────────────────────────────────────────
+# ── 测试模式（取消注释启用）──────────────────────────────────
 TEST_MODE_ARGS=(
-    # Paddle vs Torch 正确性对比
-    --accuracy=True
-    # Paddle 单框架执行
+    # --accuracy=True
     # --paddle_only=True
-    # Paddle 动态图 vs CINN；test_backward 仅此模式生效
     # --paddle_cinn=True
-    # 性能测试
     # --paddle_gpu_performance=True
     # --torch_gpu_performance=True
     # --paddle_torch_gpu_performance=True
-    # 稳定性测试
-    # --accuracy_stable=True
-)
-
-# ── 测试参数 ──────────────────────────────────────────────────
-TEST_PARAM_ARGS=(
-    # 混合精度
+    --accuracy_stable=True
     # --test_amp=True
-    # CPU 路径
     # --test_cpu=True
-    # CPU numpy 缓存；gpu_cache_mode 下自动关闭
-    # --use_cached_numpy=True
-    # GPU tensor 缓存 + GPU compare；增加显存驻留
-    # --use_gpu_cache_mode=True
-    # 对比阈值；bitwise_alignment 会将阈值置 0
+    --use_cached_numpy=True
     # --atol=1e-2
     # --rtol=1e-2
-    # --bitwise_alignment=True
-    # accuracy 容差诊断，保留 CPU compare
     # --test_tol=True
-    # 仅 paddle_cinn 生效
     # --test_backward=True
 )
 
@@ -85,7 +67,7 @@ TEST_PARAM_ARGS=(
 # ============================================================
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-if [[ ! -f "$ENGINE.py" || ! -d "tester" ]]; then
+if [[ ! -f "engineV4.py" || ! -d "tester" ]]; then
     echo "错误: 请在 PaddleAPITest 项目根目录执行此脚本"
     exit 1
 fi
@@ -188,7 +170,6 @@ SANITIZER_ARGS=(
 
 ALL_ARGS=(
     "${TEST_MODE_ARGS[@]}"
-    "${TEST_PARAM_ARGS[@]}"
     "${IN_OUT_ARGS[@]}"
     "${PARALLEL_ARGS[@]}"
     "${TIME_OUT_ARGS[@]}"
@@ -203,7 +184,6 @@ echo "  日志:    $LOG_DIR"
 echo "  GPU:     ids=$GPU_IDS  workers/gpu=$NUM_WORKERS_PER_GPU"
 echo "  超时:    ${TIME_OUT}s"
 echo "  模式:    ${TEST_MODE_ARGS[*]:-<无>}"
-echo "  参数:    ${TEST_PARAM_ARGS[*]:-<无>}"
 echo "  Sanitizer: enabled=$USE_COMPUTE_SANITIZER exitcode=$SANITIZER_ERROR_EXITCODE command='$SANITIZER_COMMAND'"
 echo "────────────────────────────────────────────"
 
