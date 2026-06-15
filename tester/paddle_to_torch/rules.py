@@ -7295,16 +7295,15 @@ class CopsSwigluGradRule(BaseRule):
 
     Backward derivatives (y is None — split last dim):
         let a = x[..., :C], b = x[..., C:]
-        da = dout * b * sigmoid(a) * (1 + a * (1 - sigmoid(a)))
+        da = silu_backward(dout * b, a)
         db = dout * silu(a)
         dx = concat([da, db], dim=-1); dy is returned as None to match
         Paddle's uninitialized second output (the framework comparator
         accepts `paddle uninitialized + torch None` as a pass).
 
-    Use only analytical sigmoid arithmetic so the autograd engine can
-    compute a second-order derivative when the framework runs
-    `torch.autograd.grad` on the rule's outputs — `aten::silu_backward`
-    has no registered derivative and would crash that path.
+    Use Torch's native silu implementation for the corresponding SiLU value.
+    The SiLU derivative is kept analytical because Torch does not expose a full
+    swiglu_grad op and aten::silu_backward is not bitwise aligned here.
     """
 
     def apply(self, paddle_api: str) -> ConvertResult:
@@ -7319,14 +7318,14 @@ if y is None:
     a = x[..., :C]
     b = x[..., C:]
     sig_a = torch.sigmoid(a)
-    silu_a = a * sig_a
+    silu_a = torch.nn.functional.silu(a)
     da = (dout * b) * sig_a * (1.0 + a * (1.0 - sig_a))
     db = dout * silu_a
     dx = torch.cat([da, db], dim=-1)
     dy = None
 else:
     sig_x = torch.sigmoid(x)
-    silu_x = x * sig_x
+    silu_x = torch.nn.functional.silu(x)
     dy = dout * silu_x
     dx = (dout * y) * sig_x * (1.0 + x * (1.0 - sig_x))
 
