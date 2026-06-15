@@ -5,9 +5,9 @@ set -euo pipefail
 # PaddleAPITest 运行脚本
 #
 # 使用方式:
-#   ./run.sh              正常启动（后台）
+#   ./run.sh              正常启动（前台）
 #   ./run.sh --stop       终止上次启动的后台进程
-#   ./run.sh --status     查看运行状态
+#   ./run.sh --status     查看后台运行状态
 #
 # 配置方法: 修改下方变量 / 注释切换即可
 # ============================================================
@@ -16,38 +16,38 @@ set -euo pipefail
 ENGINE=engineV4           # engineV2 | engineV4
 
 # ── 运行模式开关 ──────────────────────────────────────────────
-FOREGROUND=false          # true=前台运行(调试用，Ctrl+C终止)
+FOREGROUND=true           # true=前台运行(Ctrl+C终止)，false=后台 nohup 运行
 DRY_RUN=false             # true=只打印最终命令，不执行
 
 # ── compute-sanitizer ─────────────────────────────────────────
 # true=由 engineV4 为每个 worker slot 单独启动 compute-sanitizer 子进程，保留多 GPU/多 worker 并发
-USE_COMPUTE_SANITIZER=false
+USE_COMPUTE_SANITIZER=true
 SANITIZER_COMMAND="compute-sanitizer --target-processes all --error-exitcode=86"
 SANITIZER_ERROR_EXITCODE=86
 
 # ── Paddle Flags ──────────────────────────────────────────────
 export FLAGS_use_system_allocator=true
 export FLAGS_check_cuda_error=true
-export FLAGS_alloc_fill_value=255
-export FLAGS_check_nan_inf=true
+# export FLAGS_alloc_fill_value=255
+# export FLAGS_check_nan_inf=true
 
 # ── 输入输出 ──────────────────────────────────────────────────
 # NUM_GPUS!=0 时，引擎不受外部 "CUDA_VISIBLE_DEVICES" 影响
-FILE_INPUT="tester/api_config/5_accuracy/accuracy_1.txt"
+FILE_INPUT="tester/api_config/monitor_config/dsv4_v2/dsv4_0size.txt"
 # FILE_PATTERN="tester/api_config/5_accuracy/accuracy_*.txt"
-LOG_DIR="tester/api_config/test_log"
+LOG_DIR="tester/api_config/test_log_dsv4_0size_paddleonly"
 
 # ── GPU 调度 ──────────────────────────────────────────────────
 NUM_GPUS=-1
-NUM_WORKERS_PER_GPU=-1
-GPU_IDS="4-7"
+NUM_WORKERS_PER_GPU=1
+GPU_IDS="-1"
 # REQUIRED_MEMORY=10
 TIME_OUT=600
 
 # ── 测试模式（取消注释启用）──────────────────────────────────
 TEST_MODE_ARGS=(
-    --accuracy=True
-    # --paddle_only=True
+    # --accuracy=True
+    --paddle_only=True
     # --paddle_cinn=True
     # --paddle_gpu_performance=True
     # --torch_gpu_performance=True
@@ -67,7 +67,7 @@ TEST_MODE_ARGS=(
 # ============================================================
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-if [[ ! -f "$ENGINE.py" || ! -d "tester" ]]; then
+if [[ ! -f "engineV4.py" || ! -d "tester" ]]; then
     echo "错误: 请在 PaddleAPITest 项目根目录执行此脚本"
     exit 1
 fi
