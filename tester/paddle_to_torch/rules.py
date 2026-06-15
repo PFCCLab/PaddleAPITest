@@ -7128,8 +7128,8 @@ result = torch.matmul(x_mat, y_mat)
 """
         code = Code(core=core.splitlines())
         return ConvertResult.success(paddle_api, code, is_torch_corresponding=False)
-        
-        
+
+
 class CopsFull_Rule(BaseRule):
     """paddle._C_ops.full_(x, shape, value, dtype) → x.fill_(value) in-place"""
 
@@ -7365,6 +7365,7 @@ class CopsRunCustomOpRule(BaseRule):
       - "fused_swiglu_scale_clamp": x, scale, max_val → scaled+clamped swiglu fwd
       - "fused_swiglu_scale_clamp_bwd": x, scale, dy, max_val → scaled+clamped swiglu bwd
       - "fused_swiglu_probs_bwd": o1, do2_s, unzipped_probs, inplace → weighted swiglu bwd
+      - "paddlefleet_fused_swiglu_probs_bwd": same semantics as fused_swiglu_probs_bwd
     Unsupported op_names will return an error result at runtime.
     """
 
@@ -7448,7 +7449,7 @@ elif op_name == "fused_swiglu_scale_clamp_bwd":
         d_scale = d_scale.to(scale.dtype)
     result = [dx, d_scale]
 
-elif op_name == "fused_swiglu_probs_bwd":
+elif op_name in ("fused_swiglu_probs_bwd", "paddlefleet_fused_swiglu_probs_bwd"):
     # _run_custom_op("fused_swiglu_probs_bwd", o1, do2_s, unzipped_probs, inplace)
     # 输出 [do1, probs_grad, o2_s]，语义参考 paddlefleet 的 SwigluProbsGradKernel:
     #   lhs, rhs = chunk(o1, 2, -1); sig = sigmoid(lhs); silu = sig*lhs

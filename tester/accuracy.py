@@ -376,8 +376,7 @@ class APITestAccuracy(APITestBase):
                 elif (
                     paddle_item is None
                     or (
-                        isinstance(paddle_item, paddle.Tensor)
-                        and not paddle_item._is_initialized()
+                        isinstance(paddle_item, paddle.Tensor) and not paddle_item._is_initialized()
                     )
                 ) and torch_item is None:
                     # paddle is None and torch is None
