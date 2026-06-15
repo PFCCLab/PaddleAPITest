@@ -4959,6 +4959,9 @@
     "paddle._C_ops.gaussian": {
         "Rule": "CopsGaussianRule"
     },
+    "paddle._C_ops.matmul": {
+        "Rule": "CopsMatmulRule"
+    },
     "paddle._C_ops.matmul_grad": {
         "Rule": "CopsMatmulGradRule"
     },
@@ -4982,6 +4985,9 @@
     },
     "paddle._C_ops.subtract_": {
         "Rule": "CopsSubtract_Rule"
+    },
+    "paddle._C_ops.swiglu_grad": {
+        "Rule": "CopsSwigluGradRule"
     },
     "paddle._C_ops.transpose": {
         "Rule": "CopsTransposeRule"
