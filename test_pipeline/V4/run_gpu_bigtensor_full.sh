@@ -28,7 +28,7 @@ export FLAGS_check_nan_inf=true
 FILE_PATTERN="tester/api_config/monitor_config/big_tensor/GPU/monitoring_configs*.txt"
 LOG_DIR="tester/api_config/test_log_gpu_bigtensor_full"
 NUM_GPUS=-1
-NUM_WORKERS_PER_GPU=1
+NUM_WORKERS_PER_GPU=10
 GPU_IDS="-1"
 # REQUIRED_MEMORY=10
 
@@ -40,25 +40,26 @@ TEST_MODE_ARGS=(
     # --test_cpu=True
     --use_cached_numpy=True
 )
+# ============================================================
+# ========== 以下为运行逻辑，通常不需要修改 ====================
+# ============================================================
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PROJECT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
-cd "$PROJECT_ROOT"
-
 if [[ ! -f "$ENGINE.py" || ! -d "tester" ]]; then
     echo "错误: 请在 PaddleAPITest 项目根目录执行此脚本"
     exit 1
 fi
-
 SCRIPT_NAME="${BASH_SOURCE[0]##*/}"
 SCRIPT_NAME="${SCRIPT_NAME%.sh}"
 PID_FILE="${SCRIPT_DIR}/.${SCRIPT_NAME}.pid"
 
+# ── 运维命令处理 ──
 case "${1:-}" in
     --stop)
         if [[ -f "$PID_FILE" ]]; then
             pid=$(cat "$PID_FILE")
             if kill -0 "$pid" 2>/dev/null; then
+                # Kill entire process group (main + all workers)
                 kill -- -"$pid" 2>/dev/null || kill "$pid" 2>/dev/null
                 echo "已终止进程组 PGID=$pid"
             else
@@ -75,10 +76,13 @@ case "${1:-}" in
             pid=$(cat "$PID_FILE")
             if kill -0 "$pid" 2>/dev/null; then
                 echo -e "\033[32m运行中\033[0m  PID=$pid  引擎=$ENGINE"
+                # 显示子进程（worker）
                 children=$(pgrep -P "$pid" 2>/dev/null | wc -l)
                 echo "  Worker 进程数: $children"
+                # 显示运行时长
                 elapsed=$(ps -o etime= -p "$pid" 2>/dev/null | xargs)
                 echo "  已运行: ${elapsed:-unknown}"
+                # 显示日志文件
                 log=$(ls -t "$LOG_DIR"/log_*.log 2>/dev/null | head -1)
                 [[ -n "${log:-}" ]] && echo "  最新日志: $log"
             else
@@ -91,30 +95,34 @@ case "${1:-}" in
         exit 0
         ;;
     --help|-h)
-        echo "Usage: ./${BASH_SOURCE[0]##*/} [--stop|--status|--help]"
+        echo "Usage: ./run.sh [--stop|--status|--help]"
         echo ""
         echo "  (无参数)   启动测试任务"
         echo "  --stop     终止后台任务"
         echo "  --status   查看运行状态"
+        echo ""
+        echo "配置方法: 编辑脚本顶部变量，注释/取消注释切换参数"
         exit 0
         ;;
-    "") ;;
+    "") ;; # 正常启动
     *)
         echo "未知参数: $1 (使用 --help 查看帮助)"
         exit 1
         ;;
 esac
 
+# ── 防重复启动 ──
 if [[ -f "$PID_FILE" ]]; then
     old_pid=$(cat "$PID_FILE")
     if kill -0 "$old_pid" 2>/dev/null; then
         echo -e "\033[33m警告: 已有运行中的任务 PID=$old_pid\033[0m"
-        echo "使用 ./${BASH_SOURCE[0]##*/} --stop 终止后再启动，或删除 $PID_FILE 强制启动"
+        echo "使用 ./run.sh --stop 终止后再启动，或删除 $PID_FILE 强制启动"
         exit 1
     fi
     rm -f "$PID_FILE"
 fi
 
+# ── 组装参数 ──
 IN_OUT_ARGS=(
     # --api_config_file="$FILE_INPUT"
     --api_config_file_pattern="$FILE_PATTERN"
@@ -141,6 +149,7 @@ ALL_ARGS=(
     "${SANITIZER_ARGS[@]}"
 )
 
+# ── 打印有效配置 ──
 echo "── PaddleAPITest ──────────────────────────"
 echo "  引擎:    $ENGINE.py"
 echo "  输入:    $FILE_PATTERN"
@@ -150,6 +159,7 @@ echo "  模式:    ${TEST_MODE_ARGS[*]:-<无>}"
 echo "  Sanitizer: enabled=$USE_COMPUTE_SANITIZER exitcode=$SANITIZER_ERROR_EXITCODE command='$SANITIZER_COMMAND'"
 echo "────────────────────────────────────────────"
 
+# ── Dry-run 模式 ──
 if [[ "$DRY_RUN" == "true" ]]; then
     echo ""
     echo "[DRY-RUN] 最终命令:"
@@ -157,6 +167,7 @@ if [[ "$DRY_RUN" == "true" ]]; then
     exit 0
 fi
 
+# ── 创建日志目录 ──
 mkdir -p "$LOG_DIR" || {
     echo "错误: 无法创建日志目录 '$LOG_DIR'"
     exit 1
@@ -164,6 +175,7 @@ mkdir -p "$LOG_DIR" || {
 
 LOG_FILE="$LOG_DIR/log_$(date +%Y%m%d_%H%M%S).log"
 
+# ── 启动 ──
 if [[ "$FOREGROUND" == "true" ]]; then
     echo -e "\n\033[36m[前台模式] Ctrl+C 终止\033[0m"
     echo "日志同时写入: $LOG_FILE"
@@ -174,6 +186,7 @@ else
     PYTHON_PID=$!
     echo "$PYTHON_PID" > "$PID_FILE"
 
+    # 任务自然结束时清理 PID 文件；若已启动新任务，则不误删新 PID。
     (
         while kill -0 "$PYTHON_PID" 2>/dev/null; do
             sleep 5
@@ -197,8 +210,8 @@ else
     echo -e "\033[32m启动成功! PID=$PYTHON_PID\033[0m"
     echo ""
     echo "常用操作:"
-    echo "  查看状态:  ./${BASH_SOURCE[0]##*/} --status"
-    echo "  终止任务:  ./${BASH_SOURCE[0]##*/} --stop"
+    echo "  查看状态:  ./run.sh --status"
+    echo "  终止任务:  ./run.sh --stop"
     echo "  跟踪日志:  tail -f $LOG_FILE"
     echo "  GPU监控:   watch -n 1 nvidia-smi"
     echo ""

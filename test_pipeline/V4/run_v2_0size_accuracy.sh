@@ -67,7 +67,7 @@ TEST_MODE_ARGS=(
 # ============================================================
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-if [[ ! -f "engineV4.py" || ! -d "tester" ]]; then
+if [[ ! -f "$ENGINE.py" || ! -d "tester" ]]; then
     echo "错误: 请在 PaddleAPITest 项目根目录执行此脚本"
     exit 1
 fi
