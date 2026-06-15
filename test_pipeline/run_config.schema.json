@@ -1,0 +1,96 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "run_config.schema.json",
+  "title": "PaddleAPITest Run Config",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "name": {"type": "string", "description": "任务名称，用于默认 PID 文件名。"},
+    "runner": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "engine": {"type": "string", "enum": ["engineV4", "engineV2"], "default": "engineV4"},
+        "foreground": {"type": "boolean", "default": false},
+        "dry_run": {"type": "boolean", "default": false},
+        "pid_file": {"type": "string", "description": "可选；省略时 run.py 使用 .run/<name>.pid。"}
+      }
+    },
+    "env": {
+      "type": "object",
+      "description": "运行前导出的环境变量。",
+      "additionalProperties": {"type": ["string", "number", "boolean", "null"]}
+    },
+    "input": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "api_config": {"type": ["string", "null"], "description": "单条 case 配置，对应 --api_config。"},
+        "api_config_file": {"type": ["string", "null"], "description": "单个配置文件，对应 --api_config_file。"},
+        "api_config_file_pattern": {"type": ["string", "null"], "description": "多文件 glob，对应 --api_config_file_pattern。"}
+      }
+    },
+    "output": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "log_dir": {"type": "string", "description": "engine 分类日志和 run.py 主日志目录。"}
+      },
+      "required": ["log_dir"]
+    },
+    "retest": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "enabled": {"type": "boolean", "default": false},
+        "rounds": {"type": "integer", "minimum": 1, "default": 1},
+        "error_configs": {"type": ["array", "null"], "items": {"type": "string"}},
+        "log_dir_template": {
+          "type": "string",
+          "description": "支持 {base_log_dir}, {previous_log_dir}, {round}, {error_config}, {error_name}。"
+        },
+        "skip_unavailable": {"type": "boolean", "default": true},
+        "skip_missing": {"type": "boolean", "description": "兼容旧字段；新配置请使用 skip_unavailable。"},
+        "skip_empty": {"type": "boolean", "description": "兼容旧字段；新配置请使用 skip_unavailable。"}
+      }
+    },
+    "engine_args": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "paddle_only": {"type": "boolean"},
+        "paddle_cinn": {"type": "boolean"},
+        "accuracy": {"type": "boolean"},
+        "paddle_gpu_performance": {"type": "boolean"},
+        "torch_gpu_performance": {"type": "boolean"},
+        "paddle_torch_gpu_performance": {"type": "boolean"},
+        "accuracy_stable": {"type": "boolean"},
+        "paddle_custom_device": {"type": "boolean"},
+        "test_amp": {"type": "boolean"},
+        "num_gpus": {"type": "integer"},
+        "num_workers_per_gpu": {"type": "integer"},
+        "gpu_ids": {"type": "string"},
+        "required_memory": {"type": "number"},
+        "test_cpu": {"type": "boolean"},
+        "use_cached_numpy": {"type": "boolean"},
+        "atol": {"type": "number"},
+        "rtol": {"type": "number"},
+        "test_tol": {"type": "boolean"},
+        "test_backward": {"type": "boolean"},
+        "timeout": {"type": "integer"},
+        "show_runtime_status": {"type": "boolean"},
+        "random_seed": {"type": "integer"},
+        "custom_device_vs_gpu": {"type": "boolean"},
+        "custom_device_vs_gpu_mode": {"type": "string", "enum": ["upload", "download"]},
+        "bitwise_alignment": {"type": "boolean"},
+        "generate_failed_tests": {"type": "boolean"},
+        "exit_on_error": {"type": "boolean"},
+        "use_compute_sanitizer": {"type": "boolean"},
+        "sanitizer_command": {"type": "string"},
+        "sanitizer_error_exitcode": {"type": "integer"},
+        "_sanitizer_child": {"type": "boolean"}
+      }
+    }
+  },
+  "required": ["input", "output"]
+}

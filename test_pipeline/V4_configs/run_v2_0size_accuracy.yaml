@@ -1,0 +1,15 @@
+# yaml-language-server: $schema=../run_config.schema.json
+name: run_v2_0size_accuracy
+runner:
+  engine: engineV4
+  foreground: true
+input:
+  api_config_file: tester/api_config/monitor_config/dsv4_v2/v2_0size.txt
+output:
+  log_dir: tester/api_config/test_log_v2_0size_accuracy
+engine_args:
+  accuracy_stable: true
+  use_cached_numpy: true
+  num_gpus: -1
+  num_workers_per_gpu: 4
+  timeout: 600

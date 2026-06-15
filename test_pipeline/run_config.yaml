@@ -1,0 +1,130 @@
+# yaml-language-server: $schema=./run_config.schema.json
+# PaddleAPITest runner 默认配置模板（覆盖 engineV4.py 参数）
+#
+# 使用示例：
+#   python run.py --dry-run
+#   python run.py -c test_pipeline/run_config.yaml --dry-run
+#   python run.py -c test_pipeline/V4_configs/run_gpu_accuracy_full.yaml --dry-run
+#
+# 内置复测：
+# - retest.enabled=true 后，run.py 会先执行第 1 轮原始任务。
+# - 第 2 轮开始，自动读取上一轮 log_dir 下的 error config 文件作为输入。
+# - 不再需要手写“二次/三次重跑失败 case”的命令。
+#
+# 职责边界：
+# - run.py 只负责读取本配置、合并命令行覆盖、导出环境变量、启动/停止/查看进程、多轮复测编排。
+# - engineV4.py / engineV2.py 继续负责 case 执行、pattern 展开、checkpoint 续跑和失败分类。
+#
+# 配置规则：
+# - input.api_config / input.api_config_file / input.api_config_file_pattern 必须且只能配置一个。
+# - output.log_dir 必填。
+# - engine_args 中未配置或注释掉的字段使用 engineV4.py 默认值。
+# - 布尔值会被 run.py 转为 --key=True/False 传给 engine。
+
+name: run_config
+
+runner:
+  # engineV4 或 engineV2；省略时 run.py 默认使用 engineV4。
+  engine: engineV4
+  # true=前台运行并同步写主日志；false=后台运行。
+  # retest.enabled=true 且 rounds>1 时，runner 会强制前台顺序执行多轮，以便等待上一轮产物。
+  foreground: false
+  # true=只打印最终命令，不执行。也可用命令行 --dry-run 临时覆盖。
+  dry_run: false
+
+# 可选：需要导出的环境变量。值建议写成字符串，避免 YAML 布尔值转换带来歧义。
+env:
+  FLAGS_use_system_allocator: "true"
+  FLAGS_check_cuda_error: "true"
+  FLAGS_alloc_fill_value: "255"
+  FLAGS_check_nan_inf: "true"
+
+input:
+  # 单条 case 配置，直接传给 engineV4.py --api_config。
+  api_config: null
+  # 单个配置文件，直接传给 engineV4.py --api_config_file。
+  api_config_file: "tester/api_config/5_accuracy/accuracy_1.txt"
+  # 多文件 glob，直接传给 engineV4.py --api_config_file_pattern。
+  api_config_file_pattern: null
+
+output:
+  # 对应 engineV4.py --log_dir；run.py 主日志也写到该目录。
+  log_dir: "tester/api_config/test_log"
+
+retest:
+  # true=启用内置多轮复测；false=只运行原始任务一次。
+  enabled: false
+  # 总轮数，包含第 1 轮原始任务。例如 3 表示原始运行 + 两轮失败 case 复测。
+  rounds: 3
+  # 每一轮从上一轮日志目录中读取哪些失败配置文件。
+  # 如果不配置或置空，run.py 使用内置默认 error configs 列表。
+  error_configs:
+    - api_config_accuracy_error.txt
+    - api_config_paddle_error.txt
+    - api_config_timeout.txt
+    - api_config_crash.txt
+    - api_config_oom.txt
+    - api_config_cuda_error.txt
+    - api_config_match_error.txt
+    - api_config_numpy_error.txt
+    - api_config_torch_error.txt
+    - api_config_paddle_to_torch_failed.txt
+  # 复测日志目录模板。可用变量：
+  # - {base_log_dir}: 第 1 轮 output.log_dir
+  # - {previous_log_dir}: 上一轮 log_dir
+  # - {round}: 当前轮数，从 2 开始
+  # - {error_config}: 失败配置文件名，如 api_config_accuracy_error.txt
+  # - {error_name}: 简化错误名，如 accuracy_error
+  log_dir_template: "{base_log_dir}_r{round}_{error_name}"
+  # true=失败配置不存在或为空时跳过该复测分支；false=直接报错。
+  skip_unavailable: true
+
+engine_args:
+  # ========== 测试模式（engineV4 要求只启用一种主模式）==========
+  accuracy: true
+  # paddle_only: true
+  # paddle_cinn: true
+  # paddle_gpu_performance: true
+  # torch_gpu_performance: true
+  # paddle_torch_gpu_performance: true
+  # accuracy_stable: true
+  # paddle_custom_device: true
+  # custom_device_vs_gpu: true
+
+  # ========== 模式附加开关 ==========
+  # test_amp: true
+  # test_cpu: true
+  # use_cached_numpy: true
+  # test_tol: true
+  # test_backward: true
+  # bitwise_alignment: true
+  # generate_failed_tests: true
+  # exit_on_error: true
+
+  # ========== 精度阈值 ==========
+  # atol: 0.01
+  # rtol: 0.01
+
+  # ========== GPU / worker 调度 ==========
+  num_gpus: -1
+  num_workers_per_gpu: -1
+  gpu_ids: "4-7"
+  # required_memory: 10.0
+
+  # ========== 运行控制 ==========
+  timeout: 600
+  # show_runtime_status: true
+  # random_seed: 0
+
+  # ========== custom_device_vs_gpu ==========
+  # custom_device_vs_gpu_mode: "upload"  # upload | download
+
+  # ========== compute-sanitizer ==========
+  # 通常只配置 use_compute_sanitizer；命令和错误退出码使用 engineV4.py 默认值即可。
+  # use_compute_sanitizer: true
+  # sanitizer_command: "compute-sanitizer --target-processes all --error-exitcode=86"
+  # sanitizer_error_exitcode: 86
+
+  # ========== engineV4 内部参数 ==========
+  # _sanitizer_child 是 engineV4 compute-sanitizer 子进程内部参数，普通运行不要配置。
+  # _sanitizer_child: false

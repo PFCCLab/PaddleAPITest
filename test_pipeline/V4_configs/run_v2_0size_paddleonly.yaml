@@ -1,0 +1,18 @@
+# yaml-language-server: $schema=../run_config.schema.json
+name: run_v2_0size_paddleonly
+runner:
+  engine: engineV4
+  foreground: true
+env:
+  FLAGS_use_system_allocator: "true"
+  FLAGS_check_cuda_error: "true"
+input:
+  api_config_file: tester/api_config/monitor_config/dsv4_v2/v2_0size.txt
+output:
+  log_dir: tester/api_config/test_log_v2_0size_paddleonly
+engine_args:
+  paddle_only: true
+  num_gpus: -1
+  num_workers_per_gpu: 1
+  timeout: 600
+  use_compute_sanitizer: true
