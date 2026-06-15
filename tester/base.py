@@ -954,7 +954,7 @@ class APITestBase:
         elif dtype is None:
             return None
         else:
-            raise ValueError(f"Unsupport dtype: {dtype}")
+            raise ValueError(f"Unsupported dtype: {dtype}")
 
     def gen_paddle_input_with_merged_kwargs(self):
         self.paddle_args = []

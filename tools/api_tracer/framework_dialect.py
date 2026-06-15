@@ -563,7 +563,7 @@ class PyTorchDialect(FrameworkDialect):
 
     # Only takes effect in SetattrHook
     def discover_custom_ops(self) -> list[str]:
-        # TODO(@cangtianhuang): implemente me
+        # TODO(@cangtianhuang): implement me
         return []
 
     _special_type_handlers = {

@@ -493,7 +493,7 @@ x = locals().get('x')
 output = locals().get('output')
 
 def convert_seq2tensor_wrap_scalar(tlist):
-    #  recursive implementation is not supported in current engine, use vanilla verison
+    #  recursive implementation is not supported in current engine, use vanilla version
     # # stack tensors and List[scalars] on dim 0 for nested list
     # if isinstance(tlist, list):
     #     return torch.stack([convert_list2tensor(t) for t in tlist])
@@ -1718,7 +1718,7 @@ else:
         return ConvertResult.success(paddle_api, code)
 
 
-class ExpandasRule(BaseRule):
+class ExpandAsRule(BaseRule):
     def apply(self, paddle_api: str) -> ConvertResult:
         impl = """
 result = x.expand_as(y)
@@ -4004,7 +4004,7 @@ for i in range(seqlen):
             continue  # token i already assigned to expert e (duplicate topk column)
         slot = expert_counters[e]
         if slot >= tokens_per_expert[e]:
-            continue  # excess beyond tpe
+            continue  # excess beyond tokens_per_expert
         row = offsets_e[e] + slot
         rowmap[i, e] = row
         gather_src[row] = i
@@ -5535,7 +5535,7 @@ if 'axis' in locals():
         return ConvertResult.success(paddle_api, code)
 
 
-class SquenceMaskRule(BaseRule):
+class SequenceMaskRule(BaseRule):
     def apply(self, paddle_api: str) -> ConvertResult:
         core = """
 maxlen = locals().get('maxlen', None)

@@ -279,9 +279,9 @@ class FixedVisionAttention(nn.Module):
             attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(
                 q.dtype
             )
-            attn_output_splited = torch.matmul(attn_weights, v)
-            attn_output_splited = attn_output_splited.transpose(0, 1)
-            attn_output.append(attn_output_splited)
+            attn_output_split = torch.matmul(attn_weights, v)
+            attn_output_split = attn_output_split.transpose(0, 1)
+            attn_output.append(attn_output_split)
         attn_output = torch.cat(attn_output, dim=0)
         # ---change: reshape(seq_length, -1) to reshape(-1, self.num_heads * self.head_dim)---
         attn_output = attn_output.reshape(-1, self.num_heads * self.head_dim).contiguous()
