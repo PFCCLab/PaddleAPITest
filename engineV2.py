@@ -1063,7 +1063,7 @@ def main():
                             flush=True,
                         )
                     except ProcessExpired as err:
-                        # we have catched 99 and 98 error in test class, so we only print info here
+                        # we have caught 99 and 98 error in test class, so we only print info here
                         # when any cuda error and oom happen, subprocess will crash too,
                         # these case has been classified to oom and cuda_error and won't be classified to crash
                         if err.exitcode == 99:

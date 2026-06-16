@@ -257,7 +257,7 @@ Paddle2Torch 是一个专注于将 PaddlePaddle API 转换为 PyTorch 对应实�
     result = x[slices]
     """
             code = Code(core=core.splitlines())
-            return ConvertResult.success(paddle_api, code, is_torch_coresponding=False)
+            return ConvertResult.success(paddle_api, code, is_torch_corresponding=False)
     ```
 
 ### 运行测试配置
@@ -328,7 +328,7 @@ paddle.nn.functional.conv1d(x, weight, bias=None, stride=1, padding=0, dilation=
 
 4. 编写转换代码
 
-在 rules.py 中编写 Conv1dRule 类，需要手动调用 apply_generic() 方法，获取 defaults_code、map_code 代码块（通过解析 mappin.json 的配置获得，无需再手动 *设置默认值* 或 *参数映射*）
+在 rules.py 中编写 Conv1dRule 类，需要手动调用 apply_generic() 方法，获取 defaults_code、map_code 代码块（通过解析 mapping.json 的配置获得，无需再手动 *设置默认值* 或 *参数映射*）
 
 然后编写 preprocess（预处理）、core（核心执行）、postprocess（后处理）代码块
 

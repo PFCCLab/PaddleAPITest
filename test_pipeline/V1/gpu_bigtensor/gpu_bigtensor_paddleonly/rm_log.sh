@@ -1,0 +1,1 @@
+rm -rf test_pipeline/gpu_bigtensor/gpu_bigtensor_paddleonly/gpu_bigtensor_paddleonly_errorconfig_*.log

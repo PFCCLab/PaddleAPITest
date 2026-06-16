@@ -42,7 +42,7 @@ class APITestAccuracy(APITestBase):
             convert_result = self.converter.convert(self.api_config.api_name)
         except Exception as e:
             print(
-                f"[paddle_to_torch] Convertion failed for {self.api_config.config}: {e!s}",
+                f"[paddle_to_torch] Conversion failed for {self.api_config.config}: {e!s}",
                 flush=True,
             )
             write_to_log("paddle_to_torch_failed", self.api_config.config)
@@ -384,8 +384,7 @@ class APITestAccuracy(APITestBase):
                 elif (
                     paddle_item is None
                     or (
-                        isinstance(paddle_item, paddle.Tensor)
-                        and not (paddle_item._is_initialized() or paddle_item.numel() == 0)
+                        isinstance(paddle_item, paddle.Tensor) and not paddle_item._is_initialized()
                     )
                 ) and torch_item is None:
                     # paddle is None and torch is None
@@ -519,7 +518,7 @@ class APITestAccuracy(APITestBase):
                         paddle_item is None
                         or (
                             isinstance(paddle_item, paddle.Tensor)
-                            and not (paddle_item._is_initialized() or paddle_item.numel() == 0)
+                            and not paddle_item._is_initialized()
                         )
                     ) and torch_item is None:
                         # paddle is None and torch is None
@@ -594,6 +593,14 @@ def process_output(api_config, paddle_output, torch_output):
             paddle_output = paddle_output[:1]
         if isinstance(torch_output, (list, tuple)) and len(torch_output) > 1:
             torch_output = torch_output[:1]
+    elif api_config.api_name == "paddle._C_ops.swiglu_grad":
+        # When y is None, Paddle returns an uninitialized placeholder tensor for dy.
+        # Only compare dx to avoid converting the uninitialized tensor to DLPack.
+        if len(api_config.args) > 1 and api_config.args[1] is None:
+            if isinstance(paddle_output, (list, tuple)) and len(paddle_output) > 1:
+                paddle_output = paddle_output[:1]
+            if isinstance(torch_output, (list, tuple)) and len(torch_output) > 1:
+                torch_output = torch_output[:1]
     return paddle_output, torch_output
 
 

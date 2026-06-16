@@ -135,8 +135,8 @@ def generate_unique_array(num_items, float_dtype):
     max_int = (1 << bits) - 1
     current_start_value = 1
     return_list = []
-    attemp_count = 0
-    while len(return_list) < num_items and attemp_count < 3:
+    attempt_count = 0
+    while len(return_list) < num_items and attempt_count < 3:
         nums_to_generate = int(num_items * 1.5)
         if current_start_value >= max_int:
             raise ValueError(
@@ -152,7 +152,7 @@ def generate_unique_array(num_items, float_dtype):
                 numpy.concatenate([return_list, float_arr[numpy.isfinite(float_arr)]])
             )
         current_start_value = end_value
-        attemp_count += 1
+        attempt_count += 1
     if len(return_list) < num_items:
         raise ValueError(f"Could not generate {num_items} unique items of type {float_dtype}")
     return return_list[:num_items]
@@ -217,7 +217,7 @@ class TensorConfig:
         elif dtype == "float8_e5m2":
             return torch.float8_e5m2
         else:
-            raise ValueError(f"Unsupport dtype: {dtype}")
+            raise ValueError(f"Unsupported dtype: {dtype}")
 
     def numel(self):
         return _numel(self.shape)
@@ -3325,9 +3325,9 @@ class APIConfig:
 
         while True:
             prev_offset = offset
-            tocken, offset = self.get_tocken(config, offset)
+            token, offset = self.get_token(config, offset)
             if offset is None:
-                # Check for empty string "" that get_tocken cannot match
+                # Check for empty string "" that get_token cannot match
                 remaining = config[prev_offset:]
                 idx = remaining.find('""')
                 if idx >= 0:
@@ -3338,11 +3338,11 @@ class APIConfig:
 
             is_kwarg = config[offset] == "="
             if is_kwarg:
-                key = tocken
+                key = token
                 prev_offset2 = offset + 1
-                tocken, offset = self.get_tocken(config, prev_offset2)
+                token, offset = self.get_token(config, prev_offset2)
                 # Handle kwarg with empty string value: key=""
-                if tocken is None:
+                if token is None:
                     remaining = config[prev_offset2:]
                     idx = remaining.find('""')
                     if idx >= 0:
@@ -3352,7 +3352,7 @@ class APIConfig:
                     else:
                         return
 
-            value, offset = self.get_one_arg(tocken, config, offset)
+            value, offset = self.get_one_arg(token, config, offset)
 
             if offset is None:
                 return
@@ -3456,10 +3456,10 @@ class APIConfig:
     def __repr__(self):
         return self.__str__()
 
-    # def get_tocken(self, config, offset):
-    #     def is_int(tocken):
+    # def get_token(self, config, offset):
+    #     def is_int(token):
     #         try:
-    #             int(tocken)
+    #             int(token)
     #             return True
     #         except Exception as err:
     #             return False
@@ -3471,7 +3471,7 @@ class APIConfig:
     #         return match.group(), offset + match.start() + len(match.group())
     #     return None, None
 
-    def get_tocken(self, config, offset):
+    def get_token(self, config, offset):
         def is_int(token):
             try:
                 int(token)
@@ -3506,11 +3506,11 @@ class APIConfig:
         return eval(tensor_str), offset + len(tensor_str)
 
     def get_dtype(self, config, offset):
-        tocken, offset = self.get_tocken(config, offset)
+        token, offset = self.get_token(config, offset)
         if hasattr(paddle.framework, "convert_nptype_to_datatype_or_vartype"):
-            return paddle.framework.convert_nptype_to_datatype_or_vartype(tocken), offset
+            return paddle.framework.convert_nptype_to_datatype_or_vartype(token), offset
         # fallback for older Paddle versions
-        return paddle.pir.core.convert_np_dtype_to_dtype_(tocken), offset
+        return paddle.pir.core.convert_np_dtype_to_dtype_(token), offset
 
     def get_place(self, config, offset):
         """Parse Place(gpu:0), Place(cpu), etc."""
@@ -3532,8 +3532,8 @@ class APIConfig:
             return paddle.CPUPlace(), end_offset
 
     def get_vartype(self, config, offset):
-        tocken, offset = self.get_tocken(config, offset)
-        return paddle.base.framework.convert_np_dtype_to_proto_type(tocken), offset
+        token, offset = self.get_token(config, offset)
+        return paddle.base.framework.convert_np_dtype_to_proto_type(token), offset
 
     def get_list(self, config, offset):
         result = []
@@ -3554,11 +3554,11 @@ class APIConfig:
 
         offset = 1
         while True:
-            tocken, offset = self.get_tocken(list_str, offset)
+            token, offset = self.get_token(list_str, offset)
             if offset is None:
                 break
 
-            value, offset = self.get_one_arg(tocken, list_str, offset)
+            value, offset = self.get_one_arg(token, list_str, offset)
 
             if offset is None:
                 break
@@ -3586,11 +3586,11 @@ class APIConfig:
 
         offset = 1
         while True:
-            tocken, offset = self.get_tocken(tuple_str, offset)
+            token, offset = self.get_token(tuple_str, offset)
             if offset is None:
                 break
 
-            value, offset = self.get_one_arg(tocken, tuple_str, offset)
+            value, offset = self.get_one_arg(token, tuple_str, offset)
 
             if offset is None:
                 break
@@ -3618,38 +3618,38 @@ class APIConfig:
             return numpy.bool_, offset + len(numpy_type_str) + 2
         return eval(numpy_type_str), offset + len(numpy_type_str) + 2
 
-    def get_one_arg(self, tocken, config, offset):
-        if tocken == "TensorConfig":
-            value, offset = self.get_tensor(config, offset - len(tocken))
-        elif tocken == "Dtype":
+    def get_one_arg(self, token, config, offset):
+        if token == "TensorConfig":
+            value, offset = self.get_tensor(config, offset - len(token))
+        elif token == "Dtype":
             value, offset = self.get_dtype(config, offset)
-        elif tocken == "Place":
+        elif token == "Place":
             value, offset = self.get_place(config, offset)
-        elif tocken == "VarType":
+        elif token == "VarType":
             value, offset = self.get_vartype(config, offset)
-        elif tocken == "list":
+        elif token == "list":
             value, offset = self.get_list(config, offset)
-        elif tocken == "tuple":
+        elif token == "tuple":
             value, offset = self.get_tuple(config, offset)
-        elif tocken == "slice":
+        elif token == "slice":
             value, offset = self.get_slice(config, offset)
-        elif tocken == "complex":
+        elif token == "complex":
             value, offset = self.get_complex(config, offset)
-        elif tocken == "type":
+        elif token == "type":
             value, offset = self.get_numpy_type(config, offset)
-        elif tocken == "nan":
+        elif token == "nan":
             value = float("nan")
-        elif tocken is not None and config[offset - len(tocken) - 1] == '"':
-            # fix tocken is not correct in str with spaces
+        elif token is not None and config[offset - len(token) - 1] == '"':
+            # fix token is not correct in str with spaces
             next_quote_idx = config.index('"', offset)
-            value = config[offset - len(tocken) : next_quote_idx]
+            value = config[offset - len(token) : next_quote_idx]
             offset = next_quote_idx
-        elif tocken is None:
+        elif token is None:
             return None, None
         else:
-            if tocken[0] == ".":
-                tocken = "0" + tocken
-            value = eval(tocken)
+            if token[0] == ".":
+                token = "0" + token
+            value = eval(token)
         return value, offset
 
 
