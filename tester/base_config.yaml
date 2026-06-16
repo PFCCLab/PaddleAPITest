@@ -554,6 +554,7 @@ forward_only_apis:
   - standard_gamma
   - standard_normal
   - svd_lowrank
+  - swiglu_grad
   - tdm_child
   - tdm_sampler
   - to_sparse_csr

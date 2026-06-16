@@ -41,3 +41,22 @@ quote-style = "double"
 indent-style = "space"
 skip-magic-trailing-comma = false
 line-ending = "auto"
+
+[tool.typos.files]
+extend-exclude = [
+  "*.log",
+  "*.txt",
+  "profiler_outputs/",
+  "report/",
+  "test_log_*/",
+  "tools/api_tracer/api_list/",
+]
+
+[tool.typos.default.extend-words]
+UE = "UE"
+arange = "arange"
+dout = "dout"
+lod = "lod"
+nd = "nd"
+thw = "thw"
+ue = "ue"

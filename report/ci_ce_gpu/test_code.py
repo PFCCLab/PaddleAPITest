@@ -13,7 +13,7 @@ def init_input(numpy_tensor):
     torch_x = torch.tensor(numpy_tensor)
 
     numpy.testing.assert_allclose(
-        paddle_x.numpy(), torch_x.cpu().numpy(), 1e-10, 1e-10, err_msg="intput diff"
+        paddle_x.numpy(), torch_x.cpu().numpy(), 1e-10, 1e-10, err_msg="input diff"
     )
     return paddle_x, torch_x
 

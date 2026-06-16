@@ -493,7 +493,7 @@ x = locals().get('x')
 output = locals().get('output')
 
 def convert_seq2tensor_wrap_scalar(tlist):
-    #  recursive implementation is not supported in current engine, use vanilla verison
+    #  recursive implementation is not supported in current engine, use vanilla version
     # # stack tensors and List[scalars] on dim 0 for nested list
     # if isinstance(tlist, list):
     #     return torch.stack([convert_list2tensor(t) for t in tlist])
@@ -1718,7 +1718,7 @@ else:
         return ConvertResult.success(paddle_api, code)
 
 
-class ExpandasRule(BaseRule):
+class ExpandAsRule(BaseRule):
     def apply(self, paddle_api: str) -> ConvertResult:
         impl = """
 result = x.expand_as(y)
@@ -4004,7 +4004,7 @@ for i in range(seqlen):
             continue  # token i already assigned to expert e (duplicate topk column)
         slot = expert_counters[e]
         if slot >= tokens_per_expert[e]:
-            continue  # excess beyond tpe
+            continue  # excess beyond tokens_per_expert
         row = offsets_e[e] + slot
         rowmap[i, e] = row
         gather_src[row] = i
@@ -5535,7 +5535,7 @@ if 'axis' in locals():
         return ConvertResult.success(paddle_api, code)
 
 
-class SquenceMaskRule(BaseRule):
+class SequenceMaskRule(BaseRule):
     def apply(self, paddle_api: str) -> ConvertResult:
         core = """
 maxlen = locals().get('maxlen', None)
@@ -7106,6 +7106,30 @@ else:
         return ConvertResult.success(paddle_api, code, is_torch_corresponding=False)
 
 
+class CopsMatmulRule(BaseRule):
+    """paddle._C_ops.matmul(x, y, transpose_x, transpose_y) → torch.matmul with optional transpose
+
+    Paddle's primitive matmul supports:
+      - N-D tensors with broadcasting (like torch.matmul)
+      - per-operand transpose flags applied to the last two dims
+      - 1-D operands (treated as vectors, matching torch.matmul semantics)
+    """
+
+    def apply(self, paddle_api: str) -> ConvertResult:
+        core = """
+x           = locals().get("x")
+y           = locals().get("y")
+transpose_x = locals().get("transpose_x", False)
+transpose_y = locals().get("transpose_y", False)
+
+x_mat = x.mT if (transpose_x and x.dim() >= 2) else x
+y_mat = y.mT if (transpose_y and y.dim() >= 2) else y
+result = torch.matmul(x_mat, y_mat)
+"""
+        code = Code(core=core.splitlines())
+        return ConvertResult.success(paddle_api, code, is_torch_corresponding=False)
+
+
 class CopsFull_Rule(BaseRule):
     """paddle._C_ops.full_(x, shape, value, dtype) → x.fill_(value) in-place"""
 
@@ -7258,6 +7282,59 @@ result = (x.float() * x.float()).sum().reshape([1])
         return ConvertResult.success(paddle_api, code, is_torch_corresponding=False)
 
 
+class CopsSwigluGradRule(BaseRule):
+    """paddle._C_ops.swiglu_grad(x, y, dout) -> (dx, dy)
+
+    Two forward semantics depending on whether y is provided:
+        y is not None:  out = silu(x) * y          # x, y share the same shape
+        y is None:      out = silu(x[..., :C]) * x[..., C:]   where C = x.size(-1)//2
+
+    Backward derivatives (y given):
+        dy = dout * silu(x)
+        dx = dout * y * sigmoid(x) * (1 + x * (1 - sigmoid(x)))
+
+    Backward derivatives (y is None — split last dim):
+        let a = x[..., :C], b = x[..., C:]
+        da = silu_backward(dout * b, a)
+        db = dout * silu(a)
+        dx = concat([da, db], dim=-1); dy is returned as None to match
+        Paddle's uninitialized second output (the framework comparator
+        accepts `paddle uninitialized + torch None` as a pass).
+
+    Use Torch's native silu implementation for the corresponding SiLU value.
+    The SiLU derivative is kept analytical because Torch does not expose a full
+    swiglu_grad op and aten::silu_backward is not bitwise aligned here.
+    """
+
+    def apply(self, paddle_api: str) -> ConvertResult:
+        core = """
+x    = locals().get("x")
+y    = locals().get("y")
+
+dout = locals().get("dout")
+
+if y is None:
+    C = x.shape[-1] // 2
+    a = x[..., :C]
+    b = x[..., C:]
+    sig_a = torch.sigmoid(a)
+    silu_a = torch.nn.functional.silu(a)
+    da = (dout * b) * sig_a * (1.0 + a * (1.0 - sig_a))
+    db = dout * silu_a
+    dx = torch.cat([da, db], dim=-1)
+    dy = None
+else:
+    sig_x = torch.sigmoid(x)
+    silu_x = torch.nn.functional.silu(x)
+    dy = dout * silu_x
+    dx = (dout * y) * sig_x * (1.0 + x * (1.0 - sig_x))
+
+result = [dx, dy]
+"""
+        code = Code(core=core.splitlines())
+        return ConvertResult.success(paddle_api, code, is_torch_corresponding=False)
+
+
 class CopsUniformRule(BaseRule):
     """paddle._C_ops.uniform(shape, dtype, min, max, seed) → torch.empty(...).uniform_"""
 
@@ -7286,6 +7363,8 @@ class CopsRunCustomOpRule(BaseRule):
       - "fused_swiglu_bwd": dy, x → compute grad of swiglu
       - "fused_swiglu_scale_clamp": x, scale, max_val → scaled+clamped swiglu fwd
       - "fused_swiglu_scale_clamp_bwd": x, scale, dy, max_val → scaled+clamped swiglu bwd
+      - "fused_swiglu_probs_bwd": o1, do2_s, unzipped_probs, inplace → weighted swiglu bwd
+      - "paddlefleet_fused_swiglu_probs_bwd": same semantics as fused_swiglu_probs_bwd
     Unsupported op_names will return an error result at runtime.
     """
 
@@ -7332,6 +7411,7 @@ elif op_name == "fused_swiglu_scale_clamp":
     out = torch.clamp(out, min=-float(max_val), max=float(max_val))
     result = [out.to(x.dtype)]
 
+
 elif op_name == "fused_swiglu_scale_clamp_bwd":
     # _run_custom_op("fused_swiglu_scale_clamp_bwd", x, scale, dy, max_val)
     # arg1=x (original fwd input [..., 2D]), arg2=scale, arg3=dy (grad of output [..., D]),
@@ -7367,6 +7447,90 @@ elif op_name == "fused_swiglu_scale_clamp_bwd":
     if torch.is_tensor(scale):
         d_scale = d_scale.to(scale.dtype)
     result = [dx, d_scale]
+
+elif op_name in ("fused_swiglu_probs_bwd", "paddlefleet_fused_swiglu_probs_bwd"):
+    # _run_custom_op("fused_swiglu_probs_bwd", o1, do2_s, unzipped_probs, inplace)
+    # 输出 [do1, probs_grad, o2_s]，语义参考 paddlefleet 的 SwigluProbsGradKernel:
+    #   lhs, rhs = chunk(o1, 2, -1); sig = sigmoid(lhs); silu = sig*lhs
+    #   do1[..., :H] = (do2_s*probs) * rhs * sig * (1 + lhs - silu)
+    #   do1[..., H:] = (do2_s*probs) * silu
+    #   o2_s         = silu * rhs * probs
+    #   probs_grad   = sum_last_dim(do2_s * silu * rhs),shape [outer_dim],float32
+    # 注意：
+    #   1) 空输入 (numel==0) 时 Paddle 直接返回占位 tensor,不做 shape 一致性检查；
+    #   2) 大 shape + bf16 输入若整体 upcast 到 fp32 会爆显存，分块处理。
+    o1     = arg1
+    do2_s  = arg2
+    probs  = arg3
+    inplace_flag = bool(arg4) if arg4 is not None else False
+    H2 = o1.shape[-1]
+    H = H2 // 2
+    outer = 1
+    for _s in o1.shape[:-1]:
+        outer *= _s
+
+    # Paddle 的 SwigluProbsGradCUDABackward:
+    #   do1      = inplace ? o1    : empty_like(o1)
+    #   o2_s     = inplace ? do2_s : empty_like(do2_s)
+    #   probs_grad = empty({outer}, fp32)   # 始终新分配
+    # 当任一输入 numel==0 时，kernel 不执行，直接返回上述（已分配但未写入的）buffer。
+    # 因此 inplace=True 时 do1/o2_s 保留 o1/do2_s 的原值；非 inplace 时为未初始化值。
+    if o1.numel() == 0 or do2_s.numel() == 0 or probs.numel() == 0:
+        if inplace_flag:
+            do1_e  = o1.clone()
+            o2_s_e = do2_s.clone()
+        else:
+            do1_e  = torch.zeros_like(o1)
+            o2_s_e = torch.zeros_like(do2_s)
+        # probs_grad 始终是新分配的未初始化 buffer；用 0 占位
+        pg_e = torch.zeros([outer], dtype=torch.float32, device=o1.device)
+        result = [do1_e, pg_e, o2_s_e]
+    else:
+        o1_dtype  = o1.dtype
+        do2_dtype = do2_s.dtype
+        o1_2d  = o1.reshape(outer, H2)
+        do2_2d = do2_s.reshape(outer, H)
+        probs_flat = probs.reshape(-1).to(torch.float32)
+        # inplace=True 时 paddle 直接写入 o1/do2_s，复用同一存储以避免 OOM；
+        # inplace=False 时新分配输出 buffer。
+        if inplace_flag:
+            do1_out  = o1_2d
+            o2_s_out = do2_2d
+        else:
+            do1_out  = torch.empty_like(o1_2d)
+            o2_s_out = torch.empty_like(do2_2d)
+        pg_out   = torch.empty([outer], dtype=torch.float32, device=o1.device)
+        # 限制单块 fp32 中间张量总大小 ~1GB（约 10 个 [chunk, H] fp32）
+        bytes_budget = 1 << 30
+        per_row = max(1, H * 4 * 10)
+        chunk = max(1, min(outer, bytes_budget // per_row))
+        # 切片原地写入会触发 autograd 对叶子张量的报错（尤其 fp32 叶子节点），
+        # 这里整体走 no_grad：本算子是 bwd kernel 的数值复刻，不需要再次求导。
+        with torch.no_grad():
+            for s in range(0, outer, chunk):
+                e = min(outer, s + chunk)
+                # inplace 时 o1_2d 即将被写入，需先把 lhs/rhs 拷到 fp32 中间变量
+                lhs_c  = o1_2d[s:e, :H].float()
+                rhs_c  = o1_2d[s:e, H:].float()
+                do2_c  = do2_2d[s:e].float()
+                prob_c = probs_flat[s:e].unsqueeze(-1)
+                sig      = torch.sigmoid(lhs_c)
+                silu_lhs = sig * lhs_c
+                o2_val   = silu_lhs * rhs_c
+                do2_val  = do2_c * prob_c
+                x0g = do2_val * rhs_c * sig * (1.0 + lhs_c - silu_lhs)
+                x1g = do2_val * silu_lhs
+                pg_out[s:e] = (do2_c * o2_val).sum(dim=-1)
+                # o2_s 写入需在 do1 之前完成时使用 do2_2d 切片；这里 o2_s 与 do1
+                # 来自不同 buffer（即使 inplace 也是 do2_s vs o1），互不影响。
+                o2_s_out[s:e] = (o2_val * prob_c).to(do2_dtype)
+                do1_out[s:e, :H] = x0g.to(o1_dtype)
+                do1_out[s:e, H:] = x1g.to(o1_dtype)
+        result = [
+            do1_out.reshape(o1.shape),
+            pg_out,
+            o2_s_out.reshape(do2_s.shape),
+        ]
 
 else:
     raise NotImplementedError(f"CopsRunCustomOpRule: unsupported op_name={op_name!r}")

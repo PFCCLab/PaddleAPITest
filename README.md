@@ -27,7 +27,7 @@ paddle.concat(tuple(Tensor([31376, 768],"float32"),Tensor([1, 768],"float32"),),
 
 ```bash
 ├── report/
-├── test_pipline/
+├── test_pipeline/
 ├── tester/
 │   ├── api_config/
 │   ├── paddle_to_torch/
