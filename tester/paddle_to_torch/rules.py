@@ -7036,6 +7036,9 @@ else:
 
             step = math.log(b2_pow) / math.log(b2)
             if math.isfinite(step) and step > 0.0:
+                # step is the training iteration count, which is always an
+                # integer. Round to undo float32 round-trip noise from log/log.
+                step = round(step)
                 b1_pow_from_step = b1**step
                 bias_correction1 = 1.0 - b1_pow
                 fused_bias_correction1 = 1.0 - b1_pow_from_step
