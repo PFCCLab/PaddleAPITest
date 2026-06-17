@@ -27,6 +27,30 @@ class APITestAccuracy(APITestBase):
             torch.set_printoptions(profile="short")
         self.converter = get_converter()
 
+    def _reset_random_state(self, seed: int = 42):
+        """Reset numpy / paddle / torch (CPU+CUDA) RNGs so random APIs
+        (uniform, normal, randn, bernoulli, dropout, ...) produce
+        reproducible outputs across the torch run and the paddle run."""
+        numpy.random.seed(seed)
+        try:
+            paddle.seed(seed)
+            if paddle.device.is_compiled_with_cuda():
+                # paddle.seed already seeds the GPU default generator,
+                # but reset all device generators explicitly for safety.
+                try:
+                    for i in range(paddle.device.cuda.device_count()):
+                        paddle.framework.core.default_cuda_generator(i).manual_seed(seed)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        try:
+            torch.manual_seed(seed)
+            if torch.cuda.is_available():
+                torch.cuda.manual_seed_all(seed)
+        except Exception:
+            pass
+
     # @func_set_timeout(600)
     def test(self):
         if self.need_skip():
@@ -77,6 +101,11 @@ class APITestAccuracy(APITestBase):
             if not self.gen_torch_input():
                 print("gen_torch_input failed", flush=True)
                 return
+
+            # Reseed before executing torch, so that random APIs
+            # (e.g. torch.rand / uniform / normal / dropout) produce
+            # deterministic outputs across runs when --random_seed is set.
+            self._reset_random_state()
 
             # torch_args 与 torch_kwargs 是尚未映射的 torch 参数（即按 paddle 的参数顺序与关键字排列的 torch tensors）
             # (弃用)以下代码等价于:
@@ -212,6 +241,11 @@ class APITestAccuracy(APITestBase):
             if not self.gen_paddle_input():
                 print("gen_paddle_input failed")
                 return
+
+            # Reseed before executing paddle so that random APIs
+            # (paddle.uniform / normal / randn / bernoulli / dropout ...)
+            # match the torch run with the same seed.
+            self._reset_random_state()
             if "paddle.Tensor." in self.api_config.api_name:
                 api = getattr(
                     self.paddle_args[0],
