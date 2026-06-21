@@ -2936,10 +2936,7 @@ class TensorConfig:
                 "float16" if self.dtype in ["float8_e5m2", "float8_e4m3fn"] else self.dtype
             )
             storage_size = self._strided_storage_size()
-            flat_tensor_creator = (
-                paddle.zeros if original_flag.get(flag_name, False) else paddle.empty
-            )
-            flat_tensor = flat_tensor_creator(
+            flat_tensor = paddle.zeros(
                 [storage_size],
                 dtype=intermediate_dtype,
                 device=self.place,
