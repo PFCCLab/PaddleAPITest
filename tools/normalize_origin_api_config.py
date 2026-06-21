@@ -18,8 +18,8 @@
 #     ]
 #     configs = set()
 
-#     for flie in not_support_files:
-#         with open(DIR_PATH+"/"+flie, "r") as f:
+#     for file in not_support_files:
+#         with open(DIR_PATH+"/"+file, "r") as f:
 #             origin_configs = f.readlines()
 #             f.close()
 

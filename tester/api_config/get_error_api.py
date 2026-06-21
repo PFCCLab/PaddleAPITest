@@ -35,7 +35,7 @@ for item in total_config_strings:
     total_api_names.add(api_name)
 # write_to_file("total_api.txt", total_api_names)
 print(
-    "总共的congig数量：",
+    "总共的config数量：",
     len(total_config_strings),
     "总共的api数量：",
     len(total_api_names),
@@ -48,7 +48,7 @@ for item in pass_config_strings:
     pass_api_names.add(api_name)
 # write_to_file("pass_api.txt", pass_api_names)
 print(
-    "通过的congig数量：",
+    "通过的config数量：",
     len(pass_config_strings),
     "通过的api数量：",
     len(pass_api_names),
@@ -60,7 +60,7 @@ error_api_configs = get_apiconfig_from_apiname(total_config_strings, error_api_n
 write_to_file("not_pass_api_config.txt", error_api_configs)
 write_to_file("not_pass_api.txt", error_api_names)
 print(
-    "全部case不通过的congig数量：",
+    "全部case不通过的config数量：",
     len(error_api_configs),
     "全部case不通过的api数量：",
     len(error_api_names),

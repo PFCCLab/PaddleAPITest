@@ -850,7 +850,7 @@
         "Rule": "ExpandRule"
     },
     "paddle.expand_as": {
-        "Rule": "ExpandasRule"
+        "Rule": "ExpandAsRule"
     },
     "paddle.Tensor.expand_as": {
         "torch_api": "torch.Tensor.expand_as",
@@ -1104,7 +1104,7 @@
         "torch_kwargs": {
             "dims": "[axis] if isinstance(axis, int) else axis"
         },
-        "description": "no need to use locals().get('axis') sice axis is a positional argument without default value (must input)"
+        "description": "no need to use locals().get('axis') since axis is a positional argument without default value (must input)"
     },
     "paddle.Tensor.flip": {
         "torch_api": "torch.Tensor.flip",
@@ -3401,7 +3401,7 @@
         }
     },
     "paddle.nn.functional.sequence_mask": {
-        "Rule": "SquenceMaskRule"
+        "Rule": "SequenceMaskRule"
     },
     "paddle.nn.functional.sigmoid": {
         "torch_api": "torch.nn.functional.sigmoid",
@@ -4959,6 +4959,9 @@
     "paddle._C_ops.gaussian": {
         "Rule": "CopsGaussianRule"
     },
+    "paddle._C_ops.matmul": {
+        "Rule": "CopsMatmulRule"
+    },
     "paddle._C_ops.matmul_grad": {
         "Rule": "CopsMatmulGradRule"
     },
@@ -4982,6 +4985,9 @@
     },
     "paddle._C_ops.subtract_": {
         "Rule": "CopsSubtract_Rule"
+    },
+    "paddle._C_ops.swiglu_grad": {
+        "Rule": "CopsSwigluGradRule"
     },
     "paddle._C_ops.transpose": {
         "Rule": "CopsTransposeRule"

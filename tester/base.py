@@ -70,6 +70,7 @@ _COPS_API_PUBLIC_ALIAS: dict[str, str] = {
     "paddle._C_ops.clip": "paddle.clip",
     "paddle._C_ops.concat": "paddle.concat",
     "paddle._C_ops.flatten_": "paddle.flatten",
+    "paddle._C_ops.matmul": "paddle.matmul",
     "paddle._C_ops.multiply_": "paddle.multiply",
     "paddle._C_ops.numel": "paddle.numel",
     "paddle._C_ops.put_along_axis_": "paddle.put_along_axis",
@@ -148,6 +149,12 @@ no_signature_api_mappings.update(
         # squared_l2_norm(x)
         "paddle._C_ops.squared_l2_norm": {
             "x": lambda cfg: get_arg(cfg, 0, "x"),
+        },
+        # swiglu_grad(x, y, dout) -> (dx, dy); y may be None (then x is split along last dim)
+        "paddle._C_ops.swiglu_grad": {
+            "x": lambda cfg: get_arg(cfg, 0, "x"),
+            "y": lambda cfg: get_arg(cfg, 1, "y"),
+            "dout": lambda cfg: get_arg(cfg, 2, "dout"),
         },
         # _run_custom_op(op_name, *args) — op_name dispatches to per-op sub-rules
         "paddle._C_ops._run_custom_op": {
@@ -954,7 +961,7 @@ class APITestBase:
         elif dtype is None:
             return None
         else:
-            raise ValueError(f"Unsupport dtype: {dtype}")
+            raise ValueError(f"Unsupported dtype: {dtype}")
 
     def gen_paddle_input_with_merged_kwargs(self):
         self.paddle_args = []

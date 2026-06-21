@@ -27,6 +27,30 @@ class APITestAccuracy(APITestBase):
             torch.set_printoptions(profile="short")
         self.converter = get_converter()
 
+    def _reset_random_state(self, seed: int = 42):
+        """Reset numpy / paddle / torch (CPU+CUDA) RNGs so random APIs
+        (uniform, normal, randn, bernoulli, dropout, ...) produce
+        reproducible outputs across the torch run and the paddle run."""
+        numpy.random.seed(seed)
+        try:
+            paddle.seed(seed)
+            if paddle.device.is_compiled_with_cuda():
+                # paddle.seed already seeds the GPU default generator,
+                # but reset all device generators explicitly for safety.
+                try:
+                    for i in range(paddle.device.cuda.device_count()):
+                        paddle.framework.core.default_cuda_generator(i).manual_seed(seed)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        try:
+            torch.manual_seed(seed)
+            if torch.cuda.is_available():
+                torch.cuda.manual_seed_all(seed)
+        except Exception:
+            pass
+
     # @func_set_timeout(600)
     def test(self):
         if self.need_skip():
@@ -41,7 +65,7 @@ class APITestAccuracy(APITestBase):
             convert_result = self.converter.convert(self.api_config.api_name)
         except Exception as e:
             print(
-                f"[paddle_to_torch] Convertion failed for {self.api_config.config}: {e!s}",
+                f"[paddle_to_torch] Conversion failed for {self.api_config.config}: {e!s}",
                 flush=True,
             )
             write_to_log("paddle_to_torch_failed", self.api_config.config)
@@ -77,6 +101,11 @@ class APITestAccuracy(APITestBase):
             if not self.gen_torch_input():
                 print("gen_torch_input failed", flush=True)
                 return
+
+            # Reseed before executing torch, so that random APIs
+            # (e.g. torch.rand / uniform / normal / dropout) produce
+            # deterministic outputs across runs when --random_seed is set.
+            self._reset_random_state()
 
             # torch_args 与 torch_kwargs 是尚未映射的 torch 参数（即按 paddle 的参数顺序与关键字排列的 torch tensors）
             # (弃用)以下代码等价于:
@@ -212,6 +241,11 @@ class APITestAccuracy(APITestBase):
             if not self.gen_paddle_input():
                 print("gen_paddle_input failed")
                 return
+
+            # Reseed before executing paddle so that random APIs
+            # (paddle.uniform / normal / randn / bernoulli / dropout ...)
+            # match the torch run with the same seed.
+            self._reset_random_state()
             if "paddle.Tensor." in self.api_config.api_name:
                 api = getattr(
                     self.paddle_args[0],
@@ -376,8 +410,7 @@ class APITestAccuracy(APITestBase):
                 elif (
                     paddle_item is None
                     or (
-                        isinstance(paddle_item, paddle.Tensor)
-                        and not (paddle_item._is_initialized() or paddle_item.numel() == 0)
+                        isinstance(paddle_item, paddle.Tensor) and not paddle_item._is_initialized()
                     )
                 ) and torch_item is None:
                     # paddle is None and torch is None
@@ -511,7 +544,7 @@ class APITestAccuracy(APITestBase):
                         paddle_item is None
                         or (
                             isinstance(paddle_item, paddle.Tensor)
-                            and not (paddle_item._is_initialized() or paddle_item.numel() == 0)
+                            and not paddle_item._is_initialized()
                         )
                     ) and torch_item is None:
                         # paddle is None and torch is None
@@ -586,6 +619,14 @@ def process_output(api_config, paddle_output, torch_output):
             paddle_output = paddle_output[:1]
         if isinstance(torch_output, (list, tuple)) and len(torch_output) > 1:
             torch_output = torch_output[:1]
+    elif api_config.api_name == "paddle._C_ops.swiglu_grad":
+        # When y is None, Paddle returns an uninitialized placeholder tensor for dy.
+        # Only compare dx to avoid converting the uninitialized tensor to DLPack.
+        if len(api_config.args) > 1 and api_config.args[1] is None:
+            if isinstance(paddle_output, (list, tuple)) and len(paddle_output) > 1:
+                paddle_output = paddle_output[:1]
+            if isinstance(torch_output, (list, tuple)) and len(torch_output) > 1:
+                torch_output = torch_output[:1]
     return paddle_output, torch_output
 
 

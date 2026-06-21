@@ -70,7 +70,7 @@
 | `--torch_gpu_performance`        | bool  | 运行 Torch 性能测试（默认 False）                                                      |
 | `--paddle_torch_gpu_performance` | bool  | 运行 Paddle vs Torch 性能测试（默认 False）                                            |
 | `--accuracy_stable`              | bool  | 启用稳定性测试（默认 False）                                                           |
-| `--paddle_custom_device`         | bool  | 运行Custom Devic e或者XPU的API与CPU的精度对比（默认 False）                              |
+| `--paddle_custom_device`         | bool  | 运行Custom Device或者XPU的API与CPU的精度对比（默认 False）                              |
 | `--num_gpus`                     | int   | 使用的 GPU 数量（默认 -1，-1 动态最大）                                                |
 | `--num_workers_per_gpu`          | int   | 每 GPU 的 worker 进程数（默认 1，-1 动态最大）                                         |
 | `--gpu_ids`                      | str   | 使用的 GPU 序号，以逗号分隔或横线范围（默认 ""，"-1" 动态最大）                        |

@@ -20,7 +20,7 @@ def init_input(numpy_tensor):
         torch_x.cpu().detach().numpy(),
         1e-10,
         1e-10,
-        err_msg="intput diff",
+        err_msg="input diff",
     )
     return paddle_x, torch_x
 

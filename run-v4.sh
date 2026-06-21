@@ -67,6 +67,10 @@ TEST_MODE_ARGS=(
 # ============================================================
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+if [[ ! -f "$ENGINE.py" || ! -d "tester" ]]; then
+    echo "错误: 请在 PaddleAPITest 项目根目录执行此脚本"
+    exit 1
+fi
 SCRIPT_NAME="${BASH_SOURCE[0]##*/}"
 SCRIPT_NAME="${SCRIPT_NAME%.sh}"
 PID_FILE="${SCRIPT_DIR}/.${SCRIPT_NAME}.pid"
@@ -204,9 +208,9 @@ if [[ "$FOREGROUND" == "true" ]]; then
     echo -e "\n\033[36m[前台模式] Ctrl+C 终止\033[0m"
     echo "日志同时写入: $LOG_FILE"
     echo ""
-    python "$SCRIPT_DIR/$ENGINE.py" "${ALL_ARGS[@]}" 2>&1 | tee "$LOG_FILE"
+    python "$ENGINE.py" "${ALL_ARGS[@]}" 2>&1 | tee "$LOG_FILE"
 else
-    nohup setsid python "$SCRIPT_DIR/$ENGINE.py" "${ALL_ARGS[@]}" >> "$LOG_FILE" 2>&1 &
+    nohup setsid python "$ENGINE.py" "${ALL_ARGS[@]}" >> "$LOG_FILE" 2>&1 &
     PYTHON_PID=$!
     echo "$PYTHON_PID" > "$PID_FILE"
 

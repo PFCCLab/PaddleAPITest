@@ -1,0 +1,1 @@
+rm -rf test_pipeline/gpu_paddleonly/paddleonly_*.log
