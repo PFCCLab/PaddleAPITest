@@ -72,6 +72,26 @@ def get_tmp_log_path():
     return TMP_LOG_PATH
 
 
+def get_sanitizer_case_log_dir(slot_index, pid):
+    return TMP_LOG_PATH / "sanitizer" / f"slot_{slot_index}_{pid}"
+
+
+def merge_sanitizer_case_logs(case_log_dir):
+    case_tmp_dir = case_log_dir / ".tmp"
+    if not case_tmp_dir.exists():
+        return
+    for child_log in case_tmp_dir.iterdir():
+        if not child_log.is_file():
+            continue
+        target_log = TMP_LOG_PATH / child_log.name
+        with child_log.open("rb") as in_f, target_log.open("ab") as out_f:
+            shutil.copyfileobj(in_f, out_f)
+
+
+def cleanup_sanitizer_tmp_dir():
+    shutil.rmtree(TMP_LOG_PATH / "sanitizer", ignore_errors=True)
+
+
 def close_process_files():
     """关闭本进程持有的所有文件句柄"""
     global _process_file_handlers

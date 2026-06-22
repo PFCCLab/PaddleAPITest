@@ -274,18 +274,6 @@ def _build_sanitizer_case_command(api_config_str, options, log_dir):
     return cmd
 
 
-def _merge_sanitizer_case_logs(case_log_dir):
-    case_tmp_dir = case_log_dir / ".tmp"
-    if not case_tmp_dir.exists():
-        return
-    for child_log in case_tmp_dir.iterdir():
-        if not child_log.is_file():
-            continue
-        target_log = get_tmp_log_path() / child_log.name
-        with child_log.open("rb") as in_f, target_log.open("ab") as out_f:
-            shutil.copyfileobj(in_f, out_f)
-
-
 def _sanitizer_worker_loop(slot_index, gpu_id, input_queue, result_queue, options):
     if options.log_dir:
         set_test_log_path(options.log_dir)
@@ -322,7 +310,7 @@ def _sanitizer_worker_loop(slot_index, gpu_id, input_queue, result_queue, option
 
             api_config_str = task
             result_queue.put(("ack", slot_index, api_config_str))
-            case_log_dir = get_tmp_log_path() / "sanitizer" / f"slot_{slot_index}_{os.getpid()}"
+            case_log_dir = get_sanitizer_case_log_dir(slot_index, os.getpid())
             if case_log_dir.exists():
                 shutil.rmtree(case_log_dir)
             case_log_dir.mkdir(parents=True, exist_ok=True)
@@ -368,14 +356,15 @@ def _sanitizer_worker_loop(slot_index, gpu_id, input_queue, result_queue, option
 
             child_process = None
             if returncode in (0, 2):
-                _merge_sanitizer_case_logs(case_log_dir)
+                merge_sanitizer_case_logs(case_log_dir)
             shutil.rmtree(case_log_dir, ignore_errors=True)
 
             if returncode == 0:
                 result_queue.put(("done", slot_index, api_config_str))
             elif returncode == 2:
-                output_tail = "".join(output_lines)
-                result_queue.put(("error", slot_index, api_config_str, output_tail))
+                result_queue.put(
+                    ("error", slot_index, api_config_str, f"child exited with {returncode}")
+                )
             else:
                 output_tail = "".join(output_lines)
                 result_queue.put(
@@ -1026,7 +1015,6 @@ def run_test_case(api_config_str, options):
 
 def main():
     start_time = time.time()
-    print(f"Main process id: {os.getpid()}")
     set_start_method("spawn")
 
     try:
@@ -1241,8 +1229,10 @@ def main():
 
     options = parser.parse_args()
     options.paddle_version = paddle_version
-    print(f"Options: {vars(options)}", flush=True)
-    print(f"PaddlePaddle version: {paddle_version}", flush=True)
+    if not options._sanitizer_child:
+        print(f"Main process id: {os.getpid()}")
+        print(f"Options: {vars(options)}", flush=True)
+        print(f"PaddlePaddle version: {paddle_version}", flush=True)
     if options.random_seed != parser.get_default("random_seed"):
         np.random.seed(options.random_seed)
 
@@ -1464,6 +1454,8 @@ def main():
 
         # when engineV2 was interrupted, resume from .tmp dir
         aggregate_logs(cleanup=True)
+        if options.use_compute_sanitizer:
+            cleanup_sanitizer_tmp_dir()
         removed_stale_logs = cleanup_uncheckpointed_result_logs()
         if removed_stale_logs:
             print(
@@ -1715,6 +1707,8 @@ def main():
             print(f"Test time: {round(total_time / 60, 3)} minutes.", flush=True)
         finally:
             pool.shutdown()
+            if options.use_compute_sanitizer:
+                cleanup_sanitizer_tmp_dir()
             print(f"{tested_case} cases have been tested.", flush=True)
             log_counts = aggregate_logs(end=True)
             print_log_info(all_case, log_counts)
