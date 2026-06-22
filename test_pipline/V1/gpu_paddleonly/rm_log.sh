@@ -1,1 +1,0 @@
-rm -rf test_pipline/gpu_paddleonly/paddleonly_*.log

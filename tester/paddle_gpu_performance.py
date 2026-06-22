@@ -132,7 +132,7 @@ class APITestPaddleGPUPerformance(APITestBase):
                 "\t",
                 test_loop,
                 "\t",
-                "faild",
+                "failed",
             )
             if self.should_ignore_paddle_error(str(err)):
                 return
@@ -189,7 +189,7 @@ class APITestPaddleGPUPerformance(APITestBase):
                 "\t",
                 test_loop,
                 "\t",
-                "faild",
+                "failed",
             )
             if self.should_ignore_paddle_error(str(err)):
                 return

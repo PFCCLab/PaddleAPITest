@@ -3,6 +3,11 @@
 # Script to run engineV2.py
 # Usage: ./run.sh
 
+if [[ ! -f "engineV2.py" || ! -d "tester" ]]; then
+    echo "错误: 请在 PaddleAPITest 项目根目录执行此脚本"
+    exit 1
+fi
+
 # 配置参数
 # NUM_GPUS!=0 时，engineV2 不受外部 "CUDA_VISIBLE_DEVICES" 影响
 FILE_INPUT="tester/api_config/5_accuracy/accuracy_1.txt"
