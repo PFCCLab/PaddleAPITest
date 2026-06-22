@@ -88,6 +88,7 @@ SANITIZER_FORWARD_ARGS = {
     "generate_failed_tests",
     "exit_on_error",
 }
+SANITIZER_FORWARD_ARGS_SORTED = tuple(sorted(SANITIZER_FORWARD_ARGS))
 
 DEVICE_TYPE = None
 DEVICE_TYPE_DETECTED = False
@@ -251,15 +252,17 @@ def _format_cli_value(value):
     return str(value)
 
 
-def _build_sanitizer_case_command(api_config_str, options):
+def _build_sanitizer_case_command(api_config_str, options, sanitizer_cmd=None):
+    if sanitizer_cmd is None:
+        sanitizer_cmd = shlex.split(options.sanitizer_command)
     cmd = [
-        *shlex.split(options.sanitizer_command),
+        *sanitizer_cmd,
         sys.executable,
         str(Path(__file__).resolve()),
         f"--api_config={api_config_str}",
         "--_sanitizer_child=True",
     ]
-    for key in sorted(SANITIZER_FORWARD_ARGS):
+    for key in SANITIZER_FORWARD_ARGS_SORTED:
         value = getattr(options, key, None)
         if value is None:
             continue
@@ -278,6 +281,9 @@ def _sanitizer_worker_loop(slot_index, gpu_id, input_queue, result_queue, option
     redirect_stdio()
 
     child_process = None
+    sanitizer_cmd = shlex.split(options.sanitizer_command)
+    child_env = os.environ.copy()
+    child_env["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
 
     def terminate_child(*args):
         if child_process is not None and child_process.poll() is None:
@@ -307,13 +313,7 @@ def _sanitizer_worker_loop(slot_index, gpu_id, input_queue, result_queue, option
 
             api_config_str = task
             result_queue.put(("ack", slot_index, api_config_str))
-            try:
-                cmd = _build_sanitizer_case_command(api_config_str, options)
-            except ValueError as err:
-                result_queue.put(("error", slot_index, api_config_str, str(err)))
-                continue
-            env = os.environ.copy()
-            env["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
+            cmd = _build_sanitizer_case_command(api_config_str, options, sanitizer_cmd)
 
             print(
                 f"{datetime.now()} Sanitizer slot {slot_index} launch: {' '.join(shlex.quote(part) for part in cmd)}",
@@ -322,7 +322,7 @@ def _sanitizer_worker_loop(slot_index, gpu_id, input_queue, result_queue, option
             try:
                 child_process = subprocess.Popen(
                     cmd,
-                    env=env,
+                    env=child_env,
                     stdout=subprocess.PIPE,
                     stderr=subprocess.STDOUT,
                     text=True,
@@ -826,54 +826,95 @@ def get_memory_info(gpu_id):
     raise RuntimeError("No supported accelerator (GPU / XPU / Iluvatar) detected.")
 
 
+ARGUMENT_ERROR_PREFIX = "[argument error]"
+ARGUMENT_WARNING_PREFIX = "[argument warning]"
+TEST_MODE_ERROR = (
+    "specify exactly one test mode: --accuracy, --paddle_only, --paddle_cinn, "
+    "--paddle_gpu_performance, --torch_gpu_performance, "
+    "--paddle_torch_gpu_performance, --accuracy_stable, --paddle_custom_device, "
+    "--custom_device_vs_gpu"
+)
+
+
+def _print_argument(prefix, message):
+    print(f"{prefix} {message}", flush=True)
+
+
+def _parse_gpu_ids(gpu_ids_arg, device_count):
+    gpu_ids = []
+    for raw_part in gpu_ids_arg.split(","):
+        part = raw_part.strip()
+        if not part:
+            continue
+        if part == "-1":
+            gpu_ids.append(-1)
+            continue
+        if "-" in part:
+            try:
+                start, end = map(int, part.split("-", 1))
+            except ValueError:
+                raise ValueError(
+                    f"invalid --gpu_ids='{gpu_ids_arg}': expected integers or ranges like '0,2,4-7'"
+                ) from None
+            if start > end:
+                raise ValueError(f"invalid --gpu_ids='{gpu_ids_arg}': range start must be <= end")
+            gpu_ids.extend(range(start, end + 1))
+            continue
+        try:
+            gpu_ids.append(int(part))
+        except ValueError:
+            raise ValueError(
+                f"invalid --gpu_ids='{gpu_ids_arg}': expected integers or ranges like '0,2,4-7'"
+            ) from None
+
+    if not gpu_ids:
+        raise ValueError(f"invalid --gpu_ids='{gpu_ids_arg}': expected at least one GPU id")
+    seen_gpu_ids = set()
+    for gpu_id in gpu_ids:
+        if gpu_id in seen_gpu_ids:
+            raise ValueError(f"invalid --gpu_ids='{gpu_ids_arg}': duplicate GPU id {gpu_id}")
+        seen_gpu_ids.add(gpu_id)
+    if len(gpu_ids) > 1 and -1 in gpu_ids:
+        raise ValueError(
+            f"invalid --gpu_ids='{gpu_ids_arg}': -1 cannot be combined with explicit GPU IDs"
+        )
+    if gpu_ids != [-1] and not all(0 <= gpu_id < device_count for gpu_id in gpu_ids):
+        raise ValueError(
+            f"invalid --gpu_ids='{gpu_ids_arg}': valid GPU id range is [0, {device_count})"
+        )
+    return tuple(sorted(gpu_ids))
+
+
 def validate_gpu_options(options) -> tuple:
     """Validate and normalize GPU-related options."""
     device_count = get_device_count()
     if device_count == 0:
-        raise ValueError("No devices found")
-    if options.gpu_ids:
-        try:
-            gpu_ids = []
-            for part in options.gpu_ids.split(","):
-                part = part.strip()
-                if not part:
-                    continue
-                if part.startswith("-") and part[1:].isdigit():
-                    gpu_ids.append(int(part))
-                elif "-" in part and not part.startswith("-"):
-                    start, end = map(int, part.split("-"))
-                    if start > end:
-                        raise ValueError(f"Invalid range: {part} (start > end)")
-                    gpu_ids.extend(range(start, end + 1))
-                else:
-                    gpu_ids.append(int(part))
-        except ValueError:
-            raise ValueError(
-                f"Invalid gpu_ids: {options.gpu_ids} (int or range expected)"
-            ) from None
-        if len(gpu_ids) != len(set(gpu_ids)):
-            raise ValueError(f"Invalid gpu_ids: {options.gpu_ids} (duplicates)")
-        gpu_ids = sorted(set(gpu_ids))
-        if len(gpu_ids) > 1 and -1 in gpu_ids:
-            raise ValueError(f"Invalid gpu_ids: {options.gpu_ids} (-1 allowed only)")
-        if gpu_ids != [-1] and not all(0 <= id < device_count for id in gpu_ids):
-            raise ValueError(
-                f"Invalid gpu_ids: {options.gpu_ids} (valid range [0, {device_count}))"
-            )
-    else:
-        gpu_ids = [-1]
+        raise ValueError("no accelerator devices were found")
+
+    gpu_ids = _parse_gpu_ids(options.gpu_ids, device_count) if options.gpu_ids else (-1,)
     if options.num_gpus < -1 or options.num_gpus == 0 or options.num_gpus > device_count:
-        raise ValueError(f"Invalid num_gpus: {options.num_gpus}")
+        raise ValueError(
+            f"invalid --num_gpus={options.num_gpus}: expected -1 or a value in [1, {device_count}]"
+        )
     if options.num_gpus == -1:
-        options.num_gpus = device_count if gpu_ids == [-1] else len(gpu_ids)
-    if gpu_ids == [-1]:
-        gpu_ids = list(range(options.num_gpus))
+        options.num_gpus = device_count if gpu_ids == (-1,) else len(gpu_ids)
+    if gpu_ids == (-1,):
+        gpu_ids = tuple(range(options.num_gpus))
     elif len(gpu_ids) != options.num_gpus:
-        raise ValueError(f"num_gpus {options.num_gpus} mismatches gpu_ids {gpu_ids}")
+        raise ValueError(
+            f"invalid --num_gpus={options.num_gpus}: expected {len(gpu_ids)} "
+            f"to match --gpu_ids={gpu_ids}"
+        )
     if options.num_workers_per_gpu < -1 or options.num_workers_per_gpu == 0:
-        raise ValueError(f"Invalid num_workers_per_gpu: {options.num_workers_per_gpu}")
+        raise ValueError(
+            f"invalid --num_workers_per_gpu={options.num_workers_per_gpu}: "
+            "expected -1 or a positive integer"
+        )
     if options.required_memory <= 0:
-        raise ValueError(f"Invalid required_memory: {options.required_memory}")
+        raise ValueError(
+            f"invalid --required_memory={options.required_memory:g}: "
+            "expected a positive number of GiB"
+        )
     return tuple(gpu_ids)
 
 
@@ -886,6 +927,87 @@ def parse_bool(value):
             return False
     else:
         raise ValueError(f"Invalid boolean value: {value} parsed from command line")
+
+
+def _prepare_single_config_gpu(options):
+    if options.test_cpu:
+        return None
+
+    gpu_ids = validate_gpu_options(options)
+    if len(gpu_ids) != 1:
+        raise ValueError(
+            f"single --api_config run supports exactly one GPU; got {len(gpu_ids)} GPUs: {gpu_ids}"
+        )
+    os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_ids[0])
+    return gpu_ids[0]
+
+
+def _filter_sanitizer_output(output, returncode, sanitizer_error_exitcode):
+    if returncode != sanitizer_error_exitcode:
+        return output
+    return "\n".join(line for line in output.splitlines() if not line.startswith("[Pass]"))
+
+
+def _validate_sanitizer_command(command):
+    try:
+        sanitizer_cmd = shlex.split(command)
+    except ValueError as err:
+        _print_argument(ARGUMENT_ERROR_PREFIX, f"invalid --sanitizer_command: {err}")
+        return None
+    if not sanitizer_cmd:
+        _print_argument(
+            ARGUMENT_ERROR_PREFIX,
+            "invalid --sanitizer_command: command cannot be empty",
+        )
+        return None
+    if shutil.which(sanitizer_cmd[0]) is None:
+        _print_argument(
+            ARGUMENT_ERROR_PREFIX,
+            f"sanitizer executable not found: {sanitizer_cmd[0]}",
+        )
+        return None
+    return sanitizer_cmd
+
+
+def _run_single_config_with_sanitizer(options):
+    sanitizer_cmd = _validate_sanitizer_command(options.sanitizer_command)
+    if sanitizer_cmd is None:
+        return 2
+
+    try:
+        gpu_id = _prepare_single_config_gpu(options)
+    except ValueError as err:
+        _print_argument(ARGUMENT_ERROR_PREFIX, str(err))
+        return 2
+
+    api_config = options.api_config.strip()
+    cmd = _build_sanitizer_case_command(api_config, options, sanitizer_cmd)
+    env = os.environ.copy()
+    if gpu_id is not None:
+        env["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
+
+    result = subprocess.run(
+        cmd,
+        env=env,
+        check=False,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
+    output = _filter_sanitizer_output(
+        f"{result.stdout or ''}{result.stderr or ''}",
+        result.returncode,
+        options.sanitizer_error_exitcode,
+    )
+    if output:
+        print(output, end="" if output.endswith("\n") else "\n", flush=True)
+    if result.returncode == options.sanitizer_error_exitcode:
+        print(
+            f"[error] compute-sanitizer reported errors for {api_config} (exit={result.returncode})",
+            flush=True,
+        )
+    return result.returncode
 
 
 def check_gpu_memory(gpu_ids, num_workers_per_gpu, required_memory):  # required_memory in GB
@@ -1015,184 +1137,199 @@ def main():
         except Exception:
             paddle_version = "unknown"
 
-    parser = argparse.ArgumentParser(description="API Test")
-    parser.add_argument("--api_config_file", default="")
+    parser = argparse.ArgumentParser(description="Run Paddle API test cases")
+    parser.add_argument(
+        "--api_config_file",
+        default="",
+        help=(
+            "Path to a config file. Mutually exclusive with "
+            "--api_config_file_pattern and --api_config."
+        ),
+    )
     parser.add_argument(
         "--api_config_file_pattern",
         default="",
-        help="Pattern to match multiple config files (e.g., 'tester/api_config/api_config_support2torch_*.txt')",
+        help="Glob pattern(s) for config files; comma-separated patterns are supported.",
     )
-    parser.add_argument("--api_config", default="")
+    parser.add_argument(
+        "--api_config",
+        default="",
+        help="Run one API config string directly. Single-case mode supports at most one GPU.",
+    )
     parser.add_argument(
         "--paddle_only",
         type=parse_bool,
         default=False,
-        help="test paddle api only to figure out whether the api is supported",
+        help="Run Paddle-only API support checks.",
     )
     parser.add_argument(
         "--paddle_cinn",
         type=parse_bool,
         default=False,
-        help="test paddle api in dynamic graph mode and cinn mode",
+        help="Run Paddle dynamic graph vs CINN checks.",
     )
     parser.add_argument(
         "--accuracy",
         type=parse_bool,
         default=False,
-        help="test paddle api to corespoding torch api",
+        help="Run Paddle vs corresponding Torch accuracy checks.",
     )
     parser.add_argument(
         "--paddle_gpu_performance",
         type=parse_bool,
         default=False,
-        help="test paddle api performance",
+        help="Run Paddle GPU performance checks.",
     )
     parser.add_argument(
         "--torch_gpu_performance",
         type=parse_bool,
         default=False,
-        help="test torch api performance",
+        help="Run Torch GPU performance checks.",
     )
     parser.add_argument(
         "--paddle_torch_gpu_performance",
         type=parse_bool,
         default=False,
-        help="test paddle and torch api performance",
+        help="Run Paddle and Torch GPU performance checks.",
     )
     parser.add_argument(
         "--accuracy_stable",
         type=parse_bool,
         default=False,
-        help="test paddle api to corespoding torch api steadily",
+        help="Run stable Paddle vs corresponding Torch accuracy checks.",
     )
     parser.add_argument(
         "--paddle_custom_device",
         type=parse_bool,
         default=False,
-        help="test paddle api on custom device vs CPU",
+        help="Run Paddle custom device vs CPU checks.",
     )
     parser.add_argument(
         "--test_amp",
         type=parse_bool,
         default=False,
-        help="Whether to test in auto mixed precision (AMP) mode",
+        help="Enable auto mixed precision (AMP) checks.",
     )
     parser.add_argument(
         "--num_gpus",
         type=int,
         default=-1,
-        help="Number of GPUs to use, -1 to use all available",
+        help="Number of GPUs to use. Use -1 for all selected GPUs.",
     )
     parser.add_argument(
         "--num_workers_per_gpu",
         type=int,
         default=1,
-        help="Number of workers per GPU, -1 to maximize based on memory",
+        help="Workers per GPU. Use -1 to maximize workers based on free memory.",
     )
     parser.add_argument(
         "--gpu_ids",
         type=str,
         default="",
-        help="GPU IDs to use ('-1' for all available). "
-        "Accepts comma-separated values and/or ranges (e.g., '0-3,6,7')",
+        help="GPU IDs to use, e.g. '0', '0,2', '0-3'. Use '-1' for all GPUs.",
     )
     parser.add_argument(
         "--required_memory",
         type=float,
         default=10.0,
-        help="Required memory per worker in GB",
+        help="Minimum free memory required per worker, in GiB.",
     )
     parser.add_argument(
         "--test_cpu",
         type=parse_bool,
         default=False,
-        help="Whether to test CPU mode",
+        help="Run Paddle in CPU mode.",
     )
-    parser.add_argument("--use_cached_numpy", type=bool, default=False)
+    parser.add_argument(
+        "--use_cached_numpy",
+        type=parse_bool,
+        default=False,
+        help="Reuse cached NumPy inputs when available.",
+    )
     parser.add_argument(
         "--log_dir",
         type=str,
         default="",
-        help="Log directory",
+        help="Directory for test logs.",
     )
     parser.add_argument(
         "--atol",
         type=float,
         default=1e-2,
-        help="Absolute tolerance for accuracy tests",
+        help="Absolute tolerance for accuracy checks.",
     )
     parser.add_argument(
         "--rtol",
         type=float,
         default=1e-2,
-        help="Relative tolerance for accuracy tests",
+        help="Relative tolerance for accuracy checks.",
     )
     parser.add_argument(
         "--test_tol",
         type=parse_bool,
         default=False,
-        help="Whether to test tolerance range in accuracy mode",
+        help="Enable tolerance range checks in accuracy mode.",
     )
     parser.add_argument(
         "--test_backward",
         type=parse_bool,
         default=False,
-        help="Whether to test backward in paddle_cinn mode",
+        help="Enable backward checks in paddle_cinn mode.",
     )
     parser.add_argument(
         "--timeout",
         type=int,
         default=1800,
-        help="Timeout setting for a single test case, in seconds",
+        help="Timeout per test case, in seconds.",
     )
     parser.add_argument(
         "--show_runtime_status",
         type=parse_bool,
         default=True,
-        help="Whether to show the current test progress in real-time. If set to False, only failed cases will be output",
+        help="Show real-time progress; when False, only failed cases are printed.",
     )
     parser.add_argument(
         "--random_seed",
         type=int,
         default=0,
-        help="The numpy random seed ",
+        help="NumPy random seed.",
     )
     parser.add_argument(
         "--custom_device_vs_gpu",
         type=parse_bool,
         default=False,
-        help="test paddle api on custom device vs GPU",
+        help="Run Paddle custom device vs GPU checks.",
     )
     parser.add_argument(
         "--custom_device_vs_gpu_mode",
         type=str,
         choices=["upload", "download"],
         default="upload",
-        help="operation mode for custom_device_vs_gpu: 'upload' or 'download'",
+        help="Operation mode for custom_device_vs_gpu.",
     )
     parser.add_argument(
         "--bitwise_alignment",
         type=bool,
         default=False,
-        help="Whether to using bitwise alignment when run accuracy test",
+        help="Use bitwise alignment for accuracy checks.",
     )
     parser.add_argument(
         "--generate_failed_tests",
         type=parse_bool,
         default=False,
-        help="Whether to generate reproducible test files for failed cases",
+        help="Generate reproducible test files for failed cases.",
     )
     parser.add_argument(
         "--exit_on_error",
         type=parse_bool,
         default=False,
-        help="Whether to exit the process when a paddle_error occurs.",
+        help="Exit the process when a paddle_error occurs.",
     )
     parser.add_argument(
         "--use_compute_sanitizer",
         type=parse_bool,
         default=False,
-        help="Run each worker case in a compute-sanitizer wrapped subprocess.",
+        help="Run each case in a compute-sanitizer wrapped subprocess.",
     )
     parser.add_argument(
         "--sanitizer_command",
@@ -1232,19 +1369,7 @@ def main():
         options.custom_device_vs_gpu,
     ]
     if len([m for m in mode if m is True]) != 1:
-        print(
-            "Specify only one test mode:"
-            "--accuracy,"
-            "--paddle_only,"
-            "--paddle_cinn,"
-            "--paddle_gpu_performance,"
-            "--torch_gpu_performance,"
-            "--paddle_torch_gpu_performance"
-            "--accuracy_stable"
-            "--paddle_custom_device"
-            "--custom_device_vs_gpu",
-            flush=True,
-        )
+        _print_argument(ARGUMENT_ERROR_PREFIX, TEST_MODE_ERROR)
         return
 
     # 处理 custom_device_vs_gpu 模式的配置
@@ -1282,9 +1407,13 @@ def main():
             return
 
     if options.test_tol and not options.accuracy:
-        print("--test_tol takes effect when --accuracy is True.", flush=True)
+        _print_argument(
+            ARGUMENT_WARNING_PREFIX, "--test_tol takes effect only when --accuracy=True"
+        )
     if options.test_backward and not options.paddle_cinn:
-        print("--test_backward takes effect when --paddle_cinn is True.", flush=True)
+        _print_argument(
+            ARGUMENT_WARNING_PREFIX, "--test_backward takes effect only when --paddle_cinn=True"
+        )
     os.environ["USE_CACHED_NUMPY"] = str(options.use_cached_numpy)
     if options.bitwise_alignment:
         options.atol = 0.0
@@ -1310,6 +1439,14 @@ def main():
         return
 
     if options.api_config:
+        if options.use_compute_sanitizer:
+            sys.exit(_run_single_config_with_sanitizer(options))
+        try:
+            _prepare_single_config_gpu(options)
+        except ValueError as err:
+            _print_argument(ARGUMENT_ERROR_PREFIX, str(err))
+            return
+
         # Single config execution
         # Load custom ops from paddlefleet to register _run_custom_op operators
         try:
@@ -1479,18 +1616,11 @@ def main():
             )
             return
 
-        if options.use_compute_sanitizer:
-            try:
-                sanitizer_cmd = shlex.split(options.sanitizer_command)
-            except ValueError as err:
-                print(f"invalid sanitizer_command: {err}", flush=True)
-                return
-            if not sanitizer_cmd:
-                print("sanitizer_command cannot be empty", flush=True)
-                return
-            if shutil.which(sanitizer_cmd[0]) is None:
-                print(f"sanitizer command not found: {sanitizer_cmd[0]}", flush=True)
-                return
+        if (
+            options.use_compute_sanitizer
+            and _validate_sanitizer_command(options.sanitizer_command) is None
+        ):
+            return
 
         total_workers = sum(max_workers_per_gpu.values())
         print(
