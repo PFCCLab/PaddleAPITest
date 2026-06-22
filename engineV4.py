@@ -251,15 +251,18 @@ def _format_cli_value(value):
     return str(value)
 
 
-def _build_sanitizer_case_command(api_config_str, options):
+def _build_sanitizer_case_command(api_config_str, options, log_dir):
     cmd = [
         *shlex.split(options.sanitizer_command),
         sys.executable,
         str(Path(__file__).resolve()),
         f"--api_config={api_config_str}",
+        f"--log_dir={log_dir}",
         "--_sanitizer_child=True",
     ]
     for key in sorted(SANITIZER_FORWARD_ARGS):
+        if key == "log_dir":
+            continue
         value = getattr(options, key, None)
         if value is None:
             continue
@@ -269,6 +272,18 @@ def _build_sanitizer_case_command(api_config_str, options):
             continue
         cmd.append(f"--{key}={_format_cli_value(value)}")
     return cmd
+
+
+def _merge_sanitizer_case_logs(case_log_dir):
+    case_tmp_dir = case_log_dir / ".tmp"
+    if not case_tmp_dir.exists():
+        return
+    for child_log in case_tmp_dir.iterdir():
+        if not child_log.is_file():
+            continue
+        target_log = get_tmp_log_path() / child_log.name
+        with child_log.open("rb") as in_f, target_log.open("ab") as out_f:
+            shutil.copyfileobj(in_f, out_f)
 
 
 def _sanitizer_worker_loop(slot_index, gpu_id, input_queue, result_queue, options):
@@ -307,9 +322,14 @@ def _sanitizer_worker_loop(slot_index, gpu_id, input_queue, result_queue, option
 
             api_config_str = task
             result_queue.put(("ack", slot_index, api_config_str))
+            case_log_dir = get_tmp_log_path() / "sanitizer" / f"slot_{slot_index}_{os.getpid()}"
+            if case_log_dir.exists():
+                shutil.rmtree(case_log_dir)
+            case_log_dir.mkdir(parents=True, exist_ok=True)
             try:
-                cmd = _build_sanitizer_case_command(api_config_str, options)
+                cmd = _build_sanitizer_case_command(api_config_str, options, str(case_log_dir))
             except ValueError as err:
+                shutil.rmtree(case_log_dir, ignore_errors=True)
                 result_queue.put(("error", slot_index, api_config_str, str(err)))
                 continue
             env = os.environ.copy()
@@ -332,6 +352,7 @@ def _sanitizer_worker_loop(slot_index, gpu_id, input_queue, result_queue, option
                     start_new_session=True,
                 )
             except OSError as err:
+                shutil.rmtree(case_log_dir, ignore_errors=True)
                 result_queue.put(("error", slot_index, api_config_str, str(err)))
                 continue
             result_queue.put(("child", slot_index, child_process.pid))
@@ -346,6 +367,10 @@ def _sanitizer_worker_loop(slot_index, gpu_id, input_queue, result_queue, option
                     child_process.stdout.close()
 
             child_process = None
+            if returncode in (0, 2):
+                _merge_sanitizer_case_logs(case_log_dir)
+            shutil.rmtree(case_log_dir, ignore_errors=True)
+
             if returncode == 0:
                 result_queue.put(("done", slot_index, api_config_str))
             elif returncode == 2:
@@ -1595,15 +1620,18 @@ def main():
                 if external_kill:
                     print(
                         f"[warn] Worker was externally killed for {config} "
-                        f"(exit={exitcode}); retry after worker restart.",
+                        f"(exit={exitcode}); case will be retried on next run.",
                         flush=True,
                     )
                     if worker_reusable:
                         pool.mark_idle(slot_idx)
-                        pool.dispatch(slot_idx, config)
-                        active_tasks += 1
-                    else:
-                        pending_dispatch.insert(0, config)
+                    next_config = next(config_iter, None)
+                    if next_config is not None:
+                        if not worker_reusable:
+                            pending_dispatch.append(next_config)
+                        else:
+                            pool.dispatch(slot_idx, next_config)
+                            active_tasks += 1
                     continue
 
                 if worker_reusable:
@@ -1627,11 +1655,13 @@ def main():
                     )
                 elif msg_type == "crashed":
                     if exitcode == 99:
+                        write_to_log("cuda_error", config)
                         print(
                             f"[error] CUDA error for {config}",
                             flush=True,
                         )
                     elif exitcode == 98:
+                        write_to_log("oom", config)
                         print(
                             f"[error] CUDA out of memory for {config}",
                             flush=True,

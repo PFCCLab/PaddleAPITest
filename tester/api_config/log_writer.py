@@ -68,6 +68,10 @@ def set_engineV2():
     TMP_LOG_PATH.mkdir(exist_ok=True)
 
 
+def get_tmp_log_path():
+    return TMP_LOG_PATH
+
+
 def close_process_files():
     """关闭本进程持有的所有文件句柄"""
     global _process_file_handlers
@@ -132,7 +136,7 @@ def cleanup_uncheckpointed_result_logs():
         with checkpoint_file.open("r") as f:
             checkpoints = {line.strip() for line in f if line.strip()}
     except FileNotFoundError:
-        checkpoints = set()
+        return 0
     except Exception as err:
         print(f"Error reading {checkpoint_file}: {err}", flush=True)
         return 0
