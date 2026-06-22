@@ -1056,12 +1056,17 @@ def _analyze_sanitizer_output(output, returncode, sanitizer_error_exitcode):
             block_end += 1
 
         block_lines = lines[index:block_end]
+        sanitizer_line_indices = [
+            line_index
+            for line_index in range(index, block_end)
+            if lines[line_index].startswith(SANITIZER_PREFIX)
+        ]
         if _is_cuda_version_error_block(block_lines):
-            ignored_line_indices.update(range(index, block_end))
+            ignored_line_indices.update(sanitizer_line_indices)
             ignored_any = True
             saw_cuda_version_error = True
         elif _is_cu_get_proc_address_invalid_value_block(block_lines):
-            ignored_line_indices.update(range(index, block_end))
+            ignored_line_indices.update(sanitizer_line_indices)
             ignored_any = True
         elif SANITIZER_PROGRAM_HIT in line or SANITIZER_CUDA_API_ERROR in line:
             kept_sanitizer_error = True
