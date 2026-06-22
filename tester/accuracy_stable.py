@@ -20,6 +20,28 @@ class APITestAccuracyStable(APITestBase):
         torch.set_printoptions(profile="short", edgeitems=2, threshold=100, linewidth=120)
         torch.set_default_device("cuda")
 
+    def _reset_random_state(self, seed: int = 42):
+        """Reset numpy / paddle / torch (CPU+CUDA) RNGs so random APIs
+        (uniform, normal, randn, bernoulli, dropout, ...) produce
+        reproducible outputs across the torch run and the paddle run."""
+        numpy.random.seed(seed)
+        try:
+            paddle.seed(seed)
+            if paddle.device.is_compiled_with_cuda():
+                try:
+                    for i in range(paddle.device.cuda.device_count()):
+                        paddle.framework.core.default_cuda_generator(i).manual_seed(seed)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        try:
+            torch.manual_seed(seed)
+            if torch.cuda.is_available():
+                torch.cuda.manual_seed_all(seed)
+        except Exception:
+            pass
+
     def test(self):
         if self.need_skip():
             print("[Skip]", flush=True)
@@ -71,6 +93,7 @@ class APITestAccuracyStable(APITestBase):
         # iter twice
         for _i in range(2):
             # ======== torch ========
+            self._reset_random_state()
             torch_output, torch_out_grads, torch_grad_success = self.get_torch_output(
                 convert_result
             )
@@ -79,6 +102,7 @@ class APITestAccuracyStable(APITestBase):
             torch.cuda.empty_cache()
 
             # ======== paddle ========
+            self._reset_random_state()
             paddle_output, paddle_out_grads = self.get_paddle_output(torch_grad_success)
             if paddle_output is None:
                 return

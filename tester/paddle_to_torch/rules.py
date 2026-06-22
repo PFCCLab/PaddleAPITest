@@ -7036,6 +7036,9 @@ else:
 
             step = math.log(b2_pow) / math.log(b2)
             if math.isfinite(step) and step > 0.0:
+                # step is the training iteration count, which is always an
+                # integer. Round to undo float32 round-trip noise from log/log.
+                step = round(step)
                 b1_pow_from_step = b1**step
                 bias_correction1 = 1.0 - b1_pow
                 fused_bias_correction1 = 1.0 - b1_pow_from_step
@@ -7135,10 +7138,52 @@ class CopsFull_Rule(BaseRule):
 
     def apply(self, paddle_api: str) -> ConvertResult:
         core = """
+shape = locals().get('shape')
+fill_value = locals().get("value", 0.0)
+dtype = locals().get('dtype')
 x     = locals().get("x")
-value = locals().get("value", 0.0)
+
+# handle shape
+def convert_to_list(shape):
+    if isinstance(shape, torch.Tensor):
+        return shape.tolist()
+    elif isinstance(shape, (list, tuple)):
+        shape_list = []
+        for item in shape:
+            if isinstance(item, torch.Tensor):
+                if item.shape == torch.Size([]):
+                    shape_list.append(item.item())
+                else:
+                    shape_list.extend(item.tolist())
+            else:
+                shape_list.append(item)
+        return shape_list
+    elif isinstance(shape, int):
+        return [shape]
+    else:
+        return shape
+
+# handle fill_value
+def convert_to_scalar(fill_value):
+    if isinstance(fill_value, torch.Tensor):
+        return fill_value.item()
+    # example: "-inf", "3.5"
+    elif isinstance(fill_value, str):
+        return float(fill_value)
+    else:
+        return fill_value
+
+shape = convert_to_list(shape)
+fill_value = convert_to_scalar(fill_value)
+
+if dtype is None and not isinstance(fill_value, bool):
+    if isinstance(fill_value, complex):
+        dtype = torch.complex128
+    else:
+        dtype = torch.float32
+tmp = torch.full(size=shape, fill_value=fill_value, dtype=dtype)
 with torch.no_grad():
-    x.fill_(float(value))
+    x.set_(tmp)
 result = x
 """
         code = Code(core=core.splitlines())
@@ -7228,7 +7273,7 @@ dtype_map = {
 }
 dtype_val = locals().get("dtype")
 torch_dtype = dtype_map.get(str(dtype_val).split(".")[-1], torch.float32)
-result = torch.normal(mean=float(mean), std=float(std), size=list(shape)).to(torch_dtype)
+result = torch.empty(list(shape), dtype=torch_dtype).normal_(mean=float(mean), std=float(std))
 """
         code = Code(core=core.splitlines())
         return ConvertResult.success(paddle_api, code, is_torch_corresponding=False)
