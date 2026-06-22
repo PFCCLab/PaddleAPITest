@@ -90,9 +90,10 @@ def get_cached_numpy_array(
 # Format: {api_name: {arg_index: init_method}}
 # init_method: "zeros" = fill with 0, "small_positive" = fill with small positive value
 optimizer_apis = {
-    "paddle._C_ops.adamw_": {3: "zeros", 4: "zeros"},  # moment1, moment2
-    "paddle._C_ops.adam_": {3: "zeros", 4: "zeros"},
-    "paddle._C_ops.merged_adam_": {3: "zeros", 4: "zeros"},
+    # moment1, moment2, moment2_max (must be non-negative for amsgrad)
+    "paddle._C_ops.adamw_": {3: "zeros", 4: "zeros", 5: "zeros"},
+    "paddle._C_ops.adam_": {3: "zeros", 4: "zeros", 5: "zeros"},
+    "paddle._C_ops.merged_adam_": {3: "zeros", 4: "zeros", 5: "zeros"},
 }
 
 not_zero_apis = frozenset(
@@ -406,6 +407,21 @@ class TensorConfig:
                         self.numpy_tensor = (numpy.random.random(self.shape) + 0.5).astype(
                             self.dtype
                         )
+            elif api_config.api_name == "paddle._C_ops.adamw_":
+                if self.check_arg(api_config, 6, "beta1_pow") or self.check_arg(
+                    api_config, 7, "beta2_pow"
+                ):
+                    if not hasattr(api_config, "adamw_step"):
+                        api_config.adamw_step = numpy.random.randint(1, 101)
+                    beta = self.get_arg(api_config, 10, "beta1")
+                    if self.check_arg(api_config, 7, "beta2_pow"):
+                        beta = self.get_arg(api_config, 11, "beta2")
+                    self.numpy_tensor = numpy.full(
+                        self.shape,
+                        beta**api_config.adamw_step,
+                        dtype=self.dtype,
+                    )
+
             elif api_config.api_name == "paddle.arange":
                 start_val = self.get_arg(api_config, 0, "start", 0)
                 end_val = self.get_arg(api_config, 1, "end", None)
@@ -3046,8 +3062,9 @@ class TensorConfig:
             intermediate_dtype = (
                 "float16" if self.dtype in ["float8_e5m2", "float8_e4m3fn"] else self.dtype
             )
-            flat_tensor = paddle.empty(
-                [self._strided_storage_size()],
+            storage_size = self._strided_storage_size()
+            flat_tensor = paddle.zeros(
+                [storage_size],
                 dtype=intermediate_dtype,
                 device=self.place,
             )
