@@ -8,8 +8,14 @@ import paddle
 import torch
 import yaml
 
-from .api_config import USE_CACHED_NUMPY, TensorConfig, cached_numpy
-from .api_config.log_writer import log_accuracy_tolerance
+from .api_config.config_analyzer import (
+    USE_CACHED_NUMPY,
+    TensorConfig,
+    get_cached_numpy_array,
+    is_gpu_cache_mode,
+    should_skip_gpu_cleanup,
+)
+from .api_config.log_writer import log_accuracy_tolerance, write_to_log
 
 with open("tester/base_config.yaml", encoding="utf-8") as f:
     config = yaml.safe_load(f)
@@ -713,26 +719,47 @@ class APITestBase:
                         result.append(item)
         return result
 
-    def get_cached_numpy(self, dtype, shape):
-        numel = 1
-        for i in shape:
-            numel = numel * i
-        if numel > 4300000000:
-            raise RuntimeError(f"Too large tensor to get cached numpy: {numel}")
+    def get_cached_numpy(self, dtype, shape, generation_kind="output_grad", scale=1.0):
+        return get_cached_numpy_array(dtype, shape, generation_kind=generation_kind, scale=scale)
 
-        start = (4300000000 - numel - 100) if (4300000000 - numel - 100) > 0 else 0
-        if dtype in cached_numpy:
-            tensor = cached_numpy[dtype][start : start + numel].reshape(shape)
+    def _make_torch_output_grad(self, shape, dtype):
+        torch_dtype = self.convert_dtype_to_torch_type(dtype)
+        device = torch.device("cuda", torch.cuda.current_device())
+        if "int" in dtype:
+            return torch.randint(-65535, 65535, tuple(shape), device=device, dtype=torch.int64).to(
+                dtype=torch_dtype
+            )
+        if dtype in ["float8_e5m2", "float8_e4m3fn"]:
+            base_dtype = torch.float16
+        elif dtype == "bfloat16":
+            base_dtype = torch.float32
+        elif dtype.startswith("complex"):
+            real_dtype = torch.float32 if dtype == "complex64" else torch.float64
+            real_part = torch.rand(tuple(shape), device=device, dtype=real_dtype) - 0.5
+            imag_part = torch.rand(tuple(shape), device=device, dtype=real_dtype) - 0.5
+            return (real_part + 1j * imag_part).to(dtype=torch_dtype)
         else:
-            if "int" in dtype:
-                cached_numpy[dtype] = numpy.random.randint(
-                    -65535, 65535, size=4300000000, dtype="int64"
-                ).astype(dtype)
-                tensor = cached_numpy[dtype][start : start + numel].reshape(shape)
-            else:
-                cached_numpy[dtype] = (numpy.random.random([4300000000]) - 0.5).astype(dtype)
-                tensor = cached_numpy[dtype][start : start + numel].reshape(shape)
-        return tensor
+            base_dtype = torch_dtype
+        return (torch.rand(tuple(shape), device=device, dtype=base_dtype) - 0.5).to(
+            dtype=torch_dtype
+        )
+
+    def _use_gpu_output_grad(self, output):
+        if not is_gpu_cache_mode() or not torch.cuda.is_available():
+            return False
+        dtype = str(output.dtype).split(".")[-1]
+        return dtype in ["float32", "float64", "float16", "bfloat16", "complex64", "complex128"]
+
+    def _get_gpu_output_grad_pair(self, output, index):
+        if len(self.outputs_grad_numpy) <= index:
+            dtype = str(output.dtype).split(".")[-1]
+            torch_grad = self._make_torch_output_grad(output.shape, dtype)
+            paddle_grad = paddle.utils.dlpack.from_dlpack(
+                torch.utils.dlpack.to_dlpack(torch_grad.detach().clone())
+            )
+            paddle_grad.stop_gradient = False
+            self.outputs_grad_numpy.append((paddle_grad, torch_grad.detach().clone()))
+        return self.outputs_grad_numpy[index]
 
     def gen_paddle_output_and_output_grad(self, outputs):
         result_outputs = []
@@ -781,7 +808,10 @@ class APITestBase:
 
         result_outputs_grads = []
         if len(self.outputs_grad_numpy) == 0:
-            for output in result_outputs:
+            for i, output in enumerate(result_outputs):
+                if self._use_gpu_output_grad(output):
+                    self._get_gpu_output_grad_pair(output, i)
+                    continue
                 dtype = str(output.dtype).split(".")[-1]
                 if USE_CACHED_NUMPY:
                     dtype = "float32" if dtype == "bfloat16" else dtype
@@ -801,6 +831,9 @@ class APITestBase:
                         numpy_tensor = (numpy.random.random(output.shape) - 0.5).astype(numpy_dtype)
                 self.outputs_grad_numpy.append(numpy_tensor)
         for i, numpy_tensor in enumerate(self.outputs_grad_numpy):
+            if isinstance(numpy_tensor, tuple):
+                result_outputs_grads.append(numpy_tensor[0])
+                continue
             dtype = str(result_outputs[i].dtype).split(".")[-1]
             if dtype in ["float8_e5m2", "float8_e4m3fn"]:
                 intermediate_dtype = "float16"
@@ -837,7 +870,10 @@ class APITestBase:
 
         result_outputs_grads = []
         if len(self.outputs_grad_numpy) == 0:
-            for output in result_outputs:
+            for i, output in enumerate(result_outputs):
+                if self._use_gpu_output_grad(output):
+                    self._get_gpu_output_grad_pair(output, i)
+                    continue
                 dtype = str(output.dtype).split(".")[-1]
                 if USE_CACHED_NUMPY:
                     dtype = "float32" if dtype == "bfloat16" else dtype
@@ -852,6 +888,9 @@ class APITestBase:
                         numpy_tensor = (numpy.random.random(output.shape) - 0.5).astype(dtype)
                 self.outputs_grad_numpy.append(numpy_tensor)
         for i, numpy_tensor in enumerate(self.outputs_grad_numpy):
+            if isinstance(numpy_tensor, tuple):
+                result_outputs_grads.append(numpy_tensor[1])
+                continue
             dtype = str(result_outputs[i].dtype).split(".")[1]
             result_output_grad = torch.tensor(
                 numpy_tensor,
@@ -1103,7 +1142,8 @@ class APITestBase:
         ) or self.api_config.api_name == "paddle.Tensor.__setitem__":
             self.torch_args, self.torch_kwargs = self.copy_torch_input()
 
-        torch.cuda.empty_cache()
+        if not should_skip_gpu_cleanup():
+            torch.cuda.empty_cache()
         return True
 
     def np_assert_accuracy(self, np_paddle, np_torch, atol=1e-2, rtol=1e-2):
@@ -1178,9 +1218,49 @@ class APITestBase:
             else:
                 raise
 
-    def torch_assert_accuracy(self, paddle_tensor, torch_tensor, atol=1e-2, rtol=1e-2):
-        is_check_dtype = self.api_config.api_name not in not_check_dtype
+    def _prepare_torch_compare_tensors(self, paddle_tensor, torch_tensor):
+        if not paddle_tensor.is_contiguous():
+            paddle_tensor = paddle_tensor.contiguous()
+        paddle_tensor = paddle_tensor.detach()
 
+        if not torch_tensor.is_contiguous():
+            torch_tensor = torch_tensor.contiguous()
+        torch_tensor = torch_tensor.detach()
+
+        paddle_dlpack = paddle.utils.dlpack.to_dlpack(paddle_tensor)  # type: ignore[reportGeneralTypeIssues]
+        converted_paddle_tensor = torch.utils.dlpack.from_dlpack(paddle_dlpack)  # type: ignore[reportGeneralTypeIssues]
+        if torch_tensor.device != converted_paddle_tensor.device:
+            torch_tensor = torch_tensor.to(device=converted_paddle_tensor.device)
+        return converted_paddle_tensor, torch_tensor
+
+    def _torch_compare_error_msg(self, actual, expected, atol, rtol, suffix=""):
+        def error_msg(msg):
+            suffix_text = f"\n{suffix}" if suffix else ""
+            return (
+                f"Not equal to tolerance rtol={rtol}, atol={atol}{suffix_text}\n"
+                f"{msg}\n"
+                f"ACTUAL: (shape={actual.shape}, dtype={actual.dtype})\n"
+                f"{actual}\n"
+                f"DESIRED: (shape={expected.shape}, dtype={expected.dtype})\n"
+                f"{expected}"
+            )
+
+        return error_msg
+
+    def _assert_torch_close(self, actual, expected, atol, rtol, is_check_dtype, suffix=""):
+        torch.testing.assert_close(
+            actual,
+            expected,
+            rtol=rtol,
+            atol=atol,
+            equal_nan=True,
+            check_dtype=is_check_dtype,
+            msg=self._torch_compare_error_msg(actual, expected, atol, rtol, suffix),
+        )
+
+    def _torch_assert_accuracy_cpu(
+        self, paddle_tensor, torch_tensor, atol, rtol, is_check_dtype, test_tol, is_backward
+    ):
         if not paddle_tensor.is_contiguous():
             paddle_tensor = paddle_tensor.contiguous()
         paddle_tensor = paddle_tensor.cpu().detach()
@@ -1192,33 +1272,13 @@ class APITestBase:
         paddle_dlpack = paddle.utils.dlpack.to_dlpack(paddle_tensor)  # type: ignore[reportGeneralTypeIssues]
         converted_paddle_tensor = torch.utils.dlpack.from_dlpack(paddle_dlpack)  # type: ignore[reportGeneralTypeIssues]
 
-        def error_msg(msg):
-            return (
-                f"Not equal to tolerance rtol={rtol}, atol={atol}\n"
-                f"{msg}\n"
-                f"ACTUAL: (shape={converted_paddle_tensor.shape}, dtype={converted_paddle_tensor.dtype})\n"
-                f"{converted_paddle_tensor}\n"
-                f"DESIRED: (shape={torch_tensor.shape}, dtype={torch_tensor.dtype})\n"
-                f"{torch_tensor}"
-            )
-
-        bitwise_alignment = getattr(self, "bitwise_alignment", False)
-
-        if not bitwise_alignment and self.api_config.api_name in special_accuracy_atol_rtol:
-            atol, rtol = special_accuracy_atol_rtol[self.api_config.api_name]
-        test_tol = getattr(self, "test_tol", False)
-        is_backward = getattr(self, "is_backward", False)
-        if test_tol:
-            atol, rtol = 0.0, 0.0
         try:
-            torch.testing.assert_close(
+            self._assert_torch_close(
                 converted_paddle_tensor,
                 torch_tensor,
-                rtol=rtol,
-                atol=atol,
-                equal_nan=True,
-                check_dtype=is_check_dtype,
-                msg=error_msg,
+                atol,
+                rtol,
+                is_check_dtype,
             )
             if test_tol:
                 api_name = self.api_config.api_name
@@ -1257,6 +1317,57 @@ class APITestBase:
             else:
                 raise
 
+    def _torch_assert_accuracy_gpu(self, paddle_tensor, torch_tensor, atol, rtol, is_check_dtype):
+        converted_paddle_tensor, torch_tensor = self._prepare_torch_compare_tensors(
+            paddle_tensor, torch_tensor
+        )
+        if converted_paddle_tensor.shape != torch_tensor.shape:
+            raise AssertionError(
+                f"shape mismatch: paddle {converted_paddle_tensor.shape}, torch {torch_tensor.shape}"
+            )
+        if is_check_dtype and converted_paddle_tensor.dtype != torch_tensor.dtype:
+            raise AssertionError(
+                f"dtype mismatch: paddle {converted_paddle_tensor.dtype}, torch {torch_tensor.dtype}"
+            )
+
+        self._assert_torch_close(
+            converted_paddle_tensor,
+            torch_tensor,
+            atol,
+            rtol,
+            is_check_dtype,
+        )
+
+    def torch_assert_accuracy(self, paddle_tensor, torch_tensor, atol=1e-2, rtol=1e-2):
+        is_check_dtype = self.api_config.api_name not in not_check_dtype
+        bitwise_alignment = getattr(self, "bitwise_alignment", False)
+
+        if not bitwise_alignment and self.api_config.api_name in special_accuracy_atol_rtol:
+            atol, rtol = special_accuracy_atol_rtol[self.api_config.api_name]
+        test_tol = getattr(self, "test_tol", False)
+        is_backward = getattr(self, "is_backward", False)
+        if test_tol:
+            atol, rtol = 0.0, 0.0
+
+        if test_tol or not is_gpu_cache_mode():
+            self._torch_assert_accuracy_cpu(
+                paddle_tensor,
+                torch_tensor,
+                atol,
+                rtol,
+                is_check_dtype,
+                test_tol,
+                is_backward,
+            )
+            return
+        self._torch_assert_accuracy_gpu(
+            paddle_tensor,
+            torch_tensor,
+            atol,
+            rtol,
+            is_check_dtype,
+        )
+
     def test(self):
         pass
 
@@ -1270,8 +1381,9 @@ class APITestBase:
                 for i in range(len(arg_config)):
                     if isinstance(arg_config[i], TensorConfig):
                         arg_config[i].clear_tensor()
-        torch.cuda.empty_cache()
-        paddle.device.cuda.empty_cache()
+        if not should_skip_gpu_cleanup():
+            torch.cuda.empty_cache()
+            paddle.device.cuda.empty_cache()
 
     def clear_paddle_tensor(self):
         if not hasattr(self, "torch_kwargs_config"):
@@ -1283,7 +1395,8 @@ class APITestBase:
                 for i in range(len(arg_config)):
                     if isinstance(arg_config[i], TensorConfig):
                         arg_config[i].clear_paddle_tensor()
-        paddle.device.cuda.empty_cache()
+        if not should_skip_gpu_cleanup():
+            paddle.device.cuda.empty_cache()
 
     def clear_torch_tensor(self):
         if not hasattr(self, "torch_kwargs_config"):
@@ -1295,7 +1408,8 @@ class APITestBase:
                 for i in range(len(arg_config)):
                     if isinstance(arg_config[i], TensorConfig):
                         arg_config[i].clear_torch_tensor()
-        torch.cuda.empty_cache()
+        if not should_skip_gpu_cleanup():
+            torch.cuda.empty_cache()
 
     def clear_numpy_tensor(self):
         if not hasattr(self, "torch_kwargs_config"):
