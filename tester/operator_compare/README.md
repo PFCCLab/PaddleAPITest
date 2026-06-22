@@ -49,8 +49,7 @@ tester/operator_compare/
 ├── metrics.py                    # 误差指标和 tensor fingerprint
 ├── artifacts.py                  # env/results/summary/pairwise 写出
 ├── report.py                     # Markdown 报告和图示
-├── profile.py                    # profile 状态和 sqlite kernel summary 解析
-└── test_flat_operator_compare.py  # 扁平路径单元测试
+└── profile.py                    # profile 状态和 sqlite kernel summary 解析
 ```
 
 工具入口：
@@ -175,43 +174,14 @@ def runner(case: CompareCase, spec: ImplementationSpec) -> torch.Tensor:
 
 ## 4. 测试指南
 
-### 4.1 测试文件
-
-```text
-tester/operator_compare/test_flat_operator_compare.py
-```
-
-### 4.2 普通算子测试模板
-
-```python
-def test_add_case_runs_against_torch_reference(self):
-    self.assert_case_runs_against_torch_reference(
-        'paddle.add(Tensor([2], "float32"), Tensor([2], "float32"), )'
-    )
-```
-
-### 4.3 容忍浮点误差的测试模板
-
-```python
-def test_fused_linear_param_grad_add_c_ops_runs_against_torch_reference(self):
-    self.assert_case_runs_against_torch_reference(
-        'paddle._C_ops.fused_linear_param_grad_add(Tensor([8, 4], "float32"), Tensor([8, 4], "float32"), Tensor([4, 4], "float32"), None, False, False, )',
-        max_abs=1e-5,
-    )
-```
-
-### 4.4 覆盖建议
-
 新增算子时建议覆盖：
 
 1. config 能被 `APIConfig` 正确解析。
 2. `build_compare_suite()` 能生成预期 implementation id。
 3. Paddle / Torch 两个实现都能运行成功。
 4. target 相对 standard 的误差符合预期。
-5. 如果新增 `_C_ops` 参数绑定，测试覆盖对应 `_C_ops` config。
-6. 如果新增 custom implementation，测试覆盖 custom implementation id。
-
-### 4.5 验证命令
+5. 如果新增 `_C_ops` 参数绑定，使用对应 `_C_ops` config 做 CLI smoke。
+6. 如果新增 custom implementation，使用包含 custom implementation id 的 CLI smoke 验证。
 
 语法检查：
 
@@ -227,15 +197,10 @@ python -m py_compile \
   tester/operator_compare/profile.py \
   tester/operator_compare/report.py \
   tester/operator_compare/runner.py \
-  tester/operator_compare/spec.py \
-  tester/operator_compare/test_flat_operator_compare.py
+  tester/operator_compare/spec.py
 ```
 
-单元测试：
-
-```bash
-python tester/operator_compare/test_flat_operator_compare.py
-```
+真实执行 smoke 示例见下文 `add smoke` 和 `fused_linear_param_grad_add smoke`。
 
 ## 5. 使用示例
 
