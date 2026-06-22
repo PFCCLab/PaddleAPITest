@@ -6,6 +6,7 @@ import traceback
 import numpy
 import paddle
 import torch
+import yaml
 
 from .api_config.log_writer import write_to_log
 from .base import CUDA_ERROR, CUDA_OOM, APITestBase
@@ -18,14 +19,47 @@ class APITestAccuracy(APITestBase):
     def __init__(self, api_config, **kwargs):
         super().__init__(api_config)
         self.test_amp = kwargs.get("test_amp", False)
-        self.atol = kwargs.get("atol", 1e-2)
-        self.rtol = kwargs.get("rtol", 1e-2)
+        self.atol = kwargs.get("atol", 0)
+        self.rtol = kwargs.get("rtol", 0)
         self.test_tol = kwargs.get("test_tol", False)
         self.exit_on_error = kwargs.get("exit_on_error", False)
         self.bitwise_alignment = kwargs.get("bitwise_alignment", False)
+        self.manual_threshold_config_file = kwargs.get("manual_threshold_config_file", "")
+        self.manual_threshold_config = self._load_manual_threshold_config(
+            self.manual_threshold_config_file
+        )
         if self.test_tol:
             torch.set_printoptions(profile="short")
         self.converter = get_converter()
+
+    def _load_manual_threshold_config(self, manual_threshold_config_file):
+        if not manual_threshold_config_file:
+            return {}
+        with open(manual_threshold_config_file, encoding="utf-8") as f:
+            config = yaml.safe_load(f) or {}
+        return config.get("manual_threshold_config") or {}
+
+    def get_atol(self):
+        api_name = (
+            self.paddle_args[0]
+            if self.api_config.api_name == "paddle._C_ops._run_custom_op"
+            else self.api_config.api_name
+        )
+        threshold = self.manual_threshold_config.get(api_name)
+        if threshold is not None:
+            return threshold[0]
+        return self.atol
+
+    def get_rtol(self):
+        api_name = (
+            self.paddle_args[0]
+            if self.api_config.api_name == "paddle._C_ops._run_custom_op"
+            else self.api_config.api_name
+        )
+        threshold = self.manual_threshold_config.get(api_name)
+        if threshold is not None:
+            return threshold[1]
+        return self.rtol
 
     def _reset_random_state(self, seed: int = 42):
         """Reset numpy / paddle / torch (CPU+CUDA) RNGs so random APIs
@@ -310,7 +344,7 @@ class APITestAccuracy(APITestBase):
                 #     torch_tensor = torch_tensor.to(dtype=torch.float32)
                 # self.np_assert_accuracy(paddle_tensor.numpy(), torch_tensor.numpy(), atol=self.atol, rtol=self.rtol)
                 self.torch_assert_accuracy(
-                    paddle_tensor, torch_tensor, atol=self.atol, rtol=self.rtol
+                    paddle_tensor, torch_tensor, atol=self.get_atol(), rtol=self.get_rtol()
                 )
             except Exception as err:
                 if self.is_backward:
@@ -386,8 +420,8 @@ class APITestAccuracy(APITestBase):
                     self.np_assert_accuracy(
                         numpy.array(paddle_item),
                         numpy.array(torch_item),
-                        atol=self.atol,
-                        rtol=self.rtol,
+                        atol=self.get_atol(),
+                        rtol=self.get_rtol(),
                     )
                 # especially for paddle.vision.ops.distribute_fpn_proposals
                 elif isinstance(paddle_item, list) and isinstance(torch_item, list):
@@ -537,8 +571,8 @@ class APITestAccuracy(APITestBase):
                         self.np_assert_accuracy(
                             numpy.array(paddle_item),
                             numpy.array(torch_item),
-                            atol=self.atol,
-                            rtol=self.rtol,
+                            atol=self.get_atol(),
+                            rtol=self.get_rtol(),
                         )
                     elif (
                         paddle_item is None

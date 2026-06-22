@@ -47,6 +47,7 @@ VALID_TEST_ARGS = {
     "test_backward",
     "atol",
     "rtol",
+    "manual_threshold_config_file",
     "test_tol",
     "operation_mode",
     "bos_path",
@@ -655,6 +656,12 @@ def main():
         help="Relative tolerance for accuracy tests",
     )
     parser.add_argument(
+        "--manual_threshold_config_file",
+        type=str,
+        default="",
+        help="YAML file with per-API manual accuracy thresholds",
+    )
+    parser.add_argument(
         "--test_tol",
         type=parse_bool,
         default=False,
@@ -873,6 +880,7 @@ def main():
                 test_amp=options.test_amp,
                 atol=options.atol,
                 rtol=options.rtol,
+                manual_threshold_config_file=options.manual_threshold_config_file,
                 test_tol=options.test_tol,
                 bitwise_alignment=options.bitwise_alignment,
                 exit_on_error=options.exit_on_error,

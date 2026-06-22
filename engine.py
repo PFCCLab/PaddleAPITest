@@ -117,6 +117,12 @@ def main():
         help="Relative tolerance for accuracy tests",
     )
     parser.add_argument(
+        "--manual_threshold_config_file",
+        type=str,
+        default="",
+        help="YAML file with per-API manual accuracy thresholds",
+    )
+    parser.add_argument(
         "--exit_on_error",
         type=parse_bool,
         default=False,
@@ -165,6 +171,7 @@ def main():
                 test_amp=options.test_amp,
                 atol=options.atol,
                 rtol=options.rtol,
+                manual_threshold_config_file=options.manual_threshold_config_file,
                 exit_on_error=options.exit_on_error,
             )
         else:
@@ -202,6 +209,7 @@ def main():
                     test_amp=options.test_amp,
                     atol=options.atol,
                     rtol=options.rtol,
+                    manual_threshold_config_file=options.manual_threshold_config_file,
                 )
             else:
                 case = test_class(api_config, test_amp=options.test_amp)
