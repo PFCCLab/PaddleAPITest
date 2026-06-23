@@ -82,6 +82,30 @@ def set_engineV2():
     TMP_LOG_PATH.mkdir(exist_ok=True)
 
 
+def get_tmp_log_path():
+    return TMP_LOG_PATH
+
+
+def get_sanitizer_case_log_dir(slot_index, pid):
+    return TMP_LOG_PATH / "sanitizer" / f"slot_{slot_index}_{pid}"
+
+
+def merge_sanitizer_case_logs(case_log_dir):
+    case_tmp_dir = case_log_dir / ".tmp"
+    if not case_tmp_dir.exists():
+        return
+    for child_log in case_tmp_dir.iterdir():
+        if not child_log.is_file():
+            continue
+        target_log = TMP_LOG_PATH / child_log.name
+        with child_log.open("rb") as in_f, target_log.open("ab") as out_f:
+            shutil.copyfileobj(in_f, out_f)
+
+
+def cleanup_sanitizer_tmp_dir():
+    shutil.rmtree(TMP_LOG_PATH / "sanitizer", ignore_errors=True)
+
+
 def close_process_files():
     """关闭本进程持有的所有文件句柄"""
     global _process_file_handlers
@@ -164,6 +188,38 @@ def read_log(log_type):
     except Exception as err:
         print(f"Error reading {file_path}: {err}", flush=True)
         return set()
+
+
+def cleanup_uncheckpointed_result_logs():
+    """Remove result rows that were written before checkpoint during an interrupted run."""
+    checkpoint_file = TEST_LOG_PATH / "checkpoint.txt"
+    try:
+        with checkpoint_file.open("r") as f:
+            checkpoints = {line.strip() for line in f if line.strip()}
+    except FileNotFoundError:
+        return 0
+    except Exception as err:
+        print(f"Error reading {checkpoint_file}: {err}", flush=True)
+        return 0
+
+    removed = 0
+    for log_type, prefix in LOG_PREFIXES.items():
+        if log_type == "checkpoint":
+            continue
+        log_file = TEST_LOG_PATH / f"{prefix}.txt"
+        if not log_file.exists():
+            continue
+        try:
+            with log_file.open("r") as f:
+                lines = f.readlines()
+            new_lines = [line for line in lines if line.strip() in checkpoints]
+            removed += len(lines) - len(new_lines)
+            if len(new_lines) != len(lines):
+                with log_file.open("w") as f:
+                    f.writelines(new_lines)
+        except Exception as err:
+            print(f"Error cleaning {log_file}: {err}", flush=True)
+    return removed
 
 
 def _read_pending_bytes(file_path, end=False):

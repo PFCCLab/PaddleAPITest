@@ -1,6 +1,7 @@
 # test_log 一键整理小工具
 # @author: cangtianhuang
-# @date: 2025-11-11
+# @date: 2026-06-11
+
 # 整理效果：pass + error + invalid （可按类型拆分）
 from __future__ import annotations
 
@@ -12,7 +13,7 @@ from pathlib import Path
 SKIP_ERROR_INFO = [
     "(Cannot allocate memory)",
     "(InvalidArgument)",
-    "(NotFound)",
+    # "(NotFound)",
     "(ResourceExhausted)",
     "(Unimplemented)",
     "CUDA out of memory",
@@ -24,7 +25,12 @@ SKIP_ERROR_INFO = [
     "[config_convert]",
     "[torch_error]",
     "output type diff error",
+    "Too large tensor to get cached numpy",
+    "There is no grad op for inputs:",
 ]
+
+DEFAULT_TEST_LOG_PATH = Path("tester/api_config/test_log_big_tensor")
+RESULT_DIR_NAME = "error_stat_result"
 
 LOG_PREFIXES = {
     "checkpoint": "checkpoint",
@@ -154,7 +160,7 @@ def write_logs_and_meta(output_path, logs_dict, prefix):
 
 def error_state(input_path, output_path, split_errors=False):
     # 写入目标目录下的独立子文件夹，避免与原始日志文件混在同级目录
-    output_path = Path(output_path) / "error_stat_result"
+    output_path = Path(output_path) / RESULT_DIR_NAME
     if output_path.exists():
         shutil.rmtree(output_path)
         print(f"Cleared existing directory: {output_path}", flush=True)
@@ -217,13 +223,13 @@ def error_state(input_path, output_path, split_errors=False):
             write_logs_and_meta(output_path, invalid_union, "invalid")
 
 
-def main():
+def parse_args(argv=None):
     parser = argparse.ArgumentParser(description="test_log 整理工具（可按类型拆分）")
     parser.add_argument(
         "--input",
         "-i",
         type=str,
-        default="tester/api_config/test_log_big_tensor",
+        default=str(DEFAULT_TEST_LOG_PATH),
         help="输入路径",
     )
     parser.add_argument("--output", "-o", type=str, default=None, help="输出路径（默认同输入路径）")
@@ -233,10 +239,13 @@ def main():
         action="store_true",
         help="是否将错误和无效按类型拆分输出",
     )
-    args = parser.parse_args()
-    if args.output is None:
-        args.output = args.input
-    error_state(args.input, args.output, split_errors=args.split_errors)
+    return parser.parse_args(argv)
+
+
+def main(argv=None):
+    args = parse_args(argv)
+    output_path = args.output if args.output is not None else args.input
+    error_state(args.input, output_path, split_errors=args.split_errors)
 
 
 if __name__ == "__main__":

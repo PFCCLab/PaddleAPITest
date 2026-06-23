@@ -1,10 +1,15 @@
-# 获取 api 集合小工具
+# 提取 API 名集合小工具
 # @author: cangtianhuang
-# @date: 2025-09-26
+# @date: 2026-06-11
+
 from __future__ import annotations
 
 import argparse
 from pathlib import Path
+
+DEFAULT_INPUT_PATHS = ["tester/api_config/api_config_tmp.txt"]
+DEFAULT_OUTPUT_DIR = Path("tester/api_config/output")
+OUTPUT_FILE_NAME = "api_extracted.txt"
 
 
 def collect_input_files(input_paths):
@@ -22,7 +27,7 @@ def collect_input_files(input_paths):
     return files
 
 
-def extract_apis(input_paths, output_dir):
+def extract_apis(input_paths, output_dir=DEFAULT_OUTPUT_DIR):
     input_files = collect_input_files(input_paths)
     if not input_files:
         print("No valid input files found")
@@ -58,39 +63,44 @@ def extract_apis(input_paths, output_dir):
 
     print(f"Total processed: {total_processed}, Unique APIs: {len(api_names)}")
 
-    sorted_apis = sorted(api_names)
     output_path = Path(output_dir)
     output_path.mkdir(parents=True, exist_ok=True)
+    sorted_apis = sorted(api_names)
 
-    output_file = output_path / "api_extracted.txt"
+    output_file = output_path / OUTPUT_FILE_NAME
     output_file.write_text("\n".join(sorted_apis) + "\n", encoding="utf-8")
     print(f"Wrote {len(sorted_apis)} API names to {output_file}")
 
 
-def main():
-    default_input = ["tester/api_config/api_config_tmp.txt"]
-    default_output = "tester/api_config/output"
-
+def parse_args(argv=None):
     parser = argparse.ArgumentParser(
-        description="API提取工具",
+        description="API 提取工具",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 使用示例:
-  python %(prog)s -i config.txt                 # 处理单个配置文件
-  python %(prog)s -i configs/                   # 处理目录下所有.txt文件
-  python %(prog)s -i . -o output/                 # 当前目录
+  python %(prog)s -i config.txt        # 处理单个配置文件
+  python %(prog)s -i configs/          # 处理目录下所有 .txt 文件
+  python %(prog)s -i . -o output/      # 当前目录
         """,
     )
     parser.add_argument(
         "--input",
         "-i",
         nargs="+",
-        default=default_input,
+        default=DEFAULT_INPUT_PATHS,
         help="输入路径列表（支持文件或目录）",
     )
-    parser.add_argument("--output-dir", "-o", default=default_output, help="输出目录路径")
+    parser.add_argument(
+        "--output-dir",
+        "-o",
+        default=str(DEFAULT_OUTPUT_DIR),
+        help="输出目录路径",
+    )
+    return parser.parse_args(argv)
 
-    args = parser.parse_args()
+
+def main(argv=None):
+    args = parse_args(argv)
     extract_apis(args.input, args.output_dir)
 
 
