@@ -10,7 +10,7 @@ from .base import CUDA_ERROR, CUDA_OOM, APITestBase
 
 class APITestPaddleOnly(APITestBase):
     def __init__(self, api_config, **kwargs):
-        super().__init__(api_config)
+        super().__init__(api_config, use_torch=False)
         self.test_amp = kwargs.get("test_amp", False)
 
     # @func_set_timeout(600)
