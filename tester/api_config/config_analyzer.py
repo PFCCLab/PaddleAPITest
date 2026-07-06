@@ -3478,6 +3478,11 @@ class APIConfig:
             return '"' + item + '"'
         elif isinstance(item, type):
             return "type(" + str(item)[str(item).index("'") + 1 : str(item).rindex("'")] + ")"
+        elif callable(item):
+            name = getattr(item, "__name__", None) or getattr(item, "__qualname__", None)
+            if name:
+                return "callable(" + name + ")"
+            return "callable(unknown)"
         else:
             return str(item)
 
@@ -3674,6 +3679,12 @@ class APIConfig:
             value, offset = self.get_complex(config, offset)
         elif token == "type":
             value, offset = self.get_numpy_type(config, offset)
+        elif token == "callable":
+            # parse callable(name) format - store as a string marker
+            start = config.index("(", offset - len(token)) + 1
+            end = config.index(")", start)
+            value = config[start:end]  # store the callable name as string
+            offset = end + 1
         elif token == "nan":
             value = float("nan")
         elif token is not None and config[offset - len(token) - 1] == '"':
@@ -3693,11 +3704,12 @@ class APIConfig:
 def analyse_configs(config_path):
     with open(config_path) as f:
         configs = f.readlines()
-        f.close()
 
     api_configs = []
     for config in configs:
-        # print(config)
+        config = config.strip()
+        if not config or "(" not in config:
+            continue
         api_config = APIConfig(config)
         api_configs.append(api_config)
     return api_configs
