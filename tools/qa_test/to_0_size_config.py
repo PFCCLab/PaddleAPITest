@@ -162,7 +162,7 @@ def dump_item_str(item):
     elif isinstance(item, type):
         return "type(" + str(item)[str(item).index("'") + 1 : str(item).rindex("'")] + ")"
     elif callable(item):
-        name = getattr(item, '__name__', None) or getattr(item, '__qualname__', None)
+        name = getattr(item, "__name__", None) or getattr(item, "__qualname__", None)
         if name:
             return "callable(" + name + ")"
         return "callable(unknown)"
@@ -281,10 +281,15 @@ def parse_args():
     parser = argparse.ArgumentParser(
         description="将 API 配置转换为 0-size tensor 变体，用于边界测试。",
     )
-    parser.add_argument("-i", "--inputs", nargs="+", required=True,
-                        help="输入配置文件路径（可指定多个）")
-    parser.add_argument("-o", "--output", default="api_config_0_size.txt",
-                        help="输出文件路径（默认：当前目录下 api_config_0_size.txt）")
+    parser.add_argument(
+        "-i", "--inputs", nargs="+", required=True, help="输入配置文件路径（可指定多个）"
+    )
+    parser.add_argument(
+        "-o",
+        "--output",
+        default="api_config_0_size.txt",
+        help="输出文件路径（默认：当前目录下 api_config_0_size.txt）",
+    )
     return parser.parse_args()
 
 

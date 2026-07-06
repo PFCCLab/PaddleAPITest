@@ -6,6 +6,9 @@ Usage:
     python merge_configs.py -i file1.txt file2.txt file3.txt
     python merge_configs.py -i dir1/ file2.txt -o /output/merged.txt
 """
+
+from __future__ import annotations
+
 import argparse
 import glob
 import os
@@ -15,10 +18,12 @@ def parse_args():
     parser = argparse.ArgumentParser(
         description="合并多个 txt 配置文件，剔除空行。",
     )
-    parser.add_argument("-i", "--inputs", nargs="+", required=True,
-                        help="输入路径（目录或文件），可指定多个")
-    parser.add_argument("-o", "--output", default=None,
-                        help="输出文件路径。默认：第一个输入目录下 merged.txt")
+    parser.add_argument(
+        "-i", "--inputs", nargs="+", required=True, help="输入路径（目录或文件），可指定多个"
+    )
+    parser.add_argument(
+        "-o", "--output", default=None, help="输出文件路径。默认：第一个输入目录下 merged.txt"
+    )
     return parser.parse_args()
 
 
@@ -58,7 +63,7 @@ def main():
     for filepath in txt_files:
         if os.path.abspath(filepath) == output_abs:
             continue
-        with open(filepath, "r") as f:
+        with open(filepath) as f:
             for line in f:
                 stripped = line.strip()
                 if stripped:

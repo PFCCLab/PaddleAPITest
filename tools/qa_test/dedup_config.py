@@ -5,6 +5,9 @@ Usage:
     python dedup_config.py -i api_config_0_size.txt
     python dedup_config.py -i api_config_0_size.txt -o /output/dir/dedup.txt
 """
+
+from __future__ import annotations
+
 import argparse
 import os
 
@@ -13,10 +16,13 @@ def parse_args():
     parser = argparse.ArgumentParser(
         description="Deduplicate configuration lines while preserving sorted unique output.",
     )
-    parser.add_argument("-i", "--input", required=True,
-                        help="Input config file path")
-    parser.add_argument("-o", "--output", default=None,
-                        help="Output file path. Default: <input_stem>_dedup.txt in same dir as input")
+    parser.add_argument("-i", "--input", required=True, help="Input config file path")
+    parser.add_argument(
+        "-o",
+        "--output",
+        default=None,
+        help="Output file path. Default: <input_stem>_dedup.txt in same dir as input",
+    )
     return parser.parse_args()
 
 
@@ -36,7 +42,7 @@ def main():
 
     seen = set()
     total = 0
-    with open(input_path, "r", encoding="utf-8") as f:
+    with open(input_path, encoding="utf-8") as f:
         for line in f:
             total += 1
             seen.add(line.rstrip("\n"))

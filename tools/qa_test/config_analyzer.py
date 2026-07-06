@@ -2946,38 +2946,18 @@ class TensorConfig:
                         if isinstance(num_experts, TensorConfig):
                             num_experts = 32
                         seqlen = self.shape[0]
-                        # Fetch unzipped seqlen from hidden_states_unzipped (arg0) to
-                        # bound expert_counters so fetch_row never exceeds the valid
-                        # range of unzipped_token_probs / hidden_states_unzipped.
-                        hidden_config = self.get_arg(api_config, 0, "hidden_states_unzipped")
-                        if (
-                            isinstance(hidden_config, TensorConfig)
-                            and hidden_config.shape
-                            and len(hidden_config.shape) > 0
-                        ):
-                            unzipped_seqlen = hidden_config.shape[0]
-                        else:
-                            unzipped_seqlen = seqlen  # fallback
                         rowmap = numpy.full(self.shape, -1, dtype="int32")
                         if isinstance(routemap_config, TensorConfig):
                             if routemap_config.numpy_tensor is None:
                                 routemap_config.get_numpy_tensor(api_config, index=2)
                             if routemap_config.numpy_tensor is not None:
-                                # Build rowmap and keep routemap consistent: every
-                                # non-negative expert in routemap must map to a valid
-                                # fetch_row because moe_unpermute reads token_prob by it.
+                                # Build rowmap: for each expert, assign row indices in order
                                 expert_counters = numpy.zeros(num_experts, dtype="int32")
-                                routemap = routemap_config.numpy_tensor
                                 for i in range(seqlen):
                                     for e in range(num_experts):
-                                        positions = numpy.where(routemap[i] == e)[0]
-                                        if positions.size == 0:
-                                            continue
-                                        if expert_counters[e] < unzipped_seqlen:
+                                        if numpy.any(routemap_config.numpy_tensor[i] == e):
                                             rowmap[i, e] = expert_counters[e]
                                             expert_counters[e] += 1
-                                        else:
-                                            routemap[i, positions] = -1
                         self.numpy_tensor = rowmap
                     # token_prob_unzipped (arg3): float32, value in [0, 1]
                     elif self.check_arg(api_config, 3, "token_prob_unzipped"):
@@ -3478,6 +3458,11 @@ class APIConfig:
             return '"' + item + '"'
         elif isinstance(item, type):
             return "type(" + str(item)[str(item).index("'") + 1 : str(item).rindex("'")] + ")"
+        elif callable(item):
+            name = getattr(item, "__name__", None) or getattr(item, "__qualname__", None)
+            if name:
+                return "callable(" + name + ")"
+            return "callable(unknown)"
         else:
             return str(item)
 
@@ -3674,6 +3659,12 @@ class APIConfig:
             value, offset = self.get_complex(config, offset)
         elif token == "type":
             value, offset = self.get_numpy_type(config, offset)
+        elif token == "callable":
+            # parse callable(name) format - store as a string marker
+            start = config.index("(", offset - len(token)) + 1
+            end = config.index(")", start)
+            value = config[start:end]  # store the callable name as string
+            offset = end + 1
         elif token == "nan":
             value = float("nan")
         elif token is not None and config[offset - len(token) - 1] == '"':
@@ -3690,14 +3681,28 @@ class APIConfig:
         return value, offset
 
 
+# def analyse_configs(config_path):
+#     with open(config_path) as f:
+#         configs = f.readlines()
+#         f.close()
+
+#     api_configs = []
+#     for config in configs:
+#         # print(config)
+#         api_config = APIConfig(config)
+#         api_configs.append(api_config)
+#     return api_configs
+
+
 def analyse_configs(config_path):
     with open(config_path) as f:
         configs = f.readlines()
-        f.close()
 
     api_configs = []
     for config in configs:
-        # print(config)
+        config = config.strip()
+        if not config or "(" not in config:
+            continue
         api_config = APIConfig(config)
         api_configs.append(api_config)
     return api_configs

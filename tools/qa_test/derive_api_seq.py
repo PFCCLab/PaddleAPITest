@@ -33,14 +33,16 @@ B. MoE dispatch 类（router 数据相关，逐 token 路由，不可照抄）
         moe_permute、下游 reshape/transpose/getitem 切片、moe_unpermute 各行。
 """
 
+from __future__ import annotations
+
 import argparse
-import os
-import re
-import sys
 import json
 import math
+import os
 import random
-from collections import defaultdict, Counter
+import re
+import sys
+from collections import Counter, defaultdict
 
 # ──────────────────────────── 配置（运行时由 parse_args 填充） ────────────────────────────
 
@@ -64,8 +66,174 @@ MOE_PADDED_N_RAW = set()
 # 总 Σtpe = 144 * seq * 4（每调用均值 = seq*4）。input_N = round(Σtpe/1.2033)。
 # padded buffer N = Σ ceil(tpe_e/128)*128。
 MOE_PROFILE = {
-    "expert_profile_20": [0.004221, 0.009402, 0.013823, 0.017920, 0.021618, 0.024818, 0.027641, 0.031208, 0.034247, 0.037616, 0.041644, 0.045602, 0.050711, 0.055962, 0.062604, 0.070290, 0.078967, 0.091881, 0.117033, 0.162790],
-    "per_call_profile_144": [0.003664, 0.003801, 0.004234, 0.004444, 0.004525, 0.004777, 0.004919, 0.005035, 0.005125, 0.005139, 0.005180, 0.005205, 0.005312, 0.005355, 0.005375, 0.005457, 0.005564, 0.005601, 0.005675, 0.005703, 0.005709, 0.005789, 0.005803, 0.005829, 0.005858, 0.005963, 0.006043, 0.006070, 0.006091, 0.006100, 0.006104, 0.006126, 0.006133, 0.006140, 0.006171, 0.006200, 0.006234, 0.006255, 0.006274, 0.006280, 0.006307, 0.006346, 0.006366, 0.006374, 0.006409, 0.006424, 0.006438, 0.006467, 0.006474, 0.006490, 0.006528, 0.006545, 0.006573, 0.006583, 0.006598, 0.006636, 0.006648, 0.006671, 0.006675, 0.006681, 0.006692, 0.006706, 0.006721, 0.006727, 0.006731, 0.006735, 0.006742, 0.006753, 0.006800, 0.006809, 0.006825, 0.006849, 0.006865, 0.006934, 0.006941, 0.006973, 0.006980, 0.006985, 0.007008, 0.007014, 0.007018, 0.007032, 0.007048, 0.007081, 0.007096, 0.007136, 0.007147, 0.007174, 0.007184, 0.007203, 0.007225, 0.007232, 0.007273, 0.007285, 0.007297, 0.007313, 0.007364, 0.007392, 0.007431, 0.007452, 0.007475, 0.007515, 0.007547, 0.007573, 0.007606, 0.007624, 0.007629, 0.007691, 0.007701, 0.007715, 0.007758, 0.007781, 0.007834, 0.007887, 0.007920, 0.007941, 0.007958, 0.008033, 0.008083, 0.008139, 0.008153, 0.008231, 0.008283, 0.008317, 0.008353, 0.008394, 0.008409, 0.008418, 0.008460, 0.008569, 0.008642, 0.008678, 0.008729, 0.008813, 0.008845, 0.008858, 0.008933, 0.009125, 0.009336, 0.009394, 0.009520, 0.009638, 0.009690, 0.010134],
+    "expert_profile_20": [
+        0.004221,
+        0.009402,
+        0.013823,
+        0.017920,
+        0.021618,
+        0.024818,
+        0.027641,
+        0.031208,
+        0.034247,
+        0.037616,
+        0.041644,
+        0.045602,
+        0.050711,
+        0.055962,
+        0.062604,
+        0.070290,
+        0.078967,
+        0.091881,
+        0.117033,
+        0.162790,
+    ],
+    "per_call_profile_144": [
+        0.003664,
+        0.003801,
+        0.004234,
+        0.004444,
+        0.004525,
+        0.004777,
+        0.004919,
+        0.005035,
+        0.005125,
+        0.005139,
+        0.005180,
+        0.005205,
+        0.005312,
+        0.005355,
+        0.005375,
+        0.005457,
+        0.005564,
+        0.005601,
+        0.005675,
+        0.005703,
+        0.005709,
+        0.005789,
+        0.005803,
+        0.005829,
+        0.005858,
+        0.005963,
+        0.006043,
+        0.006070,
+        0.006091,
+        0.006100,
+        0.006104,
+        0.006126,
+        0.006133,
+        0.006140,
+        0.006171,
+        0.006200,
+        0.006234,
+        0.006255,
+        0.006274,
+        0.006280,
+        0.006307,
+        0.006346,
+        0.006366,
+        0.006374,
+        0.006409,
+        0.006424,
+        0.006438,
+        0.006467,
+        0.006474,
+        0.006490,
+        0.006528,
+        0.006545,
+        0.006573,
+        0.006583,
+        0.006598,
+        0.006636,
+        0.006648,
+        0.006671,
+        0.006675,
+        0.006681,
+        0.006692,
+        0.006706,
+        0.006721,
+        0.006727,
+        0.006731,
+        0.006735,
+        0.006742,
+        0.006753,
+        0.006800,
+        0.006809,
+        0.006825,
+        0.006849,
+        0.006865,
+        0.006934,
+        0.006941,
+        0.006973,
+        0.006980,
+        0.006985,
+        0.007008,
+        0.007014,
+        0.007018,
+        0.007032,
+        0.007048,
+        0.007081,
+        0.007096,
+        0.007136,
+        0.007147,
+        0.007174,
+        0.007184,
+        0.007203,
+        0.007225,
+        0.007232,
+        0.007273,
+        0.007285,
+        0.007297,
+        0.007313,
+        0.007364,
+        0.007392,
+        0.007431,
+        0.007452,
+        0.007475,
+        0.007515,
+        0.007547,
+        0.007573,
+        0.007606,
+        0.007624,
+        0.007629,
+        0.007691,
+        0.007701,
+        0.007715,
+        0.007758,
+        0.007781,
+        0.007834,
+        0.007887,
+        0.007920,
+        0.007941,
+        0.007958,
+        0.008033,
+        0.008083,
+        0.008139,
+        0.008153,
+        0.008231,
+        0.008283,
+        0.008317,
+        0.008353,
+        0.008394,
+        0.008409,
+        0.008418,
+        0.008460,
+        0.008569,
+        0.008642,
+        0.008678,
+        0.008729,
+        0.008813,
+        0.008845,
+        0.008858,
+        0.008933,
+        0.009125,
+        0.009336,
+        0.009394,
+        0.009520,
+        0.009638,
+        0.009690,
+        0.010134,
+    ],
     "input_N_divisor": 1.2033,
     "padding_alignment": 128,
     "num_experts": 20,
@@ -76,30 +244,48 @@ MOE_PROFILE = {
 
 # ──────────────────────────── 正则 ────────────────────────────
 
-NUM_RE = re.compile(r'-?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?')
-DTYPE_RE = re.compile(r'"[^"]*"|Dtype\([^)]*\)')      # 保护区：内部数字不提取
-INT_RE = re.compile(r'-?\d+')
+NUM_RE = re.compile(r"-?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?")
+DTYPE_RE = re.compile(r'"[^"]*"|Dtype\([^)]*\)')  # 保护区：内部数字不提取
+INT_RE = re.compile(r"-?\d+")
 
 # MoE 解析
 MOE_PERMUTE_RE = re.compile(
-    r'moe_permute\(Tensor\(paddle\.Size\(\[(\d+), 7168\]\).*?'
-    r'tokens_per_expert=list\[([^\]]*)\], padding_alignment=128'
+    r"moe_permute\(Tensor\(paddle\.Size\(\[(\d+), 7168\]\).*?"
+    r"tokens_per_expert=list\[([^\]]*)\], padding_alignment=128"
 )
-SLICE_RE = re.compile(r'slice\((\d+),(\d+),None\)')
+SLICE_RE = re.compile(r"slice\((\d+),(\d+),None\)")
 
 # 模型结构常量：永不作为 MoE block 标量映射的 key（即使某 block 的
 # old_padded_N / old_input_N 偶然等于其中之一）。否则会把 Size([N,7168]) 里的
 # hidden=7168 等常量误当作 buffer 维度放大。56=top_k*hidden/512、28、3584=hidden/2、
 # 20=num_experts、4=top_k、143360/1120 等也是固定结构维度。
-MODEL_CONSTANTS = frozenset({
-    7168, 3584, 1792, 56, 28, 14, 20, 4, 8, 16, 32, 64, 128,
-    143360, 1120, 256, 512, 1024,
-})
+MODEL_CONSTANTS = frozenset(
+    {
+        7168,
+        3584,
+        1792,
+        56,
+        28,
+        14,
+        20,
+        4,
+        8,
+        16,
+        32,
+        64,
+        128,
+        143360,
+        1120,
+        256,
+        512,
+        1024,
+    }
+)
 
 
 def signature(line):
     """结构签名：把所有数字替换为 #。"""
-    return NUM_RE.sub('#', line)
+    return NUM_RE.sub("#", line)
 
 
 def numbers(line):
@@ -117,6 +303,7 @@ def is_int(text):
 
 
 # ──────────────────────────── 学习仿射映射（确定类） ────────────────────────────
+
 
 def collect_position_values(lines):
     """收集每个 (signature, position) 上出现过的所有整数。"""
@@ -140,18 +327,18 @@ def build_value_map(lines_small, lines_large):
             smalls = small.get(sig, {}).get(pos, [])
             cnt_s, cnt_l = Counter(smalls), Counter(larges)
             if cnt_s == cnt_l:
-                continue                       # 整列常量，跳过
+                continue  # 整列常量，跳过
             common = cnt_s & cnt_l
             rem_s = sorted((cnt_s - common).elements())
             rem_l = sorted((cnt_l - common).elements())
             if len(rem_s) != len(rem_l) or not rem_l:
-                continue                       # 个数随 seq 变（多为 MoE），跳过
+                continue  # 个数随 seq 变（多为 MoE），跳过
             candidates = defaultdict(set)
             for v_small, v_large in zip(rem_s, rem_l):
                 v_target = v_small + (v_large - v_small) * MULT
                 candidates[v_large].add(v_target)
             for v_large, targets in candidates.items():
-                if len(targets) == 1:          # 无歧义才采用
+                if len(targets) == 1:  # 无歧义才采用
                     vmap[(sig, pos)][v_large] = next(iter(targets))
     return vmap
 
@@ -178,6 +365,7 @@ def derive_line(line, vmap):
 
 # ──────────────────────────── MoE 结构重建 ────────────────────────────
 # 见文件头 B 部分说明。
+
 
 def _proportional_int_split(total, weights, rng, jitter):
     """把整数 total 按 weights（占比，和为1）拆成 len(weights) 个非负整数，
@@ -216,7 +404,7 @@ def build_moe_plan(profile):
     pad = profile["padding_alignment"]
     n_calls = profile["moe_permute_calls"]
 
-    grand_total = n_calls * SEQ_TARGET * 4          # Σ over all calls 的 token 预算
+    grand_total = n_calls * SEQ_TARGET * 4  # Σ over all calls 的 token 预算
     # 各调用的 Σtpe（按真实占比 + 抖动，整数，和为 grand_total）
     call_sums = _proportional_int_split(grand_total, per_call, rng, JITTER)
 
@@ -236,13 +424,15 @@ def build_moe_plan(profile):
         padded_each = [math.ceil(t / pad) * pad for t in tpe]
         padded_N = sum(padded_each)
         input_N = int(round(csum / divisor))
-        plans.append({
-            "tpe": tpe,
-            "sum_tpe": sum(tpe),
-            "padded_each": padded_each,
-            "padded_N": padded_N,
-            "input_N": input_N,
-        })
+        plans.append(
+            {
+                "tpe": tpe,
+                "sum_tpe": sum(tpe),
+                "padded_each": padded_each,
+                "padded_N": padded_N,
+                "input_N": input_N,
+            }
+        )
     return plans
 
 
@@ -253,8 +443,8 @@ def _moe_block_bounds(lines):
     unpermute 行本身归入该 block 末尾。返回 [(p_idx, u_idx), ...]。
     permute 有 fp8 / bf16 两种变体，各 144 个；每个 permute 都配一个 unpermute。
     """
-    perm_idx = [i for i, l in enumerate(lines) if 'functional.moe_permute' in l]
-    unperm_idx = [i for i, l in enumerate(lines) if 'functional.moe_unpermute' in l]
+    perm_idx = [i for i, l in enumerate(lines) if "functional.moe_permute" in l]
+    unperm_idx = [i for i, l in enumerate(lines) if "functional.moe_unpermute" in l]
     blocks = []
     used = set()
     for p in perm_idx:
@@ -270,16 +460,18 @@ def _moe_block_bounds(lines):
 
 def _parse_permute(line):
     """解析 moe_permute 行，返回 (variant, input_N, tpe_list) 或 None。"""
-    m = MOE_PERMUTE_RE.search(line)        # fp8 变体（带 tokens_per_expert=）
+    m = MOE_PERMUTE_RE.search(line)  # fp8 变体（带 tokens_per_expert=）
     if m:
-        tpe = [int(x) for x in m.group(2).split(',') if x.strip()]
-        return ('fp8', int(m.group(1)), tpe)
+        tpe = [int(x) for x in m.group(2).split(",") if x.strip()]
+        return ("fp8", int(m.group(1)), tpe)
     m = re.search(
         r'moe_permute\(Tensor\(paddle\.Size\(\[(\d+), 7168\]\),"bfloat16"\), '
-        r'None,.*?, 20, list\[([^\]]*)\], padding_alignment=128', line)
+        r"None,.*?, 20, list\[([^\]]*)\], padding_alignment=128",
+        line,
+    )
     if m:
-        tpe = [int(x) for x in m.group(2).split(',') if x.strip()]
-        return ('bf16', int(m.group(1)), tpe)
+        tpe = [int(x) for x in m.group(2).split(",") if x.strip()]
+        return ("bf16", int(m.group(1)), tpe)
     return None
 
 
@@ -302,24 +494,27 @@ def _rewrite_int_run(line, old_to_new):
 
 def _rewrite_permute_line(line, variant, new_input_N, new_tpe):
     """重写 moe_permute 行：替换 input_N 与 tokens_per_expert 列表。"""
-    new_list = ','.join(str(t) for t in new_tpe) + ','
-    if variant == 'fp8':
+    new_list = ",".join(str(t) for t in new_tpe) + ","
+    if variant == "fp8":
         line = MOE_PERMUTE_RE.sub(
-            lambda m: m.group(0).replace(
-                f'Size([{m.group(1)}, 7168]', f'Size([{new_input_N}, 7168]'
-            ).replace(
-                f'tokens_per_expert=list[{m.group(2)}]',
-                f'tokens_per_expert=list[{new_list}]'
+            lambda m: m.group(0)
+            .replace(f"Size([{m.group(1)}, 7168]", f"Size([{new_input_N}, 7168]")
+            .replace(
+                f"tokens_per_expert=list[{m.group(2)}]", f"tokens_per_expert=list[{new_list}]"
             ),
-            line, count=1)
+            line,
+            count=1,
+        )
         # input_N 还出现在同一行其它 Tensor 的第一维（[N,56] [N,4]）
         m2 = _parse_permute(line)
     else:
         m = re.search(
             r'moe_permute\(Tensor\(paddle\.Size\(\[(\d+), 7168\]\),"bfloat16"\), '
-            r'None,.*?, 20, list\[([^\]]*)\], padding_alignment=128', line)
+            r"None,.*?, 20, list\[([^\]]*)\], padding_alignment=128",
+            line,
+        )
         old_in, old_list = m.group(1), m.group(2)
-        line = line.replace(f'list[{old_list}]', f'list[{new_list}]', 1)
+        line = line.replace(f"list[{old_list}]", f"list[{new_list}]", 1)
     return line
 
 
@@ -345,7 +540,7 @@ def apply_moe_reconstruction(derived, skeleton, moe_plan, profile):
        与逐 block 精确值仅差每调用方差，对合成配置的形状/量级保真度完全够用。
     """
     pad = profile["padding_alignment"]
-    r = SEQ_TARGET / SEQ_LARGE        # 全局缩放比（buffer 维近似线性）
+    r = SEQ_TARGET / SEQ_LARGE  # 全局缩放比（buffer 维近似线性）
 
     def scale128(x, mode="round"):
         """把 x 按比例 r 缩放并对齐到 128。mode: round/floor/ceil。"""
@@ -366,7 +561,7 @@ def apply_moe_reconstruction(derived, skeleton, moe_plan, profile):
     global MOE_PADDED_N, MOE_PADDED_N_RAW
     MOE_PADDED_N_RAW = set()
     for l in skeleton:
-        if 'moe_permute' not in l:
+        if "moe_permute" not in l:
             continue
         pp = _parse_permute(l)
         if pp:
@@ -393,11 +588,14 @@ def apply_moe_reconstruction(derived, skeleton, moe_plan, profile):
             tpe[tpe.index(max(tpe))] += drift
         rng2.shuffle(tpe)
         padded_each = [math.ceil(t / pad) * pad for t in tpe]
-        bf_plan.append({
-            "tpe": tpe, "padded_each": padded_each,
-            "padded_N": sum(padded_each),
-            "input_N": int(round(csum / divisor)),
-        })
+        bf_plan.append(
+            {
+                "tpe": tpe,
+                "padded_each": padded_each,
+                "padded_N": sum(padded_each),
+                "input_N": int(round(csum / divisor)),
+            }
+        )
 
     fp8_i = bf16_i = 0
     changed = 0
@@ -406,14 +604,15 @@ def apply_moe_reconstruction(derived, skeleton, moe_plan, profile):
         if parsed is None:
             continue
         variant, old_input_N, old_tpe = parsed
-        if variant == 'fp8':
-            plan = moe_plan[fp8_i % len(moe_plan)]; fp8_i += 1
+        if variant == "fp8":
+            plan = moe_plan[fp8_i % len(moe_plan)]
+            fp8_i += 1
         else:
-            plan = bf_plan[bf16_i % len(bf_plan)]; bf16_i += 1
+            plan = bf_plan[bf16_i % len(bf_plan)]
+            bf16_i += 1
         # permute 行里 input_N 出现在多个 Tensor 首维（[N,7168][N,56][N,4]）。
         # 用 scalar_map 只替换 == old_input_N 的 token；7168 等常量绝不入表。
-        line = _rewrite_permute_line(skeleton[p_idx], variant,
-                                     plan["input_N"], plan["tpe"])
+        line = _rewrite_permute_line(skeleton[p_idx], variant, plan["input_N"], plan["tpe"])
         sm = {}
         if old_input_N != plan["input_N"] and old_input_N not in MODEL_CONSTANTS:
             sm[old_input_N] = plan["input_N"]
@@ -431,25 +630,51 @@ def apply_moe_reconstruction(derived, skeleton, moe_plan, profile):
 # 携带 padded-buffer 维（数据相关、随 seq 线性增长）的算子。其首维 N 与 slice 边界
 # 需随 seq 缩放；moe_permute / moe_unpermute 已在第 1 类单独精确处理，这里跳过。
 # 缓冲维有两种书写：① Tensor(Size([N, DIM])) ② list[N, DIM,]（empty/reshape/slice 的形状参数）。
-_BUFFER_SHAPE = re.compile(r'Size\(\[(\d+), (7168|3584|56|28)\]')
+_BUFFER_SHAPE = re.compile(r"Size\(\[(\d+), (7168|3584|56|28)\]")
 # list[N,DIM,] 形式：DIM 为 MoE 维时 N=buffer。注意只匹配「DIM 在第二位」的二维形状，
 # 避免误伤 list[20,56,56,] 这类常量三维形状（其首维 20 是 num_experts 常量）。
-_BUFFER_LIST = re.compile(r'list\[(\d+),(7168|3584|56|28),\]')
+_BUFFER_LIST = re.compile(r"list\[(\d+),(7168|3584|56|28),\]")
 _BUFFER_HEADS = (
-    'paddle.Tensor.__getitem__', 'paddle.Tensor.zero_', 'paddle.assign',
-    'paddle.slice', 'paddle.empty_like', 'paddle.Tensor.reshape',
-    'paddle.incubate.nn.functional.fused_linear', 'paddle.zeros_like',
-    'paddle.Tensor.cast', 'paddle.incubate.nn.functional.fp8_quant_blockwise',
-    'paddle._C_ops._run_custom_op', 'paddle.transpose', 'paddle.Tensor.clone',
-    'paddle.Tensor.detach', 'paddle.reshape', 'paddle.nn.functional.linear',
-    'paddle.incubate.nn.functional.fused_act_dequant', 'paddle.empty',
-    'paddle.Tensor.unsqueeze', 'paddle.Tensor.contiguous',
+    "paddle.Tensor.__getitem__",
+    "paddle.Tensor.zero_",
+    "paddle.assign",
+    "paddle.slice",
+    "paddle.empty_like",
+    "paddle.Tensor.reshape",
+    "paddle.incubate.nn.functional.fused_linear",
+    "paddle.zeros_like",
+    "paddle.Tensor.cast",
+    "paddle.incubate.nn.functional.fp8_quant_blockwise",
+    "paddle._C_ops._run_custom_op",
+    "paddle.transpose",
+    "paddle.Tensor.clone",
+    "paddle.Tensor.detach",
+    "paddle.reshape",
+    "paddle.nn.functional.linear",
+    "paddle.incubate.nn.functional.fused_act_dequant",
+    "paddle.empty",
+    "paddle.Tensor.unsqueeze",
+    "paddle.Tensor.contiguous",
 )
 # 首维为这些值的是结构常量张量（[20,7168,7168]、[1120,56]、[3584,7168] 等），首维不缩放。
 # 3584=hidden/2、7168=hidden、102400=vocab 分片、14336=2·hidden、64/192/2056 等是固定结构维。
-_CONST_FIRST_DIM = frozenset({
-    20, 1120, 143360, 3584, 7168, 14336, 102400, 64, 192, 160, 256, 512, 2056,
-})
+_CONST_FIRST_DIM = frozenset(
+    {
+        20,
+        1120,
+        143360,
+        3584,
+        7168,
+        14336,
+        102400,
+        64,
+        192,
+        160,
+        256,
+        512,
+        2056,
+    }
+)
 
 
 def _scale_moe_buffer_lines(derived, skeleton, scale128, pad):
@@ -460,7 +685,7 @@ def _scale_moe_buffer_lines(derived, skeleton, scale128, pad):
     从而不碰常量张量的首维（如 [3584,7168]、[102400,7168]）。"""
     changed = 0
     for i, base in enumerate(skeleton):
-        head = base.split('(', 1)[0]
+        head = base.split("(", 1)[0]
         if head not in _BUFFER_HEADS:
             continue
         sm = _BUFFER_SHAPE.search(base)
@@ -482,12 +707,14 @@ def _scale_moe_buffer_lines(derived, skeleton, scale128, pad):
                     nb = min(scale128(b, "ceil"), new_N)
                     if na > nb:
                         na = nb
-                    new_line = (new_line[:sl.start()]
-                                + f'slice({na},{nb},None)' + new_line[sl.end():])
+                    new_line = (
+                        new_line[: sl.start()] + f"slice({na},{nb},None)" + new_line[sl.end() :]
+                    )
                 new_line = _BUFFER_SHAPE.sub(
-                    lambda m: m.group(0).replace(
-                        f'[{m.group(1)}, ', f'[{new_N}, ', 1),
-                    new_line, count=1)
+                    lambda m: m.group(0).replace(f"[{m.group(1)}, ", f"[{new_N}, ", 1),
+                    new_line,
+                    count=1,
+                )
         # ② list[N,DIM,]：empty/reshape/slice 的形状参数（N=行数, DIM∈MoE 维）。
         #    歧义点：N==7168 时既可能是 padded buffer（empty 的行数），也可能是权重 reshape
         #    的行数（list[7168,7168,] 来自 flat[51380224]=7168² 的方阵权重）。靠算子区分：
@@ -495,11 +722,12 @@ def _scale_moe_buffer_lines(derived, skeleton, scale128, pad):
         #      - reshape/slice/其它形状参数 → 可能是权重 → 用剔除常量的 MOE_PADDED_N 集合
         if lm:
             old_LN = int(lm.group(1))
-            allow = MOE_PADDED_N_RAW if head == 'paddle.empty' else MOE_PADDED_N
+            allow = MOE_PADDED_N_RAW if head == "paddle.empty" else MOE_PADDED_N
             if old_LN in allow:
                 nLN = scale128(old_LN, "ceil")
                 new_line = _BUFFER_LIST.sub(
-                    lambda m: f'list[{nLN},{m.group(2)},]', new_line, count=1)
+                    lambda m: f"list[{nLN},{m.group(2)},]", new_line, count=1
+                )
         if new_line != base:
             derived[i] = new_line
             changed += 1
@@ -514,52 +742,77 @@ _UNPERM_RE = re.compile(
     r'(moe_unpermute\(Tensor\(paddle\.Size\(\[)(\d+)(, 7168\]\),"bfloat16"\), '
     r'Tensor\(paddle\.Size\(\[)(\d+)(, 20\]\),"int32"\), '
     r'Tensor\(paddle\.Size\(\[)(\d+)(, 4\]\),"int32"\), '
-    r'Tensor\(paddle\.Size\(\[)(\d+)(\]\),"float32"\), )(\d+)(, 20, \))')
+    r'Tensor\(paddle\.Size\(\[)(\d+)(\]\),"float32"\), )(\d+)(, 20, \))'
+)
 
 
 def _scale_unpermute_lines(derived, skeleton, scale128):
     """缩放 moe_unpermute 行的 padded_N（首维与第4个张量）与 input_N（第2/3张量及尾参）。"""
     changed = 0
     for i, base in enumerate(skeleton):
-        if 'moe_unpermute' not in base:
+        if "moe_unpermute" not in base:
             continue
         m = _UNPERM_RE.search(base)
         if not m:
             continue
-        old_pad = int(m.group(2))            # padded_N
-        old_in = int(m.group(4))             # input_N
+        old_pad = int(m.group(2))  # padded_N
+        old_in = int(m.group(4))  # input_N
         new_pad = scale128(old_pad, "ceil")
         new_in = scale128(old_in, "round")
         new_line = _UNPERM_RE.sub(
-            lambda mm: (mm.group(1) + str(new_pad) + mm.group(3) + str(new_in)
-                        + mm.group(5) + str(new_in) + mm.group(7) + str(new_pad)
-                        + mm.group(9) + str(new_in) + mm.group(11)),
-            base, count=1)
+            lambda mm: (
+                mm.group(1)
+                + str(new_pad)
+                + mm.group(3)
+                + str(new_in)
+                + mm.group(5)
+                + str(new_in)
+                + mm.group(7)
+                + str(new_pad)
+                + mm.group(9)
+                + str(new_in)
+                + mm.group(11)
+            ),
+            base,
+            count=1,
+        )
         if new_line != base:
             derived[i] = new_line
             changed += 1
     return changed
 
+
 def parse_args():
     parser = argparse.ArgumentParser(
         description="API config 推导脚本：由两个不同 seq 的配置推导任意目标 seq（含 MoE 结构重建）。",
     )
-    parser.add_argument("target_seq", type=int,
-                        help="目标 sequence 长度（必须是 seq_small 的整数倍）")
-    parser.add_argument("--small", default=None,
-                        help="小 seq 配置文件路径（默认：脚本目录下 api_config_<seq_small>.txt）")
-    parser.add_argument("--large", default=None,
-                        help="大 seq 配置文件路径（默认：脚本目录下 api_config_<seq_large>.txt）")
-    parser.add_argument("--seq-small", type=int, default=1024,
-                        help="小配置的 seq 值（默认：1024）")
-    parser.add_argument("--seq-large", type=int, default=2048,
-                        help="大配置的 seq 值（默认：2048）")
-    parser.add_argument("-o", "--output", default=None,
-                        help="输出文件路径（默认：源文件同目录下 api_config_derived_<target>.txt）")
-    parser.add_argument("--seed", type=int, default=20240528,
-                        help="MoE 重建随机种子（默认：20240528）")
-    parser.add_argument("--jitter", type=float, default=0.04,
-                        help="MoE 重采样抖动幅度（默认：0.04）")
+    parser.add_argument(
+        "target_seq", type=int, help="目标 sequence 长度（必须是 seq_small 的整数倍）"
+    )
+    parser.add_argument(
+        "--small",
+        default=None,
+        help="小 seq 配置文件路径（默认：脚本目录下 api_config_<seq_small>.txt）",
+    )
+    parser.add_argument(
+        "--large",
+        default=None,
+        help="大 seq 配置文件路径（默认：脚本目录下 api_config_<seq_large>.txt）",
+    )
+    parser.add_argument("--seq-small", type=int, default=1024, help="小配置的 seq 值（默认：1024）")
+    parser.add_argument("--seq-large", type=int, default=2048, help="大配置的 seq 值（默认：2048）")
+    parser.add_argument(
+        "-o",
+        "--output",
+        default=None,
+        help="输出文件路径（默认：源文件同目录下 api_config_derived_<target>.txt）",
+    )
+    parser.add_argument(
+        "--seed", type=int, default=20240528, help="MoE 重建随机种子（默认：20240528）"
+    )
+    parser.add_argument(
+        "--jitter", type=float, default=0.04, help="MoE 重采样抖动幅度（默认：0.04）"
+    )
     return parser.parse_args()
 
 
@@ -574,8 +827,9 @@ def main():
     RANDOM_SEED = args.seed
     JITTER = args.jitter
 
-    assert (SEQ_TARGET - SEQ_SMALL) % SEQ_SMALL == 0, \
+    assert (SEQ_TARGET - SEQ_SMALL) % SEQ_SMALL == 0, (
         f"TARGET ({SEQ_TARGET}) 必须满足 (TARGET - {SEQ_SMALL}) % {SEQ_SMALL} == 0"
+    )
     MULT = (SEQ_TARGET - SEQ_SMALL) // SEQ_SMALL
 
     file_small = args.small or os.path.join(BASE_DIR, f"api_config_{SEQ_SMALL}.txt")
@@ -598,12 +852,14 @@ def main():
         print(f"错误：源文件缺失 {file_large}")
         sys.exit(1)
 
-    print(f"推导: seq {SEQ_SMALL}+{SEQ_LARGE} → {SEQ_TARGET}  "
-          f"(确定类仿射 mult={MULT}; MoE 约束重采样, seed={RANDOM_SEED})")
+    print(
+        f"推导: seq {SEQ_SMALL}+{SEQ_LARGE} → {SEQ_TARGET}  "
+        f"(确定类仿射 mult={MULT}; MoE 约束重采样, seed={RANDOM_SEED})"
+    )
     print("=" * 70)
 
-    lines_small = [l.rstrip('\n') for l in open(file_small)]
-    lines_large = [l.rstrip('\n') for l in open(file_large)]
+    lines_small = [l.rstrip("\n") for l in open(file_small)]
+    lines_large = [l.rstrip("\n") for l in open(file_large)]
     print(f"  seq={SEQ_SMALL}: {len(lines_small)} 行")
     print(f"  seq={SEQ_LARGE}: {len(lines_large)} 行 (作为输出骨架)")
 
@@ -613,8 +869,10 @@ def main():
 
     profile = load_profile()
     moe_plan = build_moe_plan(profile)
-    print(f"  MoE 重建计划: {len(moe_plan)} 个 moe_permute 调用, "
-          f"总 token 预算 {profile['moe_permute_calls'] * SEQ_TARGET * 4}")
+    print(
+        f"  MoE 重建计划: {len(moe_plan)} 个 moe_permute 调用, "
+        f"总 token 预算 {profile['moe_permute_calls'] * SEQ_TARGET * 4}"
+    )
 
     # 第一遍：确定类仿射改写（MoE block 内的行随后被结构重建覆盖）
     derived = [derive_line(l, vmap) for l in lines_large]
@@ -624,8 +882,8 @@ def main():
 
     affine_changed = sum(1 for a, b in zip(derived, lines_large) if a != b)
 
-    with open(output_path, 'w') as f:
-        f.write('\n'.join(derived) + '\n')
+    with open(output_path, "w") as f:
+        f.write("\n".join(derived) + "\n")
 
     print("=" * 70)
     print(f"完成: 共 {len(derived)} 行")

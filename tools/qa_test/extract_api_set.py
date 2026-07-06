@@ -79,13 +79,15 @@ def parse_args(argv=None):
         """,
     )
     parser.add_argument(
-        "-i", "--input",
+        "-i",
+        "--input",
         nargs="+",
         required=True,
         help="输入路径列表（支持文件或目录）",
     )
     parser.add_argument(
-        "-o", "--output",
+        "-o",
+        "--output",
         default="api_extracted.txt",
         help="输出文件路径（默认：当前目录下 api_extracted.txt）",
     )
