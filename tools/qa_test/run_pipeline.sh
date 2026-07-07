@@ -55,6 +55,16 @@ echo "  输入: $INPUT_DIR"
 echo "  输出: $OUTPUT_DIR"
 echo "======================================================================"
 
+# ─── 同步 config_analyzer.py 和 api.yaml ───
+REPO_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
+SOURCE_DIR="$REPO_DIR/tester/api_config"
+
+echo ""
+echo "[准备] 同步 config_analyzer.py 和 api.yaml..."
+cp "$SOURCE_DIR/config_analyzer.py" "$SCRIPT_DIR/config_analyzer.py"
+cp "$SOURCE_DIR/api.yaml" "$SCRIPT_DIR/api.yaml"
+echo "  已从 $SOURCE_DIR 复制到 $SCRIPT_DIR"
+
 # ─── 检查输入 ───
 if [ ! -f "$INPUT_DIR/api_config_1024.txt" ] || [ ! -f "$INPUT_DIR/api_config_2048.txt" ]; then
     echo "错误：输入目录需要至少包含 api_config_1024.txt 和 api_config_2048.txt"
@@ -111,28 +121,38 @@ python "$SCRIPT_DIR/dedup_config.py" \
 rm -f "$OUTPUT_DIR/_tmp_merged.txt"
 
 # ============================================================================
-# Step 4: 生成 0size 配置，去重 → api_config_0size_paddleonly.txt
+# Step 4: 合并原始配置(1024+2048+4096+8192)去重，再生成 0size → api_config_0size_paddleonly.txt
 # ============================================================================
 echo ""
-echo "[Step 4] 生成 0-size + 去重 → api_config_0size_paddleonly.txt..."
+echo "[Step 4] 合并原始配置(1024+2048+4096+8192) + 去重 + 生成 0-size → api_config_0size_paddleonly.txt..."
 
-# 收集所有输入：原始 + 1M
-ZERO_INPUTS=""
-for f in "$INPUT_DIR"/api_config_*.txt; do
-    ZERO_INPUTS="$ZERO_INPUTS $f"
+# 合并原始 seq 配置（不含 1M）
+ORIG_INPUTS=""
+for seq in 1024 2048 4096 8192; do
+    if [ -f "$INPUT_DIR/api_config_${seq}.txt" ]; then
+        ORIG_INPUTS="$ORIG_INPUTS $INPUT_DIR/api_config_${seq}.txt"
+    fi
 done
-ZERO_INPUTS="$ZERO_INPUTS $OUTPUT_DIR/api_config_1M.txt"
 
+python "$SCRIPT_DIR/merge_configs.py" \
+    -i $ORIG_INPUTS \
+    -o "$OUTPUT_DIR/_tmp_orig_merged.txt"
+
+python "$SCRIPT_DIR/dedup_config.py" \
+    -i "$OUTPUT_DIR/_tmp_orig_merged.txt" \
+    -o "$OUTPUT_DIR/_tmp_orig_dedup.txt"
+
+# 转 0size
 python "$SCRIPT_DIR/to_0_size_config.py" \
-    -i $ZERO_INPUTS \
+    -i "$OUTPUT_DIR/_tmp_orig_dedup.txt" \
     -o "$OUTPUT_DIR/_tmp_0size.txt"
 
-# 去重
+# 去重 0size
 python "$SCRIPT_DIR/dedup_config.py" \
     -i "$OUTPUT_DIR/_tmp_0size.txt" \
     -o "$OUTPUT_DIR/api_config_0size_paddleonly.txt"
 
-rm -f "$OUTPUT_DIR/_tmp_0size.txt"
+rm -f "$OUTPUT_DIR/_tmp_orig_merged.txt" "$OUTPUT_DIR/_tmp_orig_dedup.txt" "$OUTPUT_DIR/_tmp_0size.txt"
 
 # ============================================================================
 # Step 5: 提取 API 名集合
