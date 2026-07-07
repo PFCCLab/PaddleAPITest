@@ -944,4 +944,11 @@ apis:
  - paddle._C_ops._run_custom_op
  - paddle.nn.functional.*
  - paddle.incubate.nn.functional.*
+ - paddle._C_ops.adamw_
+ - paddle._C_ops.flashmask_attention_v2
+ - paddle._C_ops.fused_linear_param_grad_add
+ - paddle._C_ops.gaussian
+ - paddle._C_ops.matmul_grad
+ - paddle._C_ops.squared_l2_norm
+ - paddle._C_ops.uniform
 # - paddle._C_ops.*  # 默认关闭（上层接口已覆盖大多数场景）；若担心遗漏底层算子可取消注释
