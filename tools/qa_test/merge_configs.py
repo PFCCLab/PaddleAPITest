@@ -12,6 +12,7 @@ from __future__ import annotations
 import argparse
 import glob
 import os
+import re
 
 
 def parse_args():
@@ -25,6 +26,28 @@ def parse_args():
         "-o", "--output", default=None, help="输出文件路径。默认：第一个输入目录下 merged.txt"
     )
     return parser.parse_args()
+
+
+def split_merged_lines(line):
+    """拆分粘连的多条配置行。
+
+    源数据中偶尔出现两条配置写在同一行的情况，如：
+        '...axis=1, )paddle.Tensor.__mul__(Tensor...'
+    按 ')paddle.' 边界拆成独立的配置行。
+    """
+    # 匹配 ')' 紧跟 'paddle.' 的位置作为拆分点
+    parts = re.split(r"\)(paddle\.)", line)
+    if len(parts) == 1:
+        return [line]
+    # parts 形如 ['...axis=1, ', 'paddle.', 'Tensor.__mul__(...', 'paddle.', '...']
+    # 每个分隔符消耗了前一段的 ')' 和后一段的 'paddle.'
+    result = []
+    result.append(parts[0] + ")")
+    for i in range(1, len(parts) - 2, 2):
+        result.append(parts[i] + parts[i + 1] + ")")
+    # 最后一段
+    result.append(parts[-2] + parts[-1])
+    return [r for r in result if r.strip()]
 
 
 def collect_files(inputs):
@@ -67,7 +90,7 @@ def main():
             for line in f:
                 stripped = line.strip()
                 if stripped:
-                    lines.append(stripped)
+                    lines.extend(split_merged_lines(stripped))
 
     with open(output_file, "w") as f:
         f.write("\n".join(lines) + "\n")

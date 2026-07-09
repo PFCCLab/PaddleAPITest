@@ -161,11 +161,11 @@ def dump_item_str(item):
         return '"' + item + '"'
     elif isinstance(item, type):
         return "type(" + str(item)[str(item).index("'") + 1 : str(item).rindex("'")] + ")"
-    elif callable(item):
-        name = getattr(item, "__name__", None) or getattr(item, "__qualname__", None)
-        if name:
-            return "callable(" + name + ")"
-        return "callable(unknown)"
+    # elif callable(item):
+    #     name = getattr(item, "__name__", None) or getattr(item, "__qualname__", None)
+    #     if name:
+    #         return "callable(" + name + ")"
+    #     return "callable(unknown)"
     else:
         return str(item)
 
