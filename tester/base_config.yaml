@@ -309,6 +309,7 @@ forward_only_apis:
   - detection_map
   - dgc
   - dgc_momentum
+  - detach
   - diag_embed
   - diff
   - dirichlet

@@ -433,18 +433,32 @@ class TensorConfig:
 
         if self.numpy_tensor is None:
             if api_config.api_name in {"paddle.Tensor.view", "paddle.view"}:
-                if (
-                    self.check_arg(api_config, 0, "x")
-                    and original_dtype == "uint8"
-                    and str(self.get_arg(api_config, 1, "shape_or_dtype", "")) == "paddle.bfloat16"
-                ):
-                    bf16_numel = math.prod(self.shape) // 2
-                    finite_float32 = ((numpy.random.random(bf16_numel) - 0.5) * 1.2).astype(
-                        "float32"
-                    )
-                    self.numpy_tensor = (
-                        (finite_float32.view("uint32") >> 16).astype("uint16").view("uint8")
-                    )
+                # Reinterpret-cast view from uint8: pack finite float bits so check_numerics
+                # does not trip on random NaN/Inf bit patterns.
+                if self.check_arg(api_config, 0, "x") and original_dtype == "uint8":
+                    target = str(self.get_arg(api_config, 1, "shape_or_dtype", ""))
+                    nbytes = math.prod(self.shape)
+                    itemsize = {
+                        "paddle.bfloat16": 2,
+                        "paddle.float16": 2,
+                        "paddle.float32": 4,
+                        "paddle.float64": 8,
+                    }.get(target)
+                    if itemsize is not None and nbytes % itemsize == 0:
+                        numel = nbytes // itemsize
+                        if target == "paddle.bfloat16":
+                            # numpy has no bfloat16; pack finite f32 high-16 bits.
+                            finite_f32 = ((numpy.random.random(numel) - 0.5) * 1.2).astype(
+                                "float32"
+                            )
+                            self.numpy_tensor = (
+                                (finite_f32.view("uint32") >> 16).astype("uint16").view("uint8")
+                            )
+                        else:
+                            finite = ((numpy.random.random(numel) - 0.5) * 1.2).astype(
+                                target.replace("paddle.", "")
+                            )
+                            self.numpy_tensor = numpy.ascontiguousarray(finite).view("uint8")
             elif (
                 api_config.api_name in optimizer_apis
                 and self.index in optimizer_apis[api_config.api_name]
