@@ -9,7 +9,7 @@ import torch
 import yaml
 
 from .api_config.log_writer import write_to_log
-from .base import CUDA_ERROR, CUDA_OOM, APITestBase
+from .base import APITestBase
 from .paddle_to_torch import get_converter
 
 # from func_timeout import func_set_timeout
@@ -89,45 +89,48 @@ class APITestAccuracy(APITestBase):
     # @func_set_timeout(600)
     def test(self):
         if self.need_skip():
-            print("[Skip]", flush=True)
+            print(f"[skip] {self.api_config.config}", flush=True)
+            write_to_log("skip", self.api_config.config)
             return
 
         if not self.ana_api_info():
             print("ana_api_info failed", flush=True)
+            write_to_log("config_parse", self.api_config.config)
             return
 
         try:
             convert_result = self.converter.convert(self.api_config.api_name)
         except Exception as e:
             print(
-                f"[paddle_to_torch] Conversion failed for {self.api_config.config}: {e!s}",
+                f"[config_convert] Conversion failed for {self.api_config.config}: {e!s}",
                 flush=True,
             )
-            write_to_log("paddle_to_torch_failed", self.api_config.config)
+            write_to_log("config_convert", self.api_config.config)
             return
         if not convert_result.is_supported:
             print(
-                f"[paddle_to_torch] Unsupported API {self.api_config.api_name}: {convert_result.error_message}",
+                f"[config_convert] Unsupported API {self.api_config.api_name}: {convert_result.error_message}",
                 flush=True,
             )
-            write_to_log("paddle_to_torch_failed", self.api_config.config)
+            write_to_log("config_convert", self.api_config.config)
             return
         if not convert_result.code or not convert_result.code.is_valid():
             print(
-                f"[paddle_to_torch] No code generated for {self.api_config.api_name}",
+                f"[config_convert] No code generated for {self.api_config.api_name}",
                 flush=True,
             )
-            write_to_log("paddle_to_torch_failed", self.api_config.config)
+            write_to_log("config_convert", self.api_config.config)
             return
 
         try:
             if not self.gen_numpy_input():
                 print("gen_numpy_input failed")
+                write_to_log("config_input", self.api_config.config)
                 return
         except Exception as err:
-            print(f"[numpy error] {self.api_config.config}\n{err!s}")
+            print(f"[config_input] {self.api_config.config}\n{err!s}")
             traceback.print_exc()
-            write_to_log("numpy_error", self.api_config.config)
+            write_to_log("config_input", self.api_config.config)
             return
 
         try:
@@ -135,6 +138,7 @@ class APITestAccuracy(APITestBase):
             torch.set_default_device(device)
             if not self.gen_torch_input():
                 print("gen_torch_input failed", flush=True)
+                write_to_log("torch_error", self.api_config.config)
                 return
 
             # Reseed before executing torch, so that random APIs
@@ -199,12 +203,9 @@ class APITestAccuracy(APITestBase):
 
             paddle.base.core.eager._for_test_check_cuda_error()
         except Exception as err:
-            print(f"[torch error] {self.api_config.config}\n{err!s}", flush=True)
             traceback.print_exc()
-            write_to_log("torch_error", self.api_config.config)
-            if any(cuda_err in str(err) for cuda_err in CUDA_ERROR) or any(
-                cuda_err in str(err) for cuda_err in CUDA_OOM
-            ):
+            _, fatal = self.report_runtime_error(err, "torch_error", "torch_forward")
+            if fatal:
                 raise
             return
 
@@ -227,28 +228,17 @@ class APITestAccuracy(APITestBase):
                 del inputs_list, result_outputs, result_outputs_grads
             except Exception as err:
                 if str(err).startswith("Too large tensor to get cached numpy: "):
-                    print(f"[numpy error] {self.api_config.config}\n{err!s}")
-                    write_to_log("numpy_error", self.api_config.config)
+                    print(f"[config_input] {self.api_config.config}\n{err!s}")
+                    write_to_log("config_input", self.api_config.config)
                     return
-                # some torch backward error can be tolerable, so we catch cuda error here
-                if any(cuda_err in str(err) for cuda_err in CUDA_ERROR) or any(
-                    cuda_err in str(err) for cuda_err in CUDA_OOM
-                ):
-                    print(
-                        f"[torch error] backward {self.api_config.config}\n{err!s}",
-                        flush=True,
-                    )
-                    write_to_log("torch_error", self.api_config.config)
+                _, fatal = self.report_runtime_error(err, "torch_error", "torch_backward")
+                if fatal:
                     raise
-                print(str(err), flush=True)
+                return
             try:
                 paddle.base.core.eager._for_test_check_cuda_error()
             except Exception as err:
-                print(
-                    f"[torch error] backward {self.api_config.config}\n{err!s}",
-                    flush=True,
-                )
-                write_to_log("torch_error", self.api_config.config)
+                self.report_runtime_error(err, "torch_error", "torch_backward_cuda_check")
                 raise
         else:
             del self.torch_args, self.torch_kwargs
@@ -282,6 +272,7 @@ class APITestAccuracy(APITestBase):
         try:
             if not self.gen_paddle_input():
                 print("gen_paddle_input failed")
+                write_to_log("paddle_error", self.api_config.config)
                 return
 
             # Reseed before executing paddle so that random APIs
@@ -315,29 +306,17 @@ class APITestAccuracy(APITestBase):
                     else next(iter(self.paddle_kwargs.values()))
                 )
         except Exception as err:
-            if self.should_ignore_paddle_error(str(err)):
-                print(f"[Pass] {self.api_config.config}", flush=True)
-                write_to_log("pass", self.api_config.config)
-                return
-            if any(cuda_err in str(err) for cuda_err in CUDA_ERROR):
-                print(f"[cuda error] {self.api_config.config}\n{err!s}", flush=True)
-                write_to_log("cuda_error", self.api_config.config)
-                raise
-            if any(cuda_err in str(err) for cuda_err in CUDA_OOM):
-                print(f"[oom] {self.api_config.config}\n{err!s}", flush=True)
-                write_to_log("oom", self.api_config.config)
-                raise
-            print(f"[paddle error] {self.api_config.config}\n{err!s}", flush=True)
-            write_to_log("paddle_error", self.api_config.config)
-            if self.exit_on_error:
+            log_type, fatal = self.report_runtime_error(
+                err, "paddle_error", "paddle_forward", allow_ignore_paddle=True
+            )
+            if fatal or (self.exit_on_error and log_type == "paddle_error"):
                 raise
             return
 
         try:
             paddle.base.core.eager._for_test_check_cuda_error()
         except Exception as err:
-            print(f"[cuda error] {self.api_config.config}\n{err!s}", flush=True)
-            write_to_log("cuda_error", self.api_config.config)
+            self.report_runtime_error(err, "paddle_cuda", "paddle_forward_cuda_check")
             raise
 
         paddle_output, torch_output = process_output(self.api_config, paddle_output, torch_output)
@@ -355,17 +334,12 @@ class APITestAccuracy(APITestBase):
                     paddle_tensor, torch_tensor, atol=self.get_atol(), rtol=self.get_rtol()
                 )
             except Exception as err:
-                if self.is_backward:
-                    print(
-                        f"[accuracy error] backward at {idx} {self.api_config.config}\n{err!s}",
-                        flush=True,
-                    )
-                else:
-                    print(
-                        f"[accuracy error] at {idx} {self.api_config.config}\n{err!s}",
-                        flush=True,
-                    )
-                write_to_log("accuracy_error", self.api_config.config)
+                phase = "backward" if self.is_backward else "forward"
+                print(
+                    f"[paddle_accuracy] phase={phase} idx={idx} {self.api_config.config}\n{err!s}",
+                    flush=True,
+                )
+                write_to_log("paddle_accuracy", self.api_config.config)
                 if self.exit_on_error:
                     raise
                 return False
@@ -385,10 +359,10 @@ class APITestAccuracy(APITestBase):
                     )
                 except Exception as err:
                     print(
-                        f"[not compare] {self.api_config.config}\n{err!s}",
+                        f"[paddle_accuracy] reason=not_compare {self.api_config.config}\n{err!s}",
                         flush=True,
                     )
-                    write_to_log("accuracy_error", self.api_config.config)
+                    write_to_log("paddle_accuracy", self.api_config.config)
                     return
             elif isinstance(torch_output, (torch.return_types.max, torch.return_types.min)):
                 torch_output = torch_output.values
@@ -396,30 +370,30 @@ class APITestAccuracy(APITestBase):
                     return
             else:
                 print(
-                    f"[not compare] {self.api_config.config}\n"
+                    f"[paddle_accuracy] reason=not_compare {self.api_config.config}\n"
                     f"torch is {type(torch_output)} but paddle is {type(paddle_output)}",
                     flush=True,
                 )
-                write_to_log("accuracy_error", self.api_config.config)
+                write_to_log("paddle_accuracy", self.api_config.config)
                 return
         elif isinstance(paddle_output, (list, tuple)):
             if not isinstance(torch_output, (list, tuple)):
                 print(
-                    f"[not compare] {self.api_config.config}\n"
+                    f"[paddle_accuracy] reason=not_compare {self.api_config.config}\n"
                     f"torch is {type(torch_output)} but paddle is {type(paddle_output)}",
                     flush=True,
                 )
-                write_to_log("accuracy_error", self.api_config.config)
+                write_to_log("paddle_accuracy", self.api_config.config)
                 return
             paddle_output = list(paddle_output)
             torch_output = list(torch_output)
             if len(paddle_output) != len(torch_output):
                 print(
-                    f"[not compare] {self.api_config.config}\n"
+                    f"[paddle_accuracy] reason=not_compare {self.api_config.config}\n"
                     f"torch len is {len(torch_output)} but paddle len is {len(paddle_output)}",
                     flush=True,
                 )
-                write_to_log("accuracy_error", self.api_config.config)
+                write_to_log("paddle_accuracy", self.api_config.config)
                 return
             for i, (paddle_item, torch_item) in enumerate(
                 zip(paddle_output, torch_output, strict=False)
@@ -443,11 +417,11 @@ class APITestAccuracy(APITestBase):
                                 return
                     else:
                         print(
-                            f"[not compare] at {i} {self.api_config.config}\n"
+                            f"[paddle_accuracy] reason=not_compare idx={i} {self.api_config.config}\n"
                             f"torch is {type(torch_item)} but paddle is {type(paddle_item)}",
                             flush=True,
                         )
-                        write_to_log("accuracy_error", self.api_config.config)
+                        write_to_log("paddle_accuracy", self.api_config.config)
                         return
                 elif (
                     paddle_item is None
@@ -462,11 +436,11 @@ class APITestAccuracy(APITestBase):
                     torch_item, torch.Tensor
                 ):
                     print(
-                        f"[not compare] at {i} {self.api_config.config}\n"
+                        f"[paddle_accuracy] reason=not_compare idx={i} {self.api_config.config}\n"
                         f"torch is {type(torch_item)} but paddle is {type(paddle_item)}",
                         flush=True,
                     )
-                    write_to_log("accuracy_error", self.api_config.config)
+                    write_to_log("paddle_accuracy", self.api_config.config)
                     return
                 else:
                     if not compare_paddle_and_torch(paddle_item, torch_item, i):
@@ -494,46 +468,22 @@ class APITestAccuracy(APITestBase):
             except Exception as err:
                 if str(err).startswith("Too large tensor to get cached numpy: "):
                     print(
-                        f"[numpy error] backward {self.api_config.config}\n{err!s}",
+                        f"[config_input] phase=backward {self.api_config.config}\n{err!s}",
                         flush=True,
                     )
-                    write_to_log("numpy_error", self.api_config.config)
+                    write_to_log("config_input", self.api_config.config)
                     return
-                if self.should_ignore_paddle_error(str(err)):
-                    print(f"[Pass] {self.api_config.config}", flush=True)
-                    write_to_log("pass", self.api_config.config)
-                    return
-                if any(cuda_err in str(err) for cuda_err in CUDA_ERROR):
-                    print(
-                        f"[cuda error] backward {self.api_config.config}\n{err!s}",
-                        flush=True,
-                    )
-                    write_to_log("cuda_error", self.api_config.config)
-                    raise
-                if any(cuda_err in str(err) for cuda_err in CUDA_OOM):
-                    print(
-                        f"[oom] backward {self.api_config.config}\n{err!s}",
-                        flush=True,
-                    )
-                    write_to_log("oom", self.api_config.config)
-                    raise
-                print(
-                    f"[paddle error] backward {self.api_config.config}\n{err!s}",
-                    flush=True,
+                log_type, fatal = self.report_runtime_error(
+                    err, "paddle_error", "paddle_backward", allow_ignore_paddle=True
                 )
-                if self.exit_on_error:
+                if fatal or (self.exit_on_error and log_type == "paddle_error"):
                     raise
-                write_to_log("paddle_error", self.api_config.config)
                 return
 
             try:
                 paddle.base.core.eager._for_test_check_cuda_error()
             except Exception as err:
-                print(
-                    f"[cuda error] backward {self.api_config.config}\n{err!s}",
-                    flush=True,
-                )
-                write_to_log("cuda_error", self.api_config.config)
+                self.report_runtime_error(err, "paddle_cuda", "paddle_backward_cuda_check")
                 raise
 
             paddle_out_grads, torch_out_grads = process_grad_output(
@@ -547,30 +497,30 @@ class APITestAccuracy(APITestBase):
                         return
                 else:
                     print(
-                        f"[not compare] backward {self.api_config.config}\n"
+                        f"[paddle_accuracy] reason=not_compare phase=backward {self.api_config.config}\n"
                         f"torch is {type(torch_out_grads)} but paddle is {type(paddle_out_grads)}",
                         flush=True,
                     )
-                    write_to_log("accuracy_error", self.api_config.config)
+                    write_to_log("paddle_accuracy", self.api_config.config)
                     return
             elif isinstance(paddle_out_grads, (list, tuple)):
                 if not isinstance(torch_out_grads, (list, tuple)):
                     print(
-                        f"[not compare] backward {self.api_config.config}\n"
+                        f"[paddle_accuracy] reason=not_compare phase=backward {self.api_config.config}\n"
                         f"torch is {type(torch_out_grads)} but paddle is {type(paddle_out_grads)}",
                         flush=True,
                     )
-                    write_to_log("accuracy_error", self.api_config.config)
+                    write_to_log("paddle_accuracy", self.api_config.config)
                     return
                 paddle_out_grads = list(paddle_out_grads)
                 torch_out_grads = list(torch_out_grads)
                 if len(paddle_out_grads) != len(torch_out_grads):
                     print(
-                        f"[not compare] backward {self.api_config.config}\n"
+                        f"[paddle_accuracy] reason=not_compare phase=backward {self.api_config.config}\n"
                         f"torch len is {len(torch_out_grads)} but paddle len is {len(paddle_out_grads)}",
                         flush=True,
                     )
-                    write_to_log("accuracy_error", self.api_config.config)
+                    write_to_log("paddle_accuracy", self.api_config.config)
                     return
                 for i, (paddle_item, torch_item) in enumerate(
                     zip(paddle_out_grads, torch_out_grads, strict=False)
@@ -596,17 +546,17 @@ class APITestAccuracy(APITestBase):
                         torch_item, torch.Tensor
                     ):
                         print(
-                            f"[not compare] backward at {i} {self.api_config.config}\n"
+                            f"[paddle_accuracy] reason=not_compare phase=backward idx={i} {self.api_config.config}\n"
                             f"torch is {type(torch_item)} but paddle is {type(paddle_item)}",
                             flush=True,
                         )
-                        write_to_log("accuracy_error", self.api_config.config)
+                        write_to_log("paddle_accuracy", self.api_config.config)
                         return
                     else:
                         if not compare_paddle_and_torch(paddle_item, torch_item, i):
                             return
 
-        print(f"[Pass] {self.api_config.config}", flush=True)
+        print(f"[pass] {self.api_config.config}", flush=True)
         write_to_log("pass", self.api_config.config)
 
 

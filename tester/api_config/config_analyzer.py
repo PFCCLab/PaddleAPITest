@@ -9,8 +9,18 @@ import re
 
 import numpy
 import paddle
-import torch
 import yaml
+
+
+class _LazyTorch:
+    def __getattr__(self, name):
+        import torch
+
+        globals()["torch"] = torch
+        return getattr(torch, name)
+
+
+torch = _LazyTorch()
 
 USE_CACHED_NUMPY = os.getenv("USE_CACHED_NUMPY", "False").lower() == "true"
 TEST_NON_CONTIGUOUS = os.getenv("TEST_NON_CONTIGUOUS", "0").lower() in ("true", "1")
@@ -245,9 +255,9 @@ class TensorConfig:
         dtype = dtype or self.dtype
         if not is_gpu_cache_mode():
             return False
-        if not torch.cuda.is_available():
-            return False
         if self.place is not None and "cpu" in str(self.place).lower():
+            return False
+        if "gpu" not in paddle.device.get_device():
             return False
         if not self.is_contiguous or self.strides is not None:
             return False
@@ -283,7 +293,25 @@ class TensorConfig:
             self._requires_autograd(api_config, dtype),
         )
 
-    def _make_gpu_cache_tensors(self, api_config, dtype=None):
+    def _make_gpu_paddle_tensor(self, dtype=None):
+        dtype = dtype or self.dtype
+        shape = tuple(self.shape)
+        if dtype == "bool":
+            paddle_tensor = paddle.randint(0, 2, shape, dtype="int32").cast("bool")
+        elif "int" in dtype or dtype == "uint8":
+            paddle_tensor = paddle.randint(-65535, 65535, shape, dtype="int64").cast(dtype)
+        elif dtype.startswith("complex"):
+            real_dtype = "float32" if dtype == "complex64" else "float64"
+            real_part = (paddle.rand(shape, dtype=real_dtype) - 0.5) * 1.2
+            imag_part = (paddle.rand(shape, dtype=real_dtype) - 0.5) * 1.2
+            paddle_tensor = (real_part + 1j * imag_part).cast(dtype)
+        else:
+            base = (paddle.rand(shape, dtype="float32") - 0.5) * 1.2
+            paddle_tensor = base.cast(dtype)
+        paddle_tensor.stop_gradient = False
+        return paddle_tensor
+
+    def _make_gpu_cache_tensors(self, dtype=None):
         dtype = dtype or self.dtype
         torch_dtype = self.convert_dtype_to_torch_type(dtype)
         shape = tuple(self.shape)
@@ -328,8 +356,11 @@ class TensorConfig:
         return cached_gpu_inputs[key]
 
     def get_gpu_paddle_tensor(self, api_config, dtype=None):
-        entry = self._get_gpu_cache_entry(api_config, dtype)
-        self.paddle_tensor = entry["paddle"]
+        dtype = dtype or self.dtype
+        key = self._gpu_cache_key(api_config, dtype)
+        if key not in cached_gpu_inputs:
+            cached_gpu_inputs[key] = {"paddle": self._make_gpu_paddle_tensor(dtype)}
+        self.paddle_tensor = cached_gpu_inputs[key]["paddle"]
         return self.paddle_tensor
 
     def get_gpu_torch_tensor(self, api_config, dtype=None):
@@ -2981,18 +3012,38 @@ class TensorConfig:
                         if isinstance(num_experts, TensorConfig):
                             num_experts = 32
                         seqlen = self.shape[0]
+                        # Fetch unzipped seqlen from hidden_states_unzipped (arg0) to
+                        # bound expert_counters so fetch_row never exceeds the valid
+                        # range of unzipped_token_probs / hidden_states_unzipped.
+                        hidden_config = self.get_arg(api_config, 0, "hidden_states_unzipped")
+                        if (
+                            isinstance(hidden_config, TensorConfig)
+                            and hidden_config.shape
+                            and len(hidden_config.shape) > 0
+                        ):
+                            unzipped_seqlen = hidden_config.shape[0]
+                        else:
+                            unzipped_seqlen = seqlen  # fallback
                         rowmap = numpy.full(self.shape, -1, dtype="int32")
                         if isinstance(routemap_config, TensorConfig):
                             if routemap_config.numpy_tensor is None:
                                 routemap_config.get_numpy_tensor(api_config, index=2)
                             if routemap_config.numpy_tensor is not None:
-                                # Build rowmap: for each expert, assign row indices in order
+                                # Build rowmap and keep routemap consistent: every
+                                # non-negative expert in routemap must map to a valid
+                                # fetch_row because moe_unpermute reads token_prob by it.
                                 expert_counters = numpy.zeros(num_experts, dtype="int32")
+                                routemap = routemap_config.numpy_tensor
                                 for i in range(seqlen):
                                     for e in range(num_experts):
-                                        if numpy.any(routemap_config.numpy_tensor[i] == e):
+                                        positions = numpy.where(routemap[i] == e)[0]
+                                        if positions.size == 0:
+                                            continue
+                                        if expert_counters[e] < unzipped_seqlen:
                                             rowmap[i, e] = expert_counters[e]
                                             expert_counters[e] += 1
+                                        else:
+                                            routemap[i, positions] = -1
                         self.numpy_tensor = rowmap
                     # token_prob_unzipped (arg3): float32, value in [0, 1]
                     elif self.check_arg(api_config, 3, "token_prob_unzipped"):
@@ -3014,7 +3065,7 @@ class TensorConfig:
                             scalar_val = (numpy.random.random() - 0.5) * 1.2
                             self.numpy_tensor = numpy.array(scalar_val, dtype=self.dtype)
                 elif self._use_gpu_cache(original_dtype):
-                    self._get_gpu_cache_entry(api_config, original_dtype)
+                    self.get_gpu_paddle_tensor(api_config, original_dtype)
                 elif USE_CACHED_NUMPY and self.dtype not in ["int64", "float64"]:
                     self.numpy_tensor = self.get_cached_numpy(self.dtype, self.shape, scale=1.2)
                 else:

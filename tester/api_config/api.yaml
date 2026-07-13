@@ -944,4 +944,29 @@ apis:
  - paddle._C_ops._run_custom_op
  - paddle.nn.functional.*
  - paddle.incubate.nn.functional.*
+ - paddle._C_ops.adam_
+ - paddle._C_ops.adamw_
+ - paddle._C_ops.cal_aux_loss_grad
+ - paddle._C_ops.cross_entropy_with_softmax
+ - paddle._C_ops.flash_attn
+ - paddle._C_ops.flash_attn_grad
+ - paddle._C_ops.flash_attn_v3
+ - paddle._C_ops.flash_attn_v3_grad
+ - paddle._C_ops.flashmask_attention
+ - paddle._C_ops.flashmask_attention_grad
+ - paddle._C_ops.flashmask_attention_v2
+ - paddle._C_ops.flashmask_attention_v2_grad
+ - paddle._C_ops.fused_linear_param_grad_add
+ - paddle._C_ops.fused_rms_norm_ext_grad
+ - paddle._C_ops.gather_grad
+ - paddle._C_ops.gaussian
+ - paddle._C_ops.matmul_grad
+ - paddle._C_ops.moe_combine_grad
+ - paddle._C_ops.moe_gate_dispatch_grad
+ - paddle._C_ops.put_along_axis_grad
+ - paddle._C_ops.reshape_grad
+ - paddle._C_ops.squared_l2_norm
+ - paddle._C_ops.swiglu_grad
+ - paddle._C_ops.topk_grad
+ - paddle._C_ops.uniform
 # - paddle._C_ops.*  # 默认关闭（上层接口已覆盖大多数场景）；若担心遗漏底层算子可取消注释

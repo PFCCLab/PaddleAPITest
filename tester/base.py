@@ -5,7 +5,6 @@ import inspect
 
 import numpy
 import paddle
-import torch
 import yaml
 
 from .api_config.config_analyzer import (
@@ -27,13 +26,26 @@ rand_apis = frozenset(config.get("rand_apis", []))
 stochastic_behavior_apis = frozenset(config.get("stochastic_behavior_apis", []))
 single_op_no_signature_apis = frozenset(config.get("single_op_no_signature_apis", []))
 
-paddle_error_dismiss = config.get("paddle_error_dismiss", {})
+paddle_error_dismiss = {}  # disabled: covered by classify_runtime_error()
+# paddle_error_dismiss = config.get("paddle_error_dismiss", {})
 special_accuracy_atol_rtol = config.get("special_accuracy_atol_rtol", {})
 
 with open("tester/api_config/torch_error_skip.txt") as f:
     torch_error_skip = frozenset(line.strip() for line in f if line.strip())
 
 del config
+
+
+class _LazyTorch:
+    def __getattr__(self, name):
+        import torch
+
+        globals()["torch"] = torch
+        return getattr(torch, name)
+
+
+torch = _LazyTorch()
+
 
 CUDA_ERROR = frozenset(
     [
@@ -46,8 +58,38 @@ CUDA_OOM = frozenset(
     [
         "CUDA out of memory",
         "Out of memory error",
+        "ResourceExhaustedError",
+        "out of memory",
+        "OutOfMemoryError",
     ]
 )
+
+
+def classify_runtime_error(error_msg):
+    error_msg_lower = error_msg.lower()
+    oom_markers = tuple(marker.lower() for marker in CUDA_OOM) + (
+        "cannot allocate memory",
+        "std::bad_alloc",
+        "bad allocation",
+        "memoryerror",
+        "cublas_status_alloc_failed",
+    )
+    if any(marker in error_msg_lower for marker in oom_markers):
+        return "oom", True
+    cuda_markers = tuple(marker.lower() for marker in CUDA_ERROR) + (
+        "illegal memory access",
+        "invalid configuration argument",
+        "invalid resource handle",
+    )
+    if any(marker in error_msg_lower for marker in cuda_markers):
+        return "paddle_cuda", True
+    # (Unimplemented): Paddle 已知不支持的功能，当前 case 无法有效验证
+    if "(unimplemented)" in error_msg_lower:
+        return "skip", False
+    # (InvalidArgument) / (PreconditionNotMet): 输入/配置不满足前提，归入配置输入问题
+    if "(invalidargument)" in error_msg_lower or "(preconditionnotmet)" in error_msg_lower:
+        return "config_input", False
+    return None, False
 
 
 def get_arg(api_config, arg_pos, arg_name, default=None):
@@ -175,11 +217,32 @@ no_signature_api_mappings.update(
 
 
 class APITestBase:
-    def __init__(self, api_config):
+    def __init__(self, api_config, use_torch=True):
         self.api_config = api_config
         self.outputs_grad_numpy = []
-        torch.set_num_threads(8)
-        torch.set_printoptions(threshold=100, linewidth=120)
+        self.outputs_grad_paddleonly = []
+        if use_torch:
+            torch.set_num_threads(8)
+            torch.set_printoptions(threshold=100, linewidth=120)
+
+    def report_runtime_error(self, err, default_log_type, phase="", allow_ignore_paddle=False):
+        err_msg = str(err)
+        log_type, fatal = classify_runtime_error(err_msg)
+        if log_type is None and allow_ignore_paddle and self.should_ignore_paddle_error(err_msg):
+            print(f"[pass] {self.api_config.config}", flush=True)
+            write_to_log("pass", self.api_config.config)
+            return "pass", False
+        if log_type is None:
+            log_type = default_log_type
+        elif default_log_type == "torch_error" and log_type != "oom":
+            log_type = "torch_error"
+        phase_text = f" phase={phase}" if phase else ""
+        print(
+            f"[{log_type}]{phase_text} {self.api_config.config}\n{err_msg}",
+            flush=True,
+        )
+        write_to_log(log_type, self.api_config.config)
+        return log_type, fatal
 
     def need_skip(self, paddle_only=False):
         # not support
@@ -744,11 +807,35 @@ class APITestBase:
             dtype=torch_dtype
         )
 
+    def _make_paddle_output_grad(self, shape, dtype):
+        if "int" in dtype:
+            return paddle.randint(-65535, 65535, tuple(shape), dtype="int64").cast(dtype)
+        if dtype in ["float8_e5m2", "float8_e4m3fn"]:
+            base_dtype = "float16"
+        elif dtype == "bfloat16":
+            base_dtype = "float32"
+        elif dtype.startswith("complex"):
+            real_dtype = "float32" if dtype == "complex64" else "float64"
+            real_part = paddle.rand(tuple(shape), dtype=real_dtype) - 0.5
+            imag_part = paddle.rand(tuple(shape), dtype=real_dtype) - 0.5
+            return (real_part + 1j * imag_part).cast(dtype)
+        else:
+            base_dtype = dtype
+        return (paddle.rand(tuple(shape), dtype=base_dtype) - 0.5).cast(dtype)
+
     def _use_gpu_output_grad(self, output):
-        if not is_gpu_cache_mode() or not torch.cuda.is_available():
+        if not is_gpu_cache_mode() or "gpu" not in paddle.device.get_device():
             return False
         dtype = str(output.dtype).split(".")[-1]
         return dtype in ["float32", "float64", "float16", "bfloat16", "complex64", "complex128"]
+
+    def _get_gpu_output_grad_paddleonly(self, output, index):
+        if len(self.outputs_grad_paddleonly) <= index:
+            dtype = str(output.dtype).split(".")[-1]
+            paddle_grad = self._make_paddle_output_grad(output.shape, dtype)
+            paddle_grad.stop_gradient = False
+            self.outputs_grad_paddleonly.append(paddle_grad)
+        return self.outputs_grad_paddleonly[index]
 
     def _get_gpu_output_grad_pair(self, output, index):
         if len(self.outputs_grad_numpy) <= index:
@@ -807,10 +894,10 @@ class APITestBase:
                     raise ValueError("outputs format not support")
 
         result_outputs_grads = []
-        if len(self.outputs_grad_numpy) == 0:
+        if len(self.outputs_grad_numpy) == 0 and len(self.outputs_grad_paddleonly) == 0:
             for i, output in enumerate(result_outputs):
                 if self._use_gpu_output_grad(output):
-                    self._get_gpu_output_grad_pair(output, i)
+                    self._get_gpu_output_grad_paddleonly(output, i)
                     continue
                 dtype = str(output.dtype).split(".")[-1]
                 if USE_CACHED_NUMPY:
@@ -830,6 +917,8 @@ class APITestBase:
                             numpy_dtype = dtype
                         numpy_tensor = (numpy.random.random(output.shape) - 0.5).astype(numpy_dtype)
                 self.outputs_grad_numpy.append(numpy_tensor)
+        for paddle_grad in self.outputs_grad_paddleonly:
+            result_outputs_grads.append(paddle_grad)
         for i, numpy_tensor in enumerate(self.outputs_grad_numpy):
             if isinstance(numpy_tensor, tuple):
                 result_outputs_grads.append(numpy_tensor[0])

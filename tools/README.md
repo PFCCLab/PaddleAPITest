@@ -56,7 +56,7 @@
 
 - `normalize_origin_api_config.py`：历史配置归一化/整理脚本，当前包含较多历史硬编码逻辑；使用前应先确认输入输出路径。
 
-- `shrink_large_configs.py`：针对 crash、OOM、timeout、numpy_error 中的大 Tensor 配置缩小 shape，生成缩小后的回归配置。
+- `shrink_large_configs.py`：针对 paddle_crash、OOM、timeout、config_input 中的大 Tensor 配置缩小 shape，生成缩小后的回归配置。
   ```bash
   python tools/shrink_large_configs.py --error-logs test_log --source-configs source.txt --output shrunk.txt --factor 4
   ```
@@ -86,7 +86,7 @@
 
 ## 错误统计工具
 
-- `error_stat/error_stat.py`：整理 `log_inorder.log` 与 `api_config_*.txt`，输出 pass、error、invalid 分类统计目录 `error_stat_result/`。
+- `error_stat/error_stat.py`：整理 `log_inorder.log` 与 `api_config_*.txt`，输出 pass、skip、Paddle 问题、可重测和框架阻塞分类目录 `error_stat_result/`。
   ```bash
   python tools/error_stat/error_stat.py -i tester/api_config/test_log -o tester/api_config/test_log
   python tools/error_stat/error_stat.py -i tester/api_config/test_log --split-errors

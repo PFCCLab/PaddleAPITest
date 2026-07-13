@@ -262,7 +262,7 @@ class APITestPaddleDeviceVSGPU(APITestCustomDeviceVSCPU):
                     f"[compare] Forward accuracy check failed for {self.api_config.config}, error: {e}",
                     flush=True,
                 )
-                write_to_log("accuracy_error", self.api_config.config)
+                write_to_log("paddle_accuracy", self.api_config.config)
                 return False
 
             # 对比Backward梯度（如果存在且Forward通过）
@@ -324,7 +324,7 @@ class APITestPaddleDeviceVSGPU(APITestCustomDeviceVSCPU):
                 f"[compare] Comparison failed for {self.api_config.config}, error: {e}",
                 flush=True,
             )
-            write_to_log("accuracy_error", self.api_config.config)
+            write_to_log("paddle_accuracy", self.api_config.config)
             return False
 
     def test(self):

@@ -12,17 +12,18 @@ DEFAULT_OUTPUT_FILE_NAME = "api_config_skip.txt"
 LOG_PREFIXES = {
     "checkpoint": "checkpoint",
     "pass": "api_config_pass",
-    "crash": "api_config_crash",
+    "skip": "api_config_skip",
+    "paddle_error": "api_config_paddle_error",
+    "paddle_accuracy": "api_config_paddle_accuracy",
+    "paddle_bitwise": "api_config_paddle_bitwise",
+    "paddle_cuda": "api_config_paddle_cuda",
+    "paddle_crash": "api_config_paddle_crash",
     "oom": "api_config_oom",
     "timeout": "api_config_timeout",
-    "paddle_error": "api_config_paddle_error",
-    "accuracy_error": "api_config_accuracy_error",
-    "accuracy_diff": "api_config_accuracy_diff",
     "torch_error": "api_config_torch_error",
-    "paddle_to_torch_failed": "api_config_paddle_to_torch_failed",
-    "match_error": "api_config_match_error",
-    "numpy_error": "api_config_numpy_error",
-    "cuda_error": "api_config_cuda_error",
+    "config_input": "api_config_config_input",
+    "config_parse": "api_config_config_parse",
+    "config_convert": "api_config_config_convert",
 }
 
 

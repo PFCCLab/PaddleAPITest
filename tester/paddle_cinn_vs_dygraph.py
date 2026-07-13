@@ -28,7 +28,7 @@ class APITestCINNVSDygraph(APITestBase):
                 return
         except Exception as err:
             print(f"[numpy error] {self.api_config.config}\n{err!s}", flush=True)
-            write_to_log("numpy_error", self.api_config.config)
+            write_to_log("config_input", self.api_config.config)
             return
 
         if not self.gen_paddle_input():
@@ -68,7 +68,7 @@ class APITestCINNVSDygraph(APITestBase):
                 print(
                     f"[cuda error] dynamic forward {self.api_config.config}\n{err!s}",
                 )
-                write_to_log("cuda_error", self.api_config.config)
+                write_to_log("paddle_cuda", self.api_config.config)
                 raise
             if any(cuda_err in str(err) for cuda_err in CUDA_OOM):
                 print(
@@ -90,7 +90,7 @@ class APITestCINNVSDygraph(APITestBase):
                 f"[cuda error] dynamic forward {self.api_config.config}\n{err!s}",
                 flush=True,
             )
-            write_to_log("cuda_error", self.api_config.config)
+            write_to_log("paddle_cuda", self.api_config.config)
             raise
 
         need_check_grad = self.test_backward and self.need_check_grad()
@@ -119,7 +119,7 @@ class APITestCINNVSDygraph(APITestBase):
                         f"[numpy error] dynamic backward {self.api_config.config}\n{err!s}",
                         flush=True,
                     )
-                    write_to_log("numpy_error", self.api_config.config)
+                    write_to_log("config_input", self.api_config.config)
                     return
                 if self.should_ignore_paddle_error(str(err)):
                     print(f"[Pass] {self.api_config.config}", flush=True)
@@ -130,7 +130,7 @@ class APITestCINNVSDygraph(APITestBase):
                         f"[cuda error] dynamic backward {self.api_config.config}\n{err!s}",
                         flush=True,
                     )
-                    write_to_log("cuda_error", self.api_config.config)
+                    write_to_log("paddle_cuda", self.api_config.config)
                     raise
                 if any(cuda_err in str(err) for cuda_err in CUDA_OOM):
                     print(
@@ -153,7 +153,7 @@ class APITestCINNVSDygraph(APITestBase):
                     f"[cuda error] dynamic backward {self.api_config.config}\n{err!s}",
                     flush=True,
                 )
-                write_to_log("cuda_error", self.api_config.config)
+                write_to_log("paddle_cuda", self.api_config.config)
                 raise
 
         try:
@@ -237,7 +237,7 @@ class APITestCINNVSDygraph(APITestBase):
                     f"[numpy error] static backward {self.api_config.config}\n{err!s}",
                     flush=True,
                 )
-                write_to_log("numpy_error", self.api_config.config)
+                write_to_log("config_input", self.api_config.config)
                 return
             if self.should_ignore_paddle_error(str(err)):
                 print(f"[Pass] {self.api_config.config}", flush=True)
@@ -247,7 +247,7 @@ class APITestCINNVSDygraph(APITestBase):
                 print(
                     f"[cuda error] static {self.api_config.config}\n{err!s}",
                 )
-                write_to_log("cuda_error", self.api_config.config)
+                write_to_log("paddle_cuda", self.api_config.config)
                 raise
             if any(cuda_err in str(err) for cuda_err in CUDA_OOM):
                 print(
@@ -269,7 +269,7 @@ class APITestCINNVSDygraph(APITestBase):
                 f"[cuda error] static {self.api_config.config}\n{err!s}",
                 flush=True,
             )
-            write_to_log("cuda_error", self.api_config.config)
+            write_to_log("paddle_cuda", self.api_config.config)
             raise
 
         if not self.compare(dynamic_fwd_output, static_fwd_output):
@@ -292,7 +292,7 @@ class APITestCINNVSDygraph(APITestBase):
                     f"dygraph: {type(dygraph_output)}, static: {type(static_output)}\n",
                     flush=True,
                 )
-                write_to_log("match_error", self.api_config.config)
+                write_to_log("config_parse", self.api_config.config)
                 return False
             try:
                 self.paddle_assert_accuracy(dygraph_output, static_output)
@@ -301,7 +301,7 @@ class APITestCINNVSDygraph(APITestBase):
                     f"[accuracy error] {backward_str}{self.api_config.config}\n{err!s}",
                     flush=True,
                 )
-                write_to_log("accuracy_error", self.api_config.config)
+                write_to_log("paddle_accuracy", self.api_config.config)
                 return False
         elif isinstance(dygraph_output, (list, tuple)):
             if not isinstance(static_output, (list, tuple)):
@@ -310,7 +310,7 @@ class APITestCINNVSDygraph(APITestBase):
                     f"dygraph: {type(dygraph_output)}, static: {type(static_output)}\n",
                     flush=True,
                 )
-                write_to_log("match_error", self.api_config.config)
+                write_to_log("config_parse", self.api_config.config)
                 return False
             dygraph_output = list(dygraph_output)
             static_output = list(static_output)
@@ -320,7 +320,7 @@ class APITestCINNVSDygraph(APITestBase):
                     f"dygraph: {len(dygraph_output)}, static: {len(static_output)}\n",
                     flush=True,
                 )
-                write_to_log("match_error", self.api_config.config)
+                write_to_log("config_parse", self.api_config.config)
                 return False
             for i, (dygraph_item, static_item) in enumerate(
                 zip(dygraph_output, static_output, strict=False)
@@ -335,7 +335,7 @@ class APITestCINNVSDygraph(APITestBase):
                         f"dygraph: {type(dygraph_item)}, static: {type(static_item)}\n",
                         flush=True,
                     )
-                    write_to_log("match_error", self.api_config.config)
+                    write_to_log("config_parse", self.api_config.config)
                     return False
                 try:
                     self.paddle_assert_accuracy(dygraph_item, static_item)
@@ -344,7 +344,7 @@ class APITestCINNVSDygraph(APITestBase):
                         f"[accuracy error] {backward_str}{self.api_config.config}\n{err!s}",
                         flush=True,
                     )
-                    write_to_log("accuracy_error", self.api_config.config)
+                    write_to_log("paddle_accuracy", self.api_config.config)
                     return False
         elif dygraph_output is None and static_output is None:
             pass
@@ -354,6 +354,6 @@ class APITestCINNVSDygraph(APITestBase):
                 f"dygraph: {type(dygraph_output)}, static: {type(static_output)}\n",
                 flush=True,
             )
-            write_to_log("match_error", self.api_config.config)
+            write_to_log("config_parse", self.api_config.config)
             return False
         return True
