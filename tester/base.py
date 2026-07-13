@@ -27,7 +27,8 @@ rand_apis = frozenset(config.get("rand_apis", []))
 stochastic_behavior_apis = frozenset(config.get("stochastic_behavior_apis", []))
 single_op_no_signature_apis = frozenset(config.get("single_op_no_signature_apis", []))
 
-paddle_error_dismiss = config.get("paddle_error_dismiss", {})
+paddle_error_dismiss = {}  # disabled: covered by classify_runtime_error()
+# paddle_error_dismiss = config.get("paddle_error_dismiss", {})
 special_accuracy_atol_rtol = config.get("special_accuracy_atol_rtol", {})
 
 with open("tester/api_config/torch_error_skip.txt") as f:
@@ -71,6 +72,12 @@ def classify_runtime_error(error_msg):
     )
     if any(marker in error_msg_lower for marker in cuda_markers):
         return "paddle_cuda", True
+    # (Unimplemented): Paddle 已知不支持的功能，当前 case 无法有效验证
+    if "(unimplemented)" in error_msg_lower:
+        return "skip", False
+    # (InvalidArgument) / (PreconditionNotMet): 输入/配置不满足前提，归入配置输入问题
+    if "(invalidargument)" in error_msg_lower or "(preconditionnotmet)" in error_msg_lower:
+        return "config_input", False
     return None, False
 
 

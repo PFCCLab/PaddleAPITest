@@ -34,16 +34,6 @@ LOG_PREFIXES = {
     "config_convert": "api_config_config_convert",
 }
 
-LOG_ALIASES = {
-    "numpy_error": "config_input",
-    "match_error": "config_parse",
-    "paddle_to_torch_failed": "config_convert",
-    "accuracy_error": "paddle_accuracy",
-    "accuracy_diff": "paddle_bitwise",
-    "cuda_error": "paddle_cuda",
-    "crash": "paddle_crash",
-}
-
 TERMINAL_LOG_TYPES = frozenset(LOG_PREFIXES) - {"checkpoint"}
 
 _is_engineV2 = False
@@ -138,7 +128,6 @@ def write_terminal_log(log_type, line):
 
 def get_log_file(log_type: str):
     """获取指定日志类型和PID对应的日志文件路径"""
-    log_type = LOG_ALIASES.get(log_type, log_type)
     if log_type not in LOG_PREFIXES:
         raise ValueError(f"Invalid log type: {log_type}")
     prefix = LOG_PREFIXES[log_type]
@@ -152,7 +141,6 @@ def get_log_file(log_type: str):
 
 def write_to_log(log_type, line):
     """添加单条日志到当前进程的日志文件"""
-    log_type = LOG_ALIASES.get(log_type, log_type)
     line = line.strip()
     if not line:
         return
@@ -173,7 +161,6 @@ def write_to_log(log_type, line):
 
 def read_log(log_type):
     """读取文件所有行，返回集合"""
-    log_type = LOG_ALIASES.get(log_type, log_type)
     if log_type not in LOG_PREFIXES:
         raise ValueError(f"Invalid log type: {log_type}")
     cfg = get_cfg()

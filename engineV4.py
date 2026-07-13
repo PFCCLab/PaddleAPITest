@@ -1941,7 +1941,7 @@ def main():
                     )
                 elif msg_type == "crashed":
                     if exitcode == 99:
-                        write_to_log("cuda_error", config)
+                        write_to_log("paddle_cuda", config)
                         print(
                             f"[error] CUDA error for {config}",
                             flush=True,
@@ -1956,13 +1956,13 @@ def main():
                         options.use_compute_sanitizer
                         and exitcode == options.sanitizer_error_exitcode
                     ):
-                        write_to_log("cuda_error", config)
+                        write_to_log("paddle_cuda", config)
                         print(
                             f"[error] compute-sanitizer reported errors for {config} (exit={exitcode})",
                             flush=True,
                         )
                     else:
-                        write_to_log("crash", config)
+                        write_to_log("paddle_crash", config)
                         print(
                             f"[fatal] Worker crashed for {config} (exit={exitcode})",
                             flush=True,

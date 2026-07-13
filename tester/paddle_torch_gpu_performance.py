@@ -680,21 +680,21 @@ class APITestPaddleTorchGPUPerformance(APITestBase):
                 f"[paddle_to_torch] Conversion failed for {self.api_config.config}: {e!s}",
                 flush=True,
             )
-            write_to_log("paddle_to_torch_failed", self.api_config.config)
+            write_to_log("config_convert", self.api_config.config)
             return
         if not convert_result.is_supported:
             print(
                 f"[paddle_to_torch] Unsupported API {self.api_config.api_name}: {convert_result.error_message}",
                 flush=True,
             )
-            write_to_log("paddle_to_torch_failed", self.api_config.config)
+            write_to_log("config_convert", self.api_config.config)
             return
         if not convert_result.code or not convert_result.code.is_valid():
             print(
                 f"[paddle_to_torch] No code generated for {self.api_config.api_name}",
                 flush=True,
             )
-            write_to_log("paddle_to_torch_failed", self.api_config.config)
+            write_to_log("config_convert", self.api_config.config)
             return
 
         numel = total_numel(self.api_config)
@@ -719,7 +719,7 @@ class APITestPaddleTorchGPUPerformance(APITestBase):
                 return
         except Exception as err:
             print("[numpy error]", self.api_config.config, "\n", str(err))
-            write_to_log("numpy_error", self.api_config.config)
+            write_to_log("config_input", self.api_config.config)
             return
 
         try:

@@ -238,7 +238,7 @@ class APITestCustomDeviceVSCPU(APITestBase):
             target_device, device_id = self.custom_device_type, self.custom_device_id
         else:
             print("[no available device]", self.api_config.config, flush=True)
-            write_to_log("crash", self.api_config.config)
+            write_to_log("paddle_crash", self.api_config.config)
             return
 
         # 3. Parse Paddle API information
@@ -253,7 +253,7 @@ class APITestCustomDeviceVSCPU(APITestBase):
                 return
         except Exception as err:
             print("[numpy error]", self.api_config.config, "\n", str(err))
-            write_to_log("numpy_error", self.api_config.config)
+            write_to_log("config_input", self.api_config.config)
             return
 
         # 5. Run API on CPU (including forward and backward)
@@ -354,7 +354,7 @@ class APITestCustomDeviceVSCPU(APITestBase):
             write_to_log("pass", self.api_config.config)
         else:
             print("[Fail]", self.api_config.config, flush=True)
-            write_to_log("accuracy_error", self.api_config.config)
+            write_to_log("paddle_accuracy", self.api_config.config)
             # 生成可复现的单测文件
             if self.generate_failed_tests:
                 try:

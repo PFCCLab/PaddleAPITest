@@ -247,10 +247,10 @@ def _transform_line(line: str, factor: float, threshold: int) -> str:
 # ---------------------------------------------------------------------------
 
 ERROR_FILE_NAMES = {
-    "crash": "api_config_crash.txt",
+    "paddle_crash": "api_config_paddle_crash.txt",
     "oom": "api_config_oom.txt",
     "timeout": "api_config_timeout.txt",
-    "numpy_error": "api_config_numpy_error.txt",
+    "config_input": "api_config_config_input.txt",
 }
 
 
@@ -296,7 +296,7 @@ def load_source_lines(source_configs: list[Path]) -> list[str]:
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Shrink large Tensor shapes in API configs that caused crash/oom/timeout/numpy_error."
+        description="Shrink large Tensor shapes in API configs that caused paddle_crash/oom/timeout/config_input."
     )
     parser.add_argument(
         "--error-logs",
@@ -334,8 +334,8 @@ def main() -> None:
     parser.add_argument(
         "--error-types",
         nargs="+",
-        default=["crash", "oom", "timeout", "numpy_error"],
-        choices=["crash", "oom", "timeout", "numpy_error"],
+        default=["paddle_crash", "oom", "timeout", "config_input"],
+        choices=["paddle_crash", "oom", "timeout", "config_input"],
         help="Which error types to include (default: all four).",
     )
     parser.add_argument(
