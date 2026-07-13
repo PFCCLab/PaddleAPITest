@@ -9,6 +9,7 @@ import re
 
 import numpy
 import paddle
+import yaml
 
 
 class _LazyTorch:
@@ -27,6 +28,20 @@ USE_GPU_CACHE_MODE = os.getenv("USE_GPU_CACHE_MODE", "False").lower() == "true"
 SKIP_GPU_CLEANUP = os.getenv("SKIP_GPU_CLEANUP", "False").lower() == "true"
 cached_numpy = {}
 cached_gpu_inputs = {}
+AUTOGRAD_DTYPES = frozenset(
+    ["float32", "float64", "float16", "complex64", "complex128", "bfloat16"]
+)
+FLOAT8_DTYPES = frozenset(["float8_e5m2", "float8_e4m3fn"])
+CAST_THROUGH_INTERMEDIATE_DTYPES = frozenset(["bfloat16"]) | FLOAT8_DTYPES
+
+
+def _load_forward_only_apis():
+    config_path = os.path.join(os.path.dirname(__file__), "..", "base_config.yaml")
+    with open(config_path, encoding="utf-8") as f:
+        return frozenset(yaml.safe_load(f).get("forward_only_apis", []))
+
+
+FORWARD_ONLY_APIS = _load_forward_only_apis()
 
 
 def _env_bool(name, default=False):
@@ -252,6 +267,19 @@ class TensorConfig:
             return False
         return True
 
+    def _supports_autograd(self, dtype=None):
+        dtype = dtype or self.dtype
+        return dtype in AUTOGRAD_DTYPES
+
+    def _requires_autograd(self, api_config, dtype=None):
+        if not self._supports_autograd(dtype):
+            return False
+        api_name = getattr(api_config, "api_name", "")
+        api = api_name[api_name.rindex(".") + 1 :] if "." in api_name else api_name
+        if api in FORWARD_ONLY_APIS:
+            return False
+        return getattr(api_config, "test_backward", True)
+
     def _gpu_cache_key(self, api_config, dtype=None):
         dtype = dtype or self.dtype
         location = (
@@ -259,7 +287,13 @@ class TensorConfig:
             getattr(self, "key", None),
             tuple(getattr(self, "list_index", [])),
         )
-        return (api_config.config, location, dtype, _shape_tuple(self.shape))
+        return (
+            api_config.config,
+            location,
+            dtype,
+            _shape_tuple(self.shape),
+            self._requires_autograd(api_config, dtype),
+        )
 
     def _make_gpu_paddle_tensor(self, dtype=None):
         dtype = dtype or self.dtype
@@ -279,7 +313,7 @@ class TensorConfig:
         paddle_tensor.stop_gradient = False
         return paddle_tensor
 
-    def _make_gpu_cache_tensors(self, dtype=None):
+    def _make_gpu_cache_tensors(self, api_config, dtype=None):
         dtype = dtype or self.dtype
         torch_dtype = self.convert_dtype_to_torch_type(dtype)
         shape = tuple(self.shape)
@@ -301,21 +335,22 @@ class TensorConfig:
             base = (torch.rand(shape, device=device, dtype=torch.float32) - 0.5) * 1.2
             torch_tensor = base.to(dtype=torch_dtype)
 
+        requires_autograd = self._requires_autograd(api_config, dtype)
         torch_source = torch_tensor.detach()
         paddle_tensor = paddle.utils.dlpack.from_dlpack(
             torch.utils.dlpack.to_dlpack(torch_source.clone())
         )
-        paddle_tensor.stop_gradient = False
+        paddle_tensor.stop_gradient = not requires_autograd
         torch_tensor = torch_source.clone()
-        if dtype in ["float32", "float64", "float16", "complex64", "complex128", "bfloat16"]:
-            torch_tensor = torch_tensor.requires_grad_(True)
+        if requires_autograd:
+            torch_tensor = torch_tensor.detach().requires_grad_(True)
         return paddle_tensor, torch_tensor
 
     def _get_gpu_cache_entry(self, api_config, dtype=None):
         dtype = dtype or self.dtype
         key = self._gpu_cache_key(api_config, dtype)
         if key not in cached_gpu_inputs:
-            paddle_tensor, torch_tensor = self._make_gpu_cache_tensors(dtype)
+            paddle_tensor, torch_tensor = self._make_gpu_cache_tensors(api_config, dtype)
             cached_gpu_inputs[key] = {
                 "paddle": paddle_tensor,
                 "torch": torch_tensor,
@@ -3072,12 +3107,11 @@ class TensorConfig:
                     f"is_contiguous: {self.paddle_tensor.is_contiguous()}"
                 )
             else:
+                requires_autograd = self._requires_autograd(api_config)
                 intermediate_dtype = (
                     "float32"
                     if self.dtype == "bfloat16"
-                    else (
-                        "float16" if self.dtype in ["float8_e5m2", "float8_e4m3fn"] else self.dtype
-                    )
+                    else ("float16" if self.dtype in FLOAT8_DTYPES else self.dtype)
                 )
                 self.paddle_tensor = paddle.to_tensor(
                     self.get_numpy_tensor(api_config),
@@ -3085,11 +3119,11 @@ class TensorConfig:
                     place=self.place,
                 )
 
-                self.paddle_tensor.stop_gradient = False
                 if self.dtype == "bfloat16":
                     self.paddle_tensor = paddle.cast(self.paddle_tensor, dtype="bfloat16")
-                elif self.dtype in ["float8_e5m2", "float8_e4m3fn"]:
+                elif self.dtype in FLOAT8_DTYPES:
                     self.paddle_tensor = paddle.cast(self.paddle_tensor, dtype=self.dtype)
+                self.paddle_tensor.stop_gradient = not requires_autograd
         if TEST_NON_CONTIGUOUS:
             if not self.shuffle_dims:
                 ndim = self.paddle_tensor.dim()
@@ -3112,9 +3146,7 @@ class TensorConfig:
         original_flag = paddle.get_flags([flag_name])
         paddle.set_flags({flag_name: False})
         try:
-            intermediate_dtype = (
-                "float16" if self.dtype in ["float8_e5m2", "float8_e4m3fn"] else self.dtype
-            )
+            intermediate_dtype = "float16" if self.dtype in FLOAT8_DTYPES else self.dtype
             storage_size = self._strided_storage_size()
             flat_tensor = paddle.zeros(
                 [storage_size],
@@ -3129,11 +3161,11 @@ class TensorConfig:
                     dtype=intermediate_dtype,
                     place=self.place,
                 )
-            if self.dtype in ["float8_e5m2", "float8_e4m3fn"]:
+            if self.dtype in FLOAT8_DTYPES:
                 flat_tensor = paddle.cast(flat_tensor, dtype=self.dtype)
                 tensor = paddle.as_strided(flat_tensor, self.shape, self.strides)
 
-            tensor.stop_gradient = False
+            tensor.stop_gradient = not self._requires_autograd(api_config)
             return tensor
         finally:
             paddle.set_flags(original_flag)
@@ -3147,32 +3179,25 @@ class TensorConfig:
             if not self.is_contiguous and self.strides is not None:
                 self.torch_tensor = self._create_strided_torch_tensor(api_config)
             else:
-                needs_intermediate = self.dtype in ["bfloat16", "float8_e5m2", "float8_e4m3fn"]
-                if needs_intermediate:
+                needs_cast = self.dtype in CAST_THROUGH_INTERMEDIATE_DTYPES
+                if needs_cast:
                     intermediate_torch_dtype = (
                         torch.float32 if self.dtype == "bfloat16" else torch.float16
                     )
                 else:
                     intermediate_torch_dtype = self.convert_dtype_to_torch_type(self.dtype)
+                requires_grad = self._requires_autograd(api_config)
                 self.torch_tensor = torch.tensor(
                     self.get_numpy_tensor(api_config),
                     dtype=intermediate_torch_dtype,
-                    requires_grad=self.dtype
-                    in [
-                        "float32",
-                        "float64",
-                        "float16",
-                        "complex64",
-                        "complex128",
-                        "bfloat16",
-                    ],
+                    requires_grad=requires_grad and not needs_cast,
                 )
-                if self.dtype == "bfloat16":
-                    self.torch_tensor = self.torch_tensor.to(dtype=torch.bfloat16)
-                elif self.dtype in ["float8_e5m2", "float8_e4m3fn"]:
+                if needs_cast:
                     self.torch_tensor = self.torch_tensor.to(
                         dtype=self.convert_dtype_to_torch_type(self.dtype)
                     )
+                    if requires_grad:
+                        self.torch_tensor = self.torch_tensor.detach().requires_grad_(True)
         if TEST_NON_CONTIGUOUS:
             if not self.shuffle_dims:
                 ndim = self.torch_tensor.dim()
@@ -3185,7 +3210,7 @@ class TensorConfig:
     def _create_strided_torch_tensor(self, api_config):
         """Create a non-contiguous torch tensor from the shared logical numpy input."""
         device = torch.device("cuda:0") if torch.cuda.is_available() else torch.device("cpu")
-        needs_intermediate = self.dtype in ["float8_e5m2", "float8_e4m3fn"]
+        needs_intermediate = self.dtype in FLOAT8_DTYPES
         if needs_intermediate:
             intermediate_torch_dtype = torch.float16
         else:
@@ -3206,19 +3231,11 @@ class TensorConfig:
                     device=device,
                 )
             )
-        if self.dtype in ["float8_e5m2", "float8_e4m3fn"]:
+        if self.dtype in FLOAT8_DTYPES:
             flat_tensor = flat_tensor.to(dtype=self.convert_dtype_to_torch_type(self.dtype))
             tensor = torch.as_strided(flat_tensor, self.shape, self.strides)
 
-        requires_grad = self.dtype in [
-            "float32",
-            "float64",
-            "float16",
-            "complex64",
-            "complex128",
-            "bfloat16",
-        ]
-        if requires_grad:
+        if self._requires_autograd(api_config):
             tensor = tensor.detach().requires_grad_(True)
         return tensor
 
