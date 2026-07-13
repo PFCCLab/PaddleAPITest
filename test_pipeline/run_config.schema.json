@@ -1,0 +1,98 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "run_config.schema.json",
+  "title": "PaddleAPITest Run Config",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "name": {"type": "string", "description": "任务名称，用于默认 PID 文件名。"},
+    "runner": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "engine": {"type": "string", "enum": ["engineV4", "engineV2"], "default": "engineV4"},
+        "foreground": {"type": "boolean", "default": false},
+        "dry_run": {"type": "boolean", "default": false},
+        "pid_file": {"type": "string", "description": "可选；省略时 run.py 使用 .run/<name>.pid。"}
+      }
+    },
+    "env": {
+      "type": "object",
+      "description": "运行前导出的环境变量。常用于 Paddle Flags，例如 FLAGS_use_system_allocator、FLAGS_check_cuda_error、FLAGS_check_nan_inf、FLAGS_use_accuracy_compatible_kernel。",
+      "additionalProperties": {"type": ["string", "number", "boolean", "null"]}
+    },
+    "input": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "api_config": {"type": ["string", "null"], "description": "单条 case 配置，对应 --api_config。"},
+        "api_config_file": {"type": ["string", "null"], "description": "单个配置文件，对应 --api_config_file。"},
+        "api_config_file_pattern": {"type": ["string", "null"], "description": "多文件 glob，对应 --api_config_file_pattern。"}
+      }
+    },
+    "output": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "log_dir": {"type": "string", "description": "engine 分类日志和 run.py 主日志目录。"}
+      },
+      "required": ["log_dir"]
+    },
+    "retest": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "enabled": {"type": "boolean", "default": false},
+        "rounds": {"type": "integer", "minimum": 1, "default": 1},
+        "error_configs": {"type": ["array", "null"], "items": {"type": "string"}},
+        "log_dir_template": {
+          "type": "string",
+          "description": "支持 {base_log_dir}, {previous_log_dir}, {round}, {error_config}, {error_name}。"
+        },
+        "skip_unavailable": {"type": "boolean", "default": true},
+        "skip_missing": {"type": "boolean", "description": "兼容旧字段；新配置请使用 skip_unavailable。"},
+        "skip_empty": {"type": "boolean", "description": "兼容旧字段；新配置请使用 skip_unavailable。"}
+      }
+    },
+    "engine_args": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "paddle_only": {"type": "boolean", "description": "对应 --paddle_only。"},
+        "paddle_cinn": {"type": "boolean", "description": "对应 --paddle_cinn。"},
+        "accuracy": {"type": "boolean", "description": "对应 --accuracy。"},
+        "paddle_gpu_performance": {"type": "boolean", "description": "对应 --paddle_gpu_performance。"},
+        "torch_gpu_performance": {"type": "boolean", "description": "对应 --torch_gpu_performance。"},
+        "paddle_torch_gpu_performance": {"type": "boolean", "description": "对应 --paddle_torch_gpu_performance。"},
+        "accuracy_stable": {"type": "boolean", "description": "对应 --accuracy_stable。"},
+        "paddle_custom_device": {"type": "boolean", "description": "对应 --paddle_custom_device。"},
+        "custom_device_vs_gpu": {"type": "boolean", "description": "对应 --custom_device_vs_gpu。"},
+        "test_amp": {"type": "boolean", "description": "对应 --test_amp。"},
+        "num_gpus": {"type": "integer", "description": "对应 --num_gpus。"},
+        "num_workers_per_gpu": {"type": "integer", "description": "对应 --num_workers_per_gpu。"},
+        "gpu_ids": {"type": "string", "description": "对应 --gpu_ids。"},
+        "required_memory": {"type": "number", "description": "对应 --required_memory。"},
+        "test_cpu": {"type": "boolean", "description": "对应 --test_cpu。"},
+        "use_cached_numpy": {"type": "boolean", "description": "对应 --use_cached_numpy。"},
+        "use_gpu_cache_mode": {"type": "boolean", "description": "对应 --use_gpu_cache_mode。"},
+        "atol": {"type": "number", "description": "对应 --atol。"},
+        "rtol": {"type": "number", "description": "对应 --rtol。"},
+        "manual_threshold_config_file": {"type": "string", "description": "对应 --manual_threshold_config_file。"},
+        "test_tol": {"type": "boolean", "description": "对应 --test_tol。"},
+        "test_backward": {"type": "boolean", "description": "对应 --test_backward。"},
+        "timeout": {"type": "integer", "description": "对应 --timeout。"},
+        "show_runtime_status": {"type": "boolean", "description": "对应 --show_runtime_status。"},
+        "random_seed": {"type": "integer", "description": "对应 --random_seed。"},
+        "custom_device_vs_gpu_mode": {"type": "string", "enum": ["upload", "download"], "description": "对应 --custom_device_vs_gpu_mode。"},
+        "bitwise_alignment": {"type": "boolean", "description": "对应 --bitwise_alignment。"},
+        "generate_failed_tests": {"type": "boolean", "description": "对应 --generate_failed_tests。"},
+        "exit_on_error": {"type": "boolean", "description": "对应 --exit_on_error。"},
+        "use_compute_sanitizer": {"type": "boolean", "description": "engineV4 only，对应 --use_compute_sanitizer。"},
+        "sanitizer_command": {"type": "string", "description": "engineV4 only，对应 --sanitizer_command。"},
+        "sanitizer_error_exitcode": {"type": "integer", "description": "engineV4 only，对应 --sanitizer_error_exitcode。"},
+        "_sanitizer_child": {"type": "boolean", "description": "engineV4 内部参数，对应 --_sanitizer_child；普通配置不要使用。"}
+      }
+    }
+  },
+  "required": ["input", "output"]
+}

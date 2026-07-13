@@ -9,7 +9,17 @@ import re
 
 import numpy
 import paddle
-import torch
+
+
+class _LazyTorch:
+    def __getattr__(self, name):
+        import torch
+
+        globals()["torch"] = torch
+        return getattr(torch, name)
+
+
+torch = _LazyTorch()
 
 USE_CACHED_NUMPY = os.getenv("USE_CACHED_NUMPY", "False").lower() == "true"
 TEST_NON_CONTIGUOUS = os.getenv("TEST_NON_CONTIGUOUS", "0").lower() in ("true", "1")
@@ -230,9 +240,9 @@ class TensorConfig:
         dtype = dtype or self.dtype
         if not is_gpu_cache_mode():
             return False
-        if not torch.cuda.is_available():
-            return False
         if self.place is not None and "cpu" in str(self.place).lower():
+            return False
+        if "gpu" not in paddle.device.get_device():
             return False
         if not self.is_contiguous or self.strides is not None:
             return False
@@ -248,6 +258,24 @@ class TensorConfig:
             tuple(getattr(self, "list_index", [])),
         )
         return (api_config.config, location, dtype, _shape_tuple(self.shape))
+
+    def _make_gpu_paddle_tensor(self, dtype=None):
+        dtype = dtype or self.dtype
+        shape = tuple(self.shape)
+        if dtype == "bool":
+            paddle_tensor = paddle.randint(0, 2, shape, dtype="int32").cast("bool")
+        elif "int" in dtype or dtype == "uint8":
+            paddle_tensor = paddle.randint(-65535, 65535, shape, dtype="int64").cast(dtype)
+        elif dtype.startswith("complex"):
+            real_dtype = "float32" if dtype == "complex64" else "float64"
+            real_part = (paddle.rand(shape, dtype=real_dtype) - 0.5) * 1.2
+            imag_part = (paddle.rand(shape, dtype=real_dtype) - 0.5) * 1.2
+            paddle_tensor = (real_part + 1j * imag_part).cast(dtype)
+        else:
+            base = (paddle.rand(shape, dtype="float32") - 0.5) * 1.2
+            paddle_tensor = base.cast(dtype)
+        paddle_tensor.stop_gradient = False
+        return paddle_tensor
 
     def _make_gpu_cache_tensors(self, dtype=None):
         dtype = dtype or self.dtype
@@ -293,8 +321,11 @@ class TensorConfig:
         return cached_gpu_inputs[key]
 
     def get_gpu_paddle_tensor(self, api_config, dtype=None):
-        entry = self._get_gpu_cache_entry(api_config, dtype)
-        self.paddle_tensor = entry["paddle"]
+        dtype = dtype or self.dtype
+        key = self._gpu_cache_key(api_config, dtype)
+        if key not in cached_gpu_inputs:
+            cached_gpu_inputs[key] = {"paddle": self._make_gpu_paddle_tensor(dtype)}
+        self.paddle_tensor = cached_gpu_inputs[key]["paddle"]
         return self.paddle_tensor
 
     def get_gpu_torch_tensor(self, api_config, dtype=None):
@@ -2999,7 +3030,7 @@ class TensorConfig:
                             scalar_val = (numpy.random.random() - 0.5) * 1.2
                             self.numpy_tensor = numpy.array(scalar_val, dtype=self.dtype)
                 elif self._use_gpu_cache(original_dtype):
-                    self._get_gpu_cache_entry(api_config, original_dtype)
+                    self.get_gpu_paddle_tensor(api_config, original_dtype)
                 elif USE_CACHED_NUMPY and self.dtype not in ["int64", "float64"]:
                     self.numpy_tensor = self.get_cached_numpy(self.dtype, self.shape, scale=1.2)
                 else:

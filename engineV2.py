@@ -287,6 +287,85 @@ def _print_argument(prefix, message):
     print(f"{prefix} {message}", flush=True)
 
 
+def _mode_uses_torch(options):
+    return any(
+        getattr(options, opt, False)
+        for opt in (
+            "accuracy",
+            "paddle_cinn",
+            "paddle_gpu_performance",
+            "torch_gpu_performance",
+            "paddle_torch_gpu_performance",
+            "accuracy_stable",
+            "paddle_custom_device",
+            "custom_device_vs_gpu",
+        )
+    )
+
+
+def _load_test_classes(options):
+    from tester import APIConfig, APITestPaddleOnly
+
+    test_classes = {
+        "APIConfig": APIConfig,
+        "APITestPaddleOnly": APITestPaddleOnly,
+    }
+    if _mode_uses_torch(options):
+        from tester import (
+            APITestAccuracy,
+            APITestAccuracyStable,
+            APITestCINNVSDygraph,
+            APITestCustomDeviceVSCPU,
+            APITestPaddleDeviceVSGPU,
+            APITestPaddleGPUPerformance,
+            APITestPaddleTorchGPUPerformance,
+            APITestTorchGPUPerformance,
+        )
+
+        test_classes.update(
+            {
+                "APITestAccuracy": APITestAccuracy,
+                "APITestCINNVSDygraph": APITestCINNVSDygraph,
+                "APITestPaddleGPUPerformance": APITestPaddleGPUPerformance,
+                "APITestTorchGPUPerformance": APITestTorchGPUPerformance,
+                "APITestPaddleTorchGPUPerformance": APITestPaddleTorchGPUPerformance,
+                "APITestAccuracyStable": APITestAccuracyStable,
+                "APITestCustomDeviceVSCPU": APITestCustomDeviceVSCPU,
+                "APITestPaddleDeviceVSGPU": APITestPaddleDeviceVSGPU,
+            }
+        )
+    return test_classes
+
+
+def _select_test_class(options):
+    test_classes = _load_test_classes(options)
+    option_to_class_name = {
+        "paddle_only": "APITestPaddleOnly",
+        "paddle_cinn": "APITestCINNVSDygraph",
+        "accuracy": "APITestAccuracy",
+        "paddle_gpu_performance": "APITestPaddleGPUPerformance",
+        "torch_gpu_performance": "APITestTorchGPUPerformance",
+        "paddle_torch_gpu_performance": "APITestPaddleTorchGPUPerformance",
+        "accuracy_stable": "APITestAccuracyStable",
+        "paddle_custom_device": "APITestCustomDeviceVSCPU",
+        "custom_device_vs_gpu": "APITestPaddleDeviceVSGPU",
+    }
+    for opt, class_name in option_to_class_name.items():
+        if getattr(options, opt, False):
+            return test_classes[class_name]
+    return test_classes["APITestAccuracy"]
+
+
+def _clear_device_cache(options):
+    import paddle
+
+    if _mode_uses_torch(options):
+        import torch
+
+        torch.cuda.empty_cache()
+    paddle.device.cuda.empty_cache()
+
+
 def _parse_gpu_ids(gpu_ids_arg, device_count):
     gpu_ids = []
     for raw_part in gpu_ids_arg.split(","):
@@ -446,7 +525,6 @@ def init_worker_gpu(gpu_worker_list, lock, available_gpus, max_workers_per_gpu, 
         os.environ["CUDA_VISIBLE_DEVICES"] = str(assigned_gpu)
 
         import paddle
-        import torch
 
         # Load custom ops from paddlefleet to register _run_custom_op operators
         try:
@@ -458,39 +536,11 @@ def init_worker_gpu(gpu_worker_list, lock, available_gpus, max_workers_per_gpu, 
         except ImportError:
             pass
 
-        globals()["torch"] = torch
         globals()["paddle"] = paddle
-
-        from tester import (
-            APIConfig,
-            APITestAccuracy,
-            APITestAccuracyStable,
-            APITestCINNVSDygraph,
-            APITestCustomDeviceVSCPU,
-            APITestPaddleDeviceVSGPU,
-            APITestPaddleGPUPerformance,
-            APITestPaddleOnly,
-            APITestPaddleTorchGPUPerformance,
-            APITestTorchGPUPerformance,
-        )
-
-        test_classes = {
-            "APIConfig": APIConfig,
-            "APITestAccuracy": APITestAccuracy,
-            "APITestCINNVSDygraph": APITestCINNVSDygraph,
-            "APITestPaddleOnly": APITestPaddleOnly,
-            "APITestPaddleGPUPerformance": APITestPaddleGPUPerformance,
-            "APITestTorchGPUPerformance": APITestTorchGPUPerformance,
-            "APITestPaddleTorchGPUPerformance": APITestPaddleTorchGPUPerformance,
-            "APITestAccuracyStable": APITestAccuracyStable,
-            "APITestCustomDeviceVSCPU": APITestCustomDeviceVSCPU,
-            "APITestPaddleDeviceVSGPU": APITestPaddleDeviceVSGPU,
-        }
-        globals().update(test_classes)
+        globals().update(_load_test_classes(options))
 
         def signal_handler(*args):
-            torch.cuda.empty_cache()
-            paddle.device.cuda.empty_cache()
+            _clear_device_cache(options)
             restore_stdio()
             close_process_files()
             sys.exit(0)
@@ -558,22 +608,7 @@ def run_test_case(api_config_str, options):
         write_terminal_log("config_parse", api_config_str)
         return
 
-    option_to_class = {
-        "paddle_only": APITestPaddleOnly,
-        "paddle_cinn": APITestCINNVSDygraph,
-        "accuracy": APITestAccuracy,
-        "paddle_gpu_performance": APITestPaddleGPUPerformance,
-        "torch_gpu_performance": APITestTorchGPUPerformance,
-        "paddle_torch_gpu_performance": APITestPaddleTorchGPUPerformance,
-        "accuracy_stable": APITestAccuracyStable,
-        "paddle_custom_device": APITestCustomDeviceVSCPU,
-        "custom_device_vs_gpu": APITestPaddleDeviceVSGPU,
-    }
-
-    test_class = next(
-        (cls for opt, cls in option_to_class.items() if getattr(options, opt, False)),
-        APITestAccuracy,  # default fallback
-    )
+    test_class = _select_test_class(options)
     kwargs = {k: v for k, v in vars(options).items() if k in VALID_TEST_ARGS}
     case = test_class(api_config, **kwargs)
     try:
@@ -638,8 +673,7 @@ def run_test_case(api_config_str, options):
                 "paddle_torch_gpu_performance",
             )
         ) and not getattr(options, "use_gpu_cache_mode", False):
-            torch.cuda.empty_cache()
-            paddle.device.cuda.empty_cache()
+            _clear_device_cache(options)
         if options.show_runtime_status:
             try:
                 total_memory, used_memory_after = get_memory_info(gpu_id)
@@ -972,18 +1006,7 @@ def main():
         except ImportError:
             pass
 
-        from tester import (
-            APIConfig,
-            APITestAccuracy,
-            APITestAccuracyStable,
-            APITestCINNVSDygraph,
-            APITestCustomDeviceVSCPU,
-            APITestPaddleDeviceVSGPU,
-            APITestPaddleGPUPerformance,
-            APITestPaddleOnly,
-            APITestPaddleTorchGPUPerformance,
-            APITestTorchGPUPerformance,
-        )
+        globals().update(_load_test_classes(options))
 
         # set log_writer
         set_engineV2()
@@ -999,22 +1022,7 @@ def main():
             print(f"[config_parse] {options.api_config} {err!s}", flush=True)
             return
 
-        option_to_class = {
-            "paddle_only": APITestPaddleOnly,
-            "paddle_cinn": APITestCINNVSDygraph,
-            "accuracy": APITestAccuracy,
-            "paddle_gpu_performance": APITestPaddleGPUPerformance,
-            "torch_gpu_performance": APITestTorchGPUPerformance,
-            "paddle_torch_gpu_performance": APITestPaddleTorchGPUPerformance,
-            "accuracy_stable": APITestAccuracyStable,
-            "paddle_custom_device": APITestCustomDeviceVSCPU,
-            "custom_device_vs_gpu": APITestPaddleDeviceVSGPU,
-        }
-
-        test_class = next(
-            (cls for opt, cls in option_to_class.items() if getattr(options, opt, False)),
-            APITestAccuracy,  # default fallback
-        )
+        test_class = _select_test_class(options)
 
         if options.test_cpu:
             import paddle

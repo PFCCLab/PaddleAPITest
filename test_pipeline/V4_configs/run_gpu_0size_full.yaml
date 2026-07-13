@@ -1,0 +1,18 @@
+# yaml-language-server: $schema=../run_config.schema.json
+name: run_gpu_0size_full
+runner:
+  engine: engineV4
+  foreground: true
+env:
+  FLAGS_use_system_allocator: "true"
+  FLAGS_check_cuda_error: "true"
+input:
+  api_config_file_pattern: tester/api_config/monitor_config/0_size/GPU/monitoring_configs*.txt
+output:
+  log_dir: tester/api_config/test_log_gpu_0size_full
+engine_args:
+  accuracy: true
+  num_gpus: -1
+  num_workers_per_gpu: 10
+  timeout: 300
+  random_seed: 2025
