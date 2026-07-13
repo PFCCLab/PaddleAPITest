@@ -11,6 +11,7 @@ import shutil
 import signal
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from collections import deque
@@ -353,32 +354,62 @@ def _sanitizer_worker_loop(slot_index, gpu_id, input_queue, result_queue, option
                 result_queue.put(("error", slot_index, api_config_str, str(err)))
                 continue
             result_queue.put(("child", slot_index, child_process.pid))
-            output_lines = deque(maxlen=40)
-            try:
-                for line in child_process.stdout:
-                    output_lines.append(line)
-                    print(line, end="", flush=True)
-                returncode = child_process.wait()
-            finally:
-                if child_process.stdout is not None:
-                    child_process.stdout.close()
+            output_tail = deque(maxlen=40)
+            with tempfile.TemporaryFile(
+                mode="w+t", encoding="utf-8", errors="replace"
+            ) as output_file:
+                try:
+                    for line in child_process.stdout:
+                        output_tail.append(line)
+                        output_file.write(line)
+                    returncode = child_process.wait()
+                finally:
+                    if child_process.stdout is not None:
+                        child_process.stdout.close()
 
-            child_process = None
-            if returncode in (0, 2):
-                merge_sanitizer_case_logs(case_log_dir)
-            shutil.rmtree(case_log_dir, ignore_errors=True)
+                child_process = None
+                output_file.seek(0)
+                if returncode == options.sanitizer_error_exitcode:
+                    analysis = _analyze_sanitizer_output(
+                        output_file.read(), returncode, options.sanitizer_error_exitcode
+                    )
+                    if analysis.filtered_output:
+                        print(
+                            analysis.filtered_output,
+                            end="" if analysis.filtered_output.endswith("\n") else "\n",
+                            flush=True,
+                        )
+                else:
+                    analysis = SanitizerOutputAnalysis("", False)
+                    shutil.copyfileobj(output_file, sys.stdout)
+                    sys.stdout.flush()
 
-            if returncode == 0:
-                result_queue.put(("done", slot_index, api_config_str))
-            elif returncode == 2:
-                result_queue.put(
-                    ("error", slot_index, api_config_str, f"child exited with {returncode}")
-                )
-            else:
-                output_tail = "".join(output_lines)
-                result_queue.put(
-                    ("crashed", slot_index, api_config_str, returncode, output_tail, "child")
-                )
+                if returncode in (0, 2) or analysis.ignore_error_exitcode:
+                    merge_sanitizer_case_logs(case_log_dir)
+                shutil.rmtree(case_log_dir, ignore_errors=True)
+
+                if returncode == 0 or analysis.ignore_error_exitcode:
+                    result_queue.put(("done", slot_index, api_config_str))
+                elif returncode == 2:
+                    result_queue.put(
+                        (
+                            "error",
+                            slot_index,
+                            api_config_str,
+                            f"child exited with {returncode}",
+                        )
+                    )
+                else:
+                    result_queue.put(
+                        (
+                            "crashed",
+                            slot_index,
+                            api_config_str,
+                            returncode,
+                            "".join(output_tail),
+                            "child",
+                        )
+                    )
     finally:
         if child_process is not None and child_process.poll() is None:
             try:
@@ -967,10 +998,101 @@ def _prepare_single_config_gpu(options):
     return gpu_ids[0]
 
 
-def _filter_sanitizer_output(output, returncode, sanitizer_error_exitcode):
+SANITIZER_PREFIX = "========="
+SANITIZER_CUDA_API_ERROR = "CUDA API Error:"
+SANITIZER_PROGRAM_HIT = "Program hit"
+SANITIZER_ERROR_SUMMARY = "ERROR SUMMARY:"
+CUDA_VERSION_ERROR_RE = re.compile(
+    r"cudaVersion argument \(\d+\) exceeds the driver version \(\d+\)"
+)
+
+
+@dataclass(frozen=True)
+class SanitizerOutputAnalysis:
+    filtered_output: str
+    ignore_error_exitcode: bool
+
+
+def _is_sanitizer_block_boundary(line):
+    return line.startswith(SANITIZER_PREFIX) and (
+        SANITIZER_CUDA_API_ERROR in line
+        or SANITIZER_PROGRAM_HIT in line
+        or SANITIZER_ERROR_SUMMARY in line
+    )
+
+
+def _is_cuda_version_error_block(block_lines):
+    first_line = block_lines[0] if block_lines else ""
+    return (
+        SANITIZER_CUDA_API_ERROR in first_line
+        and CUDA_VERSION_ERROR_RE.search("\n".join(block_lines)) is not None
+    )
+
+
+def _is_cu_get_proc_address_invalid_value_block(block_lines):
+    first_line = block_lines[0] if block_lines else ""
+    return "CUDA_ERROR_INVALID_VALUE" in first_line and "cuGetProcAddress_v2" in first_line
+
+
+def _analyze_sanitizer_output(output, returncode, sanitizer_error_exitcode):
     if returncode != sanitizer_error_exitcode:
-        return output
-    return "\n".join(line for line in output.splitlines() if not line.startswith("[Pass]"))
+        return SanitizerOutputAnalysis(output, False)
+
+    lines = output.splitlines()
+    filtered_lines = []
+    ignored_line_indices = set()
+    ignored_any = False
+    saw_cuda_version_error = False
+    kept_sanitizer_error = False
+    index = 0
+
+    while index < len(lines):
+        line = lines[index]
+        if not _is_sanitizer_block_boundary(line):
+            index += 1
+            continue
+
+        block_end = index + 1
+        while block_end < len(lines) and not _is_sanitizer_block_boundary(lines[block_end]):
+            block_end += 1
+
+        block_lines = lines[index:block_end]
+        sanitizer_line_indices = [
+            line_index
+            for line_index in range(index, block_end)
+            if lines[line_index].startswith(SANITIZER_PREFIX)
+        ]
+        if _is_cuda_version_error_block(block_lines):
+            ignored_line_indices.update(sanitizer_line_indices)
+            ignored_any = True
+            saw_cuda_version_error = True
+        elif _is_cu_get_proc_address_invalid_value_block(block_lines):
+            ignored_line_indices.update(sanitizer_line_indices)
+            ignored_any = True
+        elif SANITIZER_PROGRAM_HIT in line or SANITIZER_CUDA_API_ERROR in line:
+            kept_sanitizer_error = True
+
+        index = block_end
+
+    ignore_error_exitcode = ignored_any and saw_cuda_version_error and not kept_sanitizer_error
+    for index, line in enumerate(lines):
+        if index in ignored_line_indices:
+            continue
+        if ignore_error_exitcode and SANITIZER_ERROR_SUMMARY in line:
+            continue
+        filtered_lines.append(line)
+
+    return SanitizerOutputAnalysis("\n".join(filtered_lines), ignore_error_exitcode)
+
+
+def _is_ignored_cuda_version_sanitizer_error(output, returncode, sanitizer_error_exitcode):
+    return _analyze_sanitizer_output(
+        output, returncode, sanitizer_error_exitcode
+    ).ignore_error_exitcode
+
+
+def _filter_sanitizer_output(output, returncode, sanitizer_error_exitcode):
+    return _analyze_sanitizer_output(output, returncode, sanitizer_error_exitcode).filtered_output
 
 
 def _validate_sanitizer_command(command):
@@ -1020,13 +1142,18 @@ def _run_single_config_with_sanitizer(options):
         encoding="utf-8",
         errors="replace",
     )
-    output = _filter_sanitizer_output(
-        f"{result.stdout or ''}{result.stderr or ''}",
-        result.returncode,
-        options.sanitizer_error_exitcode,
+    raw_output = f"{result.stdout or ''}{result.stderr or ''}"
+    analysis = _analyze_sanitizer_output(
+        raw_output, result.returncode, options.sanitizer_error_exitcode
     )
-    if output:
-        print(output, end="" if output.endswith("\n") else "\n", flush=True)
+    if analysis.filtered_output:
+        print(
+            analysis.filtered_output,
+            end="" if analysis.filtered_output.endswith("\n") else "\n",
+            flush=True,
+        )
+    if analysis.ignore_error_exitcode:
+        return 0
     if result.returncode == options.sanitizer_error_exitcode:
         print(
             f"[error] compute-sanitizer reported errors for {api_config} (exit={result.returncode})",
