@@ -1108,16 +1108,25 @@ def main():
         print(len(finish_configs), "cases in checkpoint.", flush=True)
 
         api_config_count = 0
+        skipped_non_config = 0
         api_configs = set()
         for config_file in config_files:
             try:
                 with open(config_file) as f:
-                    lines = [line.strip() for line in f if line.strip()]
-                    api_config_count += len(lines)
-                    api_configs.update(lines)
+                    for line in f:
+                        line = line.strip()
+                        if not line:
+                            continue
+                        if not line.startswith("paddle."):
+                            skipped_non_config += 1
+                            continue
+                        api_config_count += 1
+                        api_configs.add(line)
             except Exception as e:
                 print(f"Failed to read config file {config_file}: {e}", flush=True)
                 return
+        if skipped_non_config:
+            print(f"{skipped_non_config} non-config lines skipped.", flush=True)
         print(api_config_count, "cases in total.", flush=True)
         dup_case = api_config_count - len(api_configs)
         if dup_case > 0:
@@ -1241,11 +1250,12 @@ def main():
                                 flush=True,
                             )
                     except Exception as err:
-                        checkpoint_ready = False
+                        write_terminal_log("config_parse", config)
                         print(
-                            f"[warn] Test case failed for {config}: {err}",
+                            f"[config_parse] {config}: {err}",
                             flush=True,
                         )
+                        checkpoint_ready = False  # checkpoint already written by write_terminal_log
                     if checkpoint_ready:
                         tested_case += 1
                         if options.show_runtime_status or tested_case % 10000 == 0:
