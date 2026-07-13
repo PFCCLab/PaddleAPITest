@@ -761,7 +761,7 @@ class APITestBase:
                 elif isinstance(value, (tuple, list)):
                     result.extend(item for item in value if isinstance(item, paddle.Tensor))
 
-        return result
+        return [t for t in result if not t.stop_gradient]
 
     def get_torch_input_list(self):
         result = []
@@ -780,7 +780,8 @@ class APITestBase:
                 for item in value:
                     if isinstance(item, torch.Tensor):
                         result.append(item)
-        return result
+
+        return [t for t in result if t.requires_grad]
 
     def get_cached_numpy(self, dtype, shape, generation_kind="output_grad", scale=1.0):
         return get_cached_numpy_array(dtype, shape, generation_kind=generation_kind, scale=scale)

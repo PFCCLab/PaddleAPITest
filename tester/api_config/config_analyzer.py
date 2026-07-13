@@ -311,7 +311,7 @@ class TensorConfig:
         paddle_tensor.stop_gradient = False
         return paddle_tensor
 
-    def _make_gpu_cache_tensors(self, dtype=None):
+    def _make_gpu_cache_tensors(self, api_config, dtype=None):
         dtype = dtype or self.dtype
         torch_dtype = self.convert_dtype_to_torch_type(dtype)
         shape = tuple(self.shape)
