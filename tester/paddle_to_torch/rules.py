@@ -3495,7 +3495,12 @@ class LinearRule(BaseRule):
     def apply(self, paddle_api: str) -> ConvertResult:
         _, map_code = self.apply_generic()
         pre = """
-weight = weight.T.contiguous()
+import paddle
+if paddle.get_flags("FLAGS_use_accuracy_compatible_kernel")["FLAGS_use_accuracy_compatible_kernel"]:
+    weight = weight.T.contiguous()
+else:
+    # Keep transpose as a view to avoid changing the GEMM layout path.
+    weight = weight.T
 """
         core = f"result = {self.torch_api}(**_kwargs)"
         code = Code(preprocess=pre.splitlines() + map_code, core=[core])
