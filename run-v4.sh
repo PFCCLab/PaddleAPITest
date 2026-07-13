@@ -50,8 +50,8 @@ LOG_DIR="tester/api_config/test_log"
 
 # ── GPU / worker 调度 ─────────────────────────────────────────
 NUM_GPUS=-1
-NUM_WORKERS_PER_GPU=-1
-GPU_IDS="4-7"
+NUM_WORKERS_PER_GPU=1
+GPU_IDS="-1"
 # REQUIRED_MEMORY=10
 TIME_OUT=600
 
@@ -261,7 +261,10 @@ if [[ "$FOREGROUND" == "true" ]]; then
     echo -e "\n\033[36m[前台模式] Ctrl+C 终止\033[0m"
     echo "日志同时写入: $LOG_FILE"
     echo ""
+    # 忽略 shell 自身的 SIGINT，让 Ctrl+C 只作用于 python 子进程
+    trap '' INT
     python "$ENGINE.py" "${ALL_ARGS[@]}" 2>&1 | tee "$LOG_FILE"
+    trap - INT
 else
     nohup setsid python "$ENGINE.py" "${ALL_ARGS[@]}" >> "$LOG_FILE" 2>&1 &
     PYTHON_PID=$!

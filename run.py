@@ -546,9 +546,14 @@ def run_foreground(command: list[str], env: dict[str, str], log_file: Path) -> i
     )
     with log_file.open("a", encoding="utf-8") as log_handle:
         assert process.stdout is not None
-        for line in process.stdout:
-            print(line, end="")
-            log_handle.write(line)
+        try:
+            for line in process.stdout:
+                print(line, end="")
+                log_handle.write(line)
+        except KeyboardInterrupt:
+            for line in process.stdout:
+                print(line, end="")
+                log_handle.write(line)
     return process.wait()
 
 
