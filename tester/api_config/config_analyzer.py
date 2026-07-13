@@ -193,10 +193,12 @@ class TensorConfig:
         return result
 
     def __str__(self):
+        if self.place is not None:
+            return f'Tensor({self.shape},"{self.dtype}",place={self.place})'
         return f'Tensor({self.shape},"{self.dtype}")'
 
     def __repr__(self):
-        return f'Tensor({self.shape},"{self.dtype}")'
+        return self.__str__()
 
     def convert_dtype_to_torch_type(self, dtype):
         if dtype in ["float32", numpy.float32]:
@@ -3568,10 +3570,67 @@ class APIConfig:
     def get_api(self, config):
         return config[0 : config.index("(")], len(config[0 : config.index("(")])
 
+    def _match_parens(self, config, start):
+        depth = 0
+        for i in range(start, len(config)):
+            if config[i] == "(":
+                depth += 1
+            elif config[i] == ")":
+                depth -= 1
+                if depth == 0:
+                    return i
+        raise ValueError(f"Unclosed parentheses starting at offset {start}")
+
     def get_tensor(self, config, offset):
-        config = config[offset:]
-        tensor_str = config[config.index("TensorConfig") : config.index(")") + 1]
-        return eval(tensor_str), offset + len(tensor_str)
+        """Parse TensorConfig(...), including nested kwargs like place=Place(cpu)."""
+        start = config.index("(", offset)
+        end = self._match_parens(config, start)
+        # Slice to the matched span so get_token cannot look past the closing ')'.
+        tensor_str = config[start : end + 1]
+        args = []
+        kwargs = collections.OrderedDict()
+        pos = 1
+
+        def skip(p):
+            while p < len(tensor_str) and tensor_str[p] in " ,\t\n":
+                p += 1
+            return p
+
+        while True:
+            pos = skip(pos)
+            if pos >= len(tensor_str) or tensor_str[pos] == ")":
+                break
+
+            # Tensor shapes use bare list syntax, not list[...].
+            if tensor_str[pos] == "[":
+                value, pos = self.get_list(tensor_str, pos)
+                args.append(value)
+                continue
+
+            key = None
+            token, pos = self.get_token(tensor_str, pos)
+            if pos is None:
+                break
+            if pos < len(tensor_str) and tensor_str[pos] == "=":
+                key = token
+                pos = skip(pos + 1)
+                if pos < len(tensor_str) and tensor_str[pos] == "[":
+                    value, pos = self.get_list(tensor_str, pos)
+                    kwargs[key] = value
+                    continue
+                token, pos = self.get_token(tensor_str, pos)
+                if pos is None:
+                    break
+
+            value, pos = self.get_one_arg(token, tensor_str, pos)
+            if pos is None:
+                break
+            if key is not None:
+                kwargs[key] = value
+            else:
+                args.append(value)
+
+        return TensorConfig(*args, **kwargs), end + 1
 
     def get_dtype(self, config, offset):
         token, offset = self.get_token(config, offset)
