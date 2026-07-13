@@ -90,10 +90,10 @@ def reject_unknown_keys(section: str, mapping: dict[str, Any], allowed_keys: set
 def require_type(path: str, value: Any, expected_type: type | tuple[type, ...]) -> None:
     if value is None:
         return
-    if expected_type is int and isinstance(value, bool):
-        raise TypeError(f"{path} 类型应为 int，当前为 bool")
-    if expected_type in {(int, float), (float, int)} and isinstance(value, bool):
-        raise TypeError(f"{path} 类型应为 number，当前为 bool")
+    if isinstance(value, bool):
+        if expected_type is int or expected_type in {(int, float), (float, int)}:
+            actual = "int" if expected_type is int else "number"
+            raise TypeError(f"{path} 类型应为 {actual}，当前为 bool")
     if not isinstance(value, expected_type):
         if isinstance(expected_type, tuple):
             expected_name = " | ".join(t.__name__ for t in expected_type)
@@ -169,8 +169,6 @@ def validate_yaml_config(config: dict[str, Any]) -> None:
 
 
 def load_yaml(path: Path) -> dict[str, Any]:
-    if not path.exists():
-        raise FileNotFoundError(f"配置文件不存在: {path}")
     with path.open("r", encoding="utf-8") as config_file:
         config = yaml.safe_load(config_file) or {}
     if not isinstance(config, dict):
@@ -242,6 +240,13 @@ def default_pid_file(config_path: Path, config: dict[str, Any]) -> Path:
     return PROJECT_ROOT / ".run" / f"{safe_name}.pid"
 
 
+def set_input_config(input_config: dict[str, Any], key: str, value: str | None) -> None:
+    if value:
+        for k in INPUT_KEYS:
+            input_config[k] = None
+        input_config[key] = value
+
+
 def apply_overrides(config: dict[str, Any], args: argparse.Namespace) -> None:
     runner = ensure_mapping(config, "runner")
     input_config = ensure_mapping(config, "input")
@@ -258,18 +263,9 @@ def apply_overrides(config: dict[str, Any], args: argparse.Namespace) -> None:
     if args.dry_run:
         runner["dry_run"] = True
 
-    if args.api_config:
-        input_config["api_config"] = args.api_config
-        input_config["api_config_file"] = None
-        input_config["api_config_file_pattern"] = None
-    if args.api_config_file:
-        input_config["api_config_file"] = args.api_config_file
-        input_config["api_config"] = None
-        input_config["api_config_file_pattern"] = None
-    if args.api_config_file_pattern:
-        input_config["api_config_file_pattern"] = args.api_config_file_pattern
-        input_config["api_config"] = None
-        input_config["api_config_file"] = None
+    set_input_config(input_config, "api_config", args.api_config)
+    set_input_config(input_config, "api_config_file", args.api_config_file)
+    set_input_config(input_config, "api_config_file_pattern", args.api_config_file_pattern)
     if args.log_dir:
         output["log_dir"] = args.log_dir
 
@@ -388,7 +384,12 @@ def retest_error_name(error_config: str) -> str:
 
 
 def format_retest_log_dir(
-    template: str, *, base_log_dir: str, previous_log_dir: str, round_index: int, error_config: str
+    template: str,
+    *,
+    base_log_dir: str,
+    previous_log_dir: str,
+    round_index: int,
+    error_config: str,
 ) -> str:
     error_name = retest_error_name(error_config)
     return template.format(
@@ -475,8 +476,15 @@ def stop_process(pid_file: Path) -> int:
 
 
 def latest_log(log_dir: Path) -> Path | None:
-    logs = sorted(log_dir.glob("log_*.log"), key=lambda path: path.stat().st_mtime, reverse=True)
-    return logs[0] if logs else None
+    try:
+        logs = sorted(
+            log_dir.glob("log_*.log"),
+            key=lambda path: path.stat().st_mtime,
+            reverse=True,
+        )
+        return logs[0] if logs else None
+    except (OSError, FileNotFoundError):
+        return None
 
 
 def show_status(pid_file: Path, engine: str, log_dir: Path) -> int:
@@ -492,7 +500,7 @@ def show_status(pid_file: Path, engine: str, log_dir: Path) -> int:
     print(f"\033[32m运行中\033[0m  PID={pid}  引擎={engine}")
     try:
         children_output = subprocess.check_output(["pgrep", "-P", str(pid)], text=True)
-        children = len([line for line in children_output.splitlines() if line.strip()])
+        children = sum(1 for line in children_output.splitlines() if line.strip())
     except subprocess.CalledProcessError:
         children = 0
     print(f"  Worker 进程数: {children}")
@@ -501,7 +509,7 @@ def show_status(pid_file: Path, engine: str, log_dir: Path) -> int:
         elapsed = subprocess.check_output(["ps", "-o", "etime=", "-p", str(pid)], text=True).strip()
     except subprocess.CalledProcessError:
         elapsed = "unknown"
-    print(f"  已运行: {elapsed or 'unknown'}")
+    print(f"  已运行: {elapsed}")
 
     log = latest_log(log_dir)
     if log:
@@ -568,33 +576,33 @@ def run_background(
     log_handle.close()
     pid_file.write_text(f"{process.pid}\n", encoding="utf-8")
 
+    cleaner_code = (
+        "import os,sys,time\npid=int(sys.argv[1])\npid_file=sys.argv[2]\n"
+        "while True:\n"
+        "    try:\n"
+        "        os.kill(pid, 0)\n"
+        "    except ProcessLookupError:\n"
+        "        break\n"
+        "    except PermissionError:\n"
+        "        pass\n"
+        "    time.sleep(5)\n"
+        "try:\n"
+        "    recorded=open(pid_file).read().strip()\n"
+        "except FileNotFoundError:\n"
+        "    recorded=''\n"
+        "if recorded == str(pid):\n"
+        "    try:\n"
+        "        os.remove(pid_file)\n"
+        "    except FileNotFoundError:\n"
+        "        pass\n"
+    )
     cleaner = subprocess.Popen(
-        [
-            sys.executable,
-            "-c",
-            (
-                "import os,sys,time; pid=int(sys.argv[1]); pid_file=sys.argv[2]; "
-                "\nwhile True:\n"
-                "    try: os.kill(pid, 0)\n"
-                "    except ProcessLookupError: break\n"
-                "    except PermissionError: pass\n"
-                "    time.sleep(5)\n"
-                "\ntry:\n"
-                "    recorded=open(pid_file).read().strip()\n"
-                "except FileNotFoundError:\n"
-                "    recorded=''\n"
-                "\nif recorded == str(pid):\n"
-                "    try: os.remove(pid_file)\n"
-                "    except FileNotFoundError: pass\n"
-            ),
-            str(process.pid),
-            str(pid_file),
-        ],
+        [sys.executable, "-c", cleaner_code, str(process.pid), str(pid_file)],
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
         start_new_session=True,
     )
-    cleaner.poll()
+    cleaner.wait()
 
     time.sleep(1)
     if not process_running(process.pid):
@@ -640,7 +648,10 @@ def parse_args() -> argparse.Namespace:
         "--set-env", action="append", default=[], help="追加或覆盖环境变量 KEY=VALUE"
     )
     parser.add_argument(
-        "--engine-arg", action="append", default=[], help="追加或覆盖 engine 参数 KEY=VALUE"
+        "--engine-arg",
+        action="append",
+        default=[],
+        help="追加或覆盖 engine 参数 KEY=VALUE",
     )
     parser.add_argument("passthrough", nargs=argparse.REMAINDER, help="-- 后原样透传给 engine")
     return parser.parse_args()
@@ -729,10 +740,11 @@ def run_retest_plan(config_path: Path, config: dict[str, Any], passthrough: list
         return result
 
     dry_run = bool(ensure_mapping(config, "runner").get("dry_run"))
+    previous_log_dir_path = Path(base_log_dir)
     for error_config in retest_error_configs(config):
         previous_log_dir = base_log_dir
         for round_index in range(2, rounds + 1):
-            input_path = resolve_project_path(Path(previous_log_dir) / error_config)
+            input_path = resolve_project_path(previous_log_dir_path / error_config)
             next_log_dir = format_retest_log_dir(
                 log_dir_template,
                 base_log_dir=base_log_dir,
@@ -759,6 +771,7 @@ def run_retest_plan(config_path: Path, config: dict[str, Any], passthrough: list
             if result != 0:
                 return result
             previous_log_dir = next_log_dir
+            previous_log_dir_path = Path(next_log_dir)
     return 0
 
 
