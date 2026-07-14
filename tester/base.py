@@ -86,6 +86,9 @@ def classify_runtime_error(error_msg):
     # (Unimplemented): Paddle 已知不支持的功能，当前 case 无法有效验证
     if "(unimplemented)" in error_msg_lower:
         return "skip", False
+    # Paddle 输出数值检查失败
+    if "there are nan or inf" in error_msg_lower or "check_numerics" in error_msg_lower:
+        return "paddle_error", False
     # (InvalidArgument) / (PreconditionNotMet) / (OutOfRange): 输入/配置不满足前提
     if (
         "(invalidargument)" in error_msg_lower
