@@ -1357,6 +1357,22 @@
     "paddle.incubate.nn.functional.blha_get_max_len": {
         "Rule": "BlhaGetMaxLenRule"
     },
+    "paddle.incubate.nn.functional.fp8_quant_blockwise": {
+        "Rule": "Fp8QuantBlockwiseRule",
+        "set_defaults": {
+            "epsilon": 0.0,
+            "input_transpose": false,
+            "output_scale_transpose": true,
+            "return_transpose_only": false,
+            "using_pow2_scale": true,
+            "using_ue8m0_scale": false,
+            "quant_method": "'1x128'",
+            "output_type": "'e4m3'"
+        }
+    },
+    "paddle.incubate.nn.functional.fused_act_dequant": {
+        "Rule": "FusedActDequantRule"
+    },
     "paddle.incubate.nn.functional.fused_bias_act": {
         "Rule": "FusedBiasActRule"
     },

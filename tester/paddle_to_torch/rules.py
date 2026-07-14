@@ -1900,6 +1900,155 @@ if isinstance(output_size, (list, tuple)):
         return ConvertResult.success(paddle_api, code)
 
 
+class Fp8QuantBlockwiseRule(BaseRule):
+    """Torch reference for paddle.incubate.nn.functional.fp8_quant_blockwise.
+
+    Aligns with phi fp8_quant_blockwise kernel:
+    quant_scale = fp8_max / amax (optionally power-of-2), stored scale = 1/quant_scale,
+    quantized = cast(x * quant_scale, float8_e4m3fn).
+    """
+
+    def apply(self, paddle_api: str) -> ConvertResult:
+        defaults_code, _map_code = self.apply_generic()
+        # Single function body: converter exec uses separate globals/locals, so
+        # nested defs cannot close over sibling locals.
+        core = """
+_fp8_max = 448.0
+_eps = float(epsilon) if epsilon is not None else 0.0
+_input_transpose = bool(input_transpose)
+_output_scale_transpose = bool(output_scale_transpose)
+_return_transpose_only = bool(return_transpose_only)
+_using_pow2_scale = bool(using_pow2_scale)
+_using_ue8m0_scale = bool(using_ue8m0_scale)
+_quant_method = quant_method
+if _quant_method not in ("1x128", "128x128"):
+    raise ValueError(f"Unsupported quantization method: {_quant_method}")
+if output_type != "e4m3":
+    raise ValueError(f"Unsupported output type: {output_type}")
+
+def _fp8_quant_blockwise_impl(inp, eps, power2, scale_transpose, ue8m0, method, fp8_max):
+    m, n = inp.shape
+    if inp.numel() == 0:
+        q = torch.empty((m, n), dtype=torch.float8_e4m3fn, device=inp.device)
+        if method == "1x128":
+            scale_cols = (n + 127) // 128
+            scale = torch.empty((scale_cols, m) if scale_transpose else (m, scale_cols), dtype=torch.float32, device=inp.device)
+        else:
+            sm, sn = (m + 127) // 128, (n + 127) // 128
+            scale = torch.empty((sn, sm) if scale_transpose else (sm, sn), dtype=torch.float32, device=inp.device)
+        if ue8m0:
+            scale = torch.empty_like(scale, dtype=torch.int32)
+        return q, scale
+    x_f = inp.to(torch.float32)
+    if method == "1x128":
+        pad_n = (128 - (n % 128)) % 128
+        if pad_n:
+            x_f = torch.nn.functional.pad(x_f, (0, pad_n))
+        x_blk = x_f.view(m, -1, 128)
+        amax = x_blk.abs().amax(dim=-1)
+    else:
+        pad_m = (128 - (m % 128)) % 128
+        pad_n = (128 - (n % 128)) % 128
+        if pad_m or pad_n:
+            x_f = torch.nn.functional.pad(x_f, (0, pad_n, 0, pad_m))
+        pm, pn = x_f.shape
+        x_blk = x_f.view(pm // 128, 128, pn // 128, 128).permute(0, 2, 1, 3).contiguous()
+        amax = x_blk.abs().amax(dim=(-1, -2))
+    amax = amax.to(torch.float32)
+    amax_mod = torch.clamp(amax, min=eps)
+    zero_mask = amax_mod == 0
+    q_scale = torch.where(zero_mask, torch.ones_like(amax_mod), fp8_max / amax_mod)
+    inf_mask = torch.isinf(q_scale)
+    if inf_mask.any():
+        q_scale = torch.where(inf_mask, torch.full_like(q_scale, torch.finfo(torch.float32).max), q_scale)
+    if power2:
+        safe = torch.clamp(q_scale, min=torch.finfo(torch.float32).tiny)
+        exp = torch.floor(torch.log2(safe))
+        q_scale = torch.pow(torch.tensor(2.0, device=q_scale.device, dtype=q_scale.dtype), exp)
+        q_scale = torch.where(zero_mask, torch.ones_like(q_scale), q_scale)
+    deq_scale = torch.where(q_scale == 0, torch.zeros_like(q_scale), 1.0 / q_scale)
+    if method == "1x128":
+        q = (x_blk * q_scale.unsqueeze(-1)).to(torch.float8_e4m3fn).reshape(m, -1)[:, :n]
+    else:
+        q = (x_blk * q_scale.unsqueeze(-1).unsqueeze(-1)).to(torch.float8_e4m3fn)
+        q = q.permute(0, 2, 1, 3).contiguous().view(x_f.shape[0], x_f.shape[1])[:m, :n]
+    scale = deq_scale.transpose(0, 1).contiguous() if scale_transpose else deq_scale.contiguous()
+    if ue8m0:
+        base = deq_scale
+        cols = base.shape[-1]
+        pad_c = (4 - (cols % 4)) % 4
+        if pad_c:
+            base = torch.nn.functional.pad(base, (0, pad_c))
+        b = base.reshape(*base.shape[:-1], -1, 4)
+        safe = torch.clamp(b, min=torch.finfo(torch.float32).tiny)
+        exp = torch.floor(torch.log2(safe)).to(torch.int32) + 127
+        exp = torch.clamp(exp, 0, 255)
+        packed = (exp[..., 0] | (exp[..., 1] << 8) | (exp[..., 2] << 16) | (exp[..., 3] << 24)).to(torch.int32)
+        scale = packed.transpose(0, 1).contiguous() if scale_transpose else packed.contiguous()
+    return q, scale
+
+if not _input_transpose:
+    result = _fp8_quant_blockwise_impl(x, _eps, _using_pow2_scale, _output_scale_transpose, _using_ue8m0_scale, _quant_method, _fp8_max)
+else:
+    x_t = x.transpose(0, 1).contiguous()
+    q_t, s_t = _fp8_quant_blockwise_impl(x_t, _eps, _using_pow2_scale, _output_scale_transpose, _using_ue8m0_scale, _quant_method, _fp8_max)
+    if _return_transpose_only:
+        result = (q_t, s_t)
+    else:
+        q, s = _fp8_quant_blockwise_impl(x, _eps, _using_pow2_scale, _output_scale_transpose, _using_ue8m0_scale, _quant_method, _fp8_max)
+        result = (q, s, q_t, s_t)
+"""
+        code = Code(
+            preprocess=defaults_code,
+            core=core.splitlines(),
+        )
+        return ConvertResult.success(paddle_api, code, is_torch_corresponding=False)
+
+
+class FusedActDequantRule(BaseRule):
+    """Torch reference for paddle.incubate.nn.functional.fused_act_dequant.
+
+    Dequantizes float8_e4m3fn activations with per-128-column scales:
+    out = (x.float() * broadcast(scale)) -> bfloat16.
+    """
+
+    def apply(self, paddle_api: str) -> ConvertResult:
+        core = """
+_x = x
+_scale = x_scale
+x_f = _x.to(torch.float32)
+if _scale is None:
+    result = x_f.to(torch.bfloat16)
+else:
+    scale_f = _scale.to(torch.float32)
+    # Support float32 scales [M, ceil(N/128)] and packed int32 UE8M0 scales.
+    if scale_f.dtype != torch.float32:
+        scale_f = scale_f.to(torch.float32)
+    if _scale.dtype == torch.int32:
+        # Unpack UE8M0: int32 -> 4x uint8 exponents -> 2^(e-127)
+        u8 = _scale.detach().cpu().numpy().view("uint8")
+        import numpy as _np
+        scale_f = torch.from_numpy((_np.power(2.0, u8.astype("float32") - 127))).to(device=_x.device)
+        # reshape back roughly to [M, ...]
+        scale_f = scale_f.reshape(_scale.shape[0], -1)
+    # Broadcast along last dim by 128.
+    if scale_f.dim() == 1:
+        scale_f = scale_f.unsqueeze(-1)
+    scale_b = torch.repeat_interleave(scale_f, repeats=128, dim=-1)
+    if scale_b.shape[-1] < x_f.shape[-1]:
+        pad = x_f.shape[-1] - scale_b.shape[-1]
+        scale_b = torch.nn.functional.pad(scale_b, (0, pad))
+    scale_b = scale_b[..., : x_f.shape[-1]]
+    if scale_b.shape[0] != x_f.shape[0] and scale_b.shape[0] == 1:
+        scale_b = scale_b.expand(x_f.shape[0], -1)
+    elif scale_b.shape[0] > x_f.shape[0]:
+        scale_b = scale_b[: x_f.shape[0]]
+    result = (x_f * scale_b).to(torch.bfloat16)
+"""
+        code = Code(core=core.splitlines())
+        return ConvertResult.success(paddle_api, code, is_torch_corresponding=False)
+
+
 class FusedBiasActRule(BaseRule):
     def apply(self, paddle_api: str) -> ConvertResult:
         pre = """
@@ -3980,6 +4129,9 @@ class MoePermuteRule(BaseRule):
     def apply(self, paddle_api: str) -> ConvertResult:
         core = """
 import math
+_orig_hs_dtype = hidden_states.dtype
+# Compute in a supported dtype; cast gathered tokens back to the original dtype
+# so float8 inputs match paddle.nn.functional.moe_permute output dtype.
 hidden_states = hidden_states.to(torch.bfloat16) if hidden_states.dtype not in (torch.bfloat16, torch.float32, torch.float16) else hidden_states
 do_gather = locals().get('do_gather', True)
 using_ue8m0_scale = locals().get('using_ue8m0_scale', False)
@@ -4038,6 +4190,8 @@ if do_gather:
             hidden_states_unzipped[row] = hidden_states[gather_src[row]]
 else:
     hidden_states_unzipped = torch.empty(0, token_dim, dtype=hidden_states.dtype, device=hidden_states.device)
+if _orig_hs_dtype != hidden_states_unzipped.dtype:
+    hidden_states_unzipped = hidden_states_unzipped.to(_orig_hs_dtype)
 if return_expert_indices:
     expert_indices_out = torch.tensor(gather_expert_id, dtype=torch.int32, device=hidden_states.device)
     result = (hidden_states_unzipped, rowmap, token_prob_unzipped, scale_unzipped, expert_indices_out)
