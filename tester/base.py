@@ -234,8 +234,6 @@ class APITestBase:
             return "pass", False
         if log_type is None:
             log_type = default_log_type
-        elif default_log_type == "torch_error" and log_type != "oom":
-            log_type = "torch_error"
         phase_text = f" phase={phase}" if phase else ""
         print(
             f"[{log_type}]{phase_text} {self.api_config.config}\n{err_msg}",
