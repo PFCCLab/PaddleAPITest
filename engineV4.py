@@ -47,6 +47,10 @@ from tester.api_config.log_writer import *
 os.environ["FLAGS_use_system_allocator"] = "1"
 os.environ["NVIDIA_TF32_OVERRIDE"] = "0"
 
+FATAL_CUDA_EXIT_CODE = 99
+FATAL_OOM_EXIT_CODE = 98
+FATAL_TORCH_EXIT_CODE = 97
+
 VALID_TEST_ARGS = {
     "test_amp",
     "test_backward",
@@ -1283,13 +1287,49 @@ def run_test_case(api_config_str, options):
     try:
         case.test()
     except Exception as err:
-        # if fatal error happens, subprocess need to exit with non-zero status
-        if "CUDA error" in str(err) or "memory corruption" in str(err):
-            os._exit(99)
-        if "CUDA out of memory" in str(err) or "Out of memory error" in str(err):
-            os._exit(98)
-        if "AssertionError" in str(err) or "Tensor-likes are not equal" in str(err):
-            os._exit(1)
+        err_msg = str(err).lower()
+        terminal_log_type = get_terminal_log_type(api_config_str)
+        oom_markers = (
+            "cuda out of memory",
+            "out of memory error",
+            "resourceexhaustederror",
+            "out of memory",
+            "outofmemoryerror",
+            "cannot allocate memory",
+            "std::bad_alloc",
+            "bad allocation",
+            "memoryerror",
+            "cublas_status_alloc_failed",
+        )
+        cuda_markers = (
+            "cuda error",
+            "memory corruption",
+            "illegal memory access",
+            "invalid configuration argument",
+            "invalid resource handle",
+        )
+        exit_code = None
+        if any(marker in err_msg for marker in oom_markers):
+            exit_code = FATAL_OOM_EXIT_CODE
+        elif terminal_log_type == "torch_error" and any(
+            marker in err_msg for marker in cuda_markers
+        ):
+            exit_code = FATAL_TORCH_EXIT_CODE
+        elif any(marker in err_msg for marker in cuda_markers):
+            exit_code = FATAL_CUDA_EXIT_CODE
+        if exit_code is not None:
+            if has_terminal_log(api_config_str):
+                write_checkpoint(api_config_str)
+            try:
+                close_process_files()
+            finally:
+                try:
+                    restore_stdio()
+                finally:
+                    os._exit(exit_code)
+        if has_terminal_log(api_config_str):
+            write_checkpoint(api_config_str)
+            return
         # if not fatal error, subprocess will be alive and report error
         print(f"[test error] {api_config_str}: {err}", flush=True)
         raise
@@ -1959,16 +1999,22 @@ def main():
                         flush=True,
                     )
                 elif msg_type == "crashed":
-                    if exitcode == 99:
+                    if exitcode == FATAL_CUDA_EXIT_CODE:
                         write_to_log("paddle_cuda", config)
                         print(
-                            f"[error] CUDA error for {config}",
+                            f"[paddle_cuda] {config}: worker exited with CUDA error",
                             flush=True,
                         )
-                    elif exitcode == 98:
+                    elif exitcode == FATAL_OOM_EXIT_CODE:
                         write_to_log("oom", config)
                         print(
-                            f"[error] CUDA out of memory for {config}",
+                            f"[oom] {config}: worker exited with OOM",
+                            flush=True,
+                        )
+                    elif exitcode == FATAL_TORCH_EXIT_CODE:
+                        write_to_log("torch_error", config)
+                        print(
+                            f"[torch_error] {config}: worker exited with torch CUDA error",
                             flush=True,
                         )
                     elif (

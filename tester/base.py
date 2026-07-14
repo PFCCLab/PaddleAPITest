@@ -248,10 +248,6 @@ class APITestBase:
             return "pass", False
         if log_type is None:
             log_type = default_log_type
-        elif default_log_type == "torch_error" and log_type not in ("oom", "config_input", "skip"):
-            # Keep oom/config_input/skip classifications; only generic torch failures
-            # are forced into torch_error for accuracy-mode logging.
-            log_type = "torch_error"
         phase_text = f" phase={phase}" if phase else ""
         print(
             f"[{log_type}]{phase_text} {self.api_config.config}\n{err_msg}",

@@ -487,6 +487,39 @@ def aggregate_logs(end=False, cleanup=False):
                     f.writelines(f"{line}\n" for line in sorted(api_configs))
             except Exception as err:
                 print(f"Error writing to {incomplete_file}: {err}", flush=True)
+
+        # === 终态日志互斥性检查 ===
+        config_to_types: dict[str, list[str]] = {}
+        for log_type, prefix in LOG_PREFIXES.items():
+            if log_type == "checkpoint":
+                continue
+            log_file = TEST_LOG_PATH / f"{prefix}.txt"
+            if not log_file.exists():
+                continue
+            try:
+                with log_file.open("r") as f:
+                    for raw_line in f:
+                        line = raw_line.strip()
+                        if line:
+                            config_to_types.setdefault(line, []).append(log_type)
+            except Exception:
+                pass
+
+        duplicates = {config: types for config, types in config_to_types.items() if len(types) > 1}
+        if duplicates:
+            print("\n" + "!" * 50)
+            print("INTEGRITY ERROR: configs found in multiple log types:")
+            for config, types in sorted(duplicates.items())[:20]:
+                print(f"  {config}")
+                print(f"    -> {', '.join(types)}")
+            if len(duplicates) > 20:
+                print(f"  ... and {len(duplicates) - 20} more")
+            print("!" * 50 + "\n")
+            assert not duplicates, (
+                f"Log integrity violation: {len(duplicates)} config(s) appear in "
+                f"multiple terminal log types. This indicates a classification bug."
+            )
+
         return log_counts
 
 
@@ -522,18 +555,18 @@ def print_log_info(all_case, log_counts=None):
     print("\n" + "=" * 50)
     print("Test Case Statistics".center(50))
     print("=" * 50)
-    print(f"{'Pending cases':<30}: {all_case}")
-    print(f"{'Tested cases':<30}: {test_case}")
-    print(f"{'Pass cases':<30}: {pass_case}")
-    print(f"{'Skip cases':<30}: {skip_case}")
-    print(f"{'Paddle issue cases':<30}: {paddle_issue_case}")
-    print(f"{'Test issue cases':<30}: {test_issue_case}")
-    print(f"{'Retest cases':<30}: {retest_case}")
+    print(f"{'Pending cases':<30}: {all_case:>8}")
+    print(f"{'Tested cases':<30}: {test_case:>8}")
+    print(f"{'Pass cases':<30}: {pass_case:>8}")
+    print(f"{'Skip cases':<30}: {skip_case:>8}")
+    print(f"{'Paddle issue cases':<30}: {paddle_issue_case:>8}")
+    print(f"{'Test issue cases':<30}: {test_issue_case:>8}")
+    print(f"{'Retest cases':<30}: {retest_case:>8}")
     if log_counts:
         print("-" * 50)
         print("Log Type Breakdown:")
         for log_type, count in log_counts.items():
-            print(f"  {log_type:<28}: {count}")
+            print(f"  {log_type:<28}: {count:>8}")
     print("=" * 50 + "\n")
 
 

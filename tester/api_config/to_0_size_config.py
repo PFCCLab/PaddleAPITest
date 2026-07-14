@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import argparse
 import copy
 import math
+import os
 
 import numpy
 import paddle
@@ -159,6 +161,11 @@ def dump_item_str(item):
         return '"' + item + '"'
     elif isinstance(item, type):
         return "type(" + str(item)[str(item).index("'") + 1 : str(item).rindex("'")] + ")"
+    # elif callable(item):
+    #     name = getattr(item, "__name__", None) or getattr(item, "__qualname__", None)
+    #     if name:
+    #         return "callable(" + name + ")"
+    #     return "callable(unknown)"
     else:
         return str(item)
 
@@ -270,31 +277,39 @@ def to_big_tensor_config(api_config):
     return result
 
 
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description="将 API 配置转换为 0-size tensor 变体，用于边界测试。",
+    )
+    parser.add_argument(
+        "-i", "--inputs", nargs="+", required=True, help="输入配置文件路径（可指定多个）"
+    )
+    parser.add_argument(
+        "-o",
+        "--output",
+        default="api_config_0_size.txt",
+        help="输出文件路径（默认：当前目录下 api_config_0_size.txt）",
+    )
+    return parser.parse_args()
+
+
 if __name__ == "__main__":
+    args = parse_args()
+
+    output_dir = os.path.dirname(args.output)
+    if output_dir:
+        os.makedirs(output_dir, exist_ok=True)
+
     config_0_size = set()
-    for i in range(1, 7):
-        api_configs = analyse_configs(
-            f"tester/api_config/9_getset_item/api_config_merged_getset_item_{i}.txt"
-        )
+    for input_file in args.inputs:
+        print(f"处理: {input_file}")
+        api_configs = analyse_configs(input_file)
         config_0_size_chunk = []
         for api_config in tqdm(api_configs):
             config_0_size_chunk.extend(set(to_0_size_config(api_config)))
         config_0_size = config_0_size.union(set(config_0_size_chunk))
 
-    with open(
-        "tester/api_config/9_getset_item/slice/api_config_merged_getset_item.txt",
-        "w",
-    ) as f:
+    with open(args.output, "w") as f:
         f.write("\n".join(config_0_size))
 
-# if __name__ == '__main__':
-#     config_big_tensor = set()
-#     api_configs = analyse_configs("/host_home/wanghuan29/APItest3/PaddleAPITest/tester/api_config/test_log_accuracy_all/api_config_pass2.txt")
-#     for api_config in tqdm(api_configs):
-#         # print(api_config.config)
-#         config_big_tensor = config_big_tensor.union(set(to_big_tensor_config(api_config)))
-#     config_big_tensor = set(config_big_tensor)
-#     with open("/host_home/wanghuan29/APItest3/PaddleAPITest/tester/api_config/test_log_accuracy_all/bigtensor_accuracy3.txt", "w") as f:
-#         for api_config in config_big_tensor:
-#             f.write(str(api_config)+"\n")
-#         f.close()
+    print(f"输出: {args.output}，共 {len(config_0_size)} 行")

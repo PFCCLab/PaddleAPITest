@@ -33,8 +33,8 @@ LOG_DIR="tester/api_config/test_log"
 # ── GPU / worker 调度 ─────────────────────────────────────────
 # NUM_GPUS!=0 时，engineV2 不受外部 "CUDA_VISIBLE_DEVICES" 影响。
 NUM_GPUS=-1
-NUM_WORKERS_PER_GPU=-1
-GPU_IDS="4-7"
+NUM_WORKERS_PER_GPU=1
+GPU_IDS="-1"
 # REQUIRED_MEMORY=10
 TIME_OUT=600
 
