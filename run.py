@@ -59,7 +59,7 @@ ENGINE_ARG_TYPES = {
     "required_memory": (int, float),
     "test_cpu": bool,
     "use_cached_numpy": bool,
-    "use_gpu_cache_mode": bool,
+    "use_gpu_mode": bool,
     "atol": (int, float),
     "rtol": (int, float),
     "manual_threshold_config_file": str,

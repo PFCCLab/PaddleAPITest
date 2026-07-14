@@ -221,7 +221,7 @@ def build_case(config: str, mode: str, recorder: StageRecorder, args: argparse.N
                 accuracy_compare_mode=args.accuracy_compare_mode,
                 accuracy_max_elements=args.accuracy_max_elements,
                 accuracy_sample_size=args.accuracy_sample_size,
-                use_gpu_cache_mode=args.use_gpu_cache_mode,
+                use_gpu_mode=args.use_gpu_mode,
             )
         return case_cls(api_config)
 
@@ -497,7 +497,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--use-gpu-cache-mode",
         action="store_true",
-        help="enable engine-equivalent GPU tensor cache, GPU compare, and allocator reuse",
+        help="enable engine-equivalent GPU tensor generation, GPU compare, and allocator reuse",
     )
     parser.add_argument(
         "--use-gpu-input-cache",
@@ -551,8 +551,8 @@ def main() -> None:
     args = parse_args()
     if args.use_cached_numpy:
         os.environ["USE_CACHED_NUMPY"] = "True"
-    if args.use_gpu_cache_mode:
-        os.environ["USE_GPU_CACHE_MODE"] = "True"
+    if args.use_gpu_mode:
+        os.environ["USE_GPU_MODE"] = "True"
         os.environ["SKIP_GPU_CLEANUP"] = "True"
     if args.use_gpu_input_cache:
         os.environ["USE_GPU_INPUT_CACHE"] = "True"

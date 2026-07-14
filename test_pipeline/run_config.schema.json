@@ -74,7 +74,7 @@
         "required_memory": {"type": "number", "description": "对应 --required_memory。"},
         "test_cpu": {"type": "boolean", "description": "对应 --test_cpu。"},
         "use_cached_numpy": {"type": "boolean", "description": "对应 --use_cached_numpy。"},
-        "use_gpu_cache_mode": {"type": "boolean", "description": "对应 --use_gpu_cache_mode。"},
+        "use_gpu_mode": {"type": "boolean", "description": "对应 --use_gpu_mode。"},
         "atol": {"type": "number", "description": "对应 --atol。"},
         "rtol": {"type": "number", "description": "对应 --rtol。"},
         "manual_threshold_config_file": {"type": "string", "description": "对应 --manual_threshold_config_file。"},

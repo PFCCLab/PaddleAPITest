@@ -103,7 +103,7 @@ engine_args:
   # test_amp: true
   # test_cpu: true
   # use_cached_numpy: true
-  # use_gpu_cache_mode: true
+  # use_gpu_mode: true
   # test_tol: true
   # test_backward: true
   # bitwise_alignment: true

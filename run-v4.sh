@@ -80,10 +80,10 @@ TEST_PARAM_ARGS=(
     # --test_amp=True
     # CPU 路径
     # --test_cpu=True
-    # CPU numpy 缓存；gpu_cache_mode 下自动关闭
+    # CPU numpy 缓存；gpu_mode 下自动关闭
     # --use_cached_numpy=True
     # GPU tensor 缓存 + GPU compare；增加显存驻留
-    # --use_gpu_cache_mode=True
+    # --use_gpu_mode=True
     # 对比阈值；bitwise_alignment 会将阈值置 0
     # --atol=1e-2
     # --rtol=1e-2

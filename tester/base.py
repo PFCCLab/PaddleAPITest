@@ -11,7 +11,7 @@ from .api_config.config_analyzer import (
     USE_CACHED_NUMPY,
     TensorConfig,
     get_cached_numpy_array,
-    is_gpu_cache_mode,
+    is_gpu_mode,
     should_skip_gpu_cleanup,
 )
 from .api_config.log_writer import log_accuracy_tolerance, write_to_log
@@ -86,8 +86,17 @@ def classify_runtime_error(error_msg):
     # (Unimplemented): Paddle 已知不支持的功能，当前 case 无法有效验证
     if "(unimplemented)" in error_msg_lower:
         return "skip", False
-    # (InvalidArgument) / (PreconditionNotMet): 输入/配置不满足前提，归入配置输入问题
-    if "(invalidargument)" in error_msg_lower or "(preconditionnotmet)" in error_msg_lower:
+    # (InvalidArgument) / (PreconditionNotMet) / (OutOfRange): 输入/配置不满足前提
+    if (
+        "(invalidargument)" in error_msg_lower
+        or "(preconditionnotmet)" in error_msg_lower
+        or "(outofrange)" in error_msg_lower
+    ):
+        return "config_input", False
+    # Torch-side equivalents of invalid configs (accuracy runs torch before paddle).
+    if "out of bounds for dimension" in error_msg_lower:
+        return "config_input", False
+    if "is invalid for input of size" in error_msg_lower:
         return "config_input", False
     return None, False
 
@@ -219,6 +228,7 @@ no_signature_api_mappings.update(
 class APITestBase:
     def __init__(self, api_config, use_torch=True):
         self.api_config = api_config
+        self.api_config.use_torch = use_torch
         self.outputs_grad_numpy = []
         self.outputs_grad_paddleonly = []
         if use_torch:
@@ -234,7 +244,9 @@ class APITestBase:
             return "pass", False
         if log_type is None:
             log_type = default_log_type
-        elif default_log_type == "torch_error" and log_type != "oom":
+        elif default_log_type == "torch_error" and log_type not in ("oom", "config_input", "skip"):
+            # Keep oom/config_input/skip classifications; only generic torch failures
+            # are forced into torch_error for accuracy-mode logging.
             log_type = "torch_error"
         phase_text = f" phase={phase}" if phase else ""
         print(
@@ -257,51 +269,31 @@ class APITestBase:
         #     return True
         if not paddle_only and self.api_config.config in torch_error_skip:
             return True
-        # float8 types: skip only in accuracy mode (torch comparison), allow in paddle_only mode
-        if not paddle_only:
-            for i in range(len(self.api_config.args)):
-                if isinstance(self.api_config.args[i], TensorConfig):
-                    if self.api_config.args[i].dtype in ["float8_e5m2", "float8_e4m3fn"]:
-                        return True
-                elif isinstance(self.api_config.args[i], list) or isinstance(
-                    self.api_config.args[i], tuple
-                ):
-                    for j in range(len(self.api_config.args[i])):
-                        if isinstance(self.api_config.args[i][j], TensorConfig):
-                            if self.api_config.args[i][j].dtype in [
-                                "float8_e5m2",
-                                "float8_e4m3fn",
-                            ]:
-                                return True
-                elif self.api_config.args[i] in [
-                    paddle.base.core.DataType.FLOAT8_E4M3FN,
-                    paddle.base.core.DataType.FLOAT8_E5M2,
-                    "float8_e5m2",
-                    "float8_e4m3fn",
-                ]:
-                    return True
-
-            for _key, arg_config in self.api_config.kwargs.items():
-                if isinstance(arg_config, TensorConfig):
-                    if arg_config.dtype in ["float8_e5m2", "float8_e4m3fn"]:
-                        return True
-                elif isinstance(arg_config, (list, tuple)):
-                    for i in range(len(arg_config)):
-                        if isinstance(arg_config[i], TensorConfig):
-                            if arg_config[i].dtype in ["float8_e5m2", "float8_e4m3fn"]:
-                                return True
-                elif arg_config in [
-                    paddle.base.core.DataType.FLOAT8_E4M3FN,
-                    paddle.base.core.DataType.FLOAT8_E5M2,
-                    "float8_e5m2",
-                    "float8_e4m3fn",
-                ]:
-                    return True
+        # float8 dtypes are handled by TensorConfig / paddle_to_torch Rules;
+        # do not skip accuracy-mode comparison solely because of float8 inputs.
 
         return False
 
+    def _has_float8_tensor_config(self):
+        """True if any TensorConfig arg/kwarg uses float8 dtype."""
+        float8 = ("float8_e5m2", "float8_e4m3fn")
+
+        def _check(obj):
+            if isinstance(obj, TensorConfig):
+                return obj.dtype in float8
+            if isinstance(obj, (list, tuple)):
+                return any(_check(x) for x in obj)
+            return False
+
+        if any(_check(a) for a in self.api_config.args):
+            return True
+        return any(_check(v) for v in self.api_config.kwargs.values())
+
     def need_check_grad(self):
         if self.is_forward_only():
+            return False
+        # float8 autograd / numpy grad path is unsupported in current torch tooling
+        if self._has_float8_tensor_config():
             return False
 
         if self.api_config.api_name == "paddle.assign":
@@ -386,6 +378,14 @@ class APITestBase:
                 raise ValueError(f"API {api_name} has no inspectable signature")
             paddle_bound_args = paddle_sig.bind(*args, **self.api_config.kwargs)
             return finish(paddle_bound_args.arguments)
+
+        if api_name in ("paddle.Tensor.reshape", "paddle.reshape"):
+            # paddle.reshape supports variadic int args: reshape(1, 2048, -1) in addition to reshape([1, 2048, -1])
+            # Tensor.reshape signature is (x, shape, name=None), so bind() rejects multiple ints.
+            args = self.api_config.args
+            rest = args[1:]
+            if len(rest) >= 1 and all(isinstance(arg, int) for arg in rest):
+                return finish({"x": args[0], "shape": list(rest)})
 
         if api_name in no_signature_api_mappings:
             # For APIs without signatures, use the external mapping dict
@@ -825,7 +825,7 @@ class APITestBase:
         return (paddle.rand(tuple(shape), dtype=base_dtype) - 0.5).cast(dtype)
 
     def _use_gpu_output_grad(self, output):
-        if not is_gpu_cache_mode() or "gpu" not in paddle.device.get_device():
+        if not is_gpu_mode() or "gpu" not in paddle.device.get_device():
             return False
         dtype = str(output.dtype).split(".")[-1]
         return dtype in ["float32", "float64", "float16", "bfloat16", "complex64", "complex128"]
@@ -1308,6 +1308,13 @@ class APITestBase:
             else:
                 raise
 
+    def _cast_float8_for_compare(self, tensor):
+        """torch.testing.assert_close cannot compare float8 with non-zero tol."""
+        dtype = str(tensor.dtype)
+        if "float8" in dtype:
+            return tensor.to(dtype=torch.float32)
+        return tensor
+
     def _prepare_torch_compare_tensors(self, paddle_tensor, torch_tensor):
         if not paddle_tensor.is_contiguous():
             paddle_tensor = paddle_tensor.contiguous()
@@ -1321,6 +1328,8 @@ class APITestBase:
         converted_paddle_tensor = torch.utils.dlpack.from_dlpack(paddle_dlpack)  # type: ignore[reportGeneralTypeIssues]
         if torch_tensor.device != converted_paddle_tensor.device:
             torch_tensor = torch_tensor.to(device=converted_paddle_tensor.device)
+        converted_paddle_tensor = self._cast_float8_for_compare(converted_paddle_tensor)
+        torch_tensor = self._cast_float8_for_compare(torch_tensor)
         return converted_paddle_tensor, torch_tensor
 
     def _torch_compare_error_msg(self, actual, expected, atol, rtol, suffix=""):
@@ -1361,6 +1370,8 @@ class APITestBase:
 
         paddle_dlpack = paddle.utils.dlpack.to_dlpack(paddle_tensor)  # type: ignore[reportGeneralTypeIssues]
         converted_paddle_tensor = torch.utils.dlpack.from_dlpack(paddle_dlpack)  # type: ignore[reportGeneralTypeIssues]
+        converted_paddle_tensor = self._cast_float8_for_compare(converted_paddle_tensor)
+        torch_tensor = self._cast_float8_for_compare(torch_tensor)
 
         try:
             self._assert_torch_close(
@@ -1384,9 +1395,15 @@ class APITestBase:
             error_str = str(e)
             if error_str.startswith("Comparing"):
                 print("torch_assert failed, try np_assert", flush=True)
+                _p = self._cast_float8_for_compare(
+                    torch.utils.dlpack.from_dlpack(
+                        paddle.utils.dlpack.to_dlpack(paddle_tensor.detach().cpu().contiguous())
+                    )
+                ).numpy()
+                _t = self._cast_float8_for_compare(torch_tensor.detach().cpu().contiguous()).numpy()
                 self.np_assert_accuracy(
-                    paddle_tensor.numpy(),
-                    torch_tensor.numpy(),
+                    _p,
+                    _t,
                     atol,
                     rtol,
                 )
@@ -1439,7 +1456,7 @@ class APITestBase:
         if test_tol:
             atol, rtol = 0.0, 0.0
 
-        if test_tol or not is_gpu_cache_mode():
+        if test_tol or not is_gpu_mode():
             self._torch_assert_accuracy_cpu(
                 paddle_tensor,
                 torch_tensor,

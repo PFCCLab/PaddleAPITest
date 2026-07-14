@@ -24,7 +24,7 @@ class APITestAccuracy(APITestBase):
         self.test_tol = kwargs.get("test_tol", False)
         self.exit_on_error = kwargs.get("exit_on_error", False)
         self.bitwise_alignment = kwargs.get("bitwise_alignment", False)
-        self.use_gpu_cache_mode = kwargs.get("use_gpu_cache_mode", False)
+        self.use_gpu_mode = kwargs.get("use_gpu_mode", False)
         self.manual_threshold_config_file = kwargs.get("manual_threshold_config_file", "")
         self.manual_threshold_config = self._load_manual_threshold_config(
             self.manual_threshold_config_file
@@ -243,7 +243,7 @@ class APITestAccuracy(APITestBase):
         else:
             del self.torch_args, self.torch_kwargs
 
-        keep_torch_outputs_on_device = self.use_gpu_cache_mode
+        keep_torch_outputs_on_device = self.use_gpu_mode
 
         def process_torch_outputs(obj):
             if isinstance(obj, (torch.return_types.max, torch.return_types.min)):
@@ -266,7 +266,7 @@ class APITestAccuracy(APITestBase):
             torch_out_grads = process_torch_outputs(torch_out_grads)
 
         gc.collect()
-        if not self.use_gpu_cache_mode:
+        if not self.use_gpu_mode:
             torch.cuda.empty_cache()
 
         try:
