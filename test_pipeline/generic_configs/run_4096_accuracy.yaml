@@ -1,0 +1,17 @@
+# yaml-language-server: $schema=../run_config.schema.json
+# 通用 4096（大 shape）accuracy 配置：切换 ${APITEST_MODEL} 即可切换测试模型。
+# 依赖 CI 提前将 ${APITEST_MODEL}/accuracy/4096.txt 拷贝到 PaddleAPITest 下。
+name: run_4096_accuracy
+runner:
+  engine: engineV4
+  foreground: true
+input:
+  api_config_file: "${APITEST_MODEL}/accuracy/4096.txt"
+output:
+  log_dir: "test_${APITEST_MODEL}_log_4096_accuracy"
+engine_args:
+  accuracy_stable: true
+  use_cached_numpy: true
+  num_gpus: -1
+  num_workers_per_gpu: 8
+  timeout: 1200
