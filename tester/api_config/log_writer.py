@@ -496,6 +496,7 @@ def print_log_info(all_case, log_counts=None):
         log_counts = {}
     test_case = log_counts.get("checkpoint", 0)
     pass_case = log_counts.get("pass", 0)
+    skip_case = log_counts.get("skip", 0)
     paddle_issue_case = sum(
         log_counts.get(log_type, 0)
         for log_type in [
@@ -506,8 +507,7 @@ def print_log_info(all_case, log_counts=None):
             "paddle_crash",
         ]
     )
-    retest_case = sum(log_counts.get(log_type, 0) for log_type in ["oom", "timeout"])
-    framework_blocked_case = sum(
+    test_issue_case = sum(
         log_counts.get(log_type, 0)
         for log_type in [
             "torch_error",
@@ -516,19 +516,19 @@ def print_log_info(all_case, log_counts=None):
             "config_convert",
         ]
     )
-    skip_case = log_counts.get("skip", 0)
+    retest_case = sum(log_counts.get(log_type, 0) for log_type in ["oom", "timeout"])
 
     # 打印统计信息
     print("\n" + "=" * 50)
     print("Test Case Statistics".center(50))
     print("=" * 50)
-    print(f"{'Total cases':<30}: {all_case}")
+    print(f"{'Pending cases':<30}: {all_case}")
     print(f"{'Tested cases':<30}: {test_case}")
-    print(f"{'Passed cases':<30}: {pass_case}")
+    print(f"{'Pass cases':<30}: {pass_case}")
+    print(f"{'Skip cases':<30}: {skip_case}")
     print(f"{'Paddle issue cases':<30}: {paddle_issue_case}")
+    print(f"{'Test issue cases':<30}: {test_issue_case}")
     print(f"{'Retest cases':<30}: {retest_case}")
-    print(f"{'Framework blocked cases':<30}: {framework_blocked_case}")
-    print(f"{'Skipped cases':<30}: {skip_case}")
     if log_counts:
         print("-" * 50)
         print("Log Type Breakdown:")

@@ -168,12 +168,28 @@ def validate_yaml_config(config: dict[str, Any]) -> None:
         raise ValueError("engine_args.custom_device_vs_gpu_mode 仅支持 upload 或 download")
 
 
+def expand_env_vars(value: Any) -> Any:
+    """递归展开字符串中的 ${VAR} / $VAR 环境变量引用，非字符串原样返回。
+
+    用于支持通用 pipeline 配置（如 generic_configs/）中以
+    ${JELLY_APITEST_MODEL} 等环境变量占位模型名，从而仅需切换环境变量即可
+    复用同一份配置文件。未设置的变量保持原样，不报错。
+    """
+    if isinstance(value, str):
+        return os.path.expandvars(value)
+    if isinstance(value, dict):
+        return {key: expand_env_vars(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [expand_env_vars(item) for item in value]
+    return value
+
+
 def load_yaml(path: Path) -> dict[str, Any]:
     with path.open("r", encoding="utf-8") as config_file:
         config = yaml.safe_load(config_file) or {}
     if not isinstance(config, dict):
         raise ValueError(f"配置文件必须是 YAML mapping: {path}")
-    return config
+    return expand_env_vars(config)
 
 
 def parse_key_value(value: str, option_name: str) -> tuple[str, str]:
@@ -634,9 +650,21 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--background", action="store_true", help="后台运行")
     parser.add_argument("--engine", choices=["engineV2", "engineV4"], help="覆盖 runner.engine")
     parser.add_argument("--api-config", help="覆盖 input.api_config")
-    parser.add_argument("--api-config-file", help="覆盖 input.api_config_file")
+    parser.add_argument(
+        "-i",
+        "--input",
+        "--api-config-file",
+        dest="api_config_file",
+        help="覆盖 input.api_config_file（-i/--input 为别名）",
+    )
     parser.add_argument("--api-config-file-pattern", help="覆盖 input.api_config_file_pattern")
-    parser.add_argument("--log-dir", help="覆盖 output.log_dir")
+    parser.add_argument(
+        "-o",
+        "--output",
+        "--log-dir",
+        dest="log_dir",
+        help="覆盖 output.log_dir（-o/--output 为别名）",
+    )
     parser.add_argument("--timeout", type=int, help="覆盖 engine_args.timeout")
     parser.add_argument("--num-gpus", type=int, help="覆盖 engine_args.num_gpus")
     parser.add_argument(

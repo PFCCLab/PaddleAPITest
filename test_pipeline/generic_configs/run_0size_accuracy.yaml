@@ -1,0 +1,17 @@
+# yaml-language-server: $schema=../run_config.schema.json
+# 通用 0-size accuracy 配置：切换 ${APITEST_MODEL} 即可切换测试模型。
+# 依赖 CI 提前将 ${APITEST_MODEL}/accuracy_0size/0size.txt 拷贝到 PaddleAPITest 下。
+name: run_0size_accuracy
+runner:
+  engine: engineV4
+  foreground: true
+input:
+  api_config_file: "${APITEST_MODEL}/accuracy_0size/0size.txt"
+output:
+  log_dir: "test_${APITEST_MODEL}_log_0size_accuracy"
+engine_args:
+  accuracy_stable: true
+  use_cached_numpy: true
+  num_gpus: -1
+  num_workers_per_gpu: 16
+  timeout: 600

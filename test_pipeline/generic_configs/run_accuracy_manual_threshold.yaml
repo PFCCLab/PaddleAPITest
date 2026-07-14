@@ -1,0 +1,21 @@
+# yaml-language-server: $schema=../run_config.schema.json
+# 通用 accuracy_manual_threshold 配置：使用手动误差阈值配置文件做精度对比。
+# 切换 ${APITEST_MODEL} 即可切换测试模型。
+# 依赖 CI 提前将以下文件拷贝到 PaddleAPITest 下：
+#   ${APITEST_MODEL}/accuracy_manual_threshold/accuracy_manual_threshold.txt
+#   ${APITEST_MODEL}/accuracy_manual_threshold/accuracy_manual_threshold_config.yaml
+name: run_accuracy_manual_threshold
+runner:
+  engine: engineV4
+  foreground: true
+input:
+  api_config_file: "${APITEST_MODEL}/accuracy_manual_threshold/accuracy_manual_threshold.txt"
+output:
+  log_dir: "test_${APITEST_MODEL}_log_accuracy_manual_threshold"
+engine_args:
+  accuracy: true
+  manual_threshold_config_file: "${APITEST_MODEL}/accuracy_manual_threshold/accuracy_manual_threshold_config.yaml"
+  use_cached_numpy: true
+  num_gpus: -1
+  num_workers_per_gpu: 2
+  timeout: 1200
