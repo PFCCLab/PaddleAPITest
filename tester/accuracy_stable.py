@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import traceback
 
 import numpy
@@ -402,11 +403,19 @@ class APITestAccuracyStable(APITestBase):
                 try:
                     self.assert_accuracy(input1, input2, comp)
                 except Exception as err:
-                    print(
-                        f"[paddle_accuracy] comp={comp} {self.api_config.config}\n{err!s}",
-                        flush=True,
-                    )
-                    write_to_log("paddle_accuracy", self.api_config.config)
+                    err_str = str(err)
+                    if err_str.startswith("[torch_assert_OOM]"):
+                        print(
+                            f"[oom] comp={comp} {self.api_config.config}\n{err_str}",
+                            flush=True,
+                        )
+                        write_to_log("oom", self.api_config.config)
+                    else:
+                        print(
+                            f"[paddle_accuracy] comp={comp} {self.api_config.config}\n{err_str}",
+                            flush=True,
+                        )
+                        write_to_log("paddle_accuracy", self.api_config.config)
                     return
             else:
                 print(
@@ -441,11 +450,19 @@ class APITestAccuracyStable(APITestBase):
                     try:
                         self.assert_accuracy(item1, item2, comp, idx)
                     except Exception as err:
-                        print(
-                            f"[paddle_accuracy] comp={comp} {self.api_config.config}\n{err!s}",
-                            flush=True,
-                        )
-                        write_to_log("paddle_accuracy", self.api_config.config)
+                        err_str = str(err)
+                        if err_str.startswith("[torch_assert_OOM]"):
+                            print(
+                                f"[oom] comp={comp} {self.api_config.config}\n{err_str}",
+                                flush=True,
+                            )
+                            write_to_log("oom", self.api_config.config)
+                        else:
+                            print(
+                                f"[paddle_accuracy] comp={comp} {self.api_config.config}\n{err_str}",
+                                flush=True,
+                            )
+                            write_to_log("paddle_accuracy", self.api_config.config)
                         return
                 elif not isinstance(item1, (paddle.Tensor, torch.Tensor)) and not isinstance(
                     item2, (paddle.Tensor, torch.Tensor)
@@ -453,11 +470,19 @@ class APITestAccuracyStable(APITestBase):
                     try:
                         self.assert_accuracy(torch.tensor(item1), torch.tensor(item2), comp, idx)
                     except Exception as err:
-                        print(
-                            f"[paddle_accuracy] comp={comp} {self.api_config.config}\n{err!s}",
-                            flush=True,
-                        )
-                        write_to_log("paddle_accuracy", self.api_config.config)
+                        err_str = str(err)
+                        if err_str.startswith("[torch_assert_OOM]"):
+                            print(
+                                f"[oom] comp={comp} {self.api_config.config}\n{err_str}",
+                                flush=True,
+                            )
+                            write_to_log("oom", self.api_config.config)
+                        else:
+                            print(
+                                f"[paddle_accuracy] comp={comp} {self.api_config.config}\n{err_str}",
+                                flush=True,
+                            )
+                            write_to_log("paddle_accuracy", self.api_config.config)
                         return
                 else:
                     print(
@@ -471,11 +496,19 @@ class APITestAccuracyStable(APITestBase):
             try:
                 self.assert_accuracy(torch.tensor(input1), torch.tensor(input2), comp)
             except Exception as err:
-                print(
-                    f"[paddle_accuracy] comp={comp} {self.api_config.config}\n{err!s}",
-                    flush=True,
-                )
-                write_to_log("paddle_accuracy", self.api_config.config)
+                err_str = str(err)
+                if err_str.startswith("[torch_assert_OOM]"):
+                    print(
+                        f"[oom] comp={comp} {self.api_config.config}\n{err_str}",
+                        flush=True,
+                    )
+                    write_to_log("oom", self.api_config.config)
+                else:
+                    print(
+                        f"[paddle_accuracy] comp={comp} {self.api_config.config}\n{err_str}",
+                        flush=True,
+                    )
+                    write_to_log("paddle_accuracy", self.api_config.config)
                 return
 
     def assert_accuracy(self, tensor1, tensor2, comp, idx=0):
@@ -531,28 +564,50 @@ class APITestAccuracyStable(APITestBase):
             err_str = str(err)
             is_acc_err = False
             if err_str.startswith("Comparing"):
-                print("torch_assert failed, try np_assert", flush=True)
-                try:
-                    numpy.testing.assert_allclose(
-                        tensor1.cpu().numpy(),
-                        tensor2.cpu().numpy(),
-                        rtol=0.0,
-                        atol=0.0,
-                        equal_nan=True,
-                        strict=True,
+                # torch_assert internal error (OOM on large tensor)
+                if os.environ.get("PADDLEAPITEST_NP_FALLBACK", "0") == "1":
+                    # fallback to np_assert
+                    print(
+                        f"[torch_assert_OOM] comp={comp} torch.testing.assert_close OOM, fallback to np_assert",
+                        flush=True,
                     )
-                    log_accuracy_stable(
-                        "Identical",
-                        api_name,
-                        config,
-                        dtype,
-                        comp,
+                    t1_cpu = tensor1.cpu()
+                    t2_cpu = tensor2.cpu()
+                    # numpy does not support bfloat16/float8, cast to float32
+                    if t1_cpu.dtype in (torch.bfloat16,) or "float8" in str(t1_cpu.dtype):
+                        t1_cpu = t1_cpu.float()
+                    if t2_cpu.dtype in (torch.bfloat16,) or "float8" in str(t2_cpu.dtype):
+                        t2_cpu = t2_cpu.float()
+                    try:
+                        numpy.testing.assert_allclose(
+                            t1_cpu.numpy(),
+                            t2_cpu.numpy(),
+                            rtol=0.0,
+                            atol=0.0,
+                            equal_nan=True,
+                            strict=True,
+                        )
+                        log_accuracy_stable(
+                            "Identical",
+                            api_name,
+                            config,
+                            dtype,
+                            comp,
+                        )
+                        return
+                    except Exception as err_np:
+                        err_str = str(err_np)
+                        err_list = err_str.split("\n", maxsplit=3)
+                        if len(err_list) > 3 and err_list[3].startswith("Mismatched elements"):
+                            is_acc_err = True
+                        else:
+                            # np_assert also failed with unexpected error, raise np error (not torch OOM)
+                            raise err_np
+                else:
+                    # report as OOM directly, raise with recognizable prefix for outer layer
+                    raise RuntimeError(
+                        "[torch_assert_OOM] torch.testing.assert_close OOM on large tensor comparison"
                     )
-                except Exception as err_np:
-                    err_str = str(err_np)
-                    err_list = err_str.split("\n", maxsplit=3)
-                    if len(err_list) > 3 and err_list[3].startswith("Mismatched elements"):
-                        is_acc_err = True
             else:
                 err_list = err_str.split("\n", maxsplit=1)
                 if len(err_list) > 1 and (

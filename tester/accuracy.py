@@ -334,12 +334,20 @@ class APITestAccuracy(APITestBase):
                     paddle_tensor, torch_tensor, atol=self.get_atol(), rtol=self.get_rtol()
                 )
             except Exception as err:
+                err_str = str(err)
                 phase = "backward" if self.is_backward else "forward"
-                print(
-                    f"[paddle_accuracy] phase={phase} idx={idx} {self.api_config.config}\n{err!s}",
-                    flush=True,
-                )
-                write_to_log("paddle_accuracy", self.api_config.config)
+                if err_str.startswith("[torch_assert_OOM]"):
+                    print(
+                        f"[oom] phase={phase} idx={idx} {self.api_config.config}\n{err_str}",
+                        flush=True,
+                    )
+                    write_to_log("oom", self.api_config.config)
+                else:
+                    print(
+                        f"[paddle_accuracy] phase={phase} idx={idx} {self.api_config.config}\n{err_str}",
+                        flush=True,
+                    )
+                    write_to_log("paddle_accuracy", self.api_config.config)
                 if self.exit_on_error:
                     raise
                 return False

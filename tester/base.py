@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import collections
 import inspect
+import os
 
 import numpy
 import paddle
@@ -1301,13 +1302,41 @@ class APITestBase:
         except Exception as e:
             error_str = str(e)
             if error_str.startswith("Comparing"):
-                print("torch_assert failed, try np_assert", flush=True)
-                self.np_assert_accuracy(
-                    actual_paddle_tensor.numpy(),
-                    expected_paddle_tensor.numpy(),
-                    atol,
-                    rtol,
-                )
+                if os.environ.get("PADDLEAPITEST_NP_FALLBACK", "0") == "1":
+                    # torch_assert OOM or internal error, fallback to np_assert
+                    print(
+                        "[torch_assert_OOM] torch.testing.assert_close OOM, fallback to np_assert",
+                        flush=True,
+                    )
+                    # numpy does not support bfloat16/float8, cast to float32 for comparison
+                    actual_np = actual_paddle_tensor
+                    expected_np = expected_paddle_tensor
+                    if hasattr(actual_np, "dtype"):
+                        dtype_str = str(actual_np.dtype)
+                        if "bfloat16" in dtype_str or "float8" in dtype_str:
+                            actual_np = (
+                                actual_np.astype("float32")
+                                if hasattr(actual_np, "astype")
+                                else actual_np.float()
+                            )
+                    if hasattr(expected_np, "dtype"):
+                        dtype_str = str(expected_np.dtype)
+                        if "bfloat16" in dtype_str or "float8" in dtype_str:
+                            expected_np = (
+                                expected_np.astype("float32")
+                                if hasattr(expected_np, "astype")
+                                else expected_np.float()
+                            )
+                    self.np_assert_accuracy(
+                        actual_np.numpy() if hasattr(actual_np, "numpy") else actual_np,
+                        expected_np.numpy() if hasattr(expected_np, "numpy") else expected_np,
+                        atol,
+                        rtol,
+                    )
+                else:
+                    raise RuntimeError(
+                        "[torch_assert_OOM] torch.testing.assert_close OOM on large tensor comparison"
+                    )
             else:
                 raise
 
@@ -1397,19 +1426,32 @@ class APITestBase:
         except Exception as e:
             error_str = str(e)
             if error_str.startswith("Comparing"):
-                print("torch_assert failed, try np_assert", flush=True)
-                _p = self._cast_float8_for_compare(
-                    torch.utils.dlpack.from_dlpack(
-                        paddle.utils.dlpack.to_dlpack(paddle_tensor.detach().cpu().contiguous())
+                if os.environ.get("PADDLEAPITEST_NP_FALLBACK", "0") == "1":
+                    print(
+                        "[torch_assert_OOM] torch.testing.assert_close OOM, fallback to np_assert",
+                        flush=True,
                     )
-                ).numpy()
-                _t = self._cast_float8_for_compare(torch_tensor.detach().cpu().contiguous()).numpy()
-                self.np_assert_accuracy(
-                    _p,
-                    _t,
-                    atol,
-                    rtol,
-                )
+                    _p = self._cast_float8_for_compare(
+                        torch.utils.dlpack.from_dlpack(
+                            paddle.utils.dlpack.to_dlpack(paddle_tensor.detach().cpu().contiguous())
+                        )
+                    )
+                    _t = self._cast_float8_for_compare(torch_tensor.detach().cpu().contiguous())
+                    # numpy does not support bfloat16, cast to float32
+                    if _p.dtype == torch.bfloat16:
+                        _p = _p.float()
+                    if _t.dtype == torch.bfloat16:
+                        _t = _t.float()
+                    self.np_assert_accuracy(
+                        _p.numpy(),
+                        _t.numpy(),
+                        atol,
+                        rtol,
+                    )
+                else:
+                    raise RuntimeError(
+                        "[torch_assert_OOM] torch.testing.assert_close OOM on large tensor comparison"
+                    )
             elif test_tol:
                 error_info = error_str.split("\n", maxsplit=2)[1] if "\n" in error_str else None
                 if error_info and (
@@ -1440,13 +1482,40 @@ class APITestBase:
                 f"dtype mismatch: paddle {converted_paddle_tensor.dtype}, torch {torch_tensor.dtype}"
             )
 
-        self._assert_torch_close(
-            converted_paddle_tensor,
-            torch_tensor,
-            atol,
-            rtol,
-            is_check_dtype,
-        )
+        try:
+            self._assert_torch_close(
+                converted_paddle_tensor,
+                torch_tensor,
+                atol,
+                rtol,
+                is_check_dtype,
+            )
+        except Exception as e:
+            error_str = str(e)
+            if error_str.startswith("Comparing"):
+                if os.environ.get("PADDLEAPITEST_NP_FALLBACK", "0") == "1":
+                    print(
+                        "[torch_assert_OOM] torch.testing.assert_close OOM, fallback to np_assert",
+                        flush=True,
+                    )
+                    _p = converted_paddle_tensor.cpu()
+                    _t = torch_tensor.cpu()
+                    if _p.dtype == torch.bfloat16:
+                        _p = _p.float()
+                    if _t.dtype == torch.bfloat16:
+                        _t = _t.float()
+                    self.np_assert_accuracy(
+                        _p.numpy(),
+                        _t.numpy(),
+                        atol,
+                        rtol,
+                    )
+                else:
+                    raise RuntimeError(
+                        "[torch_assert_OOM] torch.testing.assert_close OOM on large tensor comparison"
+                    )
+            else:
+                raise
 
     def torch_assert_accuracy(self, paddle_tensor, torch_tensor, atol=1e-2, rtol=1e-2):
         is_check_dtype = self.api_config.api_name not in not_check_dtype
