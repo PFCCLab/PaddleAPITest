@@ -189,6 +189,7 @@ class TensorConfig:
         self.numpy_tensor = None
         self.paddle_tensor = None
         self.torch_tensor = None
+        self.gpu_source_tensor = None
         self.shuffle_dims = None
 
     def __deepcopy__(self, memo):
@@ -369,7 +370,9 @@ class TensorConfig:
     def _make_gpu_tensor_pair(self, api_config, dtype=None):
         dtype = dtype or self.dtype
         source_dtype = "float16" if dtype in FLOAT8_DTYPES else dtype
-        torch_source = self._make_gpu_torch_dense_tensor(source_dtype)
+        if self.gpu_source_tensor is None:
+            self.gpu_source_tensor = self._make_gpu_torch_dense_tensor(source_dtype)
+        torch_source = self.gpu_source_tensor
         paddle_source = paddle.utils.dlpack.from_dlpack(
             torch.utils.dlpack.to_dlpack(torch_source.detach().clone())
         )
