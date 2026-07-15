@@ -128,9 +128,9 @@ class APITestAccuracy(APITestBase):
                 write_to_log("config_input", self.api_config.config)
                 return
         except Exception as err:
-            print(f"[config_input] {self.api_config.config}\n{err!s}")
-            traceback.print_exc()
-            write_to_log("config_input", self.api_config.config)
+            log_type, fatal = self.report_runtime_error(err, "config_input", "gen_numpy_input")
+            if fatal:
+                raise
             return
 
         try:

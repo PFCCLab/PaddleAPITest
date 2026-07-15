@@ -27,8 +27,9 @@ class APITestCINNVSDygraph(APITestBase):
                 print("gen_numpy_input failed", flush=True)
                 return
         except Exception as err:
-            print(f"[numpy error] {self.api_config.config}\n{err!s}", flush=True)
-            write_to_log("config_input", self.api_config.config)
+            log_type, fatal = self.report_runtime_error(err, "config_input", "gen_numpy_input")
+            if fatal:
+                raise
             return
 
         if not self.gen_paddle_input():
