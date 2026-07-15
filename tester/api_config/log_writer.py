@@ -20,23 +20,27 @@ TMP_LOG_PATH = TEST_LOG_PATH / ".tmp"
 LOG_PREFIXES = {
     "checkpoint": "checkpoint",
     "pass": "api_config_pass",
-    "numpy_error": "api_config_numpy_error",
+    "skip": "api_config_skip",
     "paddle_error": "api_config_paddle_error",
-    "torch_error": "api_config_torch_error",
-    "paddle_to_torch_failed": "api_config_paddle_to_torch_failed",
-    "accuracy_error": "api_config_accuracy_error",
-    "accuracy_diff": "api_config_accuracy_diff",
-    "timeout": "api_config_timeout",
-    "crash": "api_config_crash",
+    "paddle_accuracy": "api_config_paddle_accuracy",
+    "paddle_bitwise": "api_config_paddle_bitwise",
+    "paddle_cuda": "api_config_paddle_cuda",
+    "paddle_crash": "api_config_paddle_crash",
     "oom": "api_config_oom",
-    "match_error": "api_config_match_error",
-    "cuda_error": "api_config_cuda_error",
+    "timeout": "api_config_timeout",
+    "torch_error": "api_config_torch_error",
+    "config_input": "api_config_config_input",
+    "config_parse": "api_config_config_parse",
+    "config_convert": "api_config_config_convert",
 }
+
+TERMINAL_LOG_TYPES = frozenset(LOG_PREFIXES) - {"checkpoint"}
 
 _is_engineV2 = False
 
 _process_file_handlers = {}
 _aggregated_offsets = {}
+_process_terminal_configs = {}
 
 # Command line arguments configuration
 # Used in engine.py
@@ -103,6 +107,25 @@ def close_process_files():
     _process_file_handlers = {}
 
 
+def has_terminal_log(line):
+    return line.strip() in _process_terminal_configs
+
+
+def get_terminal_log_type(line):
+    return _process_terminal_configs.get(line.strip())
+
+
+def write_checkpoint(line):
+    line = line.strip()
+    write_to_log("checkpoint", line)
+    _process_terminal_configs.pop(line, None)
+
+
+def write_terminal_log(log_type, line):
+    write_to_log(log_type, line)
+    write_checkpoint(line)
+
+
 def get_log_file(log_type: str):
     """获取指定日志类型和PID对应的日志文件路径"""
     if log_type not in LOG_PREFIXES:
@@ -121,12 +144,17 @@ def write_to_log(log_type, line):
     line = line.strip()
     if not line:
         return
+    terminal_log_type = _process_terminal_configs.get(line)
+    if _is_engineV2 and log_type == "pass" and terminal_log_type not in (None, "pass"):
+        return
     file_path = get_log_file(log_type)
     try:
         if file_path not in _process_file_handlers:
             _process_file_handlers[file_path] = file_path.open("a", buffering=1)
         handler = _process_file_handlers[file_path]
         handler.write(line + "\n")
+        if log_type in TERMINAL_LOG_TYPES and _is_engineV2:
+            _process_terminal_configs[line] = log_type
     except Exception as err:
         print(f"Error writing to {file_path}: {err}", flush=True)
 
@@ -452,13 +480,46 @@ def aggregate_logs(end=False, cleanup=False):
                 print(f"Error reading {log_file}: {err}", flush=True)
 
         if api_configs:
-            log_counts["skip"] = len(api_configs)
-            skip_file = TEST_LOG_PATH / "api_config_skip.txt"
+            log_counts["incomplete"] = len(api_configs)
+            incomplete_file = TEST_LOG_PATH / "api_config_incomplete.txt"
             try:
-                with skip_file.open("w") as f:
+                with incomplete_file.open("w") as f:
                     f.writelines(f"{line}\n" for line in sorted(api_configs))
             except Exception as err:
-                print(f"Error writing to {skip_file}: {err}", flush=True)
+                print(f"Error writing to {incomplete_file}: {err}", flush=True)
+
+        # === 终态日志互斥性检查 ===
+        config_to_types: dict[str, list[str]] = {}
+        for log_type, prefix in LOG_PREFIXES.items():
+            if log_type == "checkpoint":
+                continue
+            log_file = TEST_LOG_PATH / f"{prefix}.txt"
+            if not log_file.exists():
+                continue
+            try:
+                with log_file.open("r") as f:
+                    for raw_line in f:
+                        line = raw_line.strip()
+                        if line:
+                            config_to_types.setdefault(line, []).append(log_type)
+            except Exception:
+                pass
+
+        duplicates = {config: types for config, types in config_to_types.items() if len(types) > 1}
+        if duplicates:
+            print("\n" + "!" * 50)
+            print("INTEGRITY ERROR: configs found in multiple log types:")
+            for config, types in sorted(duplicates.items())[:20]:
+                print(f"  {config}")
+                print(f"    -> {', '.join(types)}")
+            if len(duplicates) > 20:
+                print(f"  ... and {len(duplicates) - 20} more")
+            print("!" * 50 + "\n")
+            assert not duplicates, (
+                f"Log integrity violation: {len(duplicates)} config(s) appear in "
+                f"multiple terminal log types. This indicates a classification bug."
+            )
+
         return log_counts
 
 
@@ -468,42 +529,44 @@ def print_log_info(all_case, log_counts=None):
         log_counts = {}
     test_case = log_counts.get("checkpoint", 0)
     pass_case = log_counts.get("pass", 0)
-    fail_case = sum(
+    skip_case = log_counts.get("skip", 0)
+    paddle_issue_case = sum(
         log_counts.get(log_type, 0)
         for log_type in [
             "paddle_error",
-            "accuracy_error",
-            "accuracy_diff",
-            "timeout",
-            "crash",
-            "oom",
-            "cuda_error",
+            "paddle_accuracy",
+            "paddle_bitwise",
+            "paddle_cuda",
+            "paddle_crash",
         ]
     )
-    skip_case = sum(
+    test_issue_case = sum(
         log_counts.get(log_type, 0)
         for log_type in [
-            "numpy_error",
             "torch_error",
-            "paddle_to_torch_failed",
-            "match_error",
+            "config_input",
+            "config_parse",
+            "config_convert",
         ]
     )
+    retest_case = sum(log_counts.get(log_type, 0) for log_type in ["oom", "timeout"])
 
     # 打印统计信息
     print("\n" + "=" * 50)
     print("Test Case Statistics".center(50))
     print("=" * 50)
-    print(f"{'Total cases':<30}: {all_case}")
-    print(f"{'Tested cases':<30}: {test_case}")
-    print(f"{'Passed cases':<30}: {pass_case}")
-    print(f"{'Failed cases':<30}: {fail_case}")
-    print(f"{'Skipped cases':<30}: {skip_case}")
+    print(f"{'Pending cases':<30}: {all_case:>8}")
+    print(f"{'Tested cases':<30}: {test_case:>8}")
+    print(f"{'Pass cases':<30}: {pass_case:>8}")
+    print(f"{'Skip cases':<30}: {skip_case:>8}")
+    print(f"{'Paddle issue cases':<30}: {paddle_issue_case:>8}")
+    print(f"{'Test issue cases':<30}: {test_issue_case:>8}")
+    print(f"{'Retest cases':<30}: {retest_case:>8}")
     if log_counts:
         print("-" * 50)
         print("Log Type Breakdown:")
         for log_type, count in log_counts.items():
-            print(f"  {log_type:<28}: {count}")
+            print(f"  {log_type:<28}: {count:>8}")
     print("=" * 50 + "\n")
 
 
@@ -563,7 +626,7 @@ def log_accuracy_tolerance(error_msg, api, config, dtype, is_backward=False):
     """
     output_file = TMP_LOG_PATH / f"tol_{os.getpid()}.csv"
     mode = "backward" if is_backward else "forward"
-    print(f"[{mode}] {config}\n{error_msg}", flush=True)
+    print(f"mode={mode} {config}\n{error_msg}", flush=True)
 
     if error_msg == "Identical":
         max_abs_diff = 0.0
@@ -611,7 +674,7 @@ def log_accuracy_tolerance(error_msg, api, config, dtype, is_backward=False):
 
 def log_accuracy_stable(error_msg, api, config, dtype, comp):
     output_file = TMP_LOG_PATH / f"stable_{os.getpid()}.csv"
-    print(f"[{comp}] {config}\n{error_msg}", flush=True)
+    print(f"comp={comp} {config}\n{error_msg}", flush=True)
 
     if error_msg == "Identical":
         max_abs_diff = 0.0

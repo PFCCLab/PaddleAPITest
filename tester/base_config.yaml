@@ -1,38 +1,41 @@
 # base_config.yaml
 
 # paddle errors which will be ignored and considered as pass
-paddle_error_dismiss:
-  # API: "error_message"
-  # API:
-  #   - "error_msg1"
-  #   - "error_msg2"
-  paddle.nn.functional.conv1d: "(PreconditionNotMet) The element size of "
-  paddle.nn.functional.conv1d_transpose: "(PreconditionNotMet) The element size of "
-  paddle.nn.functional.conv2d: "(PreconditionNotMet) The element size of "
-  paddle.nn.functional.conv2d_transpose: "(PreconditionNotMet) The element size of "
-  paddle.nn.functional.conv3d: "(PreconditionNotMet) The element size of "
-  paddle.nn.functional.conv3d_transpose: "(PreconditionNotMet) The element size of "
-  paddle.vision.ops.distribute_fpn_proposals:
-    - "(PreconditionNotMet) The number of proposals in FPN "
-    - "(PreconditionNotMet) The number of images "
-  paddle.incubate.nn.functional.variable_length_memory_efficient_attention: "(InvalidArgument) the kernel should not be launched"
-  paddle.Tensor.inverse: "(Unimplemented) cublasMatInv does not support batch_size > 65536."
-  paddle.incubate.nn.functional.fused_rms_norm : "(Fatal) Failed to launch RMSNorm kernel"
-  paddle.nn.functional.ctc_loss: "(InvalidArgument) The total number of elements "
-  paddle.unbind: "(PreconditionNotMet) The number of proposals in unbind"
-  paddle.linalg.lstsq:
-    - "(PreconditionNotMet) The element size of x should be <= INT_MAX(2147483647)"
-    - "(PreconditionNotMet) The element size of y should be <= INT_MAX(2147483647)"
-  paddle.Tensor.lu: "(PreconditionNotMet) Matrix size too large for LU decomposition."
-  paddle.linalg.solve: "(PreconditionNotMet) Input tensor 'A' or 'B' has too many elements (> INT_MAX)."
-  paddle.nn.functional.group_norm: "(Unimplemented) GroupNorm kernel launch failed"
-  paddle.einsum: "(Unimplemented) cublas GEMM does not support N >"
-  paddle.nn.functional.cross_entropy: "(PreconditionNotMet) The num of the classes should be <= INT_MAX(2147483647)"
-  paddle.nn.functional.class_center_sample:
-    - "(InvalidArgument) The total number of elements for 'label' should be less than"
-    - "(InvalidArgument) Illegal memory allocation, total allocated space must be greater than 0"
-  paddle.linalg.matrix_rank: "(PreconditionNotMet) The element size of x should be <= INT_MAX(2147483647)"
-  paddle.argsort: "(PreconditionNotMet) The dimension being sorted should be less than 2^31"
+# paddle_error_dismiss: disabled — (InvalidArgument)/(PreconditionNotMet) → config_input,
+#   (Unimplemented) → skip are now handled in classify_runtime_error() in base.py.
+#   Rules kept here for reference.
+# paddle_error_dismiss:
+#   # API: "error_message"
+#   # API:
+#   #   - "error_msg1"
+#   #   - "error_msg2"
+#   paddle.nn.functional.conv1d: "(PreconditionNotMet) The element size of "
+#   paddle.nn.functional.conv1d_transpose: "(PreconditionNotMet) The element size of "
+#   paddle.nn.functional.conv2d: "(PreconditionNotMet) The element size of "
+#   paddle.nn.functional.conv2d_transpose: "(PreconditionNotMet) The element size of "
+#   paddle.nn.functional.conv3d: "(PreconditionNotMet) The element size of "
+#   paddle.nn.functional.conv3d_transpose: "(PreconditionNotMet) The element size of "
+#   paddle.vision.ops.distribute_fpn_proposals:
+#     - "(PreconditionNotMet) The number of proposals in FPN "
+#     - "(PreconditionNotMet) The number of images "
+#   paddle.incubate.nn.functional.variable_length_memory_efficient_attention: "(InvalidArgument) the kernel should not be launched"
+#   paddle.Tensor.inverse: "(Unimplemented) cublasMatInv does not support batch_size > 65536."
+#   paddle.incubate.nn.functional.fused_rms_norm : "(Fatal) Failed to launch RMSNorm kernel"
+#   paddle.nn.functional.ctc_loss: "(InvalidArgument) The total number of elements "
+#   paddle.unbind: "(PreconditionNotMet) The number of proposals in unbind"
+#   paddle.linalg.lstsq:
+#     - "(PreconditionNotMet) The element size of x should be <= INT_MAX(2147483647)"
+#     - "(PreconditionNotMet) The element size of y should be <= INT_MAX(2147483647)"
+#   paddle.Tensor.lu: "(PreconditionNotMet) Matrix size too large for LU decomposition."
+#   paddle.linalg.solve: "(PreconditionNotMet) Input tensor 'A' or 'B' has too many elements (> INT_MAX)."
+#   paddle.nn.functional.group_norm: "(Unimplemented) GroupNorm kernel launch failed"
+#   paddle.einsum: "(Unimplemented) cublas GEMM does not support N >"
+#   paddle.nn.functional.cross_entropy: "(PreconditionNotMet) The num of the classes should be <= INT_MAX(2147483647)"
+#   paddle.nn.functional.class_center_sample:
+#     - "(InvalidArgument) The total number of elements for 'label' should be less than"
+#     - "(InvalidArgument) Illegal memory allocation, total allocated space must be greater than 0"
+#   paddle.linalg.matrix_rank: "(PreconditionNotMet) The element size of x should be <= INT_MAX(2147483647)"
+#   paddle.argsort: "(PreconditionNotMet) The dimension being sorted should be less than 2^31"
 
 # some accuracy error can be considered tolerable
 # special_accuracy_atol_rtol:

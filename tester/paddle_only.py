@@ -3,38 +3,42 @@ from __future__ import annotations
 import paddle
 
 from .api_config.log_writer import write_to_log
-from .base import CUDA_ERROR, CUDA_OOM, APITestBase
+from .base import APITestBase
 
 # from func_timeout import func_set_timeout
 
 
 class APITestPaddleOnly(APITestBase):
     def __init__(self, api_config, **kwargs):
-        super().__init__(api_config)
+        super().__init__(api_config, use_torch=False)
         self.test_amp = kwargs.get("test_amp", False)
 
     # @func_set_timeout(600)
     def test(self):
         if self.need_skip(paddle_only=True):
-            print(f"[Skip] {self.api_config.config}", flush=True)
+            print(f"[skip] {self.api_config.config}", flush=True)
+            write_to_log("skip", self.api_config.config)
             return
 
         if not self.ana_paddle_api_info():
             print("ana_paddle_api_info failed", flush=True)
+            write_to_log("config_parse", self.api_config.config)
             return
 
         try:
             if not self.gen_numpy_input():
                 print("gen_numpy_input failed", flush=True)
+                write_to_log("config_input", self.api_config.config)
                 return
         except Exception as err:
-            print(f"[numpy error] {self.api_config.config}\n{err!s}", flush=True)
-            write_to_log("numpy_error", self.api_config.config)
+            print(f"[config_input] {self.api_config.config}\n{err!s}", flush=True)
+            write_to_log("config_input", self.api_config.config)
             return
 
         try:
             if not self.gen_paddle_input():
                 print("gen_paddle_input failed", flush=True)
+                write_to_log("paddle_error", self.api_config.config)
                 return
             if self.test_amp:
                 with paddle.amp.auto_cast():
@@ -61,20 +65,11 @@ class APITestPaddleOnly(APITestBase):
             paddle_output = None
             result_outputs = None
             result_outputs_grads = None
-            if self.should_ignore_paddle_error(str(err)):
-                print(f"[Pass] {self.api_config.config}", flush=True)
-                write_to_log("pass", self.api_config.config)
-                return
-            if any(cuda_err in str(err) for cuda_err in CUDA_ERROR):
-                print(f"[cuda error] {self.api_config.config}\n{err!s}", flush=True)
-                write_to_log("cuda_error", self.api_config.config)
+            _, fatal = self.report_runtime_error(
+                err, "paddle_error", "paddle_only", allow_ignore_paddle=True
+            )
+            if fatal:
                 raise
-            if any(cuda_err in str(err) for cuda_err in CUDA_OOM):
-                print(f"[oom] {self.api_config.config}\n{err!s}", flush=True)
-                write_to_log("oom", self.api_config.config)
-                raise
-            print(f"[paddle error] {self.api_config.config}\n{err!s}", flush=True)
-            write_to_log("paddle_error", self.api_config.config)
             return
 
         try:
@@ -83,12 +78,11 @@ class APITestPaddleOnly(APITestBase):
             paddle_output = None
             result_outputs = None
             result_outputs_grads = None
-            print(f"[cuda error] {self.api_config.config}\n{err!s}", flush=True)
-            write_to_log("cuda_error", self.api_config.config)
+            self.report_runtime_error(err, "paddle_cuda", "paddle_only_cuda_check")
             raise
 
         paddle_output = None
         result_outputs = None
         result_outputs_grads = None
-        print(f"[Pass] {self.api_config.config}", flush=True)
+        print(f"[pass] {self.api_config.config}", flush=True)
         write_to_log("pass", self.api_config.config)

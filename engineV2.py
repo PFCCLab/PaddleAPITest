@@ -66,6 +66,11 @@ DEVICE_COUNT = None  # total number of devices
 _MEM_SNAPSHOT = None  # dict: gpu_id -> (total_gb, used_gb)
 _MEM_SNAPSHOT_TS = 0.0
 _MEM_SNAPSHOT_TTL = 2.0  # seconds — snapshot cache ttl
+FATAL_CUDA_EXIT_CODE = 99
+FATAL_OOM_EXIT_CODE = 98
+FATAL_TORCH_EXIT_CODE = 97
+MEMORY_WAIT_SECONDS = 10
+MEMORY_WAIT_LOG_INTERVAL = 60
 
 
 def cleanup(pool):
@@ -282,6 +287,85 @@ def _print_argument(prefix, message):
     print(f"{prefix} {message}", flush=True)
 
 
+def _mode_uses_torch(options):
+    return any(
+        getattr(options, opt, False)
+        for opt in (
+            "accuracy",
+            "paddle_cinn",
+            "paddle_gpu_performance",
+            "torch_gpu_performance",
+            "paddle_torch_gpu_performance",
+            "accuracy_stable",
+            "paddle_custom_device",
+            "custom_device_vs_gpu",
+        )
+    )
+
+
+def _load_test_classes(options):
+    from tester import APIConfig, APITestPaddleOnly
+
+    test_classes = {
+        "APIConfig": APIConfig,
+        "APITestPaddleOnly": APITestPaddleOnly,
+    }
+    if _mode_uses_torch(options):
+        from tester import (
+            APITestAccuracy,
+            APITestAccuracyStable,
+            APITestCINNVSDygraph,
+            APITestCustomDeviceVSCPU,
+            APITestPaddleDeviceVSGPU,
+            APITestPaddleGPUPerformance,
+            APITestPaddleTorchGPUPerformance,
+            APITestTorchGPUPerformance,
+        )
+
+        test_classes.update(
+            {
+                "APITestAccuracy": APITestAccuracy,
+                "APITestCINNVSDygraph": APITestCINNVSDygraph,
+                "APITestPaddleGPUPerformance": APITestPaddleGPUPerformance,
+                "APITestTorchGPUPerformance": APITestTorchGPUPerformance,
+                "APITestPaddleTorchGPUPerformance": APITestPaddleTorchGPUPerformance,
+                "APITestAccuracyStable": APITestAccuracyStable,
+                "APITestCustomDeviceVSCPU": APITestCustomDeviceVSCPU,
+                "APITestPaddleDeviceVSGPU": APITestPaddleDeviceVSGPU,
+            }
+        )
+    return test_classes
+
+
+def _select_test_class(options):
+    test_classes = _load_test_classes(options)
+    option_to_class_name = {
+        "paddle_only": "APITestPaddleOnly",
+        "paddle_cinn": "APITestCINNVSDygraph",
+        "accuracy": "APITestAccuracy",
+        "paddle_gpu_performance": "APITestPaddleGPUPerformance",
+        "torch_gpu_performance": "APITestTorchGPUPerformance",
+        "paddle_torch_gpu_performance": "APITestPaddleTorchGPUPerformance",
+        "accuracy_stable": "APITestAccuracyStable",
+        "paddle_custom_device": "APITestCustomDeviceVSCPU",
+        "custom_device_vs_gpu": "APITestPaddleDeviceVSGPU",
+    }
+    for opt, class_name in option_to_class_name.items():
+        if getattr(options, opt, False):
+            return test_classes[class_name]
+    return test_classes["APITestAccuracy"]
+
+
+def _clear_device_cache(options):
+    import paddle
+
+    if _mode_uses_torch(options):
+        import torch
+
+        torch.cuda.empty_cache()
+    paddle.device.cuda.empty_cache()
+
+
 def _parse_gpu_ids(gpu_ids_arg, device_count):
     gpu_ids = []
     for raw_part in gpu_ids_arg.split(","):
@@ -402,7 +486,7 @@ def check_gpu_memory(gpu_ids, num_workers_per_gpu, required_memory):  # required
                     else min(max_workers, num_workers_per_gpu)
                 )
         except pynvml.NVMLError as e:
-            print(f"[WARNING] Failed to check GPU {gpu_id}: {e!s}", flush=True)
+            print(f"[warn] Failed to check GPU {gpu_id}: {e!s}", flush=True)
             continue
 
     return available_gpus, max_workers_per_gpu
@@ -441,7 +525,6 @@ def init_worker_gpu(gpu_worker_list, lock, available_gpus, max_workers_per_gpu, 
         os.environ["CUDA_VISIBLE_DEVICES"] = str(assigned_gpu)
 
         import paddle
-        import torch
 
         # Load custom ops from paddlefleet to register _run_custom_op operators
         try:
@@ -453,39 +536,11 @@ def init_worker_gpu(gpu_worker_list, lock, available_gpus, max_workers_per_gpu, 
         except ImportError:
             pass
 
-        globals()["torch"] = torch
         globals()["paddle"] = paddle
-
-        from tester import (
-            APIConfig,
-            APITestAccuracy,
-            APITestAccuracyStable,
-            APITestCINNVSDygraph,
-            APITestCustomDeviceVSCPU,
-            APITestPaddleDeviceVSGPU,
-            APITestPaddleGPUPerformance,
-            APITestPaddleOnly,
-            APITestPaddleTorchGPUPerformance,
-            APITestTorchGPUPerformance,
-        )
-
-        test_classes = {
-            "APIConfig": APIConfig,
-            "APITestAccuracy": APITestAccuracy,
-            "APITestCINNVSDygraph": APITestCINNVSDygraph,
-            "APITestPaddleOnly": APITestPaddleOnly,
-            "APITestPaddleGPUPerformance": APITestPaddleGPUPerformance,
-            "APITestTorchGPUPerformance": APITestTorchGPUPerformance,
-            "APITestPaddleTorchGPUPerformance": APITestPaddleTorchGPUPerformance,
-            "APITestAccuracyStable": APITestAccuracyStable,
-            "APITestCustomDeviceVSCPU": APITestCustomDeviceVSCPU,
-            "APITestPaddleDeviceVSGPU": APITestPaddleDeviceVSGPU,
-        }
-        globals().update(test_classes)
+        globals().update(_load_test_classes(options))
 
         def signal_handler(*args):
-            torch.cuda.empty_cache()
-            paddle.device.cuda.empty_cache()
+            _clear_device_cache(options)
             restore_stdio()
             close_process_files()
             sys.exit(0)
@@ -517,6 +572,7 @@ def run_test_case(api_config_str, options):
         flush=True,
     )
 
+    last_memory_log_time = 0
     while True:
         total_memory, used_memory = get_memory_info(gpu_id)
         free_memory = total_memory - used_memory
@@ -524,52 +580,87 @@ def run_test_case(api_config_str, options):
         if free_memory >= options.required_memory:
             break
 
+        now = time.time()
+        if now - last_memory_log_time >= MEMORY_WAIT_LOG_INTERVAL:
+            print(
+                f"{datetime.now()} device {gpu_id} Free: {free_memory:.1f} GB, "
+                f"Required: {options.required_memory:.1f} GB. ",
+                "Waiting for available memory...",
+                flush=True,
+            )
+            last_memory_log_time = now
+        time.sleep(MEMORY_WAIT_SECONDS)
+
+    if options.show_runtime_status:
+        total_memory, used_memory_before = get_memory_info(gpu_id)
         print(
-            f"{datetime.now()} device {gpu_id} Free: {free_memory:.1f} GB, "
-            f"Required: {options.required_memory:.1f} GB. ",
-            "Waiting for available memory...",
+            f"{datetime.now()} GPU {gpu_id} memory before: used={used_memory_before:.1f} GB, "
+            f"free={total_memory - used_memory_before:.1f} GB",
             flush=True,
         )
-        time.sleep(60)
 
     api_config = None
     case = None
     try:
         api_config = APIConfig(api_config_str)
     except Exception as err:
-        print(f"[config parse error] {api_config_str} {err!s}", flush=True)
+        print(f"[config_parse] {api_config_str} {err!s}", flush=True)
+        write_terminal_log("config_parse", api_config_str)
         return
 
-    option_to_class = {
-        "paddle_only": APITestPaddleOnly,
-        "paddle_cinn": APITestCINNVSDygraph,
-        "accuracy": APITestAccuracy,
-        "paddle_gpu_performance": APITestPaddleGPUPerformance,
-        "torch_gpu_performance": APITestTorchGPUPerformance,
-        "paddle_torch_gpu_performance": APITestPaddleTorchGPUPerformance,
-        "accuracy_stable": APITestAccuracyStable,
-        "paddle_custom_device": APITestCustomDeviceVSCPU,
-        "custom_device_vs_gpu": APITestPaddleDeviceVSGPU,
-    }
-
-    test_class = next(
-        (cls for opt, cls in option_to_class.items() if getattr(options, opt, False)),
-        APITestAccuracy,  # default fallback
-    )
+    test_class = _select_test_class(options)
     kwargs = {k: v for k, v in vars(options).items() if k in VALID_TEST_ARGS}
     case = test_class(api_config, **kwargs)
     try:
         case.test()
+        if has_terminal_log(api_config_str):
+            write_checkpoint(api_config_str)
     except Exception as err:
-        # if fatal error happens, subprocess need to exit with non-zero status
-        if "CUDA error" in str(err) or "memory corruption" in str(err):
-            os._exit(99)
-        if "CUDA out of memory" in str(err) or "Out of memory error" in str(err):
-            os._exit(98)
-        if "AssertionError" in str(err) or "Tensor-likes are not equal" in str(err):
-            os._exit(1)
+        err_msg = str(err).lower()
+        terminal_log_type = get_terminal_log_type(api_config_str)
+        oom_markers = (
+            "cuda out of memory",
+            "out of memory error",
+            "resourceexhaustederror",
+            "out of memory",
+            "outofmemoryerror",
+            "cannot allocate memory",
+            "std::bad_alloc",
+            "bad allocation",
+            "memoryerror",
+            "cublas_status_alloc_failed",
+        )
+        cuda_markers = (
+            "cuda error",
+            "memory corruption",
+            "illegal memory access",
+            "invalid configuration argument",
+            "invalid resource handle",
+        )
+        exit_code = None
+        if any(marker in err_msg for marker in oom_markers):
+            exit_code = FATAL_OOM_EXIT_CODE
+        elif terminal_log_type == "torch_error" and any(
+            marker in err_msg for marker in cuda_markers
+        ):
+            exit_code = FATAL_TORCH_EXIT_CODE
+        elif any(marker in err_msg for marker in cuda_markers):
+            exit_code = FATAL_CUDA_EXIT_CODE
+        if exit_code is not None:
+            if has_terminal_log(api_config_str):
+                write_checkpoint(api_config_str)
+            try:
+                close_process_files()
+            finally:
+                try:
+                    restore_stdio()
+                finally:
+                    os._exit(exit_code)
+        if has_terminal_log(api_config_str):
+            write_checkpoint(api_config_str)
+            return
         # if not fatal error, subprocess will be alive and report error
-        print(f"[test error] {api_config_str}: {err}", flush=True)
+        print(f"[error] {api_config_str}: {err}", flush=True)
         raise
     finally:
         del test_class, api_config, case
@@ -582,8 +673,20 @@ def run_test_case(api_config_str, options):
                 "paddle_torch_gpu_performance",
             )
         ) and not getattr(options, "use_gpu_cache_mode", False):
-            torch.cuda.empty_cache()
-            paddle.device.cuda.empty_cache()
+            _clear_device_cache(options)
+        if options.show_runtime_status:
+            try:
+                total_memory, used_memory_after = get_memory_info(gpu_id)
+                print(
+                    f"{datetime.now()} GPU {gpu_id} memory after cleanup: used={used_memory_after:.1f} GB, "
+                    f"free={total_memory - used_memory_after:.1f} GB",
+                    flush=True,
+                )
+            except Exception as err:
+                print(
+                    f"{datetime.now()} Failed to read GPU {gpu_id} memory after cleanup: {err}",
+                    flush=True,
+                )
 
 
 def main():
@@ -903,18 +1006,7 @@ def main():
         except ImportError:
             pass
 
-        from tester import (
-            APIConfig,
-            APITestAccuracy,
-            APITestAccuracyStable,
-            APITestCINNVSDygraph,
-            APITestCustomDeviceVSCPU,
-            APITestPaddleDeviceVSGPU,
-            APITestPaddleGPUPerformance,
-            APITestPaddleOnly,
-            APITestPaddleTorchGPUPerformance,
-            APITestTorchGPUPerformance,
-        )
+        globals().update(_load_test_classes(options))
 
         # set log_writer
         set_engineV2()
@@ -927,25 +1019,10 @@ def main():
         try:
             api_config = APIConfig(options.api_config)
         except Exception as err:
-            print(f"[config parse error] {options.api_config} {err!s}", flush=True)
+            print(f"[config_parse] {options.api_config} {err!s}", flush=True)
             return
 
-        option_to_class = {
-            "paddle_only": APITestPaddleOnly,
-            "paddle_cinn": APITestCINNVSDygraph,
-            "accuracy": APITestAccuracy,
-            "paddle_gpu_performance": APITestPaddleGPUPerformance,
-            "torch_gpu_performance": APITestTorchGPUPerformance,
-            "paddle_torch_gpu_performance": APITestPaddleTorchGPUPerformance,
-            "accuracy_stable": APITestAccuracyStable,
-            "paddle_custom_device": APITestCustomDeviceVSCPU,
-            "custom_device_vs_gpu": APITestPaddleDeviceVSGPU,
-        }
-
-        test_class = next(
-            (cls for opt, cls in option_to_class.items() if getattr(options, opt, False)),
-            APITestAccuracy,  # default fallback
-        )
+        test_class = _select_test_class(options)
 
         if options.test_cpu:
             import paddle
@@ -987,7 +1064,7 @@ def main():
                 or "Error Message Summary" in str(err)
             ):
                 exit(1)
-            print(f"[test error] {options.api_config}: {err}", flush=True)
+            print(f"[error] {options.api_config}: {err}", flush=True)
         finally:
             case.clear_tensor()
             del case
@@ -1020,6 +1097,11 @@ def main():
                 return
             config_files = [options.api_config_file]
 
+        # set log_writer before resume/checkpoint handling
+        if options.log_dir:
+            set_test_log_path(options.log_dir)
+        set_engineV2()
+
         # when engineV2 was interrupted, resume from .tmp dir
         aggregate_logs(cleanup=True)
         removed_stale_logs = cleanup_uncheckpointed_result_logs()
@@ -1034,16 +1116,25 @@ def main():
         print(len(finish_configs), "cases in checkpoint.", flush=True)
 
         api_config_count = 0
+        skipped_non_config = 0
         api_configs = set()
         for config_file in config_files:
             try:
                 with open(config_file) as f:
-                    lines = [line.strip() for line in f if line.strip()]
-                    api_config_count += len(lines)
-                    api_configs.update(lines)
+                    for line in f:
+                        line = line.strip()
+                        if not line:
+                            continue
+                        if not line.startswith("paddle."):
+                            skipped_non_config += 1
+                            continue
+                        api_config_count += 1
+                        api_configs.add(line)
             except Exception as e:
                 print(f"Failed to read config file {config_file}: {e}", flush=True)
                 return
+        if skipped_non_config:
+            print(f"{skipped_non_config} non-config lines skipped.", flush=True)
         print(api_config_count, "cases in total.", flush=True)
         dup_case = api_config_count - len(api_configs)
         if dup_case > 0:
@@ -1077,11 +1168,6 @@ def main():
 
         if options.test_cpu:
             print(f"Using {cpu_count()} CPU(s) for paddle in CPU mode.", flush=True)
-
-        # set log_writer
-        if options.log_dir:
-            set_test_log_path(options.log_dir)
-        set_engineV2()
 
         # initialize process pool
         manager = Manager()
@@ -1132,23 +1218,30 @@ def main():
                         if options.show_runtime_status or tested_case % 10000 == 0:
                             print(f"[info] Test case succeeded for {config}", flush=True)
                     except TimeoutError as err:
-                        write_to_log("timeout", config)
+                        write_terminal_log("timeout", config)
                         print(
-                            f"[error] Test case timed out for {config}: {err}",
+                            f"[timeout] {config}: {err}",
                             flush=True,
                         )
                     except ProcessExpired as err:
-                        # we have caught 99 and 98 error in test class, so we only print info here
-                        # when any cuda error and oom happen, subprocess will crash too,
-                        # these case has been classified to oom and cuda_error and won't be classified to crash
-                        if err.exitcode == 99:
+                        # CUDA, OOM, and Torch fatal errors may also expire the subprocess;
+                        # classify them by dedicated terminal log types instead of falling through to crash.
+                        if err.exitcode == FATAL_CUDA_EXIT_CODE:
+                            write_terminal_log("paddle_cuda", config)
                             print(
-                                f"[error] CUDA error for {config}: {err}",
+                                f"[paddle_cuda] {config}: {err}",
                                 flush=True,
                             )
-                        elif err.exitcode == 98:
+                        elif err.exitcode == FATAL_OOM_EXIT_CODE:
+                            write_terminal_log("oom", config)
                             print(
-                                f"[error] CUDA out of memory for {config}",
+                                f"[oom] {config}: {err}",
+                                flush=True,
+                            )
+                        elif err.exitcode == FATAL_TORCH_EXIT_CODE:
+                            write_terminal_log("torch_error", config)
+                            print(
+                                f"[torch_error] {config}: {err}",
                                 flush=True,
                             )
                         elif err.exitcode in (-signal.SIGKILL, -signal.SIGTERM):
@@ -1159,16 +1252,18 @@ def main():
                                 flush=True,
                             )
                         else:
-                            write_to_log("crash", config)
+                            write_terminal_log("paddle_crash", config)
                             print(
-                                f"[fatal] Worker crashed for {config}: {err}",
+                                f"[paddle_crash] {config}: {err}",
                                 flush=True,
                             )
                     except Exception as err:
+                        write_terminal_log("config_parse", config)
                         print(
-                            f"[warn] Test case failed for {config}: {err}",
+                            f"[config_parse] {config}: {err}",
                             flush=True,
                         )
+                        checkpoint_ready = False  # checkpoint already written by write_terminal_log
                     if checkpoint_ready:
                         tested_case += 1
                         if options.show_runtime_status or tested_case % 10000 == 0:
@@ -1176,7 +1271,6 @@ def main():
                                 f"[{tested_case}/{all_case}] Testing {config}",
                                 flush=True,
                             )
-                        write_to_log("checkpoint", config)
                 aggregate_logs()
             pool.close()
             pool.join()

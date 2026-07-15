@@ -1,0 +1,20 @@
+# yaml-language-server: $schema=../run_config.schema.json
+# 通用 accuracy_compatible 配置：开启 FLAGS_use_accuracy_compatible_kernel 后的精度对比。
+# 切换 ${APITEST_MODEL} 即可切换测试模型。
+# 依赖 CI 提前将 ${APITEST_MODEL}/accuracy_compatible/accuracy_compatible.txt 拷贝到 PaddleAPITest 下。
+name: run_accuracy_compatible
+runner:
+  engine: engineV4
+  foreground: true
+env:
+  FLAGS_use_accuracy_compatible_kernel: "1"
+input:
+  api_config_file: "${APITEST_MODEL}/accuracy_compatible/accuracy_compatible.txt"
+output:
+  log_dir: "test_${APITEST_MODEL}_log_accuracy_compatible"
+engine_args:
+  accuracy_stable: true
+  use_cached_numpy: true
+  num_gpus: -1
+  num_workers_per_gpu: 2
+  timeout: 1200

@@ -5,9 +5,9 @@ set -euo pipefail
 # PaddleAPITest 运行脚本
 #
 # 使用方式:
-#   ./run.sh              正常启动（后台）
-#   ./run.sh --stop       终止上次启动的后台进程
-#   ./run.sh --status     查看运行状态
+#   ./<当前脚本名>              正常启动（后台）
+#   ./<当前脚本名> --stop       终止上次启动的后台进程
+#   ./<当前脚本名> --status     查看运行状态
 #
 # 配置方法: 修改下方变量 / 注释切换即可
 # ============================================================
@@ -19,32 +19,43 @@ ENGINE=engineV4           # engineV2 | engineV4
 FOREGROUND=false          # true=前台运行(调试用，Ctrl+C终止)
 DRY_RUN=false             # true=只打印最终命令，不执行
 
-# ── compute-sanitizer ─────────────────────────────────────────
-# true=由 engineV4 为每个 worker slot 单独启动 compute-sanitizer 子进程，保留多 GPU/多 worker 并发
+# ── compute-sanitizer（engineV4 only）──────────────────────────
+# compute-sanitizer 用于定位 CUDA kernel 的非法访存、race、同步错误等问题。
+# engineV4 会为每个 worker slot 启动独立 sanitizer 子进程，保留多 GPU/多 worker 并发。
+# engineV2 不支持以下 sanitizer 参数；ENGINE=engineV2 时请保持 USE_COMPUTE_SANITIZER=false，并不要传入 SANITIZER_ARGS。
 USE_COMPUTE_SANITIZER=false
 SANITIZER_COMMAND="compute-sanitizer --target-processes all --error-exitcode=86"
 SANITIZER_ERROR_EXITCODE=86
+# --_sanitizer_child 是 engineV4 内部参数，普通运行不要配置。
 
 # ── Paddle Flags ──────────────────────────────────────────────
+# 这些环境变量在启动 Paddle 前生效，用于控制 Paddle 运行时行为。
+# - FLAGS_use_system_allocator: 使用系统 allocator，便于释放内存和定位问题。
+# - FLAGS_check_cuda_error: 更积极检查 CUDA 错误。
+# - FLAGS_alloc_fill_value / FLAGS_check_nan_inf: 用于发现未初始化值、NaN/Inf 等数值问题。
+# - FLAGS_use_accuracy_compatible_kernel: 使用更偏精度兼容的 kernel；默认关闭，避免改变常规性能/行为基线。
 export FLAGS_use_system_allocator=true
 export FLAGS_check_cuda_error=true
 export FLAGS_alloc_fill_value=255
 export FLAGS_check_nan_inf=true
+# export FLAGS_use_accuracy_compatible_kernel=true
 
 # ── 输入输出 ──────────────────────────────────────────────────
+# input 三选一：--api_config / --api_config_file / --api_config_file_pattern
 # NUM_GPUS!=0 时，引擎不受外部 "CUDA_VISIBLE_DEVICES" 影响
+API_CONFIG=""
 FILE_INPUT="tester/api_config/5_accuracy/accuracy_1.txt"
 # FILE_PATTERN="tester/api_config/5_accuracy/accuracy_*.txt"
 LOG_DIR="tester/api_config/test_log"
 
-# ── GPU 调度 ──────────────────────────────────────────────────
+# ── GPU / worker 调度 ─────────────────────────────────────────
 NUM_GPUS=-1
-NUM_WORKERS_PER_GPU=-1
-GPU_IDS="4-7"
+NUM_WORKERS_PER_GPU=1
+GPU_IDS="-1"
 # REQUIRED_MEMORY=10
 TIME_OUT=600
 
-# ── 测试模式 ──────────────────────────────────────────────────
+# ── 测试模式：必须且只能启用一种 ───────────────────────────────
 TEST_MODE_ARGS=(
     # Paddle vs Torch 正确性对比
     --accuracy=True
@@ -58,6 +69,9 @@ TEST_MODE_ARGS=(
     # --paddle_torch_gpu_performance=True
     # 稳定性测试
     # --accuracy_stable=True
+    # 自定义设备对比
+    # --paddle_custom_device=True
+    # --custom_device_vs_gpu=True
 )
 
 # ── 测试参数 ──────────────────────────────────────────────────
@@ -73,11 +87,22 @@ TEST_PARAM_ARGS=(
     # 对比阈值；bitwise_alignment 会将阈值置 0
     # --atol=1e-2
     # --rtol=1e-2
+    # --manual_threshold_config_file="tester/api_config/manual_threshold.yaml"
     # --bitwise_alignment=True
     # accuracy 容差诊断，保留 CPU compare
     # --test_tol=True
     # 仅 paddle_cinn 生效
     # --test_backward=True
+    # 随机种子；非默认值时会设置 numpy seed
+    # --random_seed=0
+    # custom_device_vs_gpu 上传/下载模式
+    # --custom_device_vs_gpu_mode=upload
+    # 生成失败 case 的可复现测试文件
+    # --generate_failed_tests=True
+    # paddle_error 时立即退出
+    # --exit_on_error=True
+    # 控制运行时进度输出
+    # --show_runtime_status=True
 )
 
 # ============================================================
@@ -89,8 +114,9 @@ if [[ ! -f "$ENGINE.py" || ! -d "tester" ]]; then
     echo "错误: 请在 PaddleAPITest 项目根目录执行此脚本"
     exit 1
 fi
-SCRIPT_NAME="${BASH_SOURCE[0]##*/}"
-SCRIPT_NAME="${SCRIPT_NAME%.sh}"
+SCRIPT_FILE="${BASH_SOURCE[0]##*/}"
+SCRIPT_NAME="${SCRIPT_FILE%.sh}"
+RUN_COMMAND="./${SCRIPT_FILE}"
 PID_FILE="${SCRIPT_DIR}/.${SCRIPT_NAME}.pid"
 
 # ── 运维命令处理 ──
@@ -135,7 +161,7 @@ case "${1:-}" in
         exit 0
         ;;
     --help|-h)
-        echo "Usage: ./run.sh [--stop|--status|--help]"
+        echo "Usage: ${RUN_COMMAND} [--stop|--status|--help]"
         echo ""
         echo "  (无参数)   启动测试任务"
         echo "  --stop     终止后台任务"
@@ -156,7 +182,7 @@ if [[ -f "$PID_FILE" ]]; then
     old_pid=$(cat "$PID_FILE")
     if kill -0 "$old_pid" 2>/dev/null; then
         echo -e "\033[33m警告: 已有运行中的任务 PID=$old_pid\033[0m"
-        echo "使用 ./run.sh --stop 终止后再启动，或删除 $PID_FILE 强制启动"
+        echo "使用 ${RUN_COMMAND} --stop 终止后再启动，或删除 $PID_FILE 强制启动"
         exit 1
     fi
     rm -f "$PID_FILE"
@@ -164,6 +190,7 @@ fi
 
 # ── 组装参数 ──
 IN_OUT_ARGS=(
+    # --api_config="$API_CONFIG"
     --api_config_file="$FILE_INPUT"
     # --api_config_file_pattern="$FILE_PATTERN"
     --log_dir="$LOG_DIR"
@@ -180,11 +207,17 @@ TIME_OUT_ARGS=(
     --timeout="$TIME_OUT"
 )
 
-SANITIZER_ARGS=(
-    --use_compute_sanitizer="$USE_COMPUTE_SANITIZER"
-    --sanitizer_command="$SANITIZER_COMMAND"
-    --sanitizer_error_exitcode="$SANITIZER_ERROR_EXITCODE"
-)
+SANITIZER_ARGS=()
+if [[ "$ENGINE" == "engineV4" ]]; then
+    SANITIZER_ARGS=(
+        --use_compute_sanitizer="$USE_COMPUTE_SANITIZER"
+        --sanitizer_command="$SANITIZER_COMMAND"
+        --sanitizer_error_exitcode="$SANITIZER_ERROR_EXITCODE"
+    )
+elif [[ "$USE_COMPUTE_SANITIZER" == "true" ]]; then
+    echo "错误: compute-sanitizer 参数仅 engineV4 支持"
+    exit 1
+fi
 
 ALL_ARGS=(
     "${TEST_MODE_ARGS[@]}"
@@ -228,7 +261,10 @@ if [[ "$FOREGROUND" == "true" ]]; then
     echo -e "\n\033[36m[前台模式] Ctrl+C 终止\033[0m"
     echo "日志同时写入: $LOG_FILE"
     echo ""
+    # 忽略 shell 自身的 SIGINT，让 Ctrl+C 只作用于 python 子进程
+    trap '' INT
     python "$ENGINE.py" "${ALL_ARGS[@]}" 2>&1 | tee "$LOG_FILE"
+    trap - INT
 else
     nohup setsid python "$ENGINE.py" "${ALL_ARGS[@]}" >> "$LOG_FILE" 2>&1 &
     PYTHON_PID=$!
@@ -258,8 +294,8 @@ else
     echo -e "\033[32m启动成功! PID=$PYTHON_PID\033[0m"
     echo ""
     echo "常用操作:"
-    echo "  查看状态:  ./run.sh --status"
-    echo "  终止任务:  ./run.sh --stop"
+    echo "  查看状态:  ${RUN_COMMAND} --status"
+    echo "  终止任务:  ${RUN_COMMAND} --stop"
     echo "  跟踪日志:  tail -f $LOG_FILE"
     echo "  GPU监控:   watch -n 1 nvidia-smi"
     echo ""

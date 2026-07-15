@@ -1,0 +1,20 @@
+# yaml-language-server: $schema=../run_config.schema.json
+# 通用 0-size paddle_only 配置：切换 ${APITEST_MODEL} 即可切换测试模型。
+# 依赖 CI 提前将 ${APITEST_MODEL}/paddleonly_0size/0size.txt 拷贝到 PaddleAPITest 下。
+name: run_0size_paddleonly
+runner:
+  engine: engineV4
+  foreground: true
+env:
+  FLAGS_use_system_allocator: "true"
+  FLAGS_check_cuda_error: "true"
+input:
+  api_config_file: "${APITEST_MODEL}/paddleonly_0size/0size.txt"
+output:
+  log_dir: "test_${APITEST_MODEL}_log_0size_paddleonly"
+engine_args:
+  paddle_only: true
+  num_gpus: -1
+  num_workers_per_gpu: 16
+  timeout: 600
+  use_compute_sanitizer: true

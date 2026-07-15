@@ -64,7 +64,7 @@ class APITestPaddleGPUPerformance(APITestBase):
                 return
         except Exception as err:
             print("[numpy error]", self.api_config.config, "\n", str(err))
-            write_to_log("numpy_error", self.api_config.config)
+            write_to_log("config_input", self.api_config.config)
             return
 
         try:
