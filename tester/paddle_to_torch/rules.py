@@ -1939,44 +1939,133 @@ def _fp8_quant_blockwise_impl(inp, eps, power2, scale_transpose, ue8m0, method, 
         if ue8m0:
             scale = torch.empty_like(scale, dtype=torch.int32)
         return q, scale
-    x_f = inp.to(torch.float32)
+
+    _need_chunk = (m * n * 4) > (2 * 1024 * 1024 * 1024)
+
     if method == "1x128":
-        pad_n = (128 - (n % 128)) % 128
-        if pad_n:
-            x_f = torch.nn.functional.pad(x_f, (0, pad_n))
-        x_blk = x_f.view(m, -1, 128)
-        amax = x_blk.abs().amax(dim=-1)
+        scale_cols = (n + 127) // 128
+        if not _need_chunk:
+            x_f = inp.to(torch.float32)
+            pad_n = (128 - (n % 128)) % 128
+            if pad_n:
+                x_f = torch.nn.functional.pad(x_f, (0, pad_n))
+            x_blk = x_f.view(m, -1, 128)
+            amax = x_blk.abs().amax(dim=-1).to(torch.float32)
+            amax_mod = torch.clamp(amax, min=eps)
+            zero_mask = amax_mod == 0
+            q_scale = torch.where(zero_mask, torch.ones_like(amax_mod), fp8_max / amax_mod)
+            inf_mask = torch.isinf(q_scale)
+            if inf_mask.any():
+                q_scale = torch.where(inf_mask, torch.full_like(q_scale, torch.finfo(torch.float32).max), q_scale)
+            if power2:
+                safe = torch.clamp(q_scale, min=torch.finfo(torch.float32).tiny)
+                exp = torch.floor(torch.log2(safe))
+                q_scale = torch.pow(torch.tensor(2.0, device=q_scale.device, dtype=q_scale.dtype), exp)
+                q_scale = torch.where(zero_mask, torch.ones_like(q_scale), q_scale)
+            deq_scale = torch.where(q_scale == 0, torch.zeros_like(q_scale), 1.0 / q_scale)
+            q = (x_blk * q_scale.unsqueeze(-1)).to(torch.float8_e4m3fn).reshape(m, -1)[:, :n]
+            scale = deq_scale.transpose(0, 1).contiguous() if scale_transpose else deq_scale.contiguous()
+        else:
+            _bytes_budget = 512 * 1024 * 1024
+            _per_row = max(1, n * 4 * 2)
+            _chunk = max(1, min(m, _bytes_budget // _per_row))
+            q = torch.empty((m, n), dtype=torch.float8_e4m3fn, device=inp.device)
+            deq_scale = torch.empty((m, scale_cols), dtype=torch.float32, device=inp.device)
+            for _rs in range(0, m, _chunk):
+                _re = min(m, _rs + _chunk)
+                _x_f = inp[_rs:_re].to(torch.float32)
+                pad_n = (128 - (n % 128)) % 128
+                if pad_n:
+                    _x_f = torch.nn.functional.pad(_x_f, (0, pad_n))
+                _x_blk = _x_f.view(_re - _rs, -1, 128)
+                del _x_f
+                _amax = _x_blk.abs().amax(dim=-1).to(torch.float32)
+                _amax_mod = torch.clamp(_amax, min=eps)
+                _zero_mask = _amax_mod == 0
+                _q_scale = torch.where(_zero_mask, torch.ones_like(_amax_mod), fp8_max / _amax_mod)
+                _inf_mask = torch.isinf(_q_scale)
+                if _inf_mask.any():
+                    _q_scale = torch.where(_inf_mask, torch.full_like(_q_scale, torch.finfo(torch.float32).max), _q_scale)
+                if power2:
+                    _safe = torch.clamp(_q_scale, min=torch.finfo(torch.float32).tiny)
+                    _exp = torch.floor(torch.log2(_safe))
+                    _q_scale = torch.pow(torch.tensor(2.0, device=_q_scale.device, dtype=_q_scale.dtype), _exp)
+                    _q_scale = torch.where(_zero_mask, torch.ones_like(_q_scale), _q_scale)
+                _deq_scale = torch.where(_q_scale == 0, torch.zeros_like(_q_scale), 1.0 / _q_scale)
+                _q_chunk = (_x_blk * _q_scale.unsqueeze(-1)).to(torch.float8_e4m3fn).reshape(_re - _rs, -1)[:, :n]
+                del _x_blk
+                q[_rs:_re] = _q_chunk
+                deq_scale[_rs:_re] = _deq_scale
+                del _q_chunk, _deq_scale
+            scale = deq_scale.transpose(0, 1).contiguous() if scale_transpose else deq_scale.contiguous()
     else:
         pad_m = (128 - (m % 128)) % 128
         pad_n = (128 - (n % 128)) % 128
-        if pad_m or pad_n:
-            x_f = torch.nn.functional.pad(x_f, (0, pad_n, 0, pad_m))
-        pm, pn = x_f.shape
-        x_blk = x_f.view(pm // 128, 128, pn // 128, 128).permute(0, 2, 1, 3).contiguous()
-        amax = x_blk.abs().amax(dim=(-1, -2))
-    amax = amax.to(torch.float32)
-    amax_mod = torch.clamp(amax, min=eps)
-    zero_mask = amax_mod == 0
-    q_scale = torch.where(zero_mask, torch.ones_like(amax_mod), fp8_max / amax_mod)
-    inf_mask = torch.isinf(q_scale)
-    if inf_mask.any():
-        q_scale = torch.where(inf_mask, torch.full_like(q_scale, torch.finfo(torch.float32).max), q_scale)
-    if power2:
-        safe = torch.clamp(q_scale, min=torch.finfo(torch.float32).tiny)
-        exp = torch.floor(torch.log2(safe))
-        q_scale = torch.pow(torch.tensor(2.0, device=q_scale.device, dtype=q_scale.dtype), exp)
-        q_scale = torch.where(zero_mask, torch.ones_like(q_scale), q_scale)
-    deq_scale = torch.where(q_scale == 0, torch.zeros_like(q_scale), 1.0 / q_scale)
-    if method == "1x128":
-        q = (x_blk * q_scale.unsqueeze(-1)).to(torch.float8_e4m3fn).reshape(m, -1)[:, :n]
-    else:
-        q = (x_blk * q_scale.unsqueeze(-1).unsqueeze(-1)).to(torch.float8_e4m3fn)
-        q = q.permute(0, 2, 1, 3).contiguous().view(x_f.shape[0], x_f.shape[1])[:m, :n]
-    scale = deq_scale.transpose(0, 1).contiguous() if scale_transpose else deq_scale.contiguous()
+        if not _need_chunk:
+            x_f = inp.to(torch.float32)
+            if pad_m or pad_n:
+                x_f = torch.nn.functional.pad(x_f, (0, pad_n, 0, pad_m))
+            pm, pn = x_f.shape
+            x_blk = x_f.view(pm // 128, 128, pn // 128, 128).permute(0, 2, 1, 3).contiguous()
+            amax = x_blk.abs().amax(dim=(-1, -2)).to(torch.float32)
+            amax_mod = torch.clamp(amax, min=eps)
+            zero_mask = amax_mod == 0
+            q_scale = torch.where(zero_mask, torch.ones_like(amax_mod), fp8_max / amax_mod)
+            inf_mask = torch.isinf(q_scale)
+            if inf_mask.any():
+                q_scale = torch.where(inf_mask, torch.full_like(q_scale, torch.finfo(torch.float32).max), q_scale)
+            if power2:
+                safe = torch.clamp(q_scale, min=torch.finfo(torch.float32).tiny)
+                exp = torch.floor(torch.log2(safe))
+                q_scale = torch.pow(torch.tensor(2.0, device=q_scale.device, dtype=q_scale.dtype), exp)
+                q_scale = torch.where(zero_mask, torch.ones_like(q_scale), q_scale)
+            deq_scale = torch.where(q_scale == 0, torch.zeros_like(q_scale), 1.0 / q_scale)
+            q = (x_blk * q_scale.unsqueeze(-1).unsqueeze(-1)).to(torch.float8_e4m3fn)
+            q = q.permute(0, 2, 1, 3).contiguous().view(x_f.shape[0], x_f.shape[1])[:m, :n]
+            scale = deq_scale.transpose(0, 1).contiguous() if scale_transpose else deq_scale.contiguous()
+        else:
+            sm = (m + 127) // 128
+            sn = (n + 127) // 128
+            _padded_n = n + pad_n
+            _q_chunks = []
+            _deq_scale = torch.empty((sm, sn), dtype=torch.float32, device=inp.device)
+            for _rb in range(sm):
+                _r_start = _rb * 128
+                _r_end = min(m, _r_start + 128)
+                _actual_rows = _r_end - _r_start
+                _x_f = inp[_r_start:_r_end].to(torch.float32)
+                if _actual_rows < 128:
+                    _x_f = torch.nn.functional.pad(_x_f, (0, 0, 0, 128 - _actual_rows))
+                if pad_n:
+                    _x_f = torch.nn.functional.pad(_x_f, (0, pad_n))
+                _x_blk = _x_f.view(1, 128, sn, 128).permute(0, 2, 1, 3).reshape(sn, 128, 128)
+                _amax = _x_blk.abs().amax(dim=(-1, -2)).to(torch.float32)
+                _amax_mod = torch.clamp(_amax, min=eps)
+                _zero_mask = _amax_mod == 0
+                _q_scale = torch.where(_zero_mask, torch.ones_like(_amax_mod), fp8_max / _amax_mod)
+                _inf_mask = torch.isinf(_q_scale)
+                if _inf_mask.any():
+                    _q_scale = torch.where(_inf_mask, torch.full_like(_q_scale, torch.finfo(torch.float32).max), _q_scale)
+                if power2:
+                    _safe = torch.clamp(_q_scale, min=torch.finfo(torch.float32).tiny)
+                    _exp = torch.floor(torch.log2(_safe))
+                    _q_scale = torch.pow(torch.tensor(2.0, device=_q_scale.device, dtype=_q_scale.dtype), _exp)
+                    _q_scale = torch.where(_zero_mask, torch.ones_like(_q_scale), _q_scale)
+                _deq_row = torch.where(_q_scale == 0, torch.zeros_like(_q_scale), 1.0 / _q_scale)
+                _deq_scale[_rb] = _deq_row
+                _q_blk = (_x_blk * _q_scale.unsqueeze(-1).unsqueeze(-1)).to(torch.float8_e4m3fn)
+                _q_row = _q_blk.view(1, sn, 128, 128).permute(0, 2, 1, 3).reshape(128, _padded_n)[:_actual_rows, :n]
+                del _x_f, _x_blk, _q_blk
+                _q_chunks.append(_q_row)
+            q = torch.cat(_q_chunks, dim=0)
+            del _q_chunks
+            deq_scale = _deq_scale
+            scale = deq_scale.transpose(0, 1).contiguous() if scale_transpose else deq_scale.contiguous()
+
     if ue8m0:
-        base = deq_scale
-        cols = base.shape[-1]
-        pad_c = (4 - (cols % 4)) % 4
+        base = deq_scale.contiguous()
+        cols_s = base.shape[-1]
+        pad_c = (4 - (cols_s % 4)) % 4
         if pad_c:
             base = torch.nn.functional.pad(base, (0, pad_c))
         b = base.reshape(*base.shape[:-1], -1, 4)
@@ -4128,7 +4217,6 @@ if mat2.dtype == torch.float16 and input.dtype != torch.float16:
 class MoePermuteRule(BaseRule):
     def apply(self, paddle_api: str) -> ConvertResult:
         core = """
-import math
 _orig_hs_dtype = hidden_states.dtype
 # Compute in a supported dtype; cast gathered tokens back to the original dtype
 # so float8 inputs match paddle.nn.functional.moe_permute output dtype.
@@ -4138,62 +4226,98 @@ using_ue8m0_scale = locals().get('using_ue8m0_scale', False)
 return_expert_indices = locals().get('return_expert_indices', False)
 seqlen, token_dim = hidden_states.shape
 topk = expert_routemap_topk.shape[1]
+_dev = hidden_states.device
+
 # padded slots per expert: identical to kernel's InferMeta formula
-padded_per_expert = [(t + padding_alignment - 1) // padding_alignment * padding_alignment for t in tokens_per_expert]
-total_rows = sum(padded_per_expert)
-offsets_e = [0] * num_experts
-for e in range(1, num_experts):
-    offsets_e[e] = offsets_e[e - 1] + padded_per_expert[e - 1]
-rowmap = torch.full((seqlen, num_experts), -1, dtype=torch.int32, device=hidden_states.device)
-gather_src = [-1] * total_rows
-gather_prob = [0.0] * total_rows
-gather_expert_id = [-1] * total_rows
-# build per-expert token lists in row-major order (capped at tokens_per_expert[e])
-routemap_np = expert_routemap_topk.detach().cpu().numpy()
-prob_np = expert_prob_topk.detach().cpu().numpy()
-expert_counters = [0] * num_experts
-for i in range(seqlen):
-    for k in range(topk):
-        e = int(routemap_np[i, k])
-        if e < 0:
-            continue
-        if rowmap[i, e] != -1:
-            continue  # token i already assigned to expert e (duplicate topk column)
-        slot = expert_counters[e]
-        if slot >= tokens_per_expert[e]:
-            continue  # excess beyond tokens_per_expert
-        row = offsets_e[e] + slot
-        rowmap[i, e] = row
-        gather_src[row] = i
-        gather_prob[row] = float(prob_np[i, k])
-        gather_expert_id[row] = e
-        expert_counters[e] += 1
-# build prob_unzipped (1D, length=total_rows)
-token_prob_unzipped = torch.tensor(gather_prob, dtype=torch.float32, device=hidden_states.device)
+_tpe = torch.tensor(tokens_per_expert, dtype=torch.int64, device=_dev)
+_padded = ((_tpe + padding_alignment - 1) // padding_alignment * padding_alignment)
+total_rows = int(_padded.sum().item())
+_offsets = torch.zeros(num_experts, dtype=torch.int64, device=_dev)
+_offsets[1:] = torch.cumsum(_padded[:-1], dim=0)
+
+# --- Vectorized permute fully on GPU (Megatron-style argsort + index_select) ---
+_routemap = expert_routemap_topk.detach().to(torch.int64)  # (seqlen, topk) on _dev
+_prob = expert_prob_topk.detach()  # (seqlen, topk) on _dev
+
+# Flatten all (token, topk_col) assignments
+_token_ids = torch.arange(seqlen, dtype=torch.int64, device=_dev).unsqueeze(1).expand(-1, topk).reshape(-1)
+_expert_flat = _routemap.reshape(-1)  # (seqlen*topk,)
+_prob_flat = _prob.reshape(-1)  # (seqlen*topk,)
+_topk_cols = torch.arange(topk, dtype=torch.int64, device=_dev).unsqueeze(0).expand(seqlen, -1).reshape(-1)
+
+# Filter invalid (negative) expert assignments
+_valid = _expert_flat >= 0
+_token_ids = _token_ids[_valid]
+_expert_flat = _expert_flat[_valid]
+_prob_flat = _prob_flat[_valid]
+_topk_cols = _topk_cols[_valid]
+
+# Sort by (expert_id, token_idx, topk_col) to replicate kernel's sequential scan order
+_sort_keys = _expert_flat * (seqlen * topk) + _token_ids * topk + _topk_cols
+_order = torch.argsort(_sort_keys, stable=True)
+_token_ids = _token_ids[_order]
+_expert_sorted = _expert_flat[_order]
+_prob_flat = _prob_flat[_order]
+
+# Deduplicate: keep only first (token, expert) pair
+_pair_key = _token_ids * num_experts + _expert_sorted
+_shift = torch.ones(len(_pair_key), dtype=torch.bool, device=_dev)
+_shift[1:] = _pair_key[1:] != _pair_key[:-1]
+_token_ids = _token_ids[_shift]
+_expert_sorted = _expert_sorted[_shift]
+_prob_flat = _prob_flat[_shift]
+
+# Per-expert capacity capping & slot assignment
+_boundaries = torch.searchsorted(_expert_sorted.contiguous(), torch.arange(num_experts + 1, dtype=torch.int64, device=_dev))
+
+# Vectorized slot numbering within each expert using cumcount trick
+# _within_expert_idx[i] = position of entry i within its expert group (0-based)
+_expert_start = _boundaries[_expert_sorted]  # start boundary for each entry's expert
+_within_expert_idx = torch.arange(len(_expert_sorted), dtype=torch.int64, device=_dev) - _expert_start
+# Capacity mask: only keep entries with slot < tokens_per_expert[expert]
+_caps = _tpe[_expert_sorted]
+_cap_mask = _within_expert_idx < _caps
+_token_ids = _token_ids[_cap_mask]
+_expert_sorted = _expert_sorted[_cap_mask]
+_prob_flat = _prob_flat[_cap_mask]
+_within_expert_idx = _within_expert_idx[_cap_mask]
+
+# Compute output row for each kept entry
+_row_indices = _offsets[_expert_sorted] + _within_expert_idx  # int64
+
+# Build rowmap (seqlen, num_experts): rowmap[token, expert] = output row
+rowmap = torch.full((seqlen, num_experts), -1, dtype=torch.int32, device=_dev)
+rowmap[_token_ids, _expert_sorted] = _row_indices.to(torch.int32)
+
+# Build gather arrays
+_gather_src = torch.full((total_rows,), -1, dtype=torch.int64, device=_dev)
+_gather_prob = torch.zeros(total_rows, dtype=torch.float32, device=_dev)
+_gather_expert_id = torch.full((total_rows,), -1, dtype=torch.int32, device=_dev)
+_gather_src[_row_indices] = _token_ids
+_gather_prob[_row_indices] = _prob_flat
+_gather_expert_id[_row_indices] = _expert_sorted.to(torch.int32)
+
+token_prob_unzipped = _gather_prob
 # scale_unzipped: empty if scale is None
 scale = locals().get('scale')
 if scale is None:
-    scale_unzipped = torch.empty(0, dtype=torch.float32, device=hidden_states.device)
+    scale_unzipped = torch.empty(0, dtype=torch.float32, device=_dev)
 else:
     scale_fp = scale.float() if using_ue8m0_scale else scale
-    gather_scale_idx = [r for r in gather_src if r >= 0]
-    scale_unzipped = torch.zeros(total_rows, scale_fp.shape[1], dtype=scale_fp.dtype, device=hidden_states.device)
-    for row in range(total_rows):
-        if gather_src[row] >= 0:
-            scale_unzipped[row] = scale_fp[gather_src[row]]
-# build hidden_states_unzipped
+    scale_unzipped = torch.zeros(total_rows, scale_fp.shape[1], dtype=scale_fp.dtype, device=_dev)
+    _valid_rows_mask = (_gather_src >= 0)
+    scale_unzipped[_valid_rows_mask] = scale_fp[_gather_src[_valid_rows_mask]]
+# build hidden_states_unzipped via index_select
 if do_gather:
-    hs_f = hidden_states.float()
-    hidden_states_unzipped = torch.zeros(total_rows, token_dim, dtype=hidden_states.dtype, device=hidden_states.device)
-    for row in range(total_rows):
-        if gather_src[row] >= 0:
-            hidden_states_unzipped[row] = hidden_states[gather_src[row]]
+    hidden_states_unzipped = torch.zeros(total_rows, token_dim, dtype=hidden_states.dtype, device=_dev)
+    _valid_mask_g = (_gather_src >= 0)
+    hidden_states_unzipped[_valid_mask_g] = hidden_states[_gather_src[_valid_mask_g]]
 else:
-    hidden_states_unzipped = torch.empty(0, token_dim, dtype=hidden_states.dtype, device=hidden_states.device)
+    hidden_states_unzipped = torch.empty(0, token_dim, dtype=hidden_states.dtype, device=_dev)
 if _orig_hs_dtype != hidden_states_unzipped.dtype:
     hidden_states_unzipped = hidden_states_unzipped.to(_orig_hs_dtype)
 if return_expert_indices:
-    expert_indices_out = torch.tensor(gather_expert_id, dtype=torch.int32, device=hidden_states.device)
+    expert_indices_out = _gather_expert_id
     result = (hidden_states_unzipped, rowmap, token_prob_unzipped, scale_unzipped, expert_indices_out)
 else:
     result = (hidden_states_unzipped, rowmap, token_prob_unzipped, scale_unzipped)
@@ -4211,39 +4335,60 @@ topk = expert_routemap_topk.shape[1]
 token_dim = hidden_states_unzipped.shape[1] if hidden_states_unzipped.dim() > 1 else 1
 out_dtype = hidden_states_unzipped.dtype
 acc_dtype = torch.float32
-zipped_tokens = torch.zeros(seqlen, token_dim, dtype=acc_dtype, device=hidden_states_unzipped.device)
-zipped_probs = torch.zeros(seqlen, topk, dtype=torch.float32, device=hidden_states_unzipped.device)
-rowmap_np = zipped_expertwise_rowmap.detach().cpu().numpy()
-routemap_np = expert_routemap_topk.detach().cpu().numpy()
+_dev = hidden_states_unzipped.device
+
+_rowmap = zipped_expertwise_rowmap.detach().to(torch.int64)  # (seqlen, num_experts)
+_routemap = expert_routemap_topk.detach().to(torch.int64)  # (seqlen, topk)
 hs_f = hidden_states_unzipped.detach().to(acc_dtype)
-prob_np = token_prob_unzipped.detach().cpu().float().numpy().reshape(-1)
-# zipped_tokens: Paddle kernel accumulates all valid expert columns in rowmap.
-# If only one row is aggregated, kernel writes the raw bf16 value (no weighting).
-for i in range(seqlen):
-    aggreg_cnt = 0
-    raw_row = -1
-    for e in range(num_experts):
-        row = int(rowmap_np[i, e])
-        if row < 0:
-            continue
-        aggreg_cnt += 1
-        raw_row = row
-        if using_weighted_combine:
-            zipped_tokens[i] += float(prob_np[row]) * hs_f[row]
-        else:
-            zipped_tokens[i] += hs_f[row]
-    if aggreg_cnt == 1:
-        zipped_tokens[i] = hs_f[raw_row]
-# zipped_probs: Paddle kernel fills only topk entries according to expert_routemap_topk
-for i in range(seqlen):
-    for k in range(topk):
-        e = int(routemap_np[i, k])
-        if e < 0:
-            continue
-        row = int(rowmap_np[i, e])
-        if row < 0:
-            continue
-        zipped_probs[i, k] = float(prob_np[row])
+_prob_1d = token_prob_unzipped.detach().float().reshape(-1)  # (total_rows,)
+
+# --- Vectorized zipped_tokens: iterate expert columns to match kernel addition order ---
+_valid_mask = _rowmap >= 0  # (seqlen, num_experts)
+_aggreg_counts = _valid_mask.sum(dim=1)  # (seqlen,)
+
+zipped_tokens = torch.zeros(seqlen, token_dim, dtype=acc_dtype, device=_dev)
+# Accumulate per expert column (same order as kernel: expert 0, 1, ..., N-1)
+for _e_col in range(num_experts):
+    _col_valid = _rowmap[:, _e_col] >= 0  # (seqlen,) mask of tokens routed to expert _e_col
+    if not _col_valid.any():
+        continue
+    _rows = _rowmap[_col_valid, _e_col]  # row indices for valid tokens
+    _hs_gathered = hs_f[_rows]  # (n_valid, token_dim)
+    if using_weighted_combine:
+        _w = _prob_1d[_rows].unsqueeze(1)  # (n_valid, 1)
+        zipped_tokens[_col_valid] += _w * _hs_gathered
+    else:
+        zipped_tokens[_col_valid] += _hs_gathered
+
+# Special case: tokens routed to exactly 1 expert get raw value (matching kernel behavior)
+_single_mask = (_aggreg_counts == 1)
+if _single_mask.any():
+    _single_tokens = _single_mask.nonzero(as_tuple=True)[0]
+    _single_expert_col = _valid_mask[_single_tokens].to(torch.int64).argmax(dim=1)
+    _single_rows = _rowmap[_single_tokens, _single_expert_col]
+    zipped_tokens[_single_tokens] = hs_f[_single_rows]
+
+# --- Vectorized zipped_probs: advanced indexing ---
+_flat_token_ids = torch.arange(seqlen, dtype=torch.int64, device=_dev).unsqueeze(1).expand(-1, topk).reshape(-1)
+_flat_experts = _routemap.reshape(-1)  # (seqlen*topk,)
+_flat_k = torch.arange(topk, dtype=torch.int64, device=_dev).unsqueeze(0).expand(seqlen, -1).reshape(-1)
+
+# Valid: expert >= 0
+_ve = _flat_experts >= 0
+_vt = _flat_token_ids[_ve]
+_vexp = _flat_experts[_ve]
+_vk = _flat_k[_ve]
+# Lookup row from rowmap
+_vrows = _rowmap[_vt, _vexp]
+# Further filter: row >= 0
+_vr = _vrows >= 0
+_vt = _vt[_vr]
+_vk = _vk[_vr]
+_vrows = _vrows[_vr]
+
+zipped_probs = torch.zeros(seqlen, topk, dtype=torch.float32, device=_dev)
+zipped_probs[_vt, _vk] = _prob_1d[_vrows]
+
 zipped_tokens = zipped_tokens.to(out_dtype)
 result = (zipped_tokens, zipped_probs)
 """
@@ -7735,6 +7880,119 @@ elif op_name in ("fused_swiglu_probs_bwd", "paddlefleet_fused_swiglu_probs_bwd")
             pg_out,
             o2_s_out.reshape(do2_s.shape),
         ]
+
+elif op_name == "fuse_weighted_swiglu_fp8_quant":
+    # fuse_weighted_swiglu_fp8_quant(x, prob, using_pow2_scaling, use_ue8m0)
+    # Returns: [output_fp8 (rows, cols/2), scale (rows, ceil(cols/2/128))]
+    # SwiGLU(x[:, :cols/2], x[:, cols/2:]) * prob -> block-wise 1x128 FP8 quant
+    _x = arg1
+    _prob = arg2
+    _using_pow2_scaling = bool(arg3) if arg3 is not None else False
+    _use_ue8m0 = bool(arg4) if arg4 is not None else False
+    _FP8_MAX = torch.finfo(torch.float8_e4m3fn).max
+    _TILE = 128
+
+    _rows = _x.shape[0]
+    _cols = _x.shape[1]
+    _half_cols = _cols // 2
+    _num_col_blocks = (_half_cols + _TILE - 1) // _TILE
+    _dev = _x.device
+
+    _output_fp8 = torch.empty([_rows, _half_cols], dtype=torch.float8_e4m3fn, device=_dev)
+    _scale_out = torch.empty([_rows, _num_col_blocks], dtype=torch.float32, device=_dev)
+
+    _bytes_budget = 512 * 1024 * 1024
+    _per_row_bytes = max(1, _half_cols * 4 * 2)
+    _row_chunk = max(1, min(_rows, _bytes_budget // _per_row_bytes))
+
+    for _rs in range(0, _rows, _row_chunk):
+        _re = min(_rows, _rs + _row_chunk)
+        _x_chunk = _x[_rs:_re]
+        _lhs = _x_chunk[:, :_half_cols].to(torch.float32)
+        _rhs = _x_chunk[:, _half_cols:].to(torch.float32)
+        del _x_chunk
+        _silu_lhs = _lhs * torch.sigmoid(_lhs)
+        del _lhs
+        _act = _silu_lhs * _rhs
+        del _rhs, _silu_lhs
+        if _prob is not None and torch.is_tensor(_prob) and _prob.numel() > 0:
+            _act = _act * _prob[_rs:_re].to(torch.float32).unsqueeze(-1)
+        for _cb in range(_num_col_blocks):
+            _c_start = _cb * _TILE
+            _c_end = min(_c_start + _TILE, _half_cols)
+            _block = _act[:, _c_start:_c_end]
+            _amax = _block.abs().amax(dim=-1).clamp(min=1e-10)
+            _scale = _FP8_MAX / _amax
+            if _using_pow2_scaling:
+                _scale = torch.exp2(torch.floor(torch.log2(_scale)))
+            _inv_scale = 1.0 / _scale
+            _quantized = (_block * _scale.unsqueeze(-1)).clamp(-_FP8_MAX, _FP8_MAX)
+            _output_fp8[_rs:_re, _c_start:_c_end] = _quantized.to(torch.float8_e4m3fn)
+            _scale_out[_rs:_re, _cb] = _inv_scale
+        del _act
+
+    result = [_output_fp8, _scale_out]
+
+elif op_name in ("fuse_stack_fp8_quant", "fuse_stack_transpose_fp8_quant"):
+    # fuse_stack[_transpose]_fp8_quant(X_list, using_pow2_scaling, using_ue8m0_scale, output_scale_transpose)
+    # X_list: list of N tensors each [M, K] in bfloat16
+    # Returns: [output_fp8, scale]
+    import math as _math
+    _X_list = arg1
+    _using_pow2_scaling = bool(arg2) if arg2 is not None else False
+    _using_ue8m0_scale = bool(arg3) if arg3 is not None else False
+    _output_scale_transpose = bool(arg4) if arg4 is not None else False
+    _do_transpose = ("transpose" in op_name)
+    _N = len(_X_list)
+    _M, _K = _X_list[0].shape
+    _dev = _X_list[0].device
+    _FP8_MAX = torch.finfo(torch.float8_e4m3fn).max  # 448.0
+    _TILE = 128
+
+    # Stack all inputs: [N, M, K] in fp32
+    _stacked = torch.stack(_X_list, dim=0).to(torch.float32)
+    if _do_transpose:
+        _stacked = _stacked.transpose(1, 2).contiguous()
+        _out_rows = _N * _K
+        _out_cols = _M
+    else:
+        _out_rows = _N * _M
+        _out_cols = _K
+
+    _mat = _stacked.reshape(_out_rows, _out_cols)
+
+    # Block-wise quantization with 128x128 tiles
+    _num_row_blocks = _out_rows // _TILE
+    _num_col_blocks = _out_cols // _TILE
+    _tiled = _mat.reshape(_num_row_blocks, _TILE, _num_col_blocks, _TILE).permute(0, 2, 1, 3)
+    # Per-tile amax
+    _amax = _tiled.abs().amax(dim=(2, 3)).clamp(min=1e-10)
+    # scale = FP8_MAX / amax
+    _scale = _FP8_MAX / _amax
+    if _using_pow2_scaling or _using_ue8m0_scale:
+        _scale = torch.exp2(torch.floor(torch.log2(_scale)))
+    _inv_scale = 1.0 / _scale
+
+    # Quantize: multiply by scale, clamp, cast to fp8
+    _scale_expanded = _scale.unsqueeze(2).unsqueeze(3)
+    _quantized = (_tiled * _scale_expanded).clamp(-_FP8_MAX, _FP8_MAX)
+    _quantized = _quantized.permute(0, 2, 1, 3).reshape(_out_rows, _out_cols)
+    _output_fp8 = _quantized.to(torch.float8_e4m3fn)
+
+    # Scale output
+    if _using_ue8m0_scale:
+        _log2_inv = torch.log2(_inv_scale).round().to(torch.int32) + 127
+        _log2_inv = _log2_inv.clamp(0, 254)
+        _scale_out = _log2_inv.unsqueeze(1).expand(-1, _TILE, -1).reshape(_out_rows, _num_col_blocks)
+        if _output_scale_transpose:
+            _scale_out = _scale_out.t().contiguous()
+        _scale_out = _scale_out.to(torch.int32)
+    else:
+        _scale_out = _inv_scale
+        if _output_scale_transpose:
+            _scale_out = _scale_out.t().contiguous()
+
+    result = [_output_fp8, _scale_out]
 
 else:
     raise NotImplementedError(f"CopsRunCustomOpRule: unsupported op_name={op_name!r}")
