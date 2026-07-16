@@ -1906,13 +1906,116 @@ class Fp8QuantBlockwiseRule(BaseRule):
     Aligns with phi fp8_quant_blockwise kernel:
     quant_scale = fp8_max / amax (optionally power-of-2), stored scale = 1/quant_scale,
     quantized = cast(x * quant_scale, float8_e4m3fn).
+
+    Reference implementation is selected via PADDLEAPITEST_FLPGA_IMPL env var:
+      - "te"    (default): Transformer Engine Float8BlockQuantizer
+      - "torch":           Manual torch scatter-op implementation
     """
 
     def apply(self, paddle_api: str) -> ConvertResult:
+        import os
+
         defaults_code, _map_code = self.apply_generic()
-        # Single function body: converter exec uses separate globals/locals, so
-        # nested defs cannot close over sibling locals.
-        core = """
+        impl = os.environ.get("PADDLEAPITEST_FLPGA_IMPL", "te")
+        if impl == "torch":
+            core = self._torch_code()
+        else:
+            core = self._te_code()
+        code = Code(
+            preprocess=defaults_code,
+            core=core.splitlines(),
+        )
+        return ConvertResult.success(paddle_api, code, is_torch_corresponding=False)
+
+    @staticmethod
+    def _te_code() -> str:
+        return """
+import os as _os
+_fp8_max = 448.0
+_eps = float(epsilon) if epsilon is not None else 0.0
+_input_transpose = bool(input_transpose)
+_output_scale_transpose = bool(output_scale_transpose)
+_return_transpose_only = bool(return_transpose_only)
+_using_pow2_scale = bool(using_pow2_scale)
+_using_ue8m0_scale = bool(using_ue8m0_scale)
+_quant_method = quant_method
+if _quant_method not in ("1x128", "128x128"):
+    raise ValueError(f"Unsupported quantization method: {_quant_method}")
+if output_type != "e4m3":
+    raise ValueError(f"Unsupported output type: {output_type}")
+
+try:
+    import transformer_engine.pytorch as _te
+    from transformer_engine.pytorch.quantization import DType as _teDType
+except Exception as _err:
+    raise RuntimeError(
+        "PADDLEAPITEST_FLPGA_IMPL=te: cannot import transformer_engine; "
+        f"error={type(_err).__name__}: {_err}"
+    ) from _err
+
+def _te_fp8_quant_blockwise(inp, eps, power2, scale_transpose, ue8m0, method):
+    import transformer_engine.pytorch as _te
+    from transformer_engine.pytorch.quantization import DType as _teDType
+    m, n = inp.shape
+    _block_dim = 1 if method == "1x128" else 2
+    _quantizer = _te.Float8BlockQuantizer(
+        fp8_dtype=_teDType.kFloat8E4M3,
+        rowwise=True,
+        columnwise=False,
+        force_pow_2_scales=power2,
+        amax_epsilon=eps,
+        block_scaling_dim=_block_dim,
+    )
+    _result = _quantizer.quantize(inp.to(torch.bfloat16) if inp.dtype not in (torch.bfloat16, torch.float16, torch.float32) else inp)
+    q = _result._rowwise_data.view(torch.float8_e4m3fn)
+    deq_scale = _result._rowwise_scale_inv  # float32
+
+    # Handle scale transpose:
+    # TE 1D: already (scale_cols, m) = transposed format
+    # TE 2D: (sm, sn) = non-transposed format
+    if method == "1x128":
+        # TE gives (scale_cols, m) which IS the transposed layout
+        scale = deq_scale if scale_transpose else deq_scale.t().contiguous()
+    else:
+        # TE gives (sm, sn) which is NON-transposed layout
+        scale = deq_scale.t().contiguous() if scale_transpose else deq_scale
+
+    # Handle ue8m0 packing: 4 float32 exponents -> 1 packed int32
+    if ue8m0:
+        base = deq_scale.contiguous() if method == "1x128" else (deq_scale.t().contiguous() if scale_transpose else deq_scale.contiguous())
+        # base is in the final layout orientation already; pack along last dim
+        # Actually re-derive from the non-transposed deq_scale for consistent packing
+        if method == "1x128":
+            _base = deq_scale.t().contiguous()  # (m, scale_cols)
+        else:
+            _base = deq_scale.contiguous()  # (sm, sn)
+        cols_s = _base.shape[-1]
+        pad_c = (4 - (cols_s % 4)) % 4
+        if pad_c:
+            _base = torch.nn.functional.pad(_base, (0, pad_c))
+        b = _base.reshape(*_base.shape[:-1], -1, 4)
+        safe = torch.clamp(b, min=torch.finfo(torch.float32).tiny)
+        exp = torch.floor(torch.log2(safe)).to(torch.int32) + 127
+        exp = torch.clamp(exp, 0, 255)
+        packed = (exp[..., 0] | (exp[..., 1] << 8) | (exp[..., 2] << 16) | (exp[..., 3] << 24)).to(torch.int32)
+        scale = packed.transpose(0, 1).contiguous() if scale_transpose else packed.contiguous()
+    return q, scale
+
+if not _input_transpose:
+    result = _te_fp8_quant_blockwise(x, _eps, _using_pow2_scale, _output_scale_transpose, _using_ue8m0_scale, _quant_method)
+else:
+    x_t = x.transpose(0, 1).contiguous()
+    q_t, s_t = _te_fp8_quant_blockwise(x_t, _eps, _using_pow2_scale, _output_scale_transpose, _using_ue8m0_scale, _quant_method)
+    if _return_transpose_only:
+        result = (q_t, s_t)
+    else:
+        q, s = _te_fp8_quant_blockwise(x, _eps, _using_pow2_scale, _output_scale_transpose, _using_ue8m0_scale, _quant_method)
+        result = (q, s, q_t, s_t)
+"""
+
+    @staticmethod
+    def _torch_code() -> str:
+        return """
 _fp8_max = 448.0
 _eps = float(epsilon) if epsilon is not None else 0.0
 _input_transpose = bool(input_transpose)
@@ -1932,12 +2035,27 @@ def _fp8_quant_blockwise_impl(inp, eps, power2, scale_transpose, ue8m0, method, 
         q = torch.empty((m, n), dtype=torch.float8_e4m3fn, device=inp.device)
         if method == "1x128":
             scale_cols = (n + 127) // 128
-            scale = torch.empty((scale_cols, m) if scale_transpose else (m, scale_cols), dtype=torch.float32, device=inp.device)
         else:
             sm, sn = (m + 127) // 128, (n + 127) // 128
-            scale = torch.empty((sn, sm) if scale_transpose else (sm, sn), dtype=torch.float32, device=inp.device)
+            scale_cols = sn if scale_transpose else sm
+            # for 128x128: scale shape before transpose is (sm, sn)
+            scale_rows_128 = sm
         if ue8m0:
-            scale = torch.empty_like(scale, dtype=torch.int32)
+            if method == "1x128":
+                packed_cols = (scale_cols + 3) // 4
+                scale = torch.empty((packed_cols, m) if scale_transpose else (m, packed_cols), dtype=torch.int32, device=inp.device)
+            else:
+                packed_sm = (sm + 3) // 4 if not scale_transpose else sm
+                packed_sn = (sn + 3) // 4 if scale_transpose else sn
+                if scale_transpose:
+                    scale = torch.empty((packed_sn, sm), dtype=torch.int32, device=inp.device)
+                else:
+                    scale = torch.empty((sm, packed_sn), dtype=torch.int32, device=inp.device)
+        else:
+            if method == "1x128":
+                scale = torch.empty((scale_cols, m) if scale_transpose else (m, scale_cols), dtype=torch.float32, device=inp.device)
+            else:
+                scale = torch.empty((sn, sm) if scale_transpose else (sm, sn), dtype=torch.float32, device=inp.device)
         return q, scale
 
     _need_chunk = (m * n * 4) > (2 * 1024 * 1024 * 1024)
@@ -2087,10 +2205,7 @@ else:
         q, s = _fp8_quant_blockwise_impl(x, _eps, _using_pow2_scale, _output_scale_transpose, _using_ue8m0_scale, _quant_method, _fp8_max)
         result = (q, s, q_t, s_t)
 """
-        code = Code(
-            preprocess=defaults_code,
-            core=core.splitlines(),
-        )
+        return ConvertResult.success(paddle_api, code, is_torch_corresponding=False)
         return ConvertResult.success(paddle_api, code, is_torch_corresponding=False)
 
 
@@ -4303,10 +4418,16 @@ scale = locals().get('scale')
 if scale is None:
     scale_unzipped = torch.empty(0, dtype=torch.float32, device=_dev)
 else:
-    scale_fp = scale.float() if using_ue8m0_scale else scale
-    scale_unzipped = torch.zeros(total_rows, scale_fp.shape[1], dtype=scale_fp.dtype, device=_dev)
-    _valid_rows_mask = (_gather_src >= 0)
-    scale_unzipped[_valid_rows_mask] = scale_fp[_gather_src[_valid_rows_mask]]
+    if using_ue8m0_scale:
+        # ue8m0 scale is int32 packed; just scatter the packed rows as-is
+        scale_unzipped = torch.zeros(total_rows, scale.shape[1], dtype=scale.dtype, device=_dev)
+        _valid_rows_mask = (_gather_src >= 0)
+        scale_unzipped[_valid_rows_mask] = scale[_gather_src[_valid_rows_mask]]
+    else:
+        scale_fp = scale.float()
+        scale_unzipped = torch.zeros(total_rows, scale_fp.shape[1], dtype=scale_fp.dtype, device=_dev)
+        _valid_rows_mask = (_gather_src >= 0)
+        scale_unzipped[_valid_rows_mask] = scale_fp[_gather_src[_valid_rows_mask]]
 # build hidden_states_unzipped via index_select
 if do_gather:
     hidden_states_unzipped = torch.zeros(total_rows, token_dim, dtype=hidden_states.dtype, device=_dev)
@@ -7931,7 +8052,19 @@ elif op_name == "fuse_weighted_swiglu_fp8_quant":
             _scale_out[_rs:_re, _cb] = _inv_scale
         del _act
 
-    result = [_output_fp8, _scale_out]
+    if _use_ue8m0:
+        # Pack 4 exponent columns into 1 int32 (ue8m0 format)
+        _log2_inv = torch.log2(_scale_out).round().to(torch.int32) + 127
+        _log2_inv = _log2_inv.clamp(0, 254)
+        _pack_cols = _log2_inv.shape[-1]
+        _pad_c = (4 - (_pack_cols % 4)) % 4
+        if _pad_c:
+            _log2_inv = torch.nn.functional.pad(_log2_inv, (0, _pad_c))
+        _log2_inv = _log2_inv.reshape(_log2_inv.shape[0], -1, 4)
+        _scale_packed = (_log2_inv[..., 0] | (_log2_inv[..., 1] << 8) | (_log2_inv[..., 2] << 16) | (_log2_inv[..., 3] << 24)).to(torch.int32)
+        result = [_output_fp8, _scale_packed]
+    else:
+        result = [_output_fp8, _scale_out]
 
 elif op_name in ("fuse_stack_fp8_quant", "fuse_stack_transpose_fp8_quant"):
     # fuse_stack[_transpose]_fp8_quant(X_list, using_pow2_scaling, using_ue8m0_scale, output_scale_transpose)
@@ -7984,9 +8117,15 @@ elif op_name in ("fuse_stack_fp8_quant", "fuse_stack_transpose_fp8_quant"):
         _log2_inv = torch.log2(_inv_scale).round().to(torch.int32) + 127
         _log2_inv = _log2_inv.clamp(0, 254)
         _scale_out = _log2_inv.unsqueeze(1).expand(-1, _TILE, -1).reshape(_out_rows, _num_col_blocks)
+        # Pack 4 exponent columns into 1 int32 (ue8m0 format)
+        _pack_cols = _scale_out.shape[-1]
+        _pad_c = (4 - (_pack_cols % 4)) % 4
+        if _pad_c:
+            _scale_out = torch.nn.functional.pad(_scale_out, (0, _pad_c))
+        _scale_out = _scale_out.reshape(_scale_out.shape[0], -1, 4)
+        _scale_out = (_scale_out[..., 0] | (_scale_out[..., 1] << 8) | (_scale_out[..., 2] << 16) | (_scale_out[..., 3] << 24)).to(torch.int32)
         if _output_scale_transpose:
             _scale_out = _scale_out.t().contiguous()
-        _scale_out = _scale_out.to(torch.int32)
     else:
         _scale_out = _inv_scale
         if _output_scale_transpose:
