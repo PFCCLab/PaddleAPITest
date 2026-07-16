@@ -1738,9 +1738,12 @@ class TensorConfig:
                     vocab_size = numpy.random.randint(10, 1000)
                     if isinstance(weight_config, TensorConfig) and weight_config.shape:
                         vocab_size = weight_config.shape[0]
-                    self.numpy_tensor = numpy.random.randint(0, vocab_size, size=self.shape).astype(
-                        self.dtype
-                    )
+                    if vocab_size == 0:
+                        self.numpy_tensor = numpy.zeros(self.shape, dtype=self.dtype)
+                    else:
+                        self.numpy_tensor = numpy.random.randint(
+                            0, vocab_size, size=self.shape
+                        ).astype(self.dtype)
                 elif self.check_arg(api_config, 1, "weight"):
                     if self.dtype.startswith("complex"):
                         real_dtype = "float32" if self.dtype == "complex64" else "float64"
@@ -1778,9 +1781,12 @@ class TensorConfig:
                         soft_labels = soft_labels / soft_labels.sum(axis=1, keepdims=True)
                         self.numpy_tensor = soft_labels.astype(self.dtype)
                     else:
-                        self.numpy_tensor = numpy.random.randint(
-                            0, num_classes, size=self.shape
-                        ).astype(self.dtype)
+                        if num_classes == 0:
+                            self.numpy_tensor = numpy.zeros(self.shape, dtype=self.dtype)
+                        else:
+                            self.numpy_tensor = numpy.random.randint(
+                                0, num_classes, size=self.shape
+                            ).astype(self.dtype)
                 elif self.check_arg(api_config, 3, "weight"):
                     self.numpy_tensor = numpy.random.random(size=self.shape)
                     self.numpy_tensor = self.numpy_tensor / self.numpy_tensor.sum()
@@ -2635,9 +2641,12 @@ class TensorConfig:
                     if axis is None:
                         axis = 0
                     inputs = self.get_arg(api_config, 0, "x")
-                    self.numpy_tensor = numpy.random.randint(
-                        0, inputs.shape[axis], size=self.shape
-                    ).astype(self.dtype)
+                    if inputs.shape[axis] == 0:
+                        self.numpy_tensor = numpy.zeros(self.shape, dtype=self.dtype)
+                    else:
+                        self.numpy_tensor = numpy.random.randint(
+                            0, inputs.shape[axis], size=self.shape
+                        ).astype(self.dtype)
 
             elif api_config.api_name in {"paddle.Tensor.index_put", "paddle.index_put"}:
                 if self.check_arg(api_config, 1, "indices") and not self.get_arg(
@@ -2981,38 +2990,50 @@ class TensorConfig:
                         seqlen, topk = self.shape[0], self.shape[1]
                         # Generate valid routemap vectorized for large seqlen
                         routemap = numpy.full(self.shape, -1, dtype="int32")
-                        # Each row randomly assigns 1~topk experts to random positions
-                        n_assigned = numpy.random.randint(1, topk + 1, size=seqlen)
-                        # For each possible n_assigned value, batch process all rows with that count
-                        for n in range(1, topk + 1):
-                            mask = n_assigned == n
-                            count = int(mask.sum())
-                            if count == 0:
-                                continue
-                            # Generate random expert indices for these rows
-                            expert_indices = numpy.array(
-                                [
-                                    numpy.random.choice(num_experts, size=n, replace=False)
-                                    for _ in range(count)
-                                ],
-                                dtype="int32",
-                            )
-                            # Generate random positions for these rows
-                            position_indices = numpy.array(
-                                [
-                                    numpy.random.choice(topk, size=n, replace=False)
-                                    for _ in range(count)
-                                ],
-                                dtype="int32",
-                            )
-                            row_indices = numpy.where(mask)[0]
-                            for j in range(n):
-                                routemap[row_indices, position_indices[:, j]] = expert_indices[:, j]
-                        self.numpy_tensor = routemap
-                        # Update tokens_per_expert to match the generated routemap
-                        tokens_count = [int(numpy.sum(routemap == e)) for e in range(num_experts)]
-                        tokens_per_expert = self.get_arg(api_config, 5, "tokens_per_expert")
-                        tokens_per_expert[:] = tokens_count
+                        if topk == 0:
+                            # 0-size topk dimension: routemap stays all -1
+                            self.numpy_tensor = routemap
+                            tokens_per_expert = self.get_arg(api_config, 5, "tokens_per_expert")
+                            if tokens_per_expert is not None:
+                                tokens_per_expert[:] = [0] * num_experts
+                        else:
+                            # Each row randomly assigns 1~min(topk, num_experts) experts
+                            max_assign = min(topk, num_experts)
+                            n_assigned = numpy.random.randint(1, max_assign + 1, size=seqlen)
+                            # For each possible n_assigned value, batch process all rows with that count
+                            for n in range(1, max_assign + 1):
+                                mask = n_assigned == n
+                                count = int(mask.sum())
+                                if count == 0:
+                                    continue
+                                # Generate random expert indices for these rows
+                                expert_indices = numpy.array(
+                                    [
+                                        numpy.random.choice(num_experts, size=n, replace=False)
+                                        for _ in range(count)
+                                    ],
+                                    dtype="int32",
+                                )
+                                # Generate random positions for these rows
+                                position_indices = numpy.array(
+                                    [
+                                        numpy.random.choice(topk, size=n, replace=False)
+                                        for _ in range(count)
+                                    ],
+                                    dtype="int32",
+                                )
+                                row_indices = numpy.where(mask)[0]
+                                for j in range(n):
+                                    routemap[row_indices, position_indices[:, j]] = expert_indices[
+                                        :, j
+                                    ]
+                            self.numpy_tensor = routemap
+                            # Update tokens_per_expert to match the generated routemap
+                            tokens_count = [
+                                int(numpy.sum(routemap == e)) for e in range(num_experts)
+                            ]
+                            tokens_per_expert = self.get_arg(api_config, 5, "tokens_per_expert")
+                            tokens_per_expert[:] = tokens_count
                     # expert_prob_topk (arg3): float32, shape [seqlen, topk], value in [0, 1]
                     elif self.check_arg(api_config, 3, "expert_prob_topk"):
                         routemap_config = self.get_arg(api_config, 2, "expert_routemap_topk")
@@ -3047,30 +3068,37 @@ class TensorConfig:
                         seqlen, topk = self.shape[0], self.shape[1]
                         # Generate valid routemap vectorized for large seqlen
                         routemap = numpy.full(self.shape, -1, dtype="int32")
-                        n_assigned = numpy.random.randint(1, topk + 1, size=seqlen)
-                        for n in range(1, topk + 1):
-                            mask = n_assigned == n
-                            count = int(mask.sum())
-                            if count == 0:
-                                continue
-                            expert_indices = numpy.array(
-                                [
-                                    numpy.random.choice(num_experts, size=n, replace=False)
-                                    for _ in range(count)
-                                ],
-                                dtype="int32",
-                            )
-                            position_indices = numpy.array(
-                                [
-                                    numpy.random.choice(topk, size=n, replace=False)
-                                    for _ in range(count)
-                                ],
-                                dtype="int32",
-                            )
-                            row_indices = numpy.where(mask)[0]
-                            for j in range(n):
-                                routemap[row_indices, position_indices[:, j]] = expert_indices[:, j]
-                        self.numpy_tensor = routemap
+                        if topk == 0:
+                            # 0-size topk dimension: routemap stays all -1
+                            self.numpy_tensor = routemap
+                        else:
+                            max_assign = min(topk, num_experts)
+                            n_assigned = numpy.random.randint(1, max_assign + 1, size=seqlen)
+                            for n in range(1, max_assign + 1):
+                                mask = n_assigned == n
+                                count = int(mask.sum())
+                                if count == 0:
+                                    continue
+                                expert_indices = numpy.array(
+                                    [
+                                        numpy.random.choice(num_experts, size=n, replace=False)
+                                        for _ in range(count)
+                                    ],
+                                    dtype="int32",
+                                )
+                                position_indices = numpy.array(
+                                    [
+                                        numpy.random.choice(topk, size=n, replace=False)
+                                        for _ in range(count)
+                                    ],
+                                    dtype="int32",
+                                )
+                                row_indices = numpy.where(mask)[0]
+                                for j in range(n):
+                                    routemap[row_indices, position_indices[:, j]] = expert_indices[
+                                        :, j
+                                    ]
+                            self.numpy_tensor = routemap
                     # zipped_expertwise_rowmap (arg1): int32, shape [seqlen, num_experts]
                     # Needs to be valid rowmap based on routemap
                     elif self.check_arg(api_config, 1, "zipped_expertwise_rowmap"):
