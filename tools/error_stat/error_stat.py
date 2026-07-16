@@ -61,16 +61,16 @@ def check_count_consistency(parsed_keys, config_keys, prefix):
     # 校验从 log_inorder.log 解析到的 case 数量与结果文件一致，不一致说明日志不完整或被截断
     parsed_len = len(parsed_keys)
     config_len = len(config_keys)
-    if parsed_len != config_len:
-        missing_keys = config_keys - parsed_keys
-        extra_keys = parsed_keys - config_keys
-        msg = (
-            f"[ASSERT ERROR] {prefix} 数量不一致: "
-            f"config={config_len}, parsed={parsed_len}, "
-            f"缺失={len(missing_keys)} {sorted(missing_keys)[:3]}, "
-            f"多余={len(extra_keys)} {sorted(extra_keys)[:3]}"
-        )
-        raise AssertionError(msg)
+    if parsed_len == config_len:
+        return None
+    missing_keys = config_keys - parsed_keys
+    extra_keys = parsed_keys - config_keys
+    return (
+        f"[WARNING] {prefix} 数量不一致: "
+        f"config={config_len}, parsed={parsed_len}, "
+        f"缺失={len(missing_keys)} {sorted(missing_keys)[:3]}, "
+        f"多余={len(extra_keys)} {sorted(extra_keys)[:3]}"
+    )
 
 
 def read_configs(file_path):
@@ -155,6 +155,20 @@ def merge_classified_logs(classified_logs, log_types):
     return merged_logs
 
 
+def print_consistency_warnings(warnings):
+    if not warnings:
+        return
+    print("\n" + "!" * 50)
+    print("WARNING: log count consistency issues were found:")
+    for warning in warnings:
+        print(f"  {warning}")
+    print(
+        "Result files have still been generated. "
+        "Please check whether logs are incomplete or duplicated."
+    )
+    print("!" * 50 + "\n")
+
+
 def write_logs_and_meta(output_path, logs_dict, prefix):
     # 为指定分类写出三个文件：完整日志块、API 名列表、config 字符串列表
     output_path = Path(output_path)
@@ -192,13 +206,18 @@ def error_state(input_path, output_path, split_errors=False):
         return
 
     classified_logs = classify_by_config(logs, config_sets)
+    consistency_warnings = []
 
     pass_logs = classified_logs.get("pass", {})
-    check_count_consistency(set(pass_logs), config_sets["pass"], "pass")
+    warning = check_count_consistency(set(pass_logs), config_sets["pass"], "pass")
+    if warning:
+        consistency_warnings.append(warning)
     write_logs_and_meta(output_path, pass_logs, "pass")
 
     skip_logs = classified_logs.get("skip", {})
-    check_count_consistency(set(skip_logs), config_sets["skip"], "skip")
+    warning = check_count_consistency(set(skip_logs), config_sets["skip"], "skip")
+    if warning:
+        consistency_warnings.append(warning)
     if skip_logs:
         write_logs_and_meta(output_path, skip_logs, "skip")
 
@@ -208,18 +227,25 @@ def error_state(input_path, output_path, split_errors=False):
             if log_type in ("checkpoint", "pass", "skip"):
                 continue
             category_logs = classified_logs.get(log_type, {})
-            check_count_consistency(set(category_logs), configs, log_type)
+            warning = check_count_consistency(set(category_logs), configs, log_type)
+            if warning:
+                consistency_warnings.append(warning)
             if category_logs:
                 write_logs_and_meta(output_path, category_logs, log_type)
+        print_consistency_warnings(consistency_warnings)
         return
 
     # 默认汇总模式：按 SUMMARY_GROUPS 合并同组分类后输出
     for group_name, log_types in SUMMARY_GROUPS.items():
         group_logs = merge_classified_logs(classified_logs, log_types)
         group_configs = set().union(*(config_sets[log_type] for log_type in log_types))
-        check_count_consistency(set(group_logs), group_configs, group_name)
+        warning = check_count_consistency(set(group_logs), group_configs, group_name)
+        if warning:
+            consistency_warnings.append(warning)
         if group_logs:
             write_logs_and_meta(output_path, group_logs, group_name)
+
+    print_consistency_warnings(consistency_warnings)
 
 
 def parse_args(argv=None):

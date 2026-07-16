@@ -168,8 +168,7 @@ def init_log_writer(output_dir: Path) -> None:
     log_dir.mkdir(parents=True, exist_ok=True)
 
     try:
-        log_writer.set_test_log_path(str(log_dir))
-        log_writer.set_engineV2()
+        log_writer.init_log(str(log_dir), worker_tmp_logs=True)
     except Exception as err:
         print(f"[warn] failed to initialize log_writer: {err}")
 

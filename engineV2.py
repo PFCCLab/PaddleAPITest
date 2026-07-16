@@ -493,9 +493,7 @@ def check_gpu_memory(gpu_ids, num_workers_per_gpu, required_memory):  # required
 
 
 def init_worker_gpu(gpu_worker_list, lock, available_gpus, max_workers_per_gpu, options):
-    if options.log_dir:
-        set_test_log_path(options.log_dir)
-    set_engineV2()
+    init_log(options.log_dir, worker_tmp_logs=True)
     my_pid = os.getpid()
 
     def pid_exists(pid):
@@ -985,8 +983,6 @@ def main():
     if options.bitwise_alignment:
         options.atol = 0.0
         options.rtol = 0.0
-    if options.log_dir:
-        set_test_log_path(options.log_dir)
 
     if options.api_config:
         try:
@@ -1008,8 +1004,7 @@ def main():
 
         globals().update(_load_test_classes(options))
 
-        # set log_writer
-        set_engineV2()
+        init_log(options.log_dir, worker_tmp_logs=True)
 
         options.api_config = options.api_config.strip()
         print(
@@ -1097,10 +1092,7 @@ def main():
                 return
             config_files = [options.api_config_file]
 
-        # set log_writer before resume/checkpoint handling
-        if options.log_dir:
-            set_test_log_path(options.log_dir)
-        set_engineV2()
+        init_log(options.log_dir, worker_tmp_logs=True)
 
         # when engineV2 was interrupted, resume from .tmp dir
         aggregate_logs(cleanup=True)
@@ -1247,7 +1239,7 @@ def main():
                         elif err.exitcode in (-signal.SIGKILL, -signal.SIGTERM):
                             checkpoint_ready = False
                             print(
-                                f"[warn] Worker was externally killed for {config} "
+                                f"[warn] Worker was externally killed "
                                 f"(exit={err.exitcode}); case will be retried on next run.",
                                 flush=True,
                             )
