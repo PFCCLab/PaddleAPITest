@@ -1239,7 +1239,7 @@ def main():
                         elif err.exitcode in (-signal.SIGKILL, -signal.SIGTERM):
                             checkpoint_ready = False
                             print(
-                                f"[warn] Worker was externally killed "
+                                f"[warn] Worker was externally killed for {config} "
                                 f"(exit={err.exitcode}); case will be retried on next run.",
                                 flush=True,
                             )
@@ -1274,7 +1274,7 @@ def main():
         finally:
             print(f"{tested_case} cases have been tested.", flush=True)
             log_counts = aggregate_logs(end=True)
-            print_log_info(all_case, log_counts)
+            print_log_info(max(all_case - tested_case, 0), log_counts)
             end_time = time.time()
             total_time = end_time - start_time
             print(f"Test time: {round(total_time / 60, 3)} minutes.", flush=True)

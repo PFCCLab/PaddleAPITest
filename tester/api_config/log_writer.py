@@ -597,6 +597,8 @@ def _check_logs(log_counts, has_comp):
     comp_out_dir = TEST_LOG_PATH / "comp"
     if has_comp:
         log_counts["_multi_classification"] = True
+        if _scan_dups(TEST_LOG_PATH):
+            log_counts["_has_multi_result_overlap"] = True
         for dim_dir in sorted(comp_out_dir.iterdir()) if comp_out_dir.exists() else []:
             if not dim_dir.is_dir():
                 continue
@@ -644,14 +646,15 @@ def aggregate_logs(end=False, cleanup=False):
         )
         and all_success
     )
-    _clean_tmp(cleanup_tmp, all_success)
 
     if not end:
+        _clean_tmp(cleanup_tmp, all_success)
         return
 
     _sort_csv(tol_file, ["API", "dtype", "config", "mode"])
     _sort_csv(stable_file, ["API", "dtype", "config", "comp"])
     has_comp = _agg_comp(cleanup_tmp, tmp_exists)
+    _clean_tmp(cleanup_tmp, all_success)
     if has_comp:
         _sync_comp_main_summary()
     log_counts = _count_logs()
@@ -703,13 +706,14 @@ def _print_comp_dups(comp_integrity_errors):
         print("!" * 50 + "\n")
 
 
-def print_log_info(all_case, log_counts=None):
+def print_log_info(remaining_case, log_counts=None):
     """打印日志统计信息"""
     if log_counts is None:
         log_counts = {}
     integrity_errors = log_counts.get("_integrity_errors", [])
     comp_integrity_errors = log_counts.get("_comp_integrity_errors", [])
     is_multi_classification = log_counts.get("_multi_classification")
+    has_multi_result_overlap = log_counts.get("_has_multi_result_overlap")
     counts = _visible_counts(log_counts)
     paddle_types = [
         "paddle_error",
@@ -723,7 +727,7 @@ def print_log_info(all_case, log_counts=None):
     print("\n" + "=" * 50)
     print("Test Case Statistics".center(50))
     print("=" * 50)
-    print(f"{'Remaining cases':<30}: {all_case:>8}")
+    print(f"{'Remaining cases':<30}: {remaining_case:>8}")
     print(f"{'Tested cases':<30}: {counts.get('checkpoint', 0):>8}")
     print(f"{'Pass cases':<30}: {counts.get('pass', 0):>8}")
     print(f"{'Skip cases':<30}: {counts.get('skip', 0):>8}")
@@ -733,10 +737,8 @@ def print_log_info(all_case, log_counts=None):
     if counts:
         print("-" * 50)
         print("Log Type Breakdown:")
-        if is_multi_classification:
-            print(
-                "  Note: accuracy_stable comp-dimension breakdown; one config may appear in multiple result sets."
-            )
+        if is_multi_classification and has_multi_result_overlap:
+            print("  Note: In accuracy_stable mode, one config may appear in multiple result sets.")
         for log_type, count in counts.items():
             print(f"  {log_type:<28}: {count:>8}")
     print("=" * 50 + "\n")
