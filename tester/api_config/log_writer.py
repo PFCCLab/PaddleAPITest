@@ -491,14 +491,16 @@ def _count_logs():
         except Exception as err:
             print(f"Error reading {log_file}: {err}", flush=True)
 
+    incomplete_file = TEST_LOG_PATH / "api_config_incomplete.txt"
     if api_configs:
         log_counts["incomplete"] = len(api_configs)
-        incomplete_file = TEST_LOG_PATH / "api_config_incomplete.txt"
         try:
             with incomplete_file.open("w") as f:
                 f.writelines(f"{line}\n" for line in sorted(api_configs))
         except Exception as err:
             print(f"Error writing to {incomplete_file}: {err}", flush=True)
+    else:
+        incomplete_file.unlink(missing_ok=True)
     return log_counts
 
 
@@ -550,37 +552,59 @@ def _add_dups(log_counts, scope, duplicates):
         )
 
 
-def _merge_comp_main():
+def _read_log_lines(log_file):
+    if not log_file.exists():
+        return set()
+    try:
+        with log_file.open("r") as f:
+            return {line.strip() for line in f if line.strip()}
+    except Exception as err:
+        print(f"Error reading {log_file}: {err}", flush=True)
+        return set()
+
+
+def _sync_comp_main_summary():
     comp_out_dir = TEST_LOG_PATH / "comp"
     if not comp_out_dir.exists():
         return
+
+    main_lines_by_type = {
+        log_type: _read_log_lines(TEST_LOG_PATH / f"{prefix}.txt")
+        for log_type, prefix in LOG_PREFIXES.items()
+        if log_type != "checkpoint"
+    }
     for dim_dir in sorted(comp_out_dir.iterdir()):
         if not dim_dir.is_dir():
             continue
         for log_type, prefix in LOG_PREFIXES.items():
             if log_type == "checkpoint":
                 continue
-            dim_log_file = dim_dir / f"{prefix}.txt"
-            if not dim_log_file.exists():
-                continue
-            main_log_file = TEST_LOG_PATH / f"{prefix}.txt"
-            try:
-                with dim_log_file.open("r") as inf:
-                    lines = {line.strip() for line in inf if line.strip()}
-                if lines:
-                    with main_log_file.open("a") as outf:
-                        outf.writelines(f"{line}\n" for line in sorted(lines))
-            except Exception as err:
-                print(f"Error merging {dim_log_file} -> {main_log_file}: {err}", flush=True)
+            main_lines_by_type[log_type].update(_read_log_lines(dim_dir / f"{prefix}.txt"))
+
+    for log_type, lines in main_lines_by_type.items():
+        log_file = TEST_LOG_PATH / f"{LOG_PREFIXES[log_type]}.txt"
+        try:
+            if lines:
+                with log_file.open("w") as f:
+                    f.writelines(f"{line}\n" for line in sorted(lines))
+            else:
+                log_file.unlink(missing_ok=True)
+        except Exception as err:
+            print(f"Error writing to {log_file}: {err}", flush=True)
 
 
 def _check_logs(log_counts, has_comp):
     comp_out_dir = TEST_LOG_PATH / "comp"
     if has_comp:
+        log_counts["_multi_classification"] = True
         for dim_dir in sorted(comp_out_dir.iterdir()) if comp_out_dir.exists() else []:
-            if dim_dir.is_dir():
-                _add_dups(log_counts, f"comp/{dim_dir.name}", _scan_dups(dim_dir))
-        _merge_comp_main()
+            if not dim_dir.is_dir():
+                continue
+            duplicates = _scan_dups(dim_dir)
+            if duplicates:
+                log_counts.setdefault("_comp_integrity_errors", []).append(
+                    {"scope": f"comp/{dim_dir.name}", "duplicates": duplicates}
+                )
         return
     _add_dups(log_counts, "main log directory", _scan_dups(TEST_LOG_PATH))
 
@@ -627,8 +651,10 @@ def aggregate_logs(end=False, cleanup=False):
 
     _sort_csv(tol_file, ["API", "dtype", "config", "mode"])
     _sort_csv(stable_file, ["API", "dtype", "config", "comp"])
-    log_counts = _count_logs()
     has_comp = _agg_comp(cleanup_tmp, tmp_exists)
+    if has_comp:
+        _sync_comp_main_summary()
+    log_counts = _count_logs()
     _check_logs(log_counts, has_comp)
     return log_counts
 
@@ -659,11 +685,31 @@ def _print_dups(integrity_errors):
         print("!" * 50 + "\n")
 
 
+def _print_comp_dups(comp_integrity_errors):
+    for issue in comp_integrity_errors:
+        scope = issue["scope"]
+        duplicates = issue["duplicates"]
+        print("\n" + "!" * 50)
+        print(f"WARNING: configs found in multiple log types within {scope}:")
+        for config, types in sorted(duplicates.items())[:20]:
+            print(f"  {config}")
+            print(f"    -> {', '.join(types)}")
+        if len(duplicates) > 20:
+            print(f"  ... and {len(duplicates) - 20} more")
+        print(
+            f"Found {len(duplicates)} duplicated config(s) inside {scope}. "
+            "Each comp dimension should still be mutually exclusive."
+        )
+        print("!" * 50 + "\n")
+
+
 def print_log_info(all_case, log_counts=None):
     """打印日志统计信息"""
     if log_counts is None:
         log_counts = {}
     integrity_errors = log_counts.get("_integrity_errors", [])
+    comp_integrity_errors = log_counts.get("_comp_integrity_errors", [])
+    is_multi_classification = log_counts.get("_multi_classification")
     counts = _visible_counts(log_counts)
     paddle_types = [
         "paddle_error",
@@ -677,7 +723,7 @@ def print_log_info(all_case, log_counts=None):
     print("\n" + "=" * 50)
     print("Test Case Statistics".center(50))
     print("=" * 50)
-    print(f"{'Pending cases':<30}: {all_case:>8}")
+    print(f"{'Remaining cases':<30}: {all_case:>8}")
     print(f"{'Tested cases':<30}: {counts.get('checkpoint', 0):>8}")
     print(f"{'Pass cases':<30}: {counts.get('pass', 0):>8}")
     print(f"{'Skip cases':<30}: {counts.get('skip', 0):>8}")
@@ -687,10 +733,17 @@ def print_log_info(all_case, log_counts=None):
     if counts:
         print("-" * 50)
         print("Log Type Breakdown:")
+        if is_multi_classification:
+            print(
+                "  Note: accuracy_stable comp-dimension breakdown; one config may appear in multiple result sets."
+            )
         for log_type, count in counts.items():
             print(f"  {log_type:<28}: {count:>8}")
     print("=" * 50 + "\n")
-    _print_dups(integrity_errors)
+    if is_multi_classification:
+        _print_comp_dups(comp_integrity_errors)
+    else:
+        _print_dups(integrity_errors)
 
 
 stdout_fd = None
