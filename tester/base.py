@@ -68,6 +68,8 @@ CUDA_OOM = frozenset(
 
 def classify_runtime_error(error_msg):
     error_msg_lower = error_msg.lower()
+    if error_msg.startswith("[torch_assert_OOM]"):
+        return "oom", False
     oom_markers = tuple(marker.lower() for marker in CUDA_OOM) + (
         "cannot allocate memory",
         "std::bad_alloc",
@@ -254,6 +256,12 @@ class APITestBase:
             flush=True,
         )
         write_to_log(log_type, self.api_config.config)
+        return log_type, fatal
+
+    def report_compare_error(self, err, phase="", default_log_type="paddle_accuracy"):
+        log_type, fatal = self.report_runtime_error(err, default_log_type, phase)
+        if fatal:
+            raise err
         return log_type, fatal
 
     def need_skip(self, paddle_only=False):

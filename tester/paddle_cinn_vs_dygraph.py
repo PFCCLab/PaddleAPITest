@@ -298,11 +298,7 @@ class APITestCINNVSDygraph(APITestBase):
             try:
                 self.paddle_assert_accuracy(dygraph_output, static_output)
             except Exception as err:
-                print(
-                    f"[accuracy error] {backward_str}{self.api_config.config}\n{err!s}",
-                    flush=True,
-                )
-                write_to_log("paddle_accuracy", self.api_config.config)
+                self.report_compare_error(err, backward_str.strip())
                 return False
         elif isinstance(dygraph_output, (list, tuple)):
             if not isinstance(static_output, (list, tuple)):
@@ -341,11 +337,8 @@ class APITestCINNVSDygraph(APITestBase):
                 try:
                     self.paddle_assert_accuracy(dygraph_item, static_item)
                 except Exception as err:
-                    print(
-                        f"[accuracy error] {backward_str}{self.api_config.config}\n{err!s}",
-                        flush=True,
-                    )
-                    write_to_log("paddle_accuracy", self.api_config.config)
+                    phase = f"{backward_str.strip()} idx={i}" if backward_str else f"idx={i}"
+                    self.report_compare_error(err, phase)
                     return False
         elif dygraph_output is None and static_output is None:
             pass

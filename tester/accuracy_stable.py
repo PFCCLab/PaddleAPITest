@@ -403,19 +403,7 @@ class APITestAccuracyStable(APITestBase):
                 try:
                     self.assert_accuracy(input1, input2, comp)
                 except Exception as err:
-                    err_str = str(err)
-                    if err_str.startswith("[torch_assert_OOM]"):
-                        print(
-                            f"[oom] comp={comp} {self.api_config.config}\n{err_str}",
-                            flush=True,
-                        )
-                        write_to_log("oom", self.api_config.config)
-                    else:
-                        print(
-                            f"[paddle_accuracy] comp={comp} {self.api_config.config}\n{err_str}",
-                            flush=True,
-                        )
-                        write_to_log("paddle_accuracy", self.api_config.config)
+                    self.report_compare_error(err, f"comp={comp}")
                     return
             else:
                 print(
@@ -450,19 +438,7 @@ class APITestAccuracyStable(APITestBase):
                     try:
                         self.assert_accuracy(item1, item2, comp, idx)
                     except Exception as err:
-                        err_str = str(err)
-                        if err_str.startswith("[torch_assert_OOM]"):
-                            print(
-                                f"[oom] comp={comp} {self.api_config.config}\n{err_str}",
-                                flush=True,
-                            )
-                            write_to_log("oom", self.api_config.config)
-                        else:
-                            print(
-                                f"[paddle_accuracy] comp={comp} {self.api_config.config}\n{err_str}",
-                                flush=True,
-                            )
-                            write_to_log("paddle_accuracy", self.api_config.config)
+                        self.report_compare_error(err, f"comp={comp} idx={idx}")
                         return
                 elif not isinstance(item1, (paddle.Tensor, torch.Tensor)) and not isinstance(
                     item2, (paddle.Tensor, torch.Tensor)
@@ -470,19 +446,7 @@ class APITestAccuracyStable(APITestBase):
                     try:
                         self.assert_accuracy(torch.tensor(item1), torch.tensor(item2), comp, idx)
                     except Exception as err:
-                        err_str = str(err)
-                        if err_str.startswith("[torch_assert_OOM]"):
-                            print(
-                                f"[oom] comp={comp} {self.api_config.config}\n{err_str}",
-                                flush=True,
-                            )
-                            write_to_log("oom", self.api_config.config)
-                        else:
-                            print(
-                                f"[paddle_accuracy] comp={comp} {self.api_config.config}\n{err_str}",
-                                flush=True,
-                            )
-                            write_to_log("paddle_accuracy", self.api_config.config)
+                        self.report_compare_error(err, f"comp={comp} idx={idx}")
                         return
                 else:
                     print(
@@ -496,19 +460,7 @@ class APITestAccuracyStable(APITestBase):
             try:
                 self.assert_accuracy(torch.tensor(input1), torch.tensor(input2), comp)
             except Exception as err:
-                err_str = str(err)
-                if err_str.startswith("[torch_assert_OOM]"):
-                    print(
-                        f"[oom] comp={comp} {self.api_config.config}\n{err_str}",
-                        flush=True,
-                    )
-                    write_to_log("oom", self.api_config.config)
-                else:
-                    print(
-                        f"[paddle_accuracy] comp={comp} {self.api_config.config}\n{err_str}",
-                        flush=True,
-                    )
-                    write_to_log("paddle_accuracy", self.api_config.config)
+                self.report_compare_error(err, f"comp={comp}")
                 return
 
     def assert_accuracy(self, tensor1, tensor2, comp, idx=0):
