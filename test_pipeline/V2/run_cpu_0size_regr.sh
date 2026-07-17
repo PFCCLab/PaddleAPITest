@@ -11,7 +11,6 @@ LOG_DIR="tester/api_config/test_log_cpu_0size_regr"
 NUM_GPUS=-1
 NUM_WORKERS_PER_GPU=15
 GPU_IDS="-1"
-REQUIRED_MEMORY=5
 TIME_OUT=600
 
 TEST_MODE_ARGS=(
@@ -33,7 +32,6 @@ PARALLEL_ARGS=(
     --num_gpus="$NUM_GPUS"
     --num_workers_per_gpu="$NUM_WORKERS_PER_GPU"
     --gpu_ids="$GPU_IDS"
-    --required_memory="$REQUIRED_MEMORY"
 )
 TIME_OUT_ARGS=(
     --timeout="$TIME_OUT"

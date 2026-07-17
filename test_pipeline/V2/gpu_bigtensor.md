@@ -64,7 +64,6 @@ LOG_DIR="tester/api_config/test_log_big_tensor_accuracy" # 测试日志目录
 NUM_GPUS=-1 # 指定 GPU 数量，-1 表示使用所有 GPU
 NUM_WORKERS_PER_GPU=1 # 每个 GPU 仅使用 1 个 worker，避免显存溢出
 GPU_IDS="-1" # 指定 GPU 列表，-1 表示使用所有 GPU
-# REQUIRED_MEMORY=10
 
 TEST_MODE_ARGS=(
 	--accuracy=True
@@ -85,7 +84,6 @@ PARALLEL_ARGS=(
     --num_gpus="$NUM_GPUS"
     --num_workers_per_gpu="$NUM_WORKERS_PER_GPU"
     --gpu_ids="$GPU_IDS"
-    # --required_memory="$REQUIRED_MEMORY"
 )
 
 mkdir -p "$LOG_DIR" || {

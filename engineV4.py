@@ -92,7 +92,6 @@ SANITIZER_FORWARD_ARGS = {
     "test_cpu",
     "use_cached_numpy",
     "log_dir",
-    "required_memory",
     "atol",
     "rtol",
     "manual_threshold_config_file",
@@ -1036,11 +1035,6 @@ def validate_gpu_options(options) -> tuple:
             f"invalid --num_workers_per_gpu={options.num_workers_per_gpu}: "
             "expected -1 or a positive integer"
         )
-    if options.required_memory <= 0:
-        raise ValueError(
-            f"invalid --required_memory={options.required_memory:g}: "
-            "expected a positive number of GiB"
-        )
     return tuple(gpu_ids)
 
 
@@ -1242,26 +1236,19 @@ def _run_single_config_with_sanitizer(options):
     return result.returncode
 
 
-def check_gpu_memory(gpu_ids, num_workers_per_gpu, required_memory):  # required_memory in GB
+def check_gpu_memory(gpu_ids, num_workers_per_gpu):
     assert isinstance(gpu_ids, tuple) and len(gpu_ids) > 0
     available_gpus = []
     max_workers_per_gpu = {}
 
     for gpu_id in gpu_ids:
         try:
-            total_memory, used_memory = get_memory_info(gpu_id)
-            free_memory = total_memory - used_memory
-            max_workers = int(free_memory // required_memory)
-            if max_workers >= 1:
-                available_gpus.append(gpu_id)
-                max_workers_per_gpu[gpu_id] = (
-                    max_workers
-                    if num_workers_per_gpu == -1
-                    else min(max_workers, num_workers_per_gpu)
-                )
+            get_memory_info(gpu_id)
         except pynvml.NVMLError as e:
             print(f"[WARNING] Failed to check GPU {gpu_id}: {e!s}", flush=True)
             continue
+        available_gpus.append(gpu_id)
+        max_workers_per_gpu[gpu_id] = 1 if num_workers_per_gpu == -1 else num_workers_per_gpu
 
     return available_gpus, max_workers_per_gpu
 
@@ -1276,35 +1263,16 @@ def run_test_case(api_config_str, options):
         flush=True,
     )
 
-    max_memory_wait = 30  # max 30 iterations × 10s = 5 minutes
-    for wait_iter in range(max_memory_wait):
-        total_memory, used_memory = get_memory_info(gpu_id)
-        free_memory = total_memory - used_memory
-
-        if free_memory >= options.required_memory:
-            break
-
-        if wait_iter % 6 == 0:  # log every ~60s (every 6th iteration)
-            print(
-                f"{datetime.now()} device {gpu_id} Free: {free_memory:.1f} GB, "
-                f"Required: {options.required_memory:.1f} GB. "
-                f"Waiting for available memory... (attempt {wait_iter + 1}/{max_memory_wait})",
-                flush=True,
-            )
-        time.sleep(10)
-    else:
-        message = (
-            f"device {gpu_id} Memory wait timeout after {max_memory_wait * 10}s "
-            f"(free={free_memory:.1f} GB, required={options.required_memory:.1f} GB)"
-        )
-        if getattr(options, "use_gpu_mode", False):
-            raise GpuMemoryDeferred(message)
-        print(
-            f"{datetime.now()} {message}. Proceeding anyway.",
-            flush=True,
-        )
-
+    total_memory, used_memory = get_memory_info(gpu_id)
+    free_memory = total_memory - used_memory
     runtime_config = runtime_config_for_gpu(options, gpu_id)
+    gpu_config = runtime_config.gpu_mode
+    print(
+        f"{datetime.now()} device {gpu_id} memory total={total_memory:.1f} GB, "
+        f"free={free_memory:.1f} GB, workers={gpu_config.workers_on_gpu}, "
+        f"budget={gpu_config.memory_budget:.1f} GB",
+        flush=True,
+    )
 
     try:
         api_config = APIConfig(api_config_str)
@@ -1479,19 +1447,13 @@ def main():
         "--num_workers_per_gpu",
         type=int,
         default=1,
-        help="Workers per GPU. Use -1 to maximize workers based on free memory.",
+        help="Workers per GPU. In gpu_mode, -1 uses one worker per GPU.",
     )
     parser.add_argument(
         "--gpu_ids",
         type=str,
         default="",
         help="GPU IDs to use, e.g. '0', '0,2', '0-3'. Use '-1' for all GPUs.",
-    )
-    parser.add_argument(
-        "--required_memory",
-        type=float,
-        default=10.0,
-        help="Minimum free memory required per worker, in GiB.",
     )
     parser.add_argument(
         "--test_cpu",
@@ -1884,15 +1846,10 @@ def main():
         print(all_case, "cases will be tested.", flush=True)
         del api_config_count, dup_case, finish_case
 
-        # validate GPU memory
-        available_gpus, max_workers_per_gpu = check_gpu_memory(
-            gpu_ids, options.num_workers_per_gpu, options.required_memory
-        )
+        # validate GPU visibility and derive per-GPU worker counts
+        available_gpus, max_workers_per_gpu = check_gpu_memory(gpu_ids, options.num_workers_per_gpu)
         if not available_gpus:
-            print(
-                f"No GPUs with sufficient memory available. Current memory constraint is {options.required_memory} GB.",
-                flush=True,
-            )
+            print("No usable GPUs available.", flush=True)
             return
 
         if (

@@ -245,7 +245,14 @@ class APITestAccuracy(APITestBase):
         else:
             del self.torch_args, self.torch_kwargs
 
-        keep_torch_outputs_on_device = self.use_gpu_mode
+        spill_torch_outputs = False
+        if self.use_gpu_mode:
+            spill_torch_outputs = gpu_mode_maybe_empty_cache(
+                self.gpu_mode_config,
+                "after_torch",
+                request_spill=True,
+            )
+        keep_torch_outputs_on_device = self.use_gpu_mode and not spill_torch_outputs
 
         def process_torch_outputs(obj):
             if isinstance(obj, (torch.return_types.max, torch.return_types.min)):
@@ -270,7 +277,11 @@ class APITestAccuracy(APITestBase):
         gc.collect()
         if self.use_gpu_mode:
             self.clear_torch_tensor()
-            gpu_mode_maybe_empty_cache(self.gpu_mode_config, "before_paddle")
+            gpu_mode_maybe_empty_cache(
+                self.gpu_mode_config,
+                "before_paddle",
+                force=not keep_torch_outputs_on_device,
+            )
         else:
             torch.cuda.empty_cache()
 

@@ -66,7 +66,7 @@ CUDA_OOM = frozenset(
 )
 
 
-def gpu_mode_maybe_empty_cache(gpu_config, phase="", force=False):
+def gpu_mode_maybe_empty_cache(gpu_config, phase="", force=False, request_spill=False):
     if not gpu_config.enabled:
         return False
     try:
@@ -75,45 +75,45 @@ def gpu_mode_maybe_empty_cache(gpu_config, phase="", force=False):
     except Exception:
         return False
 
-    should_cleanup = bool(force)
+    try:
+        torch_reserved = torch.cuda.memory_reserved() / (1024**3)
+    except Exception:
+        torch_reserved = 0.0
+    try:
+        torch_allocated = torch.cuda.memory_allocated() / (1024**3)
+    except Exception:
+        torch_allocated = 0.0
+
+    memory_budget = float(getattr(gpu_config, "memory_budget", 0.0) or 0.0)
+    pressure_ratio = float(getattr(gpu_config, "cleanup_pressure_ratio", 0.25) or 0.25)
+    used_ratio = float(getattr(gpu_config, "cleanup_used_ratio", 0.90) or 0.90)
+    idle_reserved = max(0.0, torch_reserved - torch_allocated)
+    over_budget = memory_budget > 0 and torch_reserved >= memory_budget * used_ratio
+    should_spill = bool(request_spill and over_budget)
+
+    should_cleanup = bool(force or should_spill)
     if not should_cleanup:
-        total_memory = float(gpu_config.total_memory or 0.0)
-        workers_on_gpu = max(1, int(gpu_config.workers_on_gpu or 1))
-        required_memory = float(gpu_config.required_memory or 10.0)
-        memory_fraction = float(gpu_config.memory_fraction or 0.85)
-        pressure_ratio = float(gpu_config.cleanup_pressure_ratio or 0.25)
-        used_ratio = float(gpu_config.cleanup_used_ratio or 0.90)
-
-        try:
-            torch_reserved = torch.cuda.memory_reserved() / (1024**3)
-        except Exception:
-            torch_reserved = 0.0
-        try:
-            torch_allocated = torch.cuda.memory_allocated() / (1024**3)
-        except Exception:
-            torch_allocated = 0.0
-
-        if total_memory <= 0:
+        if memory_budget <= 0:
             should_cleanup = (
                 torch_reserved > 0 and torch_allocated / max(torch_reserved, 1e-6) < 0.5
             )
         else:
-            per_worker_budget = total_memory * memory_fraction / workers_on_gpu
-            cleanup_reserved_threshold = max(required_memory, per_worker_budget * used_ratio)
-            cleanup_idle_threshold = max(1.0, per_worker_budget * pressure_ratio)
-            idle_reserved = max(0.0, torch_reserved - torch_allocated)
-            should_cleanup = (
-                torch_reserved >= cleanup_reserved_threshold
-                or idle_reserved >= cleanup_idle_threshold
+            should_cleanup = over_budget or idle_reserved >= max(
+                1.0, memory_budget * pressure_ratio
             )
 
-    if not should_cleanup:
-        return False
+    if should_cleanup:
+        action = "spill+empty_cache" if should_spill else "empty_cache"
+        print(
+            f"[gpu_mode_memory] {phase or 'unknown'} {action} "
+            f"budget={memory_budget:.1f}G reserved={torch_reserved:.1f}G allocated={torch_allocated:.1f}G",
+            flush=True,
+        )
+        gc.collect()
+        torch.cuda.empty_cache()
+        paddle.device.cuda.empty_cache()
 
-    gc.collect()
-    torch.cuda.empty_cache()
-    paddle.device.cuda.empty_cache()
-    return True
+    return should_spill if request_spill else should_cleanup
 
 
 def classify_runtime_error(error_msg):

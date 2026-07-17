@@ -13,7 +13,6 @@ LOG_DIR="tester/api_config/test_log_tol"
 NUM_GPUS=-1
 NUM_WORKERS_PER_GPU=-1
 GPU_IDS="-1"
-# REQUIRED_MEMORY=10
 
 TEST_MODE_ARGS=(
     --accuracy=True
@@ -37,7 +36,6 @@ PARALLEL_ARGS=(
     --num_gpus="$NUM_GPUS"
     --num_workers_per_gpu="$NUM_WORKERS_PER_GPU"
     --gpu_ids="$GPU_IDS"
-    # --required_memory="$REQUIRED_MEMORY"
 )
 
 mkdir -p "$LOG_DIR" || {

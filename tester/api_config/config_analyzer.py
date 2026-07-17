@@ -278,6 +278,35 @@ class TensorConfig:
         base_dtype = "float16" if dtype in FLOAT8_DTYPES else "float32"
         return ((paddle.rand(shape, dtype=base_dtype) - 0.5) * 1.2).cast(dtype)
 
+    def _make_gpu_torch_low_temp_dense_tensor(self, dtype, pattern_dtype=None):
+        pattern_dtype = pattern_dtype or torch.float32
+        torch_dtype = self.convert_dtype_to_torch_type(dtype)
+        shape = tuple(self.shape)
+        device = torch.device("cuda", torch.cuda.current_device())
+        tensor = torch.empty(shape, device=device, dtype=torch_dtype)
+        flat_tensor = tensor.reshape(-1)
+        numel = self.numel()
+        if numel == 0:
+            return tensor
+
+        chunk_elems = min(numel, 8 * 1024 * 1024)
+        pattern_elems = min(chunk_elems, 1024 * 1024)
+        pattern = torch.linspace(
+            -0.6,
+            0.6,
+            steps=pattern_elems,
+            device=device,
+            dtype=pattern_dtype,
+        ).to(dtype=torch_dtype)
+        for start in range(0, numel, chunk_elems):
+            end = min(start + chunk_elems, numel)
+            offset = start
+            while offset < end:
+                next_offset = min(offset + pattern_elems, end)
+                flat_tensor[offset:next_offset] = pattern[: next_offset - offset]
+                offset = next_offset
+        return tensor
+
     def _make_gpu_torch_dense_tensor(self, dtype=None):
         dtype = dtype or self.dtype
         torch_dtype = self.convert_dtype_to_torch_type(dtype)
@@ -294,8 +323,11 @@ class TensorConfig:
             real_part = (torch.rand(shape, device=device, dtype=real_dtype) - 0.5) * 1.2
             imag_part = (torch.rand(shape, device=device, dtype=real_dtype) - 0.5) * 1.2
             return (real_part + 1j * imag_part).to(dtype=torch_dtype)
-        base_dtype = torch.float16 if dtype in FLOAT8_DTYPES else torch.float32
-        return ((torch.rand(shape, device=device, dtype=base_dtype) - 0.5) * 1.2).to(
+        if dtype in FLOAT8_DTYPES:
+            return self._make_gpu_torch_low_temp_dense_tensor(dtype, pattern_dtype=torch.float16)
+        if dtype in ("float16", "bfloat16"):
+            return self._make_gpu_torch_low_temp_dense_tensor(dtype, pattern_dtype=torch.float32)
+        return ((torch.rand(shape, device=device, dtype=torch.float32) - 0.5) * 1.2).to(
             dtype=torch_dtype
         )
 
@@ -373,12 +405,13 @@ class TensorConfig:
         if dtype in FLOAT8_DTYPES:
             paddle_tensor = paddle_source.cast(dtype)
             torch_tensor = torch_source.to(dtype=self.convert_dtype_to_torch_type(dtype))
+            del torch_source, paddle_source
         else:
             paddle_tensor = paddle_source
-            torch_tensor = torch_source.detach().clone()
+            torch_tensor = torch_source
+            del torch_source
         paddle_tensor = self._set_paddle_autograd(paddle_tensor, api_config, dtype)
         torch_tensor = self._set_torch_autograd(torch_tensor, api_config, dtype)
-        del torch_source
         return paddle_tensor, torch_tensor
 
     def get_gpu_paddle_tensor(self, api_config, dtype=None):

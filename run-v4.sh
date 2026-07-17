@@ -52,7 +52,6 @@ LOG_DIR="tester/api_config/test_log"
 NUM_GPUS=-1
 NUM_WORKERS_PER_GPU=1
 GPU_IDS="-1"
-# REQUIRED_MEMORY=10
 TIME_OUT=600
 
 # ── 测试模式：必须且只能启用一种 ───────────────────────────────
@@ -200,7 +199,6 @@ PARALLEL_ARGS=(
     --num_gpus="$NUM_GPUS"
     --num_workers_per_gpu="$NUM_WORKERS_PER_GPU"
     --gpu_ids="$GPU_IDS"
-    # --required_memory="$REQUIRED_MEMORY"
 )
 
 TIME_OUT_ARGS=(

@@ -6,9 +6,9 @@ from dataclasses import dataclass, field, replace
 @dataclass(frozen=True)
 class GpuModeConfig:
     enabled: bool = False
-    required_memory: float = 10.0
     workers_on_gpu: int = 1
     total_memory: float = 0.0
+    memory_budget: float = 0.0
     memory_fraction: float = 0.85
     cleanup_pressure_ratio: float = 0.25
     cleanup_used_ratio: float = 0.90
@@ -25,7 +25,6 @@ class TestRuntimeConfig:
     def from_options(cls, options):
         gpu_mode = GpuModeConfig(
             enabled=bool(options.use_gpu_mode),
-            required_memory=float(options.required_memory),
         )
         return cls(
             random_seed=int(options.random_seed),
@@ -35,19 +34,28 @@ class TestRuntimeConfig:
         )
 
     def for_gpu(self, gpu_id, workers_per_gpu, total_memory_per_gpu):
-        workers_on_gpu = workers_per_gpu.get(gpu_id, self.gpu_mode.workers_on_gpu)
-        total_memory = total_memory_per_gpu.get(gpu_id, self.gpu_mode.total_memory)
+        workers_on_gpu = max(1, int(workers_per_gpu.get(gpu_id, self.gpu_mode.workers_on_gpu) or 1))
+        total_memory = float(total_memory_per_gpu.get(gpu_id, self.gpu_mode.total_memory) or 0.0)
+        memory_budget = (
+            total_memory * self.gpu_mode.memory_fraction / workers_on_gpu
+            if total_memory > 0
+            else 0.0
+        )
         gpu_mode = replace(
             self.gpu_mode,
-            workers_on_gpu=max(1, int(workers_on_gpu or 1)),
-            total_memory=float(total_memory or 0.0),
+            workers_on_gpu=workers_on_gpu,
+            total_memory=total_memory,
+            memory_budget=memory_budget,
         )
         return replace(self, gpu_mode=gpu_mode)
 
 
 def runtime_config_for_gpu(options, gpu_id):
-    return options.runtime_config.for_gpu(
+    runtime_config = getattr(options, "runtime_config", None)
+    if runtime_config is None:
+        runtime_config = TestRuntimeConfig.from_options(options)
+    return runtime_config.for_gpu(
         gpu_id,
-        options.gpu_workers_per_gpu_map,
-        options.gpu_total_memory_map,
+        getattr(options, "gpu_workers_per_gpu_map", {}) or {},
+        getattr(options, "gpu_total_memory_map", {}) or {},
     )
