@@ -510,9 +510,7 @@ def check_gpu_memory(gpu_ids, num_workers_per_gpu, required_memory):  # required
 
 
 def init_worker_gpu(gpu_worker_list, lock, available_gpus, max_workers_per_gpu, options):
-    if options.log_dir:
-        set_test_log_path(options.log_dir)
-    set_engineV2()
+    init_log(options.log_dir, worker_tmp_logs=True)
     my_pid = os.getpid()
 
     def pid_exists(pid):
@@ -1013,8 +1011,6 @@ def main():
     if options.bitwise_alignment:
         options.atol = 0.0
         options.rtol = 0.0
-    if options.log_dir:
-        set_test_log_path(options.log_dir)
 
     if options.api_config:
         try:
@@ -1036,8 +1032,7 @@ def main():
 
         globals().update(_load_test_classes(options))
 
-        # set log_writer
-        set_engineV2()
+        init_log(options.log_dir, worker_tmp_logs=True)
 
         options.api_config = options.api_config.strip()
         print(
@@ -1126,10 +1121,7 @@ def main():
                 return
             config_files = [options.api_config_file]
 
-        # set log_writer before resume/checkpoint handling
-        if options.log_dir:
-            set_test_log_path(options.log_dir)
-        set_engineV2()
+        init_log(options.log_dir, worker_tmp_logs=True)
 
         # when engineV2 was interrupted, resume from .tmp dir
         aggregate_logs(cleanup=True)
@@ -1333,7 +1325,7 @@ def main():
         finally:
             print(f"{tested_case} cases have been tested.", flush=True)
             log_counts = aggregate_logs(end=True)
-            print_log_info(all_case, log_counts)
+            print_log_info(max(all_case - tested_case, 0), log_counts)
             end_time = time.time()
             total_time = end_time - start_time
             print(f"Test time: {round(total_time / 60, 3)} minutes.", flush=True)

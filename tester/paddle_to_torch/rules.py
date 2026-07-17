@@ -1907,7 +1907,7 @@ class Fp8QuantBlockwiseRule(BaseRule):
     quant_scale = fp8_max / amax (optionally power-of-2), stored scale = 1/quant_scale,
     quantized = cast(x * quant_scale, float8_e4m3fn).
 
-    Reference implementation is selected via PADDLEAPITEST_FLPGA_IMPL env var:
+    Reference implementation is selected via PADDLEAPITEST_IMPL env var:
       - "te"    (default): Transformer Engine Float8BlockQuantizer
       - "torch":           Manual torch scatter-op implementation
     """
@@ -1916,7 +1916,7 @@ class Fp8QuantBlockwiseRule(BaseRule):
         import os
 
         defaults_code, _map_code = self.apply_generic()
-        impl = os.environ.get("PADDLEAPITEST_FLPGA_IMPL", "te")
+        impl = os.environ.get("PADDLEAPITEST_IMPL", "te")
         if impl == "torch":
             core = self._torch_code()
         else:
@@ -1949,7 +1949,7 @@ try:
     from transformer_engine.pytorch.quantization import DType as _teDType
 except Exception as _err:
     raise RuntimeError(
-        "PADDLEAPITEST_FLPGA_IMPL=te: cannot import transformer_engine; "
+        "PADDLEAPITEST_IMPL=te: cannot import transformer_engine; "
         f"error={type(_err).__name__}: {_err}"
     ) from _err
 
@@ -1957,6 +1957,27 @@ def _te_fp8_quant_blockwise(inp, eps, power2, scale_transpose, ue8m0, method):
     import transformer_engine.pytorch as _te
     from transformer_engine.pytorch.quantization import DType as _teDType
     m, n = inp.shape
+    if inp.numel() == 0:
+        q = torch.empty((m, n), dtype=torch.float8_e4m3fn, device=inp.device)
+        if method == "1x128":
+            scale_cols = (n + 127) // 128
+            if ue8m0:
+                packed_cols = (scale_cols + 3) // 4
+                scale_shape = (packed_cols, m) if scale_transpose else (m, packed_cols)
+                scale = torch.empty(scale_shape, dtype=torch.int32, device=inp.device)
+            else:
+                scale_shape = (scale_cols, m) if scale_transpose else (m, scale_cols)
+                scale = torch.empty(scale_shape, dtype=torch.float32, device=inp.device)
+        else:
+            sm, sn = (m + 127) // 128, (n + 127) // 128
+            if ue8m0:
+                packed_sn = (sn + 3) // 4
+                scale_shape = (packed_sn, sm) if scale_transpose else (sm, packed_sn)
+                scale = torch.empty(scale_shape, dtype=torch.int32, device=inp.device)
+            else:
+                scale_shape = (sn, sm) if scale_transpose else (sm, sn)
+                scale = torch.empty(scale_shape, dtype=torch.float32, device=inp.device)
+        return q, scale
     _block_dim = 1 if method == "1x128" else 2
     _quantizer = _te.Float8BlockQuantizer(
         fp8_dtype=_teDType.kFloat8E4M3,

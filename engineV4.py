@@ -143,9 +143,7 @@ class WorkerSlot:
 
 
 def _init_worker_runtime(slot_index, gpu_id, options, *, redirect_output):
-    if options.log_dir:
-        set_test_log_path(options.log_dir)
-    set_engineV2()
+    init_log(options.log_dir, worker_tmp_logs=True)
 
     if gpu_id is not None:
         os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
@@ -268,9 +266,7 @@ def _build_sanitizer_case_command(api_config_str, options, log_dir, sanitizer_cm
 
 
 def _sanitizer_worker_loop(slot_index, gpu_id, input_queue, result_queue, options):
-    if options.log_dir:
-        set_test_log_path(options.log_dir)
-    set_engineV2()
+    init_log(options.log_dir, worker_tmp_logs=True)
     redirect_stdio()
 
     child_process = None
@@ -1708,8 +1704,6 @@ def main():
     if options.bitwise_alignment:
         options.atol = 0.0
         options.rtol = 0.0
-    if options.log_dir:
-        set_test_log_path(options.log_dir)
 
     if options._sanitizer_child:
         try:
@@ -1750,8 +1744,7 @@ def main():
 
         globals().update(_load_test_classes(options))
 
-        # set log_writer
-        set_engineV2()
+        init_log(options.log_dir, worker_tmp_logs=True)
 
         options.api_config = options.api_config.strip()
         print(
@@ -1840,6 +1833,8 @@ def main():
                 return
             config_files = [options.api_config_file]
 
+        init_log(options.log_dir, worker_tmp_logs=True)
+
         # when engineV2 was interrupted, resume from .tmp dir
         aggregate_logs(cleanup=True)
         if options.use_compute_sanitizer:
@@ -1914,11 +1909,6 @@ def main():
 
         if options.test_cpu:
             print(f"Using {cpu_count()} CPU(s) for paddle in CPU mode.", flush=True)
-
-        # set log_writer
-        if options.log_dir:
-            set_test_log_path(options.log_dir)
-        set_engineV2()
 
         # initialize worker pool (per-worker queue architecture)
         pool = WorkerPool(available_gpus, max_workers_per_gpu, options)
@@ -2125,7 +2115,7 @@ def main():
                 cleanup_sanitizer_tmp_dir()
             print(f"{tested_case} cases have been tested.", flush=True)
             log_counts = aggregate_logs(end=True)
-            print_log_info(all_case, log_counts)
+            print_log_info(max(all_case - tested_case, 0), log_counts)
             end_time = time.time()
             total_time = end_time - start_time
             print(f"Test time: {round(total_time / 60, 3)} minutes.", flush=True)

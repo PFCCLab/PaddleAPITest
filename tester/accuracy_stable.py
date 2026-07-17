@@ -8,18 +8,41 @@ import paddle
 import torch
 
 from .accuracy import process_grad_output, process_output
-from .api_config.log_writer import has_terminal_log, log_accuracy_stable, write_to_log
+from .api_config.log_writer import (
+    ALL_DIMENSIONS,
+    COMP_TO_DIMENSION,
+    has_comp_terminal_log,
+    has_terminal_log,
+    log_accuracy_stable,
+    write_to_comp_log,
+    write_to_log,
+)
 from .base import CUDA_ERROR, CUDA_OOM, APITestBase
 from .paddle_to_torch import get_converter
 
 
 class APITestAccuracyStable(APITestBase):
+    # 执行阶段错误广播映射: (iter_idx, source) -> 受影响的 comp 列表
+    _TORCH_AFFECTED_COMPS = {
+        0: ["T1P1", "T1P2", "T1T2", "T1P1B", "T1P2B", "T1T2B"],
+        1: ["T2P2", "T2P1", "T1T2", "T2P2B", "T2P1B", "T1T2B"],
+    }
+    _PADDLE_AFFECTED_COMPS = {
+        0: ["T1P1", "T2P1", "P1P2", "T1P1B", "T2P1B", "P1P2B"],
+        1: ["T2P2", "T1P2", "P1P2", "T2P2B", "T1P2B", "P1P2B"],
+    }
+
     def __init__(self, api_config, **kwargs):
         super().__init__(api_config)
         self.test_amp = kwargs.get("test_amp", False)
         self.converter = get_converter()
         torch.set_printoptions(profile="short", edgeitems=2, threshold=100, linewidth=120)
         torch.set_default_device("cuda")
+
+    def _broadcast_to_comp_dimensions(self, log_type, affected_comps):
+        """将执行阶段错误广播到所有受影响的 comp 维度"""
+        for comp in affected_comps:
+            write_to_comp_log(comp, log_type, self.api_config.config)
 
     def _reset_random_state(self, seed: int = 42):
         """Reset numpy / paddle / torch (CPU+CUDA) RNGs so random APIs
@@ -99,7 +122,7 @@ class APITestAccuracyStable(APITestBase):
             # ======== torch ========
             self._reset_random_state()
             torch_output, torch_out_grads, torch_grad_success = self.get_torch_output(
-                convert_result
+                convert_result, _i
             )
             if torch_output is None:
                 return
@@ -107,7 +130,7 @@ class APITestAccuracyStable(APITestBase):
 
             # ======== paddle ========
             self._reset_random_state()
-            paddle_output, paddle_out_grads = self.get_paddle_output(torch_grad_success)
+            paddle_output, paddle_out_grads = self.get_paddle_output(torch_grad_success, _i)
             if paddle_output is None:
                 return
             paddle.device.cuda.empty_cache()
@@ -141,11 +164,18 @@ class APITestAccuracyStable(APITestBase):
         self.compare(paddle_output_pair[0], paddle_output_pair[1], "P1P2")
         self.compare(paddle_grad_pair[0], paddle_grad_pair[1], "P1P2B")
 
+        # 逐维度写 pass
+        for dimension in ALL_DIMENSIONS:
+            if not has_comp_terminal_log(dimension, self.api_config.config):
+                # 取该维度的任一 comp 代表写 pass
+                rep_comp = next(c for c, d in COMP_TO_DIMENSION.items() if d == dimension)
+                write_to_comp_log(rep_comp, "pass", self.api_config.config)
+        # 主日志 pass（让 engine 的 has_terminal_log 能正确判断）
         if not has_terminal_log(self.api_config.config):
             print(f"[pass] {self.api_config.config}", flush=True)
             write_to_log("pass", self.api_config.config)
 
-    def get_torch_output(self, convert_result):
+    def get_torch_output(self, convert_result, iter_idx=0):
         # ======== run torch forward ========:
         torch_output = None
         try:
@@ -183,11 +213,11 @@ class APITestAccuracyStable(APITestBase):
             err_str = str(err)
             if any(cuda_err in err_str for cuda_err in CUDA_OOM):
                 print(f"[oom] {self.api_config.config}\n{err_str}", flush=True)
-                write_to_log("oom", self.api_config.config)
+                self._broadcast_to_comp_dimensions("oom", self._TORCH_AFFECTED_COMPS[iter_idx])
                 raise
             print(f"[torch_error] {self.api_config.config}\n{err_str}", flush=True)
             traceback.print_exc()
-            write_to_log("torch_error", self.api_config.config)
+            self._broadcast_to_comp_dimensions("torch_error", self._TORCH_AFFECTED_COMPS[iter_idx])
             if any(cuda_err in err_str for cuda_err in CUDA_ERROR):
                 raise
             return None, None, None
@@ -215,21 +245,25 @@ class APITestAccuracyStable(APITestBase):
                         f"[config_input] {self.api_config.config}\n{err_str}",
                         flush=True,
                     )
-                    write_to_log("config_input", self.api_config.config)
+                    self._broadcast_to_comp_dimensions(
+                        "config_input", self._TORCH_AFFECTED_COMPS[iter_idx]
+                    )
                     return None, None, None
                 if any(cuda_err in err_str for cuda_err in CUDA_OOM):
                     print(
                         f"[oom] phase=backward {self.api_config.config}\n{err_str}",
                         flush=True,
                     )
-                    write_to_log("oom", self.api_config.config)
+                    self._broadcast_to_comp_dimensions("oom", self._TORCH_AFFECTED_COMPS[iter_idx])
                     raise
                 if any(cuda_err in err_str for cuda_err in CUDA_ERROR):
                     print(
                         f"[torch_error] phase=backward {self.api_config.config}\n{err_str}",
                         flush=True,
                     )
-                    write_to_log("torch_error", self.api_config.config)
+                    self._broadcast_to_comp_dimensions(
+                        "torch_error", self._TORCH_AFFECTED_COMPS[iter_idx]
+                    )
                     raise
                 print(err_str, flush=True)
 
@@ -242,7 +276,9 @@ class APITestAccuracyStable(APITestBase):
                     flush=True,
                 )
                 traceback.print_exc()
-                write_to_log("torch_error", self.api_config.config)
+                self._broadcast_to_comp_dimensions(
+                    "torch_error", self._TORCH_AFFECTED_COMPS[iter_idx]
+                )
                 raise
 
         def process_torch_outputs(obj):
@@ -256,7 +292,7 @@ class APITestAccuracyStable(APITestBase):
         torch_out_grads = process_torch_outputs(torch_out_grads)
         return torch_output, torch_out_grads, torch_grad_success
 
-    def get_paddle_output(self, torch_grad_success):
+    def get_paddle_output(self, torch_grad_success, iter_idx=0):
         # ======== run paddle forward ========
         paddle_output = None
         try:
@@ -307,26 +343,30 @@ class APITestAccuracyStable(APITestBase):
             err_str = str(err)
             if self.should_ignore_paddle_error(err_str):
                 print(f"[pass] {self.api_config.config}", flush=True)
-                write_to_log("pass", self.api_config.config)
+                self._broadcast_to_comp_dimensions("pass", self._PADDLE_AFFECTED_COMPS[iter_idx])
                 return None, None
             if any(cuda_err in err_str for cuda_err in CUDA_ERROR):
                 print(f"[paddle_cuda] {self.api_config.config}\n{err_str}", flush=True)
-                write_to_log("paddle_cuda", self.api_config.config)
+                self._broadcast_to_comp_dimensions(
+                    "paddle_cuda", self._PADDLE_AFFECTED_COMPS[iter_idx]
+                )
                 raise
             if any(cuda_err in err_str for cuda_err in CUDA_OOM):
                 print(f"[oom] {self.api_config.config}\n{err_str}", flush=True)
-                write_to_log("oom", self.api_config.config)
+                self._broadcast_to_comp_dimensions("oom", self._PADDLE_AFFECTED_COMPS[iter_idx])
                 raise
             print(f"[paddle_error] {self.api_config.config}\n{err_str}", flush=True)
             traceback.print_exc()
-            write_to_log("paddle_error", self.api_config.config)
+            self._broadcast_to_comp_dimensions(
+                "paddle_error", self._PADDLE_AFFECTED_COMPS[iter_idx]
+            )
             return None, None
 
         try:
             paddle.base.core.eager._for_test_check_cuda_error()
         except Exception as err:
             print(f"[paddle_cuda] {self.api_config.config}\n{err!s}", flush=True)
-            write_to_log("paddle_cuda", self.api_config.config)
+            self._broadcast_to_comp_dimensions("paddle_cuda", self._PADDLE_AFFECTED_COMPS[iter_idx])
             raise
 
         # ======== run paddle backward ========
@@ -351,31 +391,39 @@ class APITestAccuracyStable(APITestBase):
                         f"[config_input] {self.api_config.config}\n{err_str}",
                         flush=True,
                     )
-                    write_to_log("config_input", self.api_config.config)
+                    self._broadcast_to_comp_dimensions(
+                        "config_input", self._PADDLE_AFFECTED_COMPS[iter_idx]
+                    )
                     return None, None
                 if self.should_ignore_paddle_error(err_str):
                     print(f"[pass] {self.api_config.config}", flush=True)
-                    write_to_log("pass", self.api_config.config)
+                    self._broadcast_to_comp_dimensions(
+                        "pass", self._PADDLE_AFFECTED_COMPS[iter_idx]
+                    )
                     return None, None
                 if any(cuda_err in err_str for cuda_err in CUDA_ERROR):
                     print(
                         f"[paddle_cuda] phase=backward {self.api_config.config}\n{err_str}",
                     )
-                    write_to_log("paddle_cuda", self.api_config.config)
+                    self._broadcast_to_comp_dimensions(
+                        "paddle_cuda", self._PADDLE_AFFECTED_COMPS[iter_idx]
+                    )
                     raise
                 if any(cuda_err in err_str for cuda_err in CUDA_OOM):
                     print(
                         f"[oom] phase=backward {self.api_config.config}\n{err_str}",
                         flush=True,
                     )
-                    write_to_log("oom", self.api_config.config)
+                    self._broadcast_to_comp_dimensions("oom", self._PADDLE_AFFECTED_COMPS[iter_idx])
                     raise
                 print(
                     f"[paddle_error] phase=backward {self.api_config.config}\n{err_str}",
                     flush=True,
                 )
                 traceback.print_exc()
-                write_to_log("paddle_error", self.api_config.config)
+                self._broadcast_to_comp_dimensions(
+                    "paddle_error", self._PADDLE_AFFECTED_COMPS[iter_idx]
+                )
                 return None, None
 
             try:
@@ -385,7 +433,9 @@ class APITestAccuracyStable(APITestBase):
                     f"[paddle_cuda] phase=backward {self.api_config.config}\n{err!s}",
                     flush=True,
                 )
-                write_to_log("paddle_cuda", self.api_config.config)
+                self._broadcast_to_comp_dimensions(
+                    "paddle_cuda", self._PADDLE_AFFECTED_COMPS[iter_idx]
+                )
                 raise
 
         def process_paddle_outputs(obj):
@@ -411,7 +461,7 @@ class APITestAccuracyStable(APITestBase):
                     f"{type(input1)} / {type(input2)}",
                     flush=True,
                 )
-                write_to_log("paddle_accuracy", self.api_config.config)
+                write_to_comp_log(comp, "paddle_accuracy", self.api_config.config)
                 return
         elif isinstance(input1, (list, tuple)):
             if not isinstance(input2, (list, tuple)):
@@ -420,7 +470,7 @@ class APITestAccuracyStable(APITestBase):
                     f"{type(input1)} / {type(input2)}",
                     flush=True,
                 )
-                write_to_log("paddle_accuracy", self.api_config.config)
+                write_to_comp_log(comp, "paddle_accuracy", self.api_config.config)
                 return
             if len(input1) != len(input2):
                 print(
@@ -429,7 +479,7 @@ class APITestAccuracyStable(APITestBase):
                     f"{type(input2)} : {len(input2)}",
                     flush=True,
                 )
-                write_to_log("paddle_accuracy", self.api_config.config)
+                write_to_comp_log(comp, "paddle_accuracy", self.api_config.config)
                 return
             for idx, (item1, item2) in enumerate(zip(input1, input2, strict=False)):
                 if isinstance(item1, (paddle.Tensor, torch.Tensor)) and isinstance(
@@ -454,7 +504,7 @@ class APITestAccuracyStable(APITestBase):
                         f"{type(item1)} / {type(item2)}",
                         flush=True,
                     )
-                    write_to_log("paddle_accuracy", self.api_config.config)
+                    write_to_comp_log(comp, "paddle_accuracy", self.api_config.config)
                     return
         else:
             try:
@@ -574,6 +624,6 @@ class APITestAccuracyStable(APITestBase):
                     dtype,
                     comp,
                 )
-                write_to_log("paddle_bitwise", config)
+                write_to_comp_log(comp, "paddle_bitwise", config)
             else:
                 raise
