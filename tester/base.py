@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import collections
+import gc
 import inspect
 import os
 
@@ -12,10 +13,9 @@ from .api_config.config_analyzer import (
     USE_CACHED_NUMPY,
     TensorConfig,
     get_cached_numpy_array,
-    is_gpu_mode,
-    should_skip_gpu_cleanup,
 )
 from .api_config.log_writer import log_accuracy_tolerance, write_to_log
+from .runtime_config import TestRuntimeConfig
 
 with open("tester/base_config.yaml", encoding="utf-8") as f:
     config = yaml.safe_load(f)
@@ -64,6 +64,56 @@ CUDA_OOM = frozenset(
         "OutOfMemoryError",
     ]
 )
+
+
+def gpu_mode_maybe_empty_cache(gpu_config, phase="", force=False):
+    if not gpu_config.enabled:
+        return False
+    try:
+        if "gpu" not in paddle.device.get_device():
+            return False
+    except Exception:
+        return False
+
+    should_cleanup = bool(force)
+    if not should_cleanup:
+        total_memory = float(gpu_config.total_memory or 0.0)
+        workers_on_gpu = max(1, int(gpu_config.workers_on_gpu or 1))
+        required_memory = float(gpu_config.required_memory or 10.0)
+        memory_fraction = float(gpu_config.memory_fraction or 0.85)
+        pressure_ratio = float(gpu_config.cleanup_pressure_ratio or 0.25)
+        used_ratio = float(gpu_config.cleanup_used_ratio or 0.90)
+
+        try:
+            torch_reserved = torch.cuda.memory_reserved() / (1024**3)
+        except Exception:
+            torch_reserved = 0.0
+        try:
+            torch_allocated = torch.cuda.memory_allocated() / (1024**3)
+        except Exception:
+            torch_allocated = 0.0
+
+        if total_memory <= 0:
+            should_cleanup = (
+                torch_reserved > 0 and torch_allocated / max(torch_reserved, 1e-6) < 0.5
+            )
+        else:
+            per_worker_budget = total_memory * memory_fraction / workers_on_gpu
+            cleanup_reserved_threshold = max(required_memory, per_worker_budget * used_ratio)
+            cleanup_idle_threshold = max(1.0, per_worker_budget * pressure_ratio)
+            idle_reserved = max(0.0, torch_reserved - torch_allocated)
+            should_cleanup = (
+                torch_reserved >= cleanup_reserved_threshold
+                or idle_reserved >= cleanup_idle_threshold
+            )
+
+    if not should_cleanup:
+        return False
+
+    gc.collect()
+    torch.cuda.empty_cache()
+    paddle.device.cuda.empty_cache()
+    return True
 
 
 def classify_runtime_error(error_msg):
@@ -232,9 +282,11 @@ no_signature_api_mappings.update(
 
 
 class APITestBase:
-    def __init__(self, api_config, use_torch=True):
+    def __init__(self, api_config, use_torch=True, runtime_config=None):
         self.api_config = api_config
         self.api_config.use_torch = use_torch
+        self.runtime_config = runtime_config or TestRuntimeConfig()
+        self.gpu_mode_config = self.runtime_config.gpu_mode
         self.outputs_grad_numpy = []
         self.outputs_grad_paddleonly = []
         if use_torch:
@@ -833,7 +885,7 @@ class APITestBase:
         return (paddle.rand(tuple(shape), dtype=base_dtype) - 0.5).cast(dtype)
 
     def _use_gpu_output_grad(self, output):
-        if not is_gpu_mode() or "gpu" not in paddle.device.get_device():
+        if not self.gpu_mode_config.enabled or "gpu" not in paddle.device.get_device():
             return False
         dtype = str(output.dtype).split(".")[-1]
         return dtype in ["float32", "float64", "float16", "bfloat16", "complex64", "complex128"]
@@ -849,12 +901,12 @@ class APITestBase:
     def _get_gpu_output_grad_pair(self, output, index):
         if len(self.outputs_grad_numpy) <= index:
             dtype = str(output.dtype).split(".")[-1]
-            torch_grad = self._make_torch_output_grad(output.shape, dtype)
+            torch_grad = self._make_torch_output_grad(output.shape, dtype).detach()
             paddle_grad = paddle.utils.dlpack.from_dlpack(
-                torch.utils.dlpack.to_dlpack(torch_grad.detach().clone())
+                torch.utils.dlpack.to_dlpack(torch_grad.clone())
             )
             paddle_grad.stop_gradient = False
-            self.outputs_grad_numpy.append((paddle_grad, torch_grad.detach().clone()))
+            self.outputs_grad_numpy.append((paddle_grad, torch_grad))
         return self.outputs_grad_numpy[index]
 
     def gen_paddle_output_and_output_grad(self, outputs):
@@ -1240,7 +1292,9 @@ class APITestBase:
         ) or self.api_config.api_name == "paddle.Tensor.__setitem__":
             self.torch_args, self.torch_kwargs = self.copy_torch_input()
 
-        if not should_skip_gpu_cleanup():
+        if self.gpu_mode_config.enabled:
+            gpu_mode_maybe_empty_cache(self.gpu_mode_config, "clear_torch_tensor")
+        else:
             torch.cuda.empty_cache()
         return True
 
@@ -1532,7 +1586,7 @@ class APITestBase:
         if test_tol:
             atol, rtol = 0.0, 0.0
 
-        if test_tol or not is_gpu_mode():
+        if test_tol or not self.gpu_mode_config.enabled:
             self._torch_assert_accuracy_cpu(
                 paddle_tensor,
                 torch_tensor,
@@ -1564,7 +1618,9 @@ class APITestBase:
                 for i in range(len(arg_config)):
                     if isinstance(arg_config[i], TensorConfig):
                         arg_config[i].clear_tensor()
-        if not should_skip_gpu_cleanup():
+        if self.gpu_mode_config.enabled:
+            gpu_mode_maybe_empty_cache(self.gpu_mode_config, "clear_tensor")
+        else:
             torch.cuda.empty_cache()
             paddle.device.cuda.empty_cache()
 
@@ -1578,7 +1634,9 @@ class APITestBase:
                 for i in range(len(arg_config)):
                     if isinstance(arg_config[i], TensorConfig):
                         arg_config[i].clear_paddle_tensor()
-        if not should_skip_gpu_cleanup():
+        if self.gpu_mode_config.enabled:
+            gpu_mode_maybe_empty_cache(self.gpu_mode_config, "clear_paddle_tensor")
+        else:
             paddle.device.cuda.empty_cache()
 
     def clear_torch_tensor(self):
@@ -1591,7 +1649,9 @@ class APITestBase:
                 for i in range(len(arg_config)):
                     if isinstance(arg_config[i], TensorConfig):
                         arg_config[i].clear_torch_tensor()
-        if not should_skip_gpu_cleanup():
+        if self.gpu_mode_config.enabled:
+            gpu_mode_maybe_empty_cache(self.gpu_mode_config, "clear_torch_tensor")
+        else:
             torch.cuda.empty_cache()
 
     def clear_numpy_tensor(self):

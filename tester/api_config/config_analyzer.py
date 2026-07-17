@@ -25,7 +25,6 @@ torch = _LazyTorch()
 USE_CACHED_NUMPY = os.getenv("USE_CACHED_NUMPY", "False").lower() == "true"
 TEST_NON_CONTIGUOUS = os.getenv("TEST_NON_CONTIGUOUS", "0").lower() in ("true", "1")
 USE_GPU_MODE = os.getenv("USE_GPU_MODE", "False").lower() == "true"
-SKIP_GPU_CLEANUP = os.getenv("SKIP_GPU_CLEANUP", "False").lower() == "true"
 cached_numpy = {}
 AUTOGRAD_DTYPES = frozenset(
     ["float32", "float64", "float16", "complex64", "complex128", "bfloat16"]
@@ -43,21 +42,8 @@ def _load_forward_only_apis():
 FORWARD_ONLY_APIS = _load_forward_only_apis()
 
 
-def _env_bool(name, default=False):
-    return os.getenv(name, str(default)).lower() in ("true", "1", "yes", "y")
-
-
-def set_gpu_mode(enabled):
-    os.environ["USE_GPU_MODE"] = str(bool(enabled))
-    os.environ["SKIP_GPU_CLEANUP"] = str(bool(enabled))
-
-
 def is_gpu_mode():
-    return _env_bool("USE_GPU_MODE", USE_GPU_MODE)
-
-
-def should_skip_gpu_cleanup():
-    return _env_bool("SKIP_GPU_CLEANUP", SKIP_GPU_CLEANUP)
+    return os.getenv("USE_GPU_MODE", str(USE_GPU_MODE)).lower() in ("true", "1", "yes", "y")
 
 
 def _shape_tuple(shape):
@@ -189,7 +175,6 @@ class TensorConfig:
         self.numpy_tensor = None
         self.paddle_tensor = None
         self.torch_tensor = None
-        self.gpu_source_tensor = None
         self.shuffle_dims = None
 
     def __deepcopy__(self, memo):
@@ -249,7 +234,7 @@ class TensorConfig:
     def get_cached_numpy(self, dtype, shape, generation_kind="input", scale=1.2):
         return get_cached_numpy_array(dtype, shape, generation_kind=generation_kind, scale=scale)
 
-    def _use_gpu(self, dtype=None):
+    def _use_gpu(self, api_config=None, dtype=None):
         if not is_gpu_mode():
             return False
         if self.place is not None and "cpu" in str(self.place).lower():
@@ -370,20 +355,21 @@ class TensorConfig:
     def _make_gpu_tensor_pair(self, api_config, dtype=None):
         dtype = dtype or self.dtype
         source_dtype = "float16" if dtype in FLOAT8_DTYPES else dtype
-        if self.gpu_source_tensor is None:
-            self.gpu_source_tensor = self._make_gpu_torch_dense_tensor(source_dtype)
-        torch_source = self.gpu_source_tensor
+        torch_source = self._make_gpu_torch_dense_tensor(source_dtype)
         paddle_source = paddle.utils.dlpack.from_dlpack(
             torch.utils.dlpack.to_dlpack(torch_source.detach().clone())
         )
         if not self.is_contiguous and self.strides is not None:
-            paddle_tensor = self._make_gpu_strided_paddle_tensor_from_values(
-                paddle_source, api_config, dtype
-            )
-            torch_tensor = self._make_gpu_strided_torch_tensor_from_values(
-                torch_source, api_config, dtype
-            )
-            return paddle_tensor, torch_tensor
+            try:
+                paddle_tensor = self._make_gpu_strided_paddle_tensor_from_values(
+                    paddle_source, api_config, dtype
+                )
+                torch_tensor = self._make_gpu_strided_torch_tensor_from_values(
+                    torch_source, api_config, dtype
+                )
+                return paddle_tensor, torch_tensor
+            finally:
+                del torch_source, paddle_source
         if dtype in FLOAT8_DTYPES:
             paddle_tensor = paddle_source.cast(dtype)
             torch_tensor = torch_source.to(dtype=self.convert_dtype_to_torch_type(dtype))
@@ -392,6 +378,7 @@ class TensorConfig:
             torch_tensor = torch_source.detach().clone()
         paddle_tensor = self._set_paddle_autograd(paddle_tensor, api_config, dtype)
         torch_tensor = self._set_torch_autograd(torch_tensor, api_config, dtype)
+        del torch_source
         return paddle_tensor, torch_tensor
 
     def get_gpu_paddle_tensor(self, api_config, dtype=None):
@@ -3145,7 +3132,7 @@ class TensorConfig:
                         self.numpy_tensor = numpy.random.random(self.shape).astype("float32")
 
             if self.numpy_tensor is None:
-                if self._use_gpu(original_dtype):
+                if self._use_gpu(api_config, original_dtype):
                     self.get_gpu_paddle_tensor(api_config, original_dtype)
                 elif self.shape == []:
                     if "int" in self.dtype:
@@ -3188,7 +3175,7 @@ class TensorConfig:
 
     def get_paddle_tensor(self, api_config):
         if self.paddle_tensor is None:
-            if self.numpy_tensor is None and self._use_gpu():
+            if self.numpy_tensor is None and self._use_gpu(api_config):
                 return self.get_gpu_paddle_tensor(api_config)
             if not self.is_contiguous and self.strides is not None:
                 self.paddle_tensor = self._create_strided_paddle_tensor(api_config)
@@ -3267,7 +3254,7 @@ class TensorConfig:
         device = torch.device("cuda:0") if torch.cuda.is_available() else torch.device("cpu")
         torch.set_default_device(device)
         if self.torch_tensor is None:
-            if self.numpy_tensor is None and self._use_gpu():
+            if self.numpy_tensor is None and self._use_gpu(api_config):
                 return self.get_gpu_torch_tensor(api_config)
             if not self.is_contiguous and self.strides is not None:
                 self.torch_tensor = self._create_strided_torch_tensor(api_config)
@@ -3336,14 +3323,14 @@ class TensorConfig:
         self.torch_tensor = None
         self.paddle_tensor = None
         self.numpy_tensor = None
-        if not should_skip_gpu_cleanup():
+        if not is_gpu_mode():
             torch.cuda.empty_cache()
             paddle.device.cuda.empty_cache()
 
     def clear_paddle_tensor(self):
         del self.paddle_tensor
         self.paddle_tensor = None
-        if not should_skip_gpu_cleanup():
+        if not is_gpu_mode():
             paddle.device.cuda.empty_cache()
 
     def clear_numpy_tensor(self):
@@ -3353,7 +3340,7 @@ class TensorConfig:
     def clear_torch_tensor(self):
         del self.torch_tensor
         self.torch_tensor = None
-        if not should_skip_gpu_cleanup():
+        if not is_gpu_mode():
             torch.cuda.empty_cache()
 
     def fill_numpy_tensor(self, full_value):
