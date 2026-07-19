@@ -73,6 +73,8 @@ ENGINE_ARG_TYPES = {
     "bitwise_alignment": bool,
     "generate_failed_tests": bool,
     "exit_on_error": bool,
+    "use_dump": bool,
+    "dump_dir": str,
     "use_compute_sanitizer": bool,
     "sanitizer_command": str,
     "sanitizer_error_exitcode": int,

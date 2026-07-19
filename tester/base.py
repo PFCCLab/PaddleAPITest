@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import collections
+import contextlib
 import inspect
 import os
 
@@ -15,6 +16,7 @@ from .api_config.config_analyzer import (
     is_gpu_mode,
     should_skip_gpu_cleanup,
 )
+from .api_config.dump_writer import DEFAULT_DUMP_DIR, DumpContext, dump_enabled
 from .api_config.log_writer import log_accuracy_tolerance, write_to_log
 
 with open("tester/base_config.yaml", encoding="utf-8") as f:
@@ -235,14 +237,52 @@ class APITestBase:
     def __init__(self, api_config, use_torch=True):
         self.api_config = api_config
         self.api_config.use_torch = use_torch
+        self.dump_context = (
+            DumpContext(
+                os.environ.get("DUMP_DIR") or DEFAULT_DUMP_DIR,
+                api_config=api_config.config,
+            )
+            if dump_enabled()
+            else None
+        )
         self.outputs_grad_numpy = []
         self.outputs_grad_paddleonly = []
         if use_torch:
             torch.set_num_threads(8)
             torch.set_printoptions(threshold=100, linewidth=120)
 
+    def run(self):
+        output_context = (
+            self.dump_context.tee_output() if self.dump_context else contextlib.nullcontext()
+        )
+        with output_context:
+            try:
+                return self.test()
+            except Exception as err:
+                if self.dump_context and self.dump_context._data.get("status") is None:
+                    self.dump_finalize("engine_error", error=str(err))
+                raise
+
+    def dump_event(self, name, **data):
+        if self.dump_context:
+            self.dump_context.event(name, **data)
+
+    def dump_error(self, name, err):
+        if self.dump_context:
+            self.dump_context.error_event(name, err)
+
+    def dump_save(self, stem, obj, framework=None):
+        if self.dump_context:
+            self.dump_context.save_tensors(stem, obj, framework=framework)
+
+    def dump_finalize(self, status, **data):
+        if self.dump_context:
+            self.dump_context.finalize(status, **data)
+
     def report_runtime_error(self, err, default_log_type, phase="", allow_ignore_paddle=False):
         err_msg = str(err)
+        if phase:
+            self.dump_error(f"{phase}_error", err)
         log_type, fatal = classify_runtime_error(err_msg)
         if log_type is None and allow_ignore_paddle and self.should_ignore_paddle_error(err_msg):
             print(f"[pass] {self.api_config.config}", flush=True)

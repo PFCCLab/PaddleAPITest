@@ -42,6 +42,11 @@ if TYPE_CHECKING:
         APITestTorchGPUPerformance,
     )
 
+from tester.api_config.dump_writer import (
+    finalize_from_parent,
+    parse_strict_bool,
+    resolve_dump_options,
+)
 from tester.api_config.log_writer import *
 
 os.environ["FLAGS_use_system_allocator"] = "1"
@@ -1025,6 +1030,17 @@ def validate_gpu_options(options) -> tuple:
     return tuple(gpu_ids)
 
 
+def _resolve_dump_options(parser, options):
+    try:
+        options.use_dump, options.dump_dir = resolve_dump_options(
+            options.use_dump, options.dump_dir
+        )
+    except ValueError as err:
+        parser.error(str(err))
+    os.environ["USE_DUMP"] = str(options.use_dump)
+    os.environ["DUMP_DIR"] = options.dump_dir
+
+
 def parse_bool(value):
     if isinstance(value, str):
         value = value.lower()
@@ -1275,13 +1291,14 @@ def run_test_case(api_config_str, options):
     except Exception as err:
         print(f"[config_parse] {api_config_str} {err!s}", flush=True)
         write_to_log("config_parse", api_config_str)
+        finalize_from_parent("config_parse", error=str(err))
         return
 
     test_class = _select_test_class(options)
     kwargs = {k: v for k, v in vars(options).items() if k in VALID_TEST_ARGS}
     case = test_class(api_config, **kwargs)
     try:
-        case.test()
+        case.run()
     except Exception as err:
         err_msg = str(err).lower()
         terminal_log_type = get_terminal_log_type(api_config_str)
@@ -1314,6 +1331,7 @@ def run_test_case(api_config_str, options):
         elif any(marker in err_msg for marker in cuda_markers):
             exit_code = FATAL_CUDA_EXIT_CODE
         if exit_code is not None:
+            finalize_from_parent("engine_fatal", exit_code=exit_code, error=str(err))
             if has_terminal_log(api_config_str):
                 write_checkpoint(api_config_str)
             try:
@@ -1328,6 +1346,7 @@ def run_test_case(api_config_str, options):
             return
         # if not fatal error, subprocess will be alive and report error
         print(f"[test error] {api_config_str}: {err}", flush=True)
+        finalize_from_parent("engine_error", error=str(err))
         raise
     finally:
         del test_class, api_config, case
@@ -1359,7 +1378,7 @@ def main():
         except Exception:
             paddle_version = "unknown"
 
-    parser = argparse.ArgumentParser(description="Run Paddle API test cases")
+    parser = argparse.ArgumentParser(description="Run Paddle API test cases", allow_abbrev=False)
     parser.add_argument(
         "--api_config_file",
         default="",
@@ -1560,6 +1579,17 @@ def main():
         help="Exit the process when a paddle_error occurs.",
     )
     parser.add_argument(
+        "--use_dump",
+        type=parse_strict_bool,
+        default=None,
+        help="Enable dump tracing (True or False). Overrides USE_DUMP.",
+    )
+    parser.add_argument(
+        "--dump_dir",
+        default=None,
+        help="Dump output directory. Overrides DUMP_DIR; empty uses the default directory.",
+    )
+    parser.add_argument(
         "--use_compute_sanitizer",
         type=parse_bool,
         default=False,
@@ -1585,6 +1615,7 @@ def main():
     )
 
     options = parser.parse_args()
+    _resolve_dump_options(parser, options)
     options.paddle_version = paddle_version
     if not options._sanitizer_child:
         print(f"Main process id: {os.getpid()}")
@@ -1607,6 +1638,15 @@ def main():
     if len([m for m in mode if m is True]) != 1:
         _print_argument(ARGUMENT_ERROR_PREFIX, TEST_MODE_ERROR)
         return
+    if options.use_dump:
+        if not options.api_config or options.api_config_file or options.api_config_file_pattern:
+            _print_argument(ARGUMENT_ERROR_PREFIX, "dump only supports single --api_config runs")
+            return
+        if not (options.accuracy or options.paddle_only):
+            _print_argument(
+                ARGUMENT_ERROR_PREFIX, "dump currently supports only --accuracy or --paddle_only"
+            )
+            return
 
     # 处理 custom_device_vs_gpu 模式的配置
     bos_config_data = None
@@ -1719,6 +1759,7 @@ def main():
             api_config = APIConfig(options.api_config)
         except Exception as err:
             print(f"[config_parse] {options.api_config} {err!s}", flush=True)
+            finalize_from_parent("config_parse", error=str(err))
             return
 
         test_class = _select_test_class(options)
@@ -1754,7 +1795,7 @@ def main():
         else:
             case = test_class(api_config, test_amp=options.test_amp)
         try:
-            case.test()
+            case.run()
         except Exception as err:
             if (
                 "Tensor-likes are not equal" in str(err)
