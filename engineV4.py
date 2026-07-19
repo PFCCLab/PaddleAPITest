@@ -208,13 +208,13 @@ def _worker_loop(slot_index, gpu_id, input_queue, result_queue, options):
 
         try:
             run_test_case(api_config_str, options)
-            result_queue.put(("done", slot_index, api_config_str))
+            result_queue.put(("done", slot_index, api_config_str, os.getpid()))
         except SystemExit:
             # run_test_case calls os._exit for CUDA errors, this shouldn't reach here
             # but if it does via sys.exit, let it propagate
             raise
         except Exception as e:
-            result_queue.put(("error", slot_index, api_config_str, str(e)))
+            result_queue.put(("error", slot_index, api_config_str, str(e), os.getpid()))
 
     # Graceful exit
     try:
@@ -292,6 +292,7 @@ def _sanitizer_worker_loop(slot_index, gpu_id, input_queue, result_queue, option
 
             api_config_str = task
             result_queue.put(("ack", slot_index, api_config_str))
+            case_id = write_case_begin(api_config_str)
             case_log_dir = get_sanitizer_case_log_dir(slot_index, os.getpid())
             if case_log_dir.exists():
                 shutil.rmtree(case_log_dir)
@@ -302,7 +303,8 @@ def _sanitizer_worker_loop(slot_index, gpu_id, input_queue, result_queue, option
                 )
             except ValueError as err:
                 shutil.rmtree(case_log_dir, ignore_errors=True)
-                result_queue.put(("error", slot_index, api_config_str, str(err)))
+                write_case_end("error", case_id=case_id)
+                result_queue.put(("error", slot_index, api_config_str, str(err), os.getpid()))
                 continue
 
             print(
@@ -323,7 +325,8 @@ def _sanitizer_worker_loop(slot_index, gpu_id, input_queue, result_queue, option
                 )
             except OSError as err:
                 shutil.rmtree(case_log_dir, ignore_errors=True)
-                result_queue.put(("error", slot_index, api_config_str, str(err)))
+                write_case_end("error", case_id=case_id)
+                result_queue.put(("error", slot_index, api_config_str, str(err), os.getpid()))
                 continue
             result_queue.put(("child", slot_index, child_process.pid))
             output_tail = deque(maxlen=40)
@@ -361,14 +364,17 @@ def _sanitizer_worker_loop(slot_index, gpu_id, input_queue, result_queue, option
                 shutil.rmtree(case_log_dir, ignore_errors=True)
 
                 if returncode == 0 or analysis.ignore_error_exitcode:
-                    result_queue.put(("done", slot_index, api_config_str))
+                    write_case_end("done", case_id=case_id)
+                    result_queue.put(("done", slot_index, api_config_str, os.getpid()))
                 elif returncode == 2:
+                    write_case_end("error", case_id=case_id)
                     result_queue.put(
                         (
                             "error",
                             slot_index,
                             api_config_str,
                             f"child exited with {returncode}",
+                            os.getpid(),
                         )
                     )
                 else:
@@ -591,15 +597,19 @@ class WorkerPool:
         if self._closed or self._shutdown_event.is_set():
             return
         config = slot.current_task
+        old_pid = slot.process.pid if slot.process else None
         print(
             f"{datetime.now()} Watchdog: slot {slot.index} timeout, killing PID {slot.process.pid}",
             flush=True,
         )
         self._kill_slot_child(slot)
         self._kill_process(slot.process)
+        if old_pid is not None and config is not None:
+            append_case_end_to_worker_log(old_pid, "timeout", api_config_str=config)
+            mark_inorder_case_complete(old_pid, flush=True)
         if self._closed or self._shutdown_event.is_set():
             return
-        self.result_queue.put(("timeout", slot.index, config))
+        self.result_queue.put(("timeout", slot.index, config, old_pid))
         self._spawn_worker(slot)
 
     def _handle_crash(self, slot):
@@ -1239,108 +1249,117 @@ def check_gpu_memory(gpu_ids, num_workers_per_gpu, required_memory):  # required
 
 def run_test_case(api_config_str, options):
     """Run a single test case for the given API configuration."""
-    cuda_visible = os.environ.get("CUDA_VISIBLE_DEVICES", "0")
-    gpu_id = int(cuda_visible.split(",")[0])
+    case_id = write_case_begin(api_config_str)
+    case_status = "done"
+    try:
+        cuda_visible = os.environ.get("CUDA_VISIBLE_DEVICES", "0")
+        gpu_id = int(cuda_visible.split(",")[0])
 
-    print(
-        f"{datetime.now()} GPU {gpu_id} {os.getpid()} [paddle {options.paddle_version}] test begin: {api_config_str}",
-        flush=True,
-    )
-
-    max_memory_wait = 30  # max 30 iterations × 10s = 5 minutes
-    for wait_iter in range(max_memory_wait):
-        total_memory, used_memory = get_memory_info(gpu_id)
-        free_memory = total_memory - used_memory
-
-        if free_memory >= options.required_memory:
-            break
-
-        if wait_iter % 6 == 0:  # log every ~60s (every 6th iteration)
-            print(
-                f"{datetime.now()} device {gpu_id} Free: {free_memory:.1f} GB, "
-                f"Required: {options.required_memory:.1f} GB. "
-                f"Waiting for available memory... (attempt {wait_iter + 1}/{max_memory_wait})",
-                flush=True,
-            )
-        time.sleep(10)
-    else:
         print(
-            f"{datetime.now()} device {gpu_id} Memory wait timeout after {max_memory_wait * 10}s. "
-            f"Proceeding anyway (free={free_memory:.1f} GB, required={options.required_memory:.1f} GB).",
+            f"{datetime.now()} GPU {gpu_id} {os.getpid()} [paddle {options.paddle_version}] test begin: {api_config_str}",
             flush=True,
         )
 
-    try:
-        api_config = APIConfig(api_config_str)
-    except Exception as err:
-        print(f"[config_parse] {api_config_str} {err!s}", flush=True)
-        write_to_log("config_parse", api_config_str)
-        return
+        max_memory_wait = 30  # max 30 iterations × 10s = 5 minutes
+        for wait_iter in range(max_memory_wait):
+            total_memory, used_memory = get_memory_info(gpu_id)
+            free_memory = total_memory - used_memory
 
-    test_class = _select_test_class(options)
-    kwargs = {k: v for k, v in vars(options).items() if k in VALID_TEST_ARGS}
-    case = test_class(api_config, **kwargs)
-    try:
-        case.test()
-    except Exception as err:
-        err_msg = str(err).lower()
-        terminal_log_type = get_terminal_log_type(api_config_str)
-        oom_markers = (
-            "cuda out of memory",
-            "out of memory error",
-            "resourceexhaustederror",
-            "out of memory",
-            "outofmemoryerror",
-            "cannot allocate memory",
-            "std::bad_alloc",
-            "bad allocation",
-            "memoryerror",
-            "cublas_status_alloc_failed",
-        )
-        cuda_markers = (
-            "cuda error",
-            "memory corruption",
-            "illegal memory access",
-            "invalid configuration argument",
-            "invalid resource handle",
-        )
-        exit_code = None
-        if any(marker in err_msg for marker in oom_markers):
-            exit_code = FATAL_OOM_EXIT_CODE
-        elif terminal_log_type == "torch_error" and any(
-            marker in err_msg for marker in cuda_markers
-        ):
-            exit_code = FATAL_TORCH_EXIT_CODE
-        elif any(marker in err_msg for marker in cuda_markers):
-            exit_code = FATAL_CUDA_EXIT_CODE
-        if exit_code is not None:
+            if free_memory >= options.required_memory:
+                break
+
+            if wait_iter % 6 == 0:  # log every ~60s (every 6th iteration)
+                print(
+                    f"{datetime.now()} device {gpu_id} Free: {free_memory:.1f} GB, "
+                    f"Required: {options.required_memory:.1f} GB. "
+                    f"Waiting for available memory... (attempt {wait_iter + 1}/{max_memory_wait})",
+                    flush=True,
+                )
+            time.sleep(10)
+        else:
+            print(
+                f"{datetime.now()} device {gpu_id} Memory wait timeout after {max_memory_wait * 10}s. "
+                f"Proceeding anyway (free={free_memory:.1f} GB, required={options.required_memory:.1f} GB).",
+                flush=True,
+            )
+
+        try:
+            api_config = APIConfig(api_config_str)
+        except Exception as err:
+            print(f"[config_parse] {api_config_str} {err!s}", flush=True)
+            write_to_log("config_parse", api_config_str)
+            return
+
+        test_class = _select_test_class(options)
+        kwargs = {k: v for k, v in vars(options).items() if k in VALID_TEST_ARGS}
+        case = test_class(api_config, **kwargs)
+        try:
+            case.test()
+        except Exception as err:
+            err_msg = str(err).lower()
+            terminal_log_type = get_terminal_log_type(api_config_str)
+            oom_markers = (
+                "cuda out of memory",
+                "out of memory error",
+                "resourceexhaustederror",
+                "out of memory",
+                "outofmemoryerror",
+                "cannot allocate memory",
+                "std::bad_alloc",
+                "bad allocation",
+                "memoryerror",
+                "cublas_status_alloc_failed",
+            )
+            cuda_markers = (
+                "cuda error",
+                "memory corruption",
+                "illegal memory access",
+                "invalid configuration argument",
+                "invalid resource handle",
+            )
+            exit_code = None
+            if any(marker in err_msg for marker in oom_markers):
+                exit_code = FATAL_OOM_EXIT_CODE
+            elif terminal_log_type == "torch_error" and any(
+                marker in err_msg for marker in cuda_markers
+            ):
+                exit_code = FATAL_TORCH_EXIT_CODE
+            elif any(marker in err_msg for marker in cuda_markers):
+                exit_code = FATAL_CUDA_EXIT_CODE
+            if exit_code is not None:
+                if has_terminal_log(api_config_str):
+                    write_checkpoint(api_config_str)
+                try:
+                    close_process_files()
+                finally:
+                    try:
+                        restore_stdio()
+                    finally:
+                        os._exit(exit_code)
             if has_terminal_log(api_config_str):
                 write_checkpoint(api_config_str)
-            try:
-                close_process_files()
-            finally:
-                try:
-                    restore_stdio()
-                finally:
-                    os._exit(exit_code)
-        if has_terminal_log(api_config_str):
-            write_checkpoint(api_config_str)
-            return
-        # if not fatal error, subprocess will be alive and report error
-        print(f"[test error] {api_config_str}: {err}", flush=True)
+                return
+            # if not fatal error, subprocess will be alive and report error
+            print(f"[test error] {api_config_str}: {err}", flush=True)
+            raise
+        finally:
+            del test_class, api_config, case
+            gc.collect()
+            if not any(
+                getattr(options, opt)
+                for opt in (
+                    "paddle_gpu_performance",
+                    "torch_gpu_performance",
+                    "paddle_torch_gpu_performance",
+                )
+            ) and not getattr(options, "use_gpu_mode", False):
+                _clear_device_cache(options)
+
+    except BaseException:
+        case_status = "error"
         raise
     finally:
-        del test_class, api_config, case
-        gc.collect()
-        if not any(
-            getattr(options, opt)
-            for opt in (
-                "paddle_gpu_performance",
-                "torch_gpu_performance",
-                "paddle_torch_gpu_performance",
-            )
-        ) and not getattr(options, "use_gpu_mode", False):
-            _clear_device_cache(options)
+        write_case_end(case_status, case_id=case_id)
 
 
 def main():
@@ -1940,7 +1959,22 @@ def main():
                 slot_idx = msg[1]
                 config = msg[2]
                 exitcode = msg[3] if msg_type == "crashed" and len(msg) > 3 else None
-                crash_source = msg[5] if msg_type == "crashed" and len(msg) > 5 else "worker"
+                crash_source = "worker"
+                worker_pid = None
+                if msg_type == "done":
+                    worker_pid = msg[3] if len(msg) > 3 else None
+                elif msg_type == "error":
+                    worker_pid = msg[4] if len(msg) > 4 else None
+                elif msg_type == "timeout":
+                    worker_pid = msg[3] if len(msg) > 3 else None
+                elif msg_type == "crashed":
+                    if len(msg) > 5 and msg[5] == "child":
+                        crash_source = "child"
+                        worker_pid = msg[6] if len(msg) > 6 else None
+                    else:
+                        worker_pid = msg[4] if len(msg) > 4 else None
+                if worker_pid is not None:
+                    mark_inorder_case_complete(worker_pid, flush=msg_type in ("timeout", "crashed"))
                 worker_reusable = msg_type in ("done", "error") or (
                     msg_type == "crashed"
                     and options.use_compute_sanitizer

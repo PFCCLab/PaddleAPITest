@@ -562,129 +562,139 @@ def init_worker_gpu(gpu_worker_list, lock, available_gpus, max_workers_per_gpu, 
 
 def run_test_case(api_config_str, options):
     """Run a single test case for the given API configuration."""
-    cuda_visible = os.environ.get("CUDA_VISIBLE_DEVICES", "0")
-    gpu_id = int(cuda_visible.split(",")[0])
+    case_id = write_case_begin(api_config_str)
+    case_status = "done"
+    try:
+        cuda_visible = os.environ.get("CUDA_VISIBLE_DEVICES", "0")
+        gpu_id = int(cuda_visible.split(",")[0])
 
-    print(
-        f"{datetime.now()} GPU {gpu_id} {os.getpid()} [paddle {options.paddle_version}] test begin: {api_config_str}",
-        flush=True,
-    )
-
-    last_memory_log_time = 0
-    while True:
-        total_memory, used_memory = get_memory_info(gpu_id)
-        free_memory = total_memory - used_memory
-
-        if free_memory >= options.required_memory:
-            break
-
-        now = time.time()
-        if now - last_memory_log_time >= MEMORY_WAIT_LOG_INTERVAL:
-            print(
-                f"{datetime.now()} device {gpu_id} Free: {free_memory:.1f} GB, "
-                f"Required: {options.required_memory:.1f} GB. ",
-                "Waiting for available memory...",
-                flush=True,
-            )
-            last_memory_log_time = now
-        time.sleep(MEMORY_WAIT_SECONDS)
-
-    if options.show_runtime_status:
-        total_memory, used_memory_before = get_memory_info(gpu_id)
         print(
-            f"{datetime.now()} GPU {gpu_id} memory before: used={used_memory_before:.1f} GB, "
-            f"free={total_memory - used_memory_before:.1f} GB",
+            f"{datetime.now()} GPU {gpu_id} {os.getpid()} [paddle {options.paddle_version}] test begin: {api_config_str}",
             flush=True,
         )
 
-    api_config = None
-    case = None
-    try:
-        api_config = APIConfig(api_config_str)
-    except Exception as err:
-        print(f"[config_parse] {api_config_str} {err!s}", flush=True)
-        write_terminal_log("config_parse", api_config_str)
-        return
+        last_memory_log_time = 0
+        while True:
+            total_memory, used_memory = get_memory_info(gpu_id)
+            free_memory = total_memory - used_memory
 
-    test_class = _select_test_class(options)
-    kwargs = {k: v for k, v in vars(options).items() if k in VALID_TEST_ARGS}
-    case = test_class(api_config, **kwargs)
-    try:
-        case.test()
-        if has_terminal_log(api_config_str):
-            write_checkpoint(api_config_str)
-    except Exception as err:
-        err_msg = str(err).lower()
-        terminal_log_type = get_terminal_log_type(api_config_str)
-        oom_markers = (
-            "cuda out of memory",
-            "out of memory error",
-            "resourceexhaustederror",
-            "out of memory",
-            "outofmemoryerror",
-            "cannot allocate memory",
-            "std::bad_alloc",
-            "bad allocation",
-            "memoryerror",
-            "cublas_status_alloc_failed",
-        )
-        cuda_markers = (
-            "cuda error",
-            "memory corruption",
-            "illegal memory access",
-            "invalid configuration argument",
-            "invalid resource handle",
-        )
-        exit_code = None
-        if any(marker in err_msg for marker in oom_markers):
-            exit_code = FATAL_OOM_EXIT_CODE
-        elif terminal_log_type == "torch_error" and any(
-            marker in err_msg for marker in cuda_markers
-        ):
-            exit_code = FATAL_TORCH_EXIT_CODE
-        elif any(marker in err_msg for marker in cuda_markers):
-            exit_code = FATAL_CUDA_EXIT_CODE
-        if exit_code is not None:
+            if free_memory >= options.required_memory:
+                break
+
+            now = time.time()
+            if now - last_memory_log_time >= MEMORY_WAIT_LOG_INTERVAL:
+                print(
+                    f"{datetime.now()} device {gpu_id} Free: {free_memory:.1f} GB, "
+                    f"Required: {options.required_memory:.1f} GB. ",
+                    "Waiting for available memory...",
+                    flush=True,
+                )
+                last_memory_log_time = now
+            time.sleep(MEMORY_WAIT_SECONDS)
+
+        if options.show_runtime_status:
+            total_memory, used_memory_before = get_memory_info(gpu_id)
+            print(
+                f"{datetime.now()} GPU {gpu_id} memory before: used={used_memory_before:.1f} GB, "
+                f"free={total_memory - used_memory_before:.1f} GB",
+                flush=True,
+            )
+
+        api_config = None
+        case = None
+        try:
+            api_config = APIConfig(api_config_str)
+        except Exception as err:
+            print(f"[config_parse] {api_config_str} {err!s}", flush=True)
+            write_terminal_log("config_parse", api_config_str)
+            return os.getpid()
+
+        test_class = _select_test_class(options)
+        kwargs = {k: v for k, v in vars(options).items() if k in VALID_TEST_ARGS}
+        case = test_class(api_config, **kwargs)
+        try:
+            case.test()
             if has_terminal_log(api_config_str):
                 write_checkpoint(api_config_str)
-            try:
-                close_process_files()
-            finally:
+        except Exception as err:
+            err_msg = str(err).lower()
+            terminal_log_type = get_terminal_log_type(api_config_str)
+            oom_markers = (
+                "cuda out of memory",
+                "out of memory error",
+                "resourceexhaustederror",
+                "out of memory",
+                "outofmemoryerror",
+                "cannot allocate memory",
+                "std::bad_alloc",
+                "bad allocation",
+                "memoryerror",
+                "cublas_status_alloc_failed",
+            )
+            cuda_markers = (
+                "cuda error",
+                "memory corruption",
+                "illegal memory access",
+                "invalid configuration argument",
+                "invalid resource handle",
+            )
+            exit_code = None
+            if any(marker in err_msg for marker in oom_markers):
+                exit_code = FATAL_OOM_EXIT_CODE
+            elif terminal_log_type == "torch_error" and any(
+                marker in err_msg for marker in cuda_markers
+            ):
+                exit_code = FATAL_TORCH_EXIT_CODE
+            elif any(marker in err_msg for marker in cuda_markers):
+                exit_code = FATAL_CUDA_EXIT_CODE
+            if exit_code is not None:
+                if has_terminal_log(api_config_str):
+                    write_checkpoint(api_config_str)
                 try:
-                    restore_stdio()
+                    close_process_files()
                 finally:
-                    os._exit(exit_code)
-        if has_terminal_log(api_config_str):
-            write_checkpoint(api_config_str)
-            return
-        # if not fatal error, subprocess will be alive and report error
-        print(f"[error] {api_config_str}: {err}", flush=True)
+                    try:
+                        restore_stdio()
+                    finally:
+                        os._exit(exit_code)
+            if has_terminal_log(api_config_str):
+                write_checkpoint(api_config_str)
+                return os.getpid()
+            # if not fatal error, subprocess will be alive and report error
+            print(f"[error] {api_config_str}: {err}", flush=True)
+            raise
+        finally:
+            del test_class, api_config, case
+            gc.collect()
+            if not any(
+                getattr(options, opt)
+                for opt in (
+                    "paddle_gpu_performance",
+                    "torch_gpu_performance",
+                    "paddle_torch_gpu_performance",
+                )
+            ) and not getattr(options, "use_gpu_mode", False):
+                _clear_device_cache(options)
+            if options.show_runtime_status:
+                try:
+                    total_memory, used_memory_after = get_memory_info(gpu_id)
+                    print(
+                        f"{datetime.now()} GPU {gpu_id} memory after cleanup: used={used_memory_after:.1f} GB, "
+                        f"free={total_memory - used_memory_after:.1f} GB",
+                        flush=True,
+                    )
+                except Exception as err:
+                    print(
+                        f"{datetime.now()} Failed to read GPU {gpu_id} memory after cleanup: {err}",
+                        flush=True,
+                    )
+
+        return os.getpid()
+    except BaseException:
+        case_status = "error"
         raise
     finally:
-        del test_class, api_config, case
-        gc.collect()
-        if not any(
-            getattr(options, opt)
-            for opt in (
-                "paddle_gpu_performance",
-                "torch_gpu_performance",
-                "paddle_torch_gpu_performance",
-            )
-        ) and not getattr(options, "use_gpu_mode", False):
-            _clear_device_cache(options)
-        if options.show_runtime_status:
-            try:
-                total_memory, used_memory_after = get_memory_info(gpu_id)
-                print(
-                    f"{datetime.now()} GPU {gpu_id} memory after cleanup: used={used_memory_after:.1f} GB, "
-                    f"free={total_memory - used_memory_after:.1f} GB",
-                    flush=True,
-                )
-            except Exception as err:
-                print(
-                    f"{datetime.now()} Failed to read GPU {gpu_id} memory after cleanup: {err}",
-                    flush=True,
-                )
+        write_case_end(case_status, case_id=case_id)
 
 
 def main():
@@ -1206,37 +1216,50 @@ def main():
                     config = futures[future]
                     checkpoint_ready = True
                     try:
-                        future.result()
+                        worker_pid = future.result()
+                        mark_inorder_case_complete(worker_pid)
                         if options.show_runtime_status or tested_case % 10000 == 0:
                             print(f"[info] Test case succeeded for {config}", flush=True)
                     except TimeoutError as err:
                         write_terminal_log("timeout", config)
+                        worker_pid = getattr(err, "pid", None)
+                        if worker_pid is not None:
+                            append_case_end_to_worker_log(
+                                worker_pid, "timeout", api_config_str=config
+                            )
+                            mark_inorder_case_complete(worker_pid, flush=True)
                         print(
                             f"[timeout] {config}: {err}",
                             flush=True,
                         )
                     except ProcessExpired as err:
+                        worker_pid = getattr(err, "pid", None)
+                        expired_status = "paddle_crash"
                         # CUDA, OOM, and Torch fatal errors may also expire the subprocess;
                         # classify them by dedicated terminal log types instead of falling through to crash.
                         if err.exitcode == FATAL_CUDA_EXIT_CODE:
+                            expired_status = "paddle_cuda"
                             write_terminal_log("paddle_cuda", config)
                             print(
                                 f"[paddle_cuda] {config}: {err}",
                                 flush=True,
                             )
                         elif err.exitcode == FATAL_OOM_EXIT_CODE:
+                            expired_status = "oom"
                             write_terminal_log("oom", config)
                             print(
                                 f"[oom] {config}: {err}",
                                 flush=True,
                             )
                         elif err.exitcode == FATAL_TORCH_EXIT_CODE:
+                            expired_status = "torch_error"
                             write_terminal_log("torch_error", config)
                             print(
                                 f"[torch_error] {config}: {err}",
                                 flush=True,
                             )
                         elif err.exitcode in (-signal.SIGKILL, -signal.SIGTERM):
+                            expired_status = "timeout"
                             checkpoint_ready = False
                             print(
                                 f"[warn] Worker was externally killed for {config} "
@@ -1256,6 +1279,11 @@ def main():
                             flush=True,
                         )
                         checkpoint_ready = False  # checkpoint already written by write_terminal_log
+                        if worker_pid is not None:
+                            append_case_end_to_worker_log(
+                                worker_pid, expired_status, api_config_str=config
+                            )
+                            mark_inorder_case_complete(worker_pid, flush=True)
                     if checkpoint_ready:
                         tested_case += 1
                         if options.show_runtime_status or tested_case % 10000 == 0:

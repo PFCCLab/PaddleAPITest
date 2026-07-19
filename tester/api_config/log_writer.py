@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import csv
+import hashlib
 import io
 import os
 import re
@@ -72,12 +73,17 @@ COMP_TO_DIMENSION = {
 ALL_DIMENSIONS = sorted(set(COMP_TO_DIMENSION.values()))
 TOL_HEADER = ["API", "config", "dtype", "mode", "max_abs_diff", "max_rel_diff"]
 STABLE_HEADER = ["API", "config", "dtype", "comp", "max_abs_diff", "max_rel_diff"]
+INORDER_FLUSH_CASE_BLOCKS = 1000
+CASE_BEGIN_TAG = "[CASE_BEGIN]"
+CASE_END_TAG = "[CASE_END]"
 
 _use_worker_tmp_logs = False
 
 _process_file_handlers = {}
 _aggregated_offsets = {}
 _process_terminal_configs = {}
+_inorder_case_starts = {}
+_pending_inorder_blocks = []
 # 每维度的 terminal configs 追踪: dimension -> {config_line -> log_type}
 _comp_terminal_configs: dict[str, dict[str, str]] = {}
 
@@ -102,6 +108,8 @@ def _reset_runtime():
     close_process_files()
     _aggregated_offsets.clear()
     _process_terminal_configs.clear()
+    _inorder_case_starts.clear()
+    _pending_inorder_blocks.clear()
     _comp_terminal_configs.clear()
 
 
@@ -347,6 +355,120 @@ def _save_offsets(pending_offsets, cleanup):
             file_path.unlink()
 
 
+def _get_worker_log_file(pid=None):
+    worker_pid = os.getpid() if pid is None else pid
+    return TMP_LOG_PATH / f"log_{worker_pid}.log"
+
+
+def get_case_id(api_config_str):
+    return hashlib.sha1(api_config_str.encode("utf-8", errors="replace")).hexdigest()[:12]
+
+
+def write_case_begin(api_config_str):
+    case_id = get_case_id(api_config_str)
+    print(f"{CASE_BEGIN_TAG} case_id={case_id}", flush=True)
+    return case_id
+
+
+def _format_case_end(status, case_id=None, api_config_str=None):
+    if case_id is None and api_config_str is not None:
+        case_id = get_case_id(api_config_str)
+    case_part = f" case_id={case_id}" if case_id else ""
+    return f"{CASE_END_TAG}{case_part} status={status}"
+
+
+def write_case_end(status, case_id=None, api_config_str=None):
+    print(_format_case_end(status, case_id, api_config_str), flush=True)
+
+
+def append_case_end_to_worker_log(pid, status, case_id=None, api_config_str=None):
+    if pid is None:
+        return False
+    end_line = _format_case_end(status, case_id, api_config_str)
+    try:
+        log_file = _get_worker_log_file(pid)
+        log_file.parent.mkdir(parents=True, exist_ok=True)
+        if log_file.exists() and " case_id=" in end_line:
+            with log_file.open("rb") as f:
+                f.seek(max(0, log_file.stat().st_size - 65536))
+                tail = f.read().decode("utf-8", errors="replace")
+            if end_line.rsplit(" status=", 1)[0] in tail:
+                return True
+        with log_file.open("a", encoding="utf-8") as f:
+            f.write(f"{end_line}\n")
+        return True
+    except Exception as err:
+        print(f"Error writing case end to worker log {pid}: {err}", flush=True)
+        return False
+
+
+def _copy_log_range(file_path, out_f, start_offset, end_offset):
+    with file_path.open("rb") as in_f:
+        in_f.seek(start_offset)
+        remaining = max(0, end_offset - start_offset)
+        while remaining > 0:
+            data = in_f.read(min(4 * 1024 * 1024, remaining))
+            if not data:
+                break
+            remaining -= len(data)
+            in_buf = io.BytesIO(data)
+            while True:
+                lines = in_buf.readlines(4 * 1024 * 1024)
+                if not lines:
+                    break
+                for line in lines:
+                    out_f.write(line[:200000] + b"\n" if len(line) > 200000 else line)
+
+
+def _copy_and_mark_inorder_range(file_path, out_f, start_offset, end_offset, *, clear=False):
+    if end_offset < start_offset:
+        start_offset = 0
+    if end_offset > start_offset:
+        _copy_log_range(file_path, out_f, start_offset, end_offset)
+    _save_offset(file_path, end_offset, clear=clear)
+    _inorder_case_starts[file_path] = end_offset
+
+
+def mark_inorder_case_complete(pid=None, *, flush=False):
+    if not _use_worker_tmp_logs:
+        return True
+    file_path = _get_worker_log_file(pid)
+    if not file_path.exists():
+        return True
+    try:
+        end_offset = file_path.stat().st_size
+    except Exception as err:
+        print(f"Error reading worker log size {file_path}: {err}", flush=True)
+        return False
+    start_offset = _inorder_case_starts.get(file_path, _aggregated_offsets.get(file_path, 0))
+    if end_offset < start_offset:
+        start_offset = 0
+    if end_offset > start_offset:
+        _pending_inorder_blocks.append((file_path, start_offset, end_offset))
+    _inorder_case_starts[file_path] = end_offset
+    if flush or len(_pending_inorder_blocks) >= INORDER_FLUSH_CASE_BLOCKS:
+        return flush_inorder_case_blocks(force=True)
+    return True
+
+
+def flush_inorder_case_blocks(force=False):
+    if not _pending_inorder_blocks:
+        return True
+    if not force and len(_pending_inorder_blocks) < INORDER_FLUSH_CASE_BLOCKS:
+        return True
+    out_file = TEST_LOG_PATH / "log_inorder.log"
+    try:
+        with out_file.open("ab") as out_f:
+            while _pending_inorder_blocks:
+                file_path, start_offset, end_offset = _pending_inorder_blocks.pop(0)
+                _copy_and_mark_inorder_range(file_path, out_f, start_offset, end_offset)
+        return True
+    except Exception as err:
+        print(f"Error flushing case blocks to {out_file}: {err}", flush=True)
+        out_file.unlink(missing_ok=True)
+        return False
+
+
 def _read_lines(log_files, cleanup):
     all_lines = set()
     pending_offsets = {}
@@ -389,25 +511,26 @@ def _agg_results(cleanup, tmp_exists):
 
 
 def _agg_inorder(cleanup, tmp_exists):
-    log_files = sorted(TMP_LOG_PATH.glob("log_*.log")) if tmp_exists else []
+    if not tmp_exists:
+        return True
+    if not flush_inorder_case_blocks(force=True):
+        return False
+    log_files = sorted(TMP_LOG_PATH.glob("log_*.log"))
     if not log_files:
         return True
 
     out_file = TEST_LOG_PATH / "log_inorder.log"
-    pending_offsets = {}
     try:
         with out_file.open("ab") as out_f:
             for file_path in log_files:
                 try:
-                    data, _, end_offset = _read_pending_bytes(file_path, end=cleanup)
-                    pending_offsets[file_path] = end_offset
-                    in_f = io.BytesIO(data)
-                    while True:
-                        lines = in_f.readlines(4 * 1024 * 1024)
-                        if not lines:
-                            break
-                        for line in lines:
-                            out_f.write(line[:200000] + b"\n" if len(line) > 200000 else line)
+                    start_offset = _aggregated_offsets.get(file_path, 0)
+                    end_offset = file_path.stat().st_size
+                    _copy_and_mark_inorder_range(
+                        file_path, out_f, start_offset, end_offset, clear=cleanup
+                    )
+                    if cleanup:
+                        file_path.unlink()
                 except Exception as err:
                     print(f"Error reading {file_path}: {err}", flush=True)
                     out_file.unlink(missing_ok=True)
@@ -416,8 +539,6 @@ def _agg_inorder(cleanup, tmp_exists):
         print(f"Error writing to {out_file}: {err}", flush=True)
         out_file.unlink(missing_ok=True)
         return False
-
-    _save_offsets(pending_offsets, cleanup)
     return True
 
 
@@ -627,7 +748,10 @@ def aggregate_logs(end=False, cleanup=False):
     tol_file = TEST_LOG_PATH / "tol.csv"
     stable_file = TEST_LOG_PATH / "stable.csv"
     all_success = _agg_results(cleanup_tmp, tmp_exists)
-    all_success = _agg_inorder(cleanup_tmp, tmp_exists) and all_success
+    if cleanup_tmp:
+        all_success = _agg_inorder(cleanup_tmp, tmp_exists) and all_success
+    else:
+        all_success = flush_inorder_case_blocks() and all_success
     all_success = (
         _agg_csv(
             sorted(TMP_LOG_PATH.glob("tol_*.csv")) if tmp_exists else [],
