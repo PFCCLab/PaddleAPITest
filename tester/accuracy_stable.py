@@ -64,6 +64,54 @@ class APITestAccuracyStable(APITestBase):
             return {key: self._move_result_to_cpu(item) for key, item in value.items()}
         return value
 
+    def _result_num_bytes(self, value):
+        if isinstance(value, (torch.Tensor, paddle.Tensor)):
+            try:
+                return int(value.numel()) * int(value.element_size())
+            except Exception:
+                return 0
+        if isinstance(value, (list, tuple)):
+            return sum(self._result_num_bytes(item) for item in value)
+        if isinstance(value, dict):
+            return sum(self._result_num_bytes(item) for item in value.values())
+        return 0
+
+    def _move_result_to_gpu(self, value):
+        if isinstance(value, torch.Tensor):
+            return value.to(device="cuda", non_blocking=True)
+        if isinstance(value, paddle.Tensor):
+            return value.cuda()
+        if isinstance(value, list):
+            return [self._move_result_to_gpu(item) for item in value]
+        if isinstance(value, tuple):
+            return tuple(self._move_result_to_gpu(item) for item in value)
+        if isinstance(value, dict):
+            return {key: self._move_result_to_gpu(item) for key, item in value.items()}
+        return value
+
+    def _try_restore_spilled_results_to_gpu(self, results):
+        required_bytes = sum(self._result_num_bytes(value) for value in results)
+        if required_bytes <= 0:
+            return None
+        try:
+            free_bytes, _ = torch.cuda.mem_get_info()
+            available_bytes = free_bytes
+            memory_budget = float(getattr(self.gpu_mode_config, "memory_budget", 0.0) or 0.0)
+            if memory_budget > 0:
+                reserved_bytes = torch.cuda.memory_reserved()
+                budget_headroom = max(
+                    0,
+                    int(memory_budget * (1024**3)) - reserved_bytes,
+                )
+                available_bytes = min(available_bytes, budget_headroom)
+            # Leave 20% headroom for allocator and comparison temporaries.
+            if required_bytes * 5 > available_bytes * 4:
+                return None
+            restored = tuple(self._move_result_to_gpu(value) for value in results)
+            return restored
+        except Exception:
+            return None
+
     def _clear_runtime_inputs(self, framework):
         for attr_name in (f"{framework}_args", f"{framework}_kwargs"):
             if hasattr(self, attr_name):
@@ -210,7 +258,25 @@ class APITestAccuracyStable(APITestBase):
                     gpu_mode_maybe_empty_cache(
                         self.gpu_mode_config,
                         "accuracy_stable_after_first_compare_spill",
+                        force=True,
                     )
+
+        if self.use_gpu_mode:
+            restored_results = self._try_restore_spilled_results_to_gpu(
+                (
+                    torch_output_pair[0],
+                    paddle_output_pair[0],
+                    torch_grad_pair[0],
+                    paddle_grad_pair[0],
+                )
+            )
+            if restored_results is not None:
+                (
+                    torch_output_pair[0],
+                    paddle_output_pair[0],
+                    torch_grad_pair[0],
+                    paddle_grad_pair[0],
+                ) = restored_results
 
         # ======== summary ========
         self.compare(torch_output_pair[1], paddle_output_pair[1], "T2P2")

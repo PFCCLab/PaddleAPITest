@@ -103,12 +103,6 @@ def gpu_mode_maybe_empty_cache(gpu_config, phase="", force=False, request_spill=
             )
 
     if should_cleanup:
-        action = "spill+empty_cache" if should_spill else "empty_cache"
-        print(
-            f"[gpu_mode_memory] {phase or 'unknown'} {action} "
-            f"budget={memory_budget:.1f}G reserved={torch_reserved:.1f}G allocated={torch_allocated:.1f}G",
-            flush=True,
-        )
         gc.collect()
         torch.cuda.empty_cache()
         paddle.device.cuda.empty_cache()
@@ -1401,7 +1395,9 @@ class APITestBase:
     def _torch_assert_accuracy_in_chunks(
         self, actual, expected, atol, rtol, error_msg, working_bytes
     ):
-        temp_bytes_per_element = max(32, actual.element_size() + expected.element_size() + 16)
+        temp_bytes_per_element = max(
+            32, 4 * max(actual.element_size(), expected.element_size()) + 16
+        )
         chunk_numel = max(1, working_bytes // temp_bytes_per_element)
         actual_flat = actual.reshape(-1)
         expected_flat = expected.reshape(-1)
@@ -1411,12 +1407,6 @@ class APITestBase:
         max_rel_diff = -1.0
         max_rel_index = 0
         exact_compare = atol == 0.0 and rtol == 0.0
-
-        print(
-            f"[chunk_compare] numel={actual_flat.numel()} chunk_numel={chunk_numel} "
-            f"dtype={actual.dtype}",
-            flush=True,
-        )
         for start in range(0, actual_flat.numel(), chunk_numel):
             end = min(actual_flat.numel(), start + chunk_numel)
             actual_chunk = actual_flat[start:end]
@@ -1425,19 +1415,19 @@ class APITestBase:
                 equal = actual_chunk == expected_chunk
                 if actual_chunk.is_floating_point() or actual_chunk.is_complex():
                     equal |= torch.isnan(actual_chunk) & torch.isnan(expected_chunk)
-                mismatch = ~equal
+                mismatch = equal.logical_not_()
             else:
                 if "float8" in str(actual_chunk.dtype):
                     actual_chunk = actual_chunk.float()
                 if "float8" in str(expected_chunk.dtype):
                     expected_chunk = expected_chunk.float()
-                mismatch = ~torch.isclose(
+                mismatch = torch.isclose(
                     actual_chunk,
                     expected_chunk,
                     rtol=rtol,
                     atol=atol,
                     equal_nan=True,
-                )
+                ).logical_not_()
 
             chunk_mismatch_count = int(mismatch.sum().item())
             mismatch_count += chunk_mismatch_count
@@ -1450,24 +1440,48 @@ class APITestBase:
             elif actual_chunk.dtype == torch.float64 or expected_chunk.dtype == torch.float64:
                 actual_for_diff = actual_chunk.to(torch.float64)
                 expected_for_diff = expected_chunk.to(torch.float64)
-            else:
+            elif "float8" in str(actual_chunk.dtype) or "float8" in str(expected_chunk.dtype):
                 actual_for_diff = actual_chunk.float()
                 expected_for_diff = expected_chunk.float()
+            elif not actual_chunk.dtype.is_floating_point and not actual_chunk.dtype.is_complex:
+                actual_for_diff = actual_chunk.to(torch.int64)
+                expected_for_diff = expected_chunk.to(torch.int64)
+            else:
+                actual_for_diff = actual_chunk
+                expected_for_diff = expected_chunk
             abs_diff = torch.abs(actual_for_diff - expected_for_diff)
-            abs_diff = abs_diff.masked_fill(~mismatch, -1.0)
+            matched = ~mismatch
+            abs_diff.masked_fill_(matched, -1.0)
             chunk_max_abs, chunk_abs_index = torch.max(abs_diff, dim=0)
-            chunk_max_abs_value = float(chunk_max_abs.item())
+            rel_diff = abs_diff / torch.abs(expected_for_diff)
+            rel_diff.masked_fill_(matched, -1.0)
+            chunk_max_rel, chunk_rel_index = torch.max(rel_diff, dim=0)
+
+            # Transfer all reduction results in one synchronization.  Calling
+            # .item() for every value dominates scans with hundreds of chunks.
+            (
+                chunk_max_abs_value,
+                chunk_abs_index_value,
+                chunk_max_rel_value,
+                chunk_rel_index_value,
+            ) = (
+                torch.stack(
+                    (
+                        chunk_max_abs.to(torch.float64),
+                        chunk_abs_index.to(torch.float64),
+                        chunk_max_rel.to(torch.float64),
+                        chunk_rel_index.to(torch.float64),
+                    )
+                )
+                .cpu()
+                .tolist()
+            )
             if chunk_max_abs_value > max_abs_diff:
                 max_abs_diff = chunk_max_abs_value
-                max_abs_index = start + int(chunk_abs_index.item())
-
-            rel_diff = abs_diff / torch.abs(expected_for_diff)
-            rel_diff = rel_diff.masked_fill(~mismatch, -1.0)
-            chunk_max_rel, chunk_rel_index = torch.max(rel_diff, dim=0)
-            chunk_max_rel_value = float(chunk_max_rel.item())
+                max_abs_index = start + int(chunk_abs_index_value)
             if chunk_max_rel_value > max_rel_diff:
                 max_rel_diff = chunk_max_rel_value
-                max_rel_index = start + int(chunk_rel_index.item())
+                max_rel_index = start + int(chunk_rel_index_value)
 
         if mismatch_count == 0:
             return
@@ -1561,8 +1575,6 @@ class APITestBase:
                 f"{expected_name} {expected_tensor.dtype}"
             )
 
-        exact_compare = atol == 0.0 and rtol == 0.0
-
         def error_msg(msg):
             return (
                 f"Not equal to tolerance rtol={rtol}, atol={atol}\n"
@@ -1575,15 +1587,35 @@ class APITestBase:
 
         try:
             working_bytes = 1024**3
-            if actual_tensor.is_cuda:
+            estimated_temp_bytes = actual_tensor.numel() * max(
+                32,
+                4 * max(actual_tensor.element_size(), expected_tensor.element_size()) + 16,
+            )
+            # Small tensors always use torch.testing.assert_close directly. Avoid
+            # querying the CUDA driver for a working budget on that hot path.
+            needs_chunk_budget = estimated_temp_bytes > working_bytes
+            if actual_tensor.is_cuda and needs_chunk_budget:
                 try:
                     free_bytes, _ = torch.cuda.mem_get_info(actual_tensor.device)
-                    working_bytes = min(working_bytes, max(256 * 1024**2, free_bytes // 50))
+                    max_working_bytes = 16 * 1024**3
+                    min_working_bytes = 256 * 1024**2
+                    working_bytes = min(max_working_bytes, max(min_working_bytes, free_bytes // 5))
+
+                    memory_budget = float(
+                        getattr(self.gpu_mode_config, "memory_budget", 0.0) or 0.0
+                    )
+                    if memory_budget > 0:
+                        reserved_bytes = torch.cuda.memory_reserved(actual_tensor.device)
+                        budget_headroom = max(
+                            0,
+                            int(memory_budget * (1024**3)) - reserved_bytes,
+                        )
+                        working_bytes = min(
+                            working_bytes,
+                            max(min_working_bytes, budget_headroom // 5),
+                        )
                 except Exception:
                     pass
-            estimated_temp_bytes = actual_tensor.numel() * max(
-                8, actual_tensor.element_size() + expected_tensor.element_size() + 4
-            )
             if estimated_temp_bytes > working_bytes:
                 self._torch_assert_accuracy_in_chunks(
                     actual_tensor,
@@ -1603,12 +1635,12 @@ class APITestBase:
                     )
                 return
 
-            # PyTorch supports direct FP8 comparison only for exact tolerances.
-            if not exact_compare:
-                if "float8" in str(actual_tensor.dtype):
-                    actual_tensor = actual_tensor.float()
-                if "float8" in str(expected_tensor.dtype):
-                    expected_tensor = expected_tensor.float()
+            # Keep FP8 diagnostics consistent with the chunked path by comparing
+            # promoted float32 values even for exact comparisons.
+            if "float8" in str(actual_tensor.dtype):
+                actual_tensor = actual_tensor.float()
+            if "float8" in str(expected_tensor.dtype):
+                expected_tensor = expected_tensor.float()
             torch.testing.assert_close(
                 actual_tensor,
                 expected_tensor,

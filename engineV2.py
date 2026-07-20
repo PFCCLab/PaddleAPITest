@@ -575,16 +575,7 @@ def run_test_case(api_config_str, options):
         flush=True,
     )
 
-    total_memory, used_memory = get_memory_info(gpu_id)
-    free_memory = total_memory - used_memory
     runtime_config = runtime_config_for_gpu(options, gpu_id)
-    gpu_config = runtime_config.gpu_mode
-    print(
-        f"{datetime.now()} device {gpu_id} memory total={total_memory:.1f} GB, "
-        f"free={free_memory:.1f} GB, workers={gpu_config.workers_on_gpu}, "
-        f"budget={gpu_config.memory_budget:.1f} GB",
-        flush=True,
-    )
 
     if options.show_runtime_status:
         total_memory, used_memory_before = get_memory_info(gpu_id)
@@ -967,10 +958,9 @@ def main():
     os.environ["USE_CACHED_NUMPY"] = str(options.use_cached_numpy)
     os.environ["USE_GPU_MODE"] = str(options.use_gpu_mode)
     if options.use_gpu_mode:
-        print(
-            "[gpu_mode] enabled: GPU tensor generation, GPU compare, and allocator reuse are active.",
-            flush=True,
-        )
+        print("[gpu_mode] enabled: use GPU tensors and comparison.", flush=True)
+    elif options.use_cached_numpy:
+        print("[use_cached_numpy] enabled: reuse cached NumPy inputs.", flush=True)
     if options.bitwise_alignment:
         options.atol = 0.0
         options.rtol = 0.0
