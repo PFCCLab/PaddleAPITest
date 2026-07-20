@@ -551,10 +551,6 @@ def init_worker_gpu(gpu_worker_list, lock, available_gpus, max_workers_per_gpu, 
 
         redirect_stdio()
 
-        print(
-            f"{datetime.now()} Worker PID: {my_pid}, Assigned GPU ID: {assigned_gpu}",
-            flush=True,
-        )
     except Exception as e:
         print(f"{datetime.now()} Worker {my_pid} initialization failed: {e}", flush=True)
         raise
@@ -562,14 +558,19 @@ def init_worker_gpu(gpu_worker_list, lock, available_gpus, max_workers_per_gpu, 
 
 def run_test_case(api_config_str, options):
     """Run a single test case for the given API configuration."""
-    case_id = write_case_begin(api_config_str)
+    completion = [os.getpid(), None]
+    started_at = time.monotonic()
+    gpu_id = int(os.environ.get("CUDA_VISIBLE_DEVICES", "0").split(",")[0])
+    case_id = write_case_begin(
+        api_config_str,
+        worker_pid=os.getpid(),
+        gpu=gpu_id,
+        paddle_version=options.paddle_version,
+    )
     case_status = "done"
     try:
-        cuda_visible = os.environ.get("CUDA_VISIBLE_DEVICES", "0")
-        gpu_id = int(cuda_visible.split(",")[0])
-
         print(
-            f"{datetime.now()} GPU {gpu_id} {os.getpid()} [paddle {options.paddle_version}] test begin: {api_config_str}",
+            f"test begin: {api_config_str}",
             flush=True,
         )
 
@@ -608,7 +609,7 @@ def run_test_case(api_config_str, options):
             print(f"[config_parse] {api_config_str} {err!s}", flush=True)
             write_terminal_log("config_parse", api_config_str)
             case_status = "error"
-            return os.getpid()
+            return completion
 
         test_class = _select_test_class(options)
         kwargs = {k: v for k, v in vars(options).items() if k in VALID_TEST_ARGS}
@@ -660,7 +661,7 @@ def run_test_case(api_config_str, options):
                         os._exit(exit_code)
             if has_terminal_log(api_config_str):
                 write_checkpoint(api_config_str)
-                return os.getpid()
+                return completion
             # if not fatal error, subprocess will be alive and report error
             print(f"[error] {api_config_str}: {err}", flush=True)
             raise
@@ -690,12 +691,17 @@ def run_test_case(api_config_str, options):
                         flush=True,
                     )
 
-        return os.getpid()
+        return completion
     except BaseException:
         case_status = "error"
         raise
     finally:
-        write_case_end(case_status, case_id=case_id)
+        completion[1] = write_case_end(
+            case_status,
+            case_id=case_id,
+            api_config_str=api_config_str,
+            duration_ms=round((time.monotonic() - started_at) * 1000),
+        )
 
 
 def main():
@@ -1217,18 +1223,18 @@ def main():
                     config = futures[future]
                     checkpoint_ready = True
                     try:
-                        worker_pid = future.result()
-                        mark_inorder_case_complete(worker_pid)
+                        worker_pid, completed_offset = future.result()
+                        mark_inorder_case_complete(worker_pid, completed_offset)
                         if options.show_runtime_status or tested_case % 10000 == 0:
                             print(f"[info] Test case succeeded for {config}", flush=True)
                     except TimeoutError as err:
                         write_terminal_log("timeout", config)
                         worker_pid = getattr(err, "pid", None)
                         if worker_pid is not None:
-                            append_case_end_to_worker_log(
+                            completed_offset = append_case_end_to_worker_log(
                                 worker_pid, "timeout", api_config_str=config
                             )
-                            mark_inorder_case_complete(worker_pid, flush=True)
+                            mark_inorder_case_complete(worker_pid, completed_offset)
                         print(
                             f"[timeout] {config}: {err}",
                             flush=True,
@@ -1281,10 +1287,10 @@ def main():
                         )
                         checkpoint_ready = False  # checkpoint already written by write_terminal_log
                         if worker_pid is not None:
-                            append_case_end_to_worker_log(
+                            completed_offset = append_case_end_to_worker_log(
                                 worker_pid, expired_status, api_config_str=config
                             )
-                            mark_inorder_case_complete(worker_pid, flush=True)
+                            mark_inorder_case_complete(worker_pid, completed_offset)
                     if checkpoint_ready:
                         tested_case += 1
                         if options.show_runtime_status or tested_case % 10000 == 0:

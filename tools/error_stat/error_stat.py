@@ -10,7 +10,11 @@ import re
 import shutil
 from pathlib import Path
 
-from tester.api_config.log_writer import CASE_BEGIN_TAG, CASE_END_TAG, LOG_PREFIXES
+from tester.api_config.log_writer import (
+    CASE_BEGIN_TAG,
+    CASE_END_TAG,
+    LOG_PREFIXES,
+)
 
 DEFAULT_TEST_LOG_PATH = Path("tester/api_config/test_log_big_tensor")
 RESULT_DIR_NAME = "error_stat_result"
@@ -88,12 +92,6 @@ def _parse_tagged_logs(input_text):
             match = re.search(r"case_id=([^\s]+)", line)
             current_case_id = match.group(1) if match else None
             continue
-        if "test begin" in line and current_case_id is None:
-            if current_content:
-                logs.append("\n".join(current_content))
-            current_content = [line]
-            current_case_id = None
-            continue
         if current_content:
             current_content.append(line)
             if line.startswith(CASE_END_TAG):
@@ -145,7 +143,7 @@ def _parse_legacy_logs(input_text):
 
 
 def parse_logs(input_path):
-    # 优先按 CASE tag 分割；旧日志 fallback 到 "test begin" 分割。
+    # 新日志按 CASE tag 分割；无 tag 的存量日志按 test begin 分割。
     log_path = Path(input_path) / "log_inorder.log"
     if not log_path.exists():
         print(f"{log_path} not exists", flush=True)
@@ -161,8 +159,10 @@ def parse_logs(input_path):
     return logs
 
 
-def get_sort_key(content):
-    match = re.search(r"test begin: (.*)$", content.split("\n", 1)[0])
+def get_config_key(content):
+    # Structured logs are split at CASE_BEGIN; the config remains on the
+    # test-begin line inside each block. Legacy blocks use the same line.
+    match = re.search(r"test begin: ([^\r\n]*)", content)
     return match.group(1).strip() if match else ""
 
 
@@ -171,7 +171,7 @@ def classify_by_config(logs, config_sets):
     # 同一 case 理论上只出现在一个终态文件中；checkpoint 不作为分类输出，跳过。
     classified_logs = {}
     for content in logs:
-        key = get_sort_key(content)
+        key = get_config_key(content)
         if not key:
             continue
         for log_type, configs in config_sets.items():
