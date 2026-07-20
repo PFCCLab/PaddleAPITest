@@ -293,7 +293,7 @@ def _sanitizer_worker_loop(slot_index, gpu_id, input_queue, result_queue, option
             api_config_str = task
             result_queue.put(("ack", slot_index, api_config_str))
             case_id = write_case_begin(api_config_str)
-            case_log_dir = get_sanitizer_case_log_dir(slot_index, os.getpid())
+            case_log_dir = get_case_log_dir(slot_index, os.getpid())
             if case_log_dir.exists():
                 shutil.rmtree(case_log_dir)
             case_log_dir.mkdir(parents=True, exist_ok=True)
@@ -360,7 +360,7 @@ def _sanitizer_worker_loop(slot_index, gpu_id, input_queue, result_queue, option
                     sys.stdout.flush()
 
                 if returncode in (0, 2) or analysis.ignore_error_exitcode:
-                    merge_sanitizer_case_logs(case_log_dir)
+                    merge_case_logs(case_log_dir)
                 shutil.rmtree(case_log_dir, ignore_errors=True)
 
                 if returncode == 0 or analysis.ignore_error_exitcode:
@@ -378,6 +378,7 @@ def _sanitizer_worker_loop(slot_index, gpu_id, input_queue, result_queue, option
                         )
                     )
                 else:
+                    write_case_end("crashed", case_id=case_id)
                     result_queue.put(
                         (
                             "crashed",
@@ -625,6 +626,8 @@ class WorkerPool:
         if self._closed or self._shutdown_event.is_set():
             return
         if config is not None:
+            append_case_end_to_worker_log(slot.process.pid, "crashed", api_config_str=config)
+            mark_inorder_case_complete(slot.process.pid, flush=True)
             self.result_queue.put(("crashed", slot.index, config, exitcode))
         self._spawn_worker(slot)
 
@@ -1821,7 +1824,7 @@ def main():
         # when engineV2 was interrupted, resume from .tmp dir
         aggregate_logs(cleanup=True)
         if options.use_compute_sanitizer:
-            cleanup_sanitizer_tmp_dir()
+            clean_case_logs()
         removed_stale_logs = cleanup_uncheckpointed_result_logs()
         if removed_stale_logs:
             print(
@@ -2093,7 +2096,7 @@ def main():
         finally:
             pool.shutdown()
             if options.use_compute_sanitizer:
-                cleanup_sanitizer_tmp_dir()
+                clean_case_logs()
             print(f"{tested_case} cases have been tested.", flush=True)
             log_counts = aggregate_logs(end=True)
             print_log_info(max(all_case - tested_case, 0), log_counts)
