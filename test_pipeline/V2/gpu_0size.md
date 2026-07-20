@@ -67,7 +67,6 @@ LOG_DIR="tester/api_config/test_log_0_size_gpu_accuracy" # 测试日志目录
 NUM_GPUS=-1 # 指定 GPU 数量，-1 表示使用所有 GPU
 NUM_WORKERS_PER_GPU=15 # 每个 GPU 使用 15 个 worker（建议不超过 15 个，否则内存会爆）
 GPU_IDS="-1" # 指定 GPU 列表，-1 表示使用所有 GPU
-REQUIRED_MEMORY=5 # 每个 worker 预估所需显存 GB
 
 TEST_MODE_ARGS=(
 	--accuracy=True
@@ -88,7 +87,6 @@ PARALLEL_ARGS=(
     --num_gpus="$NUM_GPUS"
     --num_workers_per_gpu="$NUM_WORKERS_PER_GPU"
     --gpu_ids="$GPU_IDS"
-    --required_memory="$REQUIRED_MEMORY"
 )
 
 mkdir -p "$LOG_DIR" || {
@@ -135,7 +133,7 @@ TEST_MODE_ARGS=(
 
 若不使用 `run_0_gpu.sh`，以测试 0 size gpu accuracy 为例，可直接执行以下命令：（建议使用 nohup 避免终端终止时停止主进程）
 ```bash
-python engineV2.py --api_config_file_pattern="tester/api_config/7_0_size/0_size_tensor_1_8_[1-2].txt" --accuracy=True --num_gpus=-1 --num_workers_per_gpu=15 --required_memory=5 --log_dir="tester/api_config/test_log_0_size_gpu_accuracy" >> "tester/api_config/test_log_0_size_gpu_accuracy/log.log" 2>&1
+python engineV2.py --api_config_file_pattern="tester/api_config/7_0_size/0_size_tensor_1_8_[1-2].txt" --accuracy=True --num_gpus=-1 --num_workers_per_gpu=15 --log_dir="tester/api_config/test_log_0_size_gpu_accuracy" >> "tester/api_config/test_log_0_size_gpu_accuracy/log.log" 2>&1
 ```
 
 或者直接运行 run_0_gpu.sh：

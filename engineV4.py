@@ -43,6 +43,7 @@ if TYPE_CHECKING:
     )
 
 from tester.api_config.log_writer import *
+from tester.runtime_config import TestRuntimeConfig, runtime_config_for_gpu
 
 os.environ["FLAGS_use_system_allocator"] = "1"
 os.environ["NVIDIA_TF32_OVERRIDE"] = "0"
@@ -50,6 +51,11 @@ os.environ["NVIDIA_TF32_OVERRIDE"] = "0"
 FATAL_CUDA_EXIT_CODE = 99
 FATAL_OOM_EXIT_CODE = 98
 FATAL_TORCH_EXIT_CODE = 97
+
+
+class GpuMemoryDeferred(Exception):
+    """Raised when a GPU-mode case should wait for more free memory."""
+
 
 VALID_TEST_ARGS = {
     "test_amp",
@@ -67,6 +73,7 @@ VALID_TEST_ARGS = {
     "bitwise_alignment",
     "exit_on_error",
     "use_gpu_mode",
+    "runtime_config",
 }
 
 SANITIZER_FORWARD_ARGS = {
@@ -84,7 +91,6 @@ SANITIZER_FORWARD_ARGS = {
     "test_cpu",
     "use_cached_numpy",
     "log_dir",
-    "required_memory",
     "atol",
     "rtol",
     "manual_threshold_config_file",
@@ -207,6 +213,17 @@ def _worker_loop(slot_index, gpu_id, input_queue, result_queue, options):
             run_test_case(api_config_str, options)
             result_queue.put(
                 ("done", slot_index, api_config_str, os.getpid(), get_worker_log_offset())
+            )
+        except GpuMemoryDeferred as e:
+            result_queue.put(
+                (
+                    "deferred",
+                    slot_index,
+                    api_config_str,
+                    str(e),
+                    os.getpid(),
+                    get_worker_log_offset(),
+                )
             )
         except SystemExit:
             # run_test_case calls os._exit for CUDA errors, this shouldn't reach here
@@ -430,6 +447,15 @@ class WorkerPool:
             self.options = SimpleNamespace(**vars(options))
         else:
             self.options = options
+        self.options.gpu_workers_per_gpu_map = dict(max_workers_per_gpu)
+        gpu_total_memory_map = {}
+        for gpu_id in available_gpus:
+            try:
+                gpu_total_memory_map[gpu_id] = get_memory_info(gpu_id)[0]
+            except Exception:
+                pass
+        self.options.gpu_total_memory_map = gpu_total_memory_map
+        self.options.runtime_config = TestRuntimeConfig.from_options(self.options)
         self.result_queue = mp.Queue()
         self.slots: list[WorkerSlot] = []
         self._shutdown_event = threading.Event()
@@ -1049,11 +1075,6 @@ def validate_gpu_options(options) -> tuple:
             f"invalid --num_workers_per_gpu={options.num_workers_per_gpu}: "
             "expected -1 or a positive integer"
         )
-    if options.required_memory <= 0:
-        raise ValueError(
-            f"invalid --required_memory={options.required_memory:g}: "
-            "expected a positive number of GiB"
-        )
     return tuple(gpu_ids)
 
 
@@ -1070,6 +1091,9 @@ def parse_bool(value):
 
 def _prepare_single_config_gpu(options):
     if options.test_cpu:
+        options.gpu_workers_per_gpu_map = {}
+        options.gpu_total_memory_map = {}
+        options.runtime_config = TestRuntimeConfig.from_options(options)
         return None
 
     gpu_ids = validate_gpu_options(options)
@@ -1078,6 +1102,13 @@ def _prepare_single_config_gpu(options):
             f"single --api_config run supports exactly one GPU; got {len(gpu_ids)} GPUs: {gpu_ids}"
         )
     os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_ids[0])
+    try:
+        options.gpu_total_memory_map = {gpu_ids[0]: get_memory_info(gpu_ids[0])[0]}
+    except Exception:
+        options.gpu_total_memory_map = {}
+    options.gpu_workers_per_gpu_map = {gpu_ids[0]: 1}
+    options.runtime_config = TestRuntimeConfig.from_options(options)
+    options.runtime_config = runtime_config_for_gpu(options, gpu_ids[0])
     return gpu_ids[0]
 
 
@@ -1286,29 +1317,7 @@ def run_test_case(api_config_str, options):
     case_status = "done"
     try:
         print(f"test begin: {api_config_str}", flush=True)
-
-        max_memory_wait = 30  # max 30 iterations × 10s = 5 minutes
-        for wait_iter in range(max_memory_wait):
-            total_memory, used_memory = get_memory_info(gpu_id)
-            free_memory = total_memory - used_memory
-
-            if free_memory >= options.required_memory:
-                break
-
-            if wait_iter % 6 == 0:  # log every ~60s (every 6th iteration)
-                print(
-                    f"{datetime.now()} device {gpu_id} Free: {free_memory:.1f} GB, "
-                    f"Required: {options.required_memory:.1f} GB. "
-                    f"Waiting for available memory... (attempt {wait_iter + 1}/{max_memory_wait})",
-                    flush=True,
-                )
-            time.sleep(10)
-        else:
-            print(
-                f"{datetime.now()} device {gpu_id} Memory wait timeout after {max_memory_wait * 10}s. "
-                f"Proceeding anyway (free={free_memory:.1f} GB, required={options.required_memory:.1f} GB).",
-                flush=True,
-            )
+        runtime_config = runtime_config_for_gpu(options, gpu_id)
 
         try:
             api_config = APIConfig(api_config_str)
@@ -1320,6 +1329,7 @@ def run_test_case(api_config_str, options):
 
         test_class = _select_test_class(options)
         kwargs = {k: v for k, v in vars(options).items() if k in VALID_TEST_ARGS}
+        kwargs["runtime_config"] = runtime_config
         case = test_class(api_config, **kwargs)
         try:
             case.test()
@@ -1383,6 +1393,9 @@ def run_test_case(api_config_str, options):
             ) and not getattr(options, "use_gpu_mode", False):
                 _clear_device_cache(options)
 
+    except GpuMemoryDeferred:
+        case_status = "deferred"
+        raise
     except BaseException:
         case_status = "error"
         raise
@@ -1495,19 +1508,13 @@ def main():
         "--num_workers_per_gpu",
         type=int,
         default=1,
-        help="Workers per GPU. Use -1 to maximize workers based on free memory.",
+        help="Workers per GPU. In gpu_mode, -1 uses one worker per GPU.",
     )
     parser.add_argument(
         "--gpu_ids",
         type=str,
         default="",
         help="GPU IDs to use, e.g. '0', '0,2', '0-3'. Use '-1' for all GPUs.",
-    )
-    parser.add_argument(
-        "--required_memory",
-        type=float,
-        default=10.0,
-        help="Minimum free memory required per worker, in GiB.",
     )
     parser.add_argument(
         "--test_cpu",
@@ -1712,12 +1719,10 @@ def main():
         options.use_cached_numpy = False
     os.environ["USE_CACHED_NUMPY"] = str(options.use_cached_numpy)
     os.environ["USE_GPU_MODE"] = str(options.use_gpu_mode)
-    os.environ["SKIP_GPU_CLEANUP"] = str(options.use_gpu_mode)
     if options.use_gpu_mode:
-        print(
-            "[gpu_mode] enabled: GPU tensor generation, GPU compare, and allocator reuse are active.",
-            flush=True,
-        )
+        print("[gpu_mode] enabled: use GPU tensors and comparison.", flush=True)
+    elif options.use_cached_numpy:
+        print("[use_cached_numpy] enabled: reuse cached NumPy inputs.", flush=True)
     if options.bitwise_alignment:
         options.atol = 0.0
         options.rtol = 0.0
@@ -1764,62 +1769,16 @@ def main():
         init_log(options.log_dir, worker_tmp_logs=True)
 
         options.api_config = options.api_config.strip()
-        print(
-            f"{datetime.now()} [paddle {paddle_version}] test begin: {options.api_config}",
-            flush=True,
-        )
         try:
-            api_config = APIConfig(options.api_config)
-        except Exception as err:
-            print(f"[config_parse] {options.api_config} {err!s}", flush=True)
-            return
-
-        test_class = _select_test_class(options)
-
-        if options.test_cpu:
-            import paddle
-
-            paddle.device.set_device("cpu")
-        if options.custom_device_vs_gpu:
-            # custom_device_vs_gpu 模式需要传递额外参数
-            case = test_class(
-                api_config,
-                operation_mode=options.operation_mode,
-                bos_path=options.bos_path,
-                bos_conf_path=options.bos_conf_path,
-                bcecmd_path=options.bcecmd_path,
-                random_seed=options.random_seed,
-                atol=options.atol,
-                rtol=options.rtol,
-            )
-        elif options.accuracy:
-            case = test_class(
-                api_config,
-                test_amp=options.test_amp,
-                atol=options.atol,
-                rtol=options.rtol,
-                manual_threshold_config_file=options.manual_threshold_config_file,
-                test_tol=options.test_tol,
-                bitwise_alignment=options.bitwise_alignment,
-                exit_on_error=options.exit_on_error,
-                use_gpu_mode=options.use_gpu_mode,
-            )
-        else:
-            case = test_class(api_config, test_amp=options.test_amp)
-        try:
-            case.test()
+            run_test_case(options.api_config, options)
         except Exception as err:
             if (
                 "Tensor-likes are not equal" in str(err)
                 or "Mismatched elements" in str(err)
-                or "Tensor-likes are not equal" in str(err)
                 or "Error Message Summary" in str(err)
             ):
                 exit(1)
             print(f"[test error] {options.api_config}: {err}", flush=True)
-        finally:
-            case.clear_tensor()
-            del case
     elif options.api_config_file or options.api_config_file_pattern:
         # validate GPU options
         gpu_ids = validate_gpu_options(options)
@@ -1900,15 +1859,10 @@ def main():
         print(all_case, "cases will be tested.", flush=True)
         del api_config_count, dup_case, finish_case
 
-        # validate GPU memory
-        available_gpus, max_workers_per_gpu = check_gpu_memory(
-            gpu_ids, options.num_workers_per_gpu, options.required_memory
-        )
+        # validate GPU visibility and derive per-GPU worker counts
+        available_gpus, max_workers_per_gpu = check_gpu_memory(gpu_ids, options.num_workers_per_gpu)
         if not available_gpus:
-            print(
-                f"No GPUs with sufficient memory available. Current memory constraint is {options.required_memory} GB.",
-                flush=True,
-            )
+            print("No usable GPUs available.", flush=True)
             return
 
         if (
@@ -1960,6 +1914,13 @@ def main():
             while active_tasks > 0 or pending_dispatch:
                 msg = pool.collect_one(timeout=5.0)
                 if msg is None:
+                    if pending_dispatch:
+                        for slot in pool.idle_slots():
+                            if not pending_dispatch:
+                                break
+                            config = pending_dispatch.pop(0)
+                            pool.dispatch(slot.index, config)
+                            active_tasks += 1
                     continue  # watchdog handles timeouts/crashes
 
                 msg_type = msg[0]
@@ -2004,6 +1965,9 @@ def main():
                     completed_offset = msg[5] if len(msg) > 5 else None
                 elif msg_type == "timeout":
                     worker_pid = msg[3] if len(msg) > 3 else None
+                elif msg_type == "deferred":
+                    worker_pid = msg[4] if len(msg) > 4 else None
+                    completed_offset = msg[5] if len(msg) > 5 else None
                 elif msg_type == "crashed":
                     if len(msg) > 5 and msg[5] == "child":
                         crash_source = "child"
@@ -2013,7 +1977,7 @@ def main():
                         worker_pid = msg[4] if len(msg) > 4 else None
                 if worker_pid is not None:
                     mark_inorder_case_complete(worker_pid, completed_offset)
-                worker_reusable = msg_type in ("done", "error") or (
+                worker_reusable = msg_type in ("done", "error", "deferred") or (
                     msg_type == "crashed"
                     and options.use_compute_sanitizer
                     and crash_source == "child"
@@ -2043,6 +2007,13 @@ def main():
 
                 if worker_reusable:
                     pool.mark_idle(slot_idx)
+
+                if msg_type == "deferred":
+                    reason = msg[3] if len(msg) > 3 else "insufficient GPU memory"
+                    pending_dispatch.append(config)
+                    print(f"[gpu_mode] Deferred {config}: {reason}", flush=True)
+                    continue
+
                 tested_case += 1
 
                 if options.show_runtime_status or tested_case % 10000 == 0:

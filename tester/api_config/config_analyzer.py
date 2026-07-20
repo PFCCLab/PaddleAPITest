@@ -25,7 +25,6 @@ torch = _LazyTorch()
 USE_CACHED_NUMPY = os.getenv("USE_CACHED_NUMPY", "False").lower() == "true"
 TEST_NON_CONTIGUOUS = os.getenv("TEST_NON_CONTIGUOUS", "0").lower() in ("true", "1")
 USE_GPU_MODE = os.getenv("USE_GPU_MODE", "False").lower() == "true"
-SKIP_GPU_CLEANUP = os.getenv("SKIP_GPU_CLEANUP", "False").lower() == "true"
 cached_numpy = {}
 AUTOGRAD_DTYPES = frozenset(
     ["float32", "float64", "float16", "complex64", "complex128", "bfloat16"]
@@ -43,21 +42,8 @@ def _load_forward_only_apis():
 FORWARD_ONLY_APIS = _load_forward_only_apis()
 
 
-def _env_bool(name, default=False):
-    return os.getenv(name, str(default)).lower() in ("true", "1", "yes", "y")
-
-
-def set_gpu_mode(enabled):
-    os.environ["USE_GPU_MODE"] = str(bool(enabled))
-    os.environ["SKIP_GPU_CLEANUP"] = str(bool(enabled))
-
-
 def is_gpu_mode():
-    return _env_bool("USE_GPU_MODE", USE_GPU_MODE)
-
-
-def should_skip_gpu_cleanup():
-    return _env_bool("SKIP_GPU_CLEANUP", SKIP_GPU_CLEANUP)
+    return os.getenv("USE_GPU_MODE", str(USE_GPU_MODE)).lower() in ("true", "1", "yes", "y")
 
 
 def _shape_tuple(shape):
@@ -189,7 +175,6 @@ class TensorConfig:
         self.numpy_tensor = None
         self.paddle_tensor = None
         self.torch_tensor = None
-        self.gpu_source_tensor = None
         self.shuffle_dims = None
 
     def __deepcopy__(self, memo):
@@ -249,7 +234,7 @@ class TensorConfig:
     def get_cached_numpy(self, dtype, shape, generation_kind="input", scale=1.2):
         return get_cached_numpy_array(dtype, shape, generation_kind=generation_kind, scale=scale)
 
-    def _use_gpu(self, dtype=None):
+    def _use_gpu(self, api_config=None, dtype=None):
         if not is_gpu_mode():
             return False
         if self.place is not None and "cpu" in str(self.place).lower():
@@ -293,6 +278,35 @@ class TensorConfig:
         base_dtype = "float16" if dtype in FLOAT8_DTYPES else "float32"
         return ((paddle.rand(shape, dtype=base_dtype) - 0.5) * 1.2).cast(dtype)
 
+    def _make_gpu_torch_low_temp_dense_tensor(self, dtype, pattern_dtype=None):
+        pattern_dtype = pattern_dtype or torch.float32
+        torch_dtype = self.convert_dtype_to_torch_type(dtype)
+        shape = tuple(self.shape)
+        device = torch.device("cuda", torch.cuda.current_device())
+        tensor = torch.empty(shape, device=device, dtype=torch_dtype)
+        flat_tensor = tensor.reshape(-1)
+        numel = self.numel()
+        if numel == 0:
+            return tensor
+
+        chunk_elems = min(numel, 8 * 1024 * 1024)
+        pattern_elems = min(chunk_elems, 1024 * 1024)
+        pattern = torch.linspace(
+            -0.6,
+            0.6,
+            steps=pattern_elems,
+            device=device,
+            dtype=pattern_dtype,
+        ).to(dtype=torch_dtype)
+        for start in range(0, numel, chunk_elems):
+            end = min(start + chunk_elems, numel)
+            offset = start
+            while offset < end:
+                next_offset = min(offset + pattern_elems, end)
+                flat_tensor[offset:next_offset] = pattern[: next_offset - offset]
+                offset = next_offset
+        return tensor
+
     def _make_gpu_torch_dense_tensor(self, dtype=None):
         dtype = dtype or self.dtype
         torch_dtype = self.convert_dtype_to_torch_type(dtype)
@@ -309,8 +323,11 @@ class TensorConfig:
             real_part = (torch.rand(shape, device=device, dtype=real_dtype) - 0.5) * 1.2
             imag_part = (torch.rand(shape, device=device, dtype=real_dtype) - 0.5) * 1.2
             return (real_part + 1j * imag_part).to(dtype=torch_dtype)
-        base_dtype = torch.float16 if dtype in FLOAT8_DTYPES else torch.float32
-        return ((torch.rand(shape, device=device, dtype=base_dtype) - 0.5) * 1.2).to(
+        if dtype in FLOAT8_DTYPES:
+            return self._make_gpu_torch_low_temp_dense_tensor(dtype, pattern_dtype=torch.float16)
+        if dtype in ("float16", "bfloat16"):
+            return self._make_gpu_torch_low_temp_dense_tensor(dtype, pattern_dtype=torch.float32)
+        return ((torch.rand(shape, device=device, dtype=torch.float32) - 0.5) * 1.2).to(
             dtype=torch_dtype
         )
 
@@ -370,26 +387,29 @@ class TensorConfig:
     def _make_gpu_tensor_pair(self, api_config, dtype=None):
         dtype = dtype or self.dtype
         source_dtype = "float16" if dtype in FLOAT8_DTYPES else dtype
-        if self.gpu_source_tensor is None:
-            self.gpu_source_tensor = self._make_gpu_torch_dense_tensor(source_dtype)
-        torch_source = self.gpu_source_tensor
+        torch_source = self._make_gpu_torch_dense_tensor(source_dtype)
         paddle_source = paddle.utils.dlpack.from_dlpack(
-            torch.utils.dlpack.to_dlpack(torch_source.detach().clone())
+            torch.utils.dlpack.to_dlpack(torch_source.detach())
         )
         if not self.is_contiguous and self.strides is not None:
-            paddle_tensor = self._make_gpu_strided_paddle_tensor_from_values(
-                paddle_source, api_config, dtype
-            )
-            torch_tensor = self._make_gpu_strided_torch_tensor_from_values(
-                torch_source, api_config, dtype
-            )
-            return paddle_tensor, torch_tensor
+            try:
+                paddle_tensor = self._make_gpu_strided_paddle_tensor_from_values(
+                    paddle_source, api_config, dtype
+                )
+                torch_tensor = self._make_gpu_strided_torch_tensor_from_values(
+                    torch_source, api_config, dtype
+                )
+                return paddle_tensor, torch_tensor
+            finally:
+                del torch_source, paddle_source
         if dtype in FLOAT8_DTYPES:
             paddle_tensor = paddle_source.cast(dtype)
             torch_tensor = torch_source.to(dtype=self.convert_dtype_to_torch_type(dtype))
+            del torch_source, paddle_source
         else:
             paddle_tensor = paddle_source
-            torch_tensor = torch_source.detach().clone()
+            torch_tensor = torch_source
+            del torch_source
         paddle_tensor = self._set_paddle_autograd(paddle_tensor, api_config, dtype)
         torch_tensor = self._set_torch_autograd(torch_tensor, api_config, dtype)
         return paddle_tensor, torch_tensor
@@ -2997,43 +3017,41 @@ class TensorConfig:
                             if tokens_per_expert is not None:
                                 tokens_per_expert[:] = [0] * num_experts
                         else:
-                            # Each row randomly assigns 1~min(topk, num_experts) experts
-                            max_assign = min(topk, num_experts)
-                            n_assigned = numpy.random.randint(1, max_assign + 1, size=seqlen)
-                            # For each possible n_assigned value, batch process all rows with that count
-                            for n in range(1, max_assign + 1):
-                                mask = n_assigned == n
-                                count = int(mask.sum())
-                                if count == 0:
-                                    continue
-                                # Generate random expert indices for these rows
-                                expert_indices = numpy.array(
-                                    [
-                                        numpy.random.choice(num_experts, size=n, replace=False)
-                                        for _ in range(count)
-                                    ],
-                                    dtype="int32",
-                                )
-                                # Generate random positions for these rows
-                                position_indices = numpy.array(
-                                    [
-                                        numpy.random.choice(topk, size=n, replace=False)
-                                        for _ in range(count)
-                                    ],
-                                    dtype="int32",
-                                )
-                                row_indices = numpy.where(mask)[0]
-                                for j in range(n):
-                                    routemap[row_indices, position_indices[:, j]] = expert_indices[
-                                        :, j
-                                    ]
-                            self.numpy_tensor = routemap
-                            # Update tokens_per_expert to match the generated routemap
-                            tokens_count = [
-                                int(numpy.sum(routemap == e)) for e in range(num_experts)
-                            ]
                             tokens_per_expert = self.get_arg(api_config, 5, "tokens_per_expert")
-                            tokens_per_expert[:] = tokens_count
+                            if (
+                                isinstance(tokens_per_expert, list)
+                                and len(tokens_per_expert) == num_experts
+                            ):
+                                total_assignments = sum(tokens_per_expert)
+                                if total_assignments > seqlen * topk or any(
+                                    count < 0 or count > seqlen for count in tokens_per_expert
+                                ):
+                                    raise ValueError(
+                                        "tokens_per_expert cannot be represented by the "
+                                        "expert_routemap_topk shape"
+                                    )
+                                cursor = 0
+                                for expert, count in enumerate(tokens_per_expert):
+                                    positions = numpy.arange(cursor, cursor + count, dtype="int64")
+                                    rows = positions % seqlen
+                                    columns = (positions // seqlen) % topk
+                                    routemap[rows, columns] = expert
+                                    cursor += count
+                            else:
+                                max_assign = min(topk, num_experts)
+                                n_assigned = numpy.random.randint(1, max_assign + 1, size=seqlen)
+                                for row, count in enumerate(n_assigned):
+                                    columns = numpy.random.choice(topk, size=count, replace=False)
+                                    routemap[row, columns] = numpy.random.choice(
+                                        num_experts, size=count, replace=False
+                                    )
+                                tokens_count = [
+                                    int(numpy.sum(routemap == expert))
+                                    for expert in range(num_experts)
+                                ]
+                                if tokens_per_expert is not None:
+                                    tokens_per_expert[:] = tokens_count
+                            self.numpy_tensor = routemap
                     # expert_prob_topk (arg3): float32, shape [seqlen, topk], value in [0, 1]
                     elif self.check_arg(api_config, 3, "expert_prob_topk"):
                         routemap_config = self.get_arg(api_config, 2, "expert_routemap_topk")
@@ -3145,7 +3163,7 @@ class TensorConfig:
                         self.numpy_tensor = numpy.random.random(self.shape).astype("float32")
 
             if self.numpy_tensor is None:
-                if self._use_gpu(original_dtype):
+                if self._use_gpu(api_config, original_dtype):
                     self.get_gpu_paddle_tensor(api_config, original_dtype)
                 elif self.shape == []:
                     if "int" in self.dtype:
@@ -3188,7 +3206,7 @@ class TensorConfig:
 
     def get_paddle_tensor(self, api_config):
         if self.paddle_tensor is None:
-            if self.numpy_tensor is None and self._use_gpu():
+            if self.numpy_tensor is None and self._use_gpu(api_config):
                 return self.get_gpu_paddle_tensor(api_config)
             if not self.is_contiguous and self.strides is not None:
                 self.paddle_tensor = self._create_strided_paddle_tensor(api_config)
@@ -3267,7 +3285,7 @@ class TensorConfig:
         device = torch.device("cuda:0") if torch.cuda.is_available() else torch.device("cpu")
         torch.set_default_device(device)
         if self.torch_tensor is None:
-            if self.numpy_tensor is None and self._use_gpu():
+            if self.numpy_tensor is None and self._use_gpu(api_config):
                 return self.get_gpu_torch_tensor(api_config)
             if not self.is_contiguous and self.strides is not None:
                 self.torch_tensor = self._create_strided_torch_tensor(api_config)
@@ -3336,14 +3354,14 @@ class TensorConfig:
         self.torch_tensor = None
         self.paddle_tensor = None
         self.numpy_tensor = None
-        if not should_skip_gpu_cleanup():
+        if not is_gpu_mode():
             torch.cuda.empty_cache()
             paddle.device.cuda.empty_cache()
 
     def clear_paddle_tensor(self):
         del self.paddle_tensor
         self.paddle_tensor = None
-        if not should_skip_gpu_cleanup():
+        if not is_gpu_mode():
             paddle.device.cuda.empty_cache()
 
     def clear_numpy_tensor(self):
@@ -3353,7 +3371,7 @@ class TensorConfig:
     def clear_torch_tensor(self):
         del self.torch_tensor
         self.torch_tensor = None
-        if not should_skip_gpu_cleanup():
+        if not is_gpu_mode():
             torch.cuda.empty_cache()
 
     def fill_numpy_tensor(self, full_value):

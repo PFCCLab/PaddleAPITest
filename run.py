@@ -56,7 +56,6 @@ ENGINE_ARG_TYPES = {
     "num_gpus": int,
     "num_workers_per_gpu": int,
     "gpu_ids": str,
-    "required_memory": (int, float),
     "test_cpu": bool,
     "use_cached_numpy": bool,
     "use_gpu_mode": bool,
@@ -290,7 +289,6 @@ def apply_overrides(config: dict[str, Any], args: argparse.Namespace) -> None:
         "num_gpus": args.num_gpus,
         "num_workers_per_gpu": args.num_workers_per_gpu,
         "gpu_ids": args.gpu_ids,
-        "required_memory": args.required_memory,
     }
     for key, value in simple_engine_overrides.items():
         if value is not None:
@@ -676,7 +674,6 @@ def parse_args() -> argparse.Namespace:
         "--num-workers-per-gpu", type=int, help="覆盖 engine_args.num_workers_per_gpu"
     )
     parser.add_argument("--gpu-ids", help="覆盖 engine_args.gpu_ids")
-    parser.add_argument("--required-memory", type=float, help="覆盖 engine_args.required_memory")
     parser.add_argument(
         "--set-env", action="append", default=[], help="追加或覆盖环境变量 KEY=VALUE"
     )
