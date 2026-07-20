@@ -11,12 +11,12 @@
 #   bash run_pipeline.sh -i api_config_0703 -o api_config_dedup_0703
 #
 # 最终输出：
-#   api_config_1M_paddleonly.txt              - 推导 1M，去重（仅 1M）
-#   api_config_{1024,2048,4096}_paddleonly.txt - 原始配置合并去重，文件名按实际存在的 seq 动态生成
-#   api_config_0size_paddleonly.txt           - 0size 配置去重
-#   1M_api_extracted.txt                      - 从上面提取的 API 名集合
-#   {1024,2048,4096}_api_extracted.txt        - 从上面提取的 API 名集合
-#   0size_api_extracted.txt                   - 从上面提取的 API 名集合
+#   paddleonly/1M_preprocessed.txt                  - 推导 1M，去重（仅 1M）
+#   paddleonly/2048_4096_8192_preprocessed.txt      - 原始配置合并去重，日志会显示实际参与合并的 seq
+#   paddleonly_0size/0size_preprocessed.txt         - 0size 配置去重
+#   paddleonly/1M_api_extracted.txt                 - 从上面提取的 API 名集合
+#   paddleonly/2048_4096_8192_api_extracted.txt      - 从上面提取的 API 名集合
+#   paddleonly_0size/0size_api_extracted.txt        - 从上面提取的 API 名集合
 #
 # 注：1024/2048 为必需（用于推导 4096/1M），缺失会直接报错退出；
 #     4096 缺失仅跳过验证与该 seq 的合并，输出文件名会自动去掉对应部分。
@@ -53,12 +53,18 @@ fi
 INPUT_DIR="$(cd "$INPUT_DIR" && pwd)"
 mkdir -p "$OUTPUT_DIR"
 OUTPUT_DIR="$(cd "$OUTPUT_DIR" && pwd)"
+PADDLEONLY_DIR="$OUTPUT_DIR/paddleonly"
+PADDLEONLY_0SIZE_DIR="$OUTPUT_DIR/paddleonly_0size"
+mkdir -p "$PADDLEONLY_DIR" "$PADDLEONLY_0SIZE_DIR"
 
 echo "======================================================================"
 echo "API Config 全流程处理"
 echo "  输入: $INPUT_DIR"
 echo "  输出: $OUTPUT_DIR"
 echo "======================================================================"
+echo ""
+echo "[输入物料]"
+ls -la "$INPUT_DIR"
 
 # ─── 同步 config_analyzer.py 和 api.yaml ───
 REPO_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
@@ -109,23 +115,23 @@ python "$SCRIPT_DIR/derive_api_seq.py" 1048576 \
     -o "$OUTPUT_DIR/api_config_1M.txt"
 
 # ============================================================================
-# Step 3: 1M 去重 → api_config_1M_paddleonly.txt（仅 1M，不与原始配置合并）
+# Step 3: 1M 去重 → paddleonly/1M_preprocessed.txt（仅 1M，不与原始配置合并）
 # ============================================================================
 echo ""
-echo "[Step 3] 去重 → api_config_1M_paddleonly.txt..."
+echo "[Step 3] 去重 → paddleonly/1M_preprocessed.txt..."
 
 python "$SCRIPT_DIR/dedup_config.py" \
     -i "$OUTPUT_DIR/api_config_1M.txt" \
-    -o "$OUTPUT_DIR/api_config_1M_paddleonly.txt"
+    -o "$PADDLEONLY_DIR/1M_preprocessed.txt"
 
 # ============================================================================
 # Step 4: 合并原始配置(1024+2048+4096，按实际存在的文件)去重
-#         再由该去重结果生成 0size → api_config_0size_paddleonly.txt
+#         再由该去重结果生成 0size → paddleonly_0size/0size_preprocessed.txt
 # ============================================================================
 echo ""
 echo "[Step 4] 合并原始配置(按实际存在的 seq) + 去重，并生成 0-size..."
 
-# 合并原始 seq 配置（不含 1M、8192），文件名按实际存在的 seq 动态生成
+# 合并原始 seq 配置（不含 1M、8192），产物固定命名，日志保留实际存在的 seq
 ORIG_INPUTS=""
 ORIG_SEQS=""
 for seq in 1024 2048 4096; do
@@ -142,8 +148,8 @@ if [ -z "$ORIG_INPUTS" ]; then
     exit 1
 fi
 
-ORIG_MERGED_NAME="api_config_${ORIG_SEQS}_paddleonly.txt"
-echo "  实际参与合并的 seq: $ORIG_SEQS  →  $ORIG_MERGED_NAME"
+ORIG_MERGED_NAME="2048_4096_8192_preprocessed.txt"
+echo "  实际参与合并的 seq: $ORIG_SEQS  →  paddleonly/$ORIG_MERGED_NAME"
 
 python "$SCRIPT_DIR/merge_configs.py" \
     -i $ORIG_INPUTS \
@@ -151,17 +157,17 @@ python "$SCRIPT_DIR/merge_configs.py" \
 
 python "$SCRIPT_DIR/dedup_config.py" \
     -i "$OUTPUT_DIR/_tmp_orig_merged.txt" \
-    -o "$OUTPUT_DIR/$ORIG_MERGED_NAME"
+    -o "$PADDLEONLY_DIR/$ORIG_MERGED_NAME"
 
 # 转 0size
 python "$SCRIPT_DIR/to_0_size_config.py" \
-    -i "$OUTPUT_DIR/$ORIG_MERGED_NAME" \
+    -i "$PADDLEONLY_DIR/$ORIG_MERGED_NAME" \
     -o "$OUTPUT_DIR/_tmp_0size.txt"
 
 # 去重 0size
 python "$SCRIPT_DIR/dedup_config.py" \
     -i "$OUTPUT_DIR/_tmp_0size.txt" \
-    -o "$OUTPUT_DIR/api_config_0size_paddleonly.txt"
+    -o "$PADDLEONLY_0SIZE_DIR/0size_preprocessed.txt"
 
 rm -f "$OUTPUT_DIR/_tmp_orig_merged.txt" "$OUTPUT_DIR/_tmp_0size.txt"
 
@@ -172,16 +178,16 @@ echo ""
 echo "[Step 5] 提取 API 名称集合..."
 
 python "$SCRIPT_DIR/extract_api_set.py" \
-    -i "$OUTPUT_DIR/api_config_1M_paddleonly.txt" \
-    -o "$OUTPUT_DIR/1M_api_extracted.txt"
+    -i "$PADDLEONLY_DIR/1M_preprocessed.txt" \
+    -o "$PADDLEONLY_DIR/1M_api_extracted.txt"
 
 python "$SCRIPT_DIR/extract_api_set.py" \
-    -i "$OUTPUT_DIR/$ORIG_MERGED_NAME" \
-    -o "$OUTPUT_DIR/${ORIG_SEQS}_api_extracted.txt"
+    -i "$PADDLEONLY_DIR/$ORIG_MERGED_NAME" \
+    -o "$PADDLEONLY_DIR/2048_4096_8192_api_extracted.txt"
 
 python "$SCRIPT_DIR/extract_api_set.py" \
-    -i "$OUTPUT_DIR/api_config_0size_paddleonly.txt" \
-    -o "$OUTPUT_DIR/0size_api_extracted.txt"
+    -i "$PADDLEONLY_0SIZE_DIR/0size_preprocessed.txt" \
+    -o "$PADDLEONLY_0SIZE_DIR/0size_api_extracted.txt"
 
 # ============================================================================
 # 清理中间文件，只保留最终结果
