@@ -388,12 +388,6 @@ def append_case_end_to_worker_log(pid, status, case_id=None, api_config_str=None
     try:
         log_file = _get_worker_log_file(pid)
         log_file.parent.mkdir(parents=True, exist_ok=True)
-        if log_file.exists() and " case_id=" in end_line:
-            with log_file.open("rb") as f:
-                f.seek(max(0, log_file.stat().st_size - 65536))
-                tail = f.read().decode("utf-8", errors="replace")
-            if end_line.rsplit(" status=", 1)[0] in tail:
-                return True
         with log_file.open("a", encoding="utf-8") as f:
             f.write(f"{end_line}\n")
         return True

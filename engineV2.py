@@ -607,6 +607,7 @@ def run_test_case(api_config_str, options):
         except Exception as err:
             print(f"[config_parse] {api_config_str} {err!s}", flush=True)
             write_terminal_log("config_parse", api_config_str)
+            case_status = "error"
             return os.getpid()
 
         test_class = _select_test_class(options)
