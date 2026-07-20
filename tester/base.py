@@ -1398,212 +1398,270 @@ class APITestBase:
             else:
                 raise
 
-    def _cast_float8_for_compare(self, tensor):
-        """torch.testing.assert_close cannot compare float8 with non-zero tol."""
-        dtype = str(tensor.dtype)
-        if "float8" in dtype:
-            return tensor.to(dtype=torch.float32)
-        return tensor
-
-    def _prepare_torch_compare_tensors(self, paddle_tensor, torch_tensor):
-        if not paddle_tensor.is_contiguous():
-            paddle_tensor = paddle_tensor.contiguous()
-        paddle_tensor = paddle_tensor.detach()
-
-        if not torch_tensor.is_contiguous():
-            torch_tensor = torch_tensor.contiguous()
-        torch_tensor = torch_tensor.detach()
-
-        paddle_dlpack = paddle.utils.dlpack.to_dlpack(paddle_tensor)  # type: ignore[reportGeneralTypeIssues]
-        converted_paddle_tensor = torch.utils.dlpack.from_dlpack(paddle_dlpack)  # type: ignore[reportGeneralTypeIssues]
-        if torch_tensor.device != converted_paddle_tensor.device:
-            torch_tensor = torch_tensor.to(device=converted_paddle_tensor.device)
-        converted_paddle_tensor = self._cast_float8_for_compare(converted_paddle_tensor)
-        torch_tensor = self._cast_float8_for_compare(torch_tensor)
-        return converted_paddle_tensor, torch_tensor
-
-    def _torch_compare_error_msg(self, actual, expected, atol, rtol, suffix=""):
-        def error_msg(msg):
-            suffix_text = f"\n{suffix}" if suffix else ""
-            return (
-                f"Not equal to tolerance rtol={rtol}, atol={atol}{suffix_text}\n"
-                f"{msg}\n"
-                f"ACTUAL: (shape={actual.shape}, dtype={actual.dtype})\n"
-                f"{actual}\n"
-                f"DESIRED: (shape={expected.shape}, dtype={expected.dtype})\n"
-                f"{expected}"
-            )
-
-        return error_msg
-
-    def _assert_torch_close(self, actual, expected, atol, rtol, is_check_dtype, suffix=""):
-        torch.testing.assert_close(
-            actual,
-            expected,
-            rtol=rtol,
-            atol=atol,
-            equal_nan=True,
-            check_dtype=is_check_dtype,
-            msg=self._torch_compare_error_msg(actual, expected, atol, rtol, suffix),
-        )
-
-    def _torch_assert_accuracy_cpu(
-        self, paddle_tensor, torch_tensor, atol, rtol, is_check_dtype, test_tol, is_backward
+    def _torch_assert_accuracy_in_chunks(
+        self, actual, expected, atol, rtol, error_msg, working_bytes
     ):
-        if not paddle_tensor.is_contiguous():
-            paddle_tensor = paddle_tensor.contiguous()
-        paddle_tensor = paddle_tensor.cpu().detach()
+        temp_bytes_per_element = max(32, actual.element_size() + expected.element_size() + 16)
+        chunk_numel = max(1, working_bytes // temp_bytes_per_element)
+        actual_flat = actual.reshape(-1)
+        expected_flat = expected.reshape(-1)
+        mismatch_count = 0
+        max_abs_diff = -1.0
+        max_abs_index = 0
+        max_rel_diff = -1.0
+        max_rel_index = 0
+        exact_compare = atol == 0.0 and rtol == 0.0
 
-        if not torch_tensor.is_contiguous():
-            torch_tensor = torch_tensor.contiguous()
-        torch_tensor = torch_tensor.cpu().detach()
-
-        paddle_dlpack = paddle.utils.dlpack.to_dlpack(paddle_tensor)  # type: ignore[reportGeneralTypeIssues]
-        converted_paddle_tensor = torch.utils.dlpack.from_dlpack(paddle_dlpack)  # type: ignore[reportGeneralTypeIssues]
-        converted_paddle_tensor = self._cast_float8_for_compare(converted_paddle_tensor)
-        torch_tensor = self._cast_float8_for_compare(torch_tensor)
-
-        try:
-            self._assert_torch_close(
-                converted_paddle_tensor,
-                torch_tensor,
-                atol,
-                rtol,
-                is_check_dtype,
-            )
-            if test_tol:
-                api_name = self.api_config.api_name
-                config = self.api_config.config[:120000]
-                log_accuracy_tolerance(
-                    "Identical",
-                    api_name,
-                    config,
-                    str(paddle_tensor.dtype),
-                    is_backward,
-                )
-        except Exception as e:
-            error_str = str(e)
-            if error_str.startswith("Comparing"):
-                if os.environ.get("PADDLEAPITEST_NP_FALLBACK", "0") == "1":
-                    print(
-                        "[torch_assert_OOM] torch.testing.assert_close OOM, fallback to np_assert",
-                        flush=True,
-                    )
-                    _p = self._cast_float8_for_compare(
-                        torch.utils.dlpack.from_dlpack(
-                            paddle.utils.dlpack.to_dlpack(paddle_tensor.detach().cpu().contiguous())
-                        )
-                    )
-                    _t = self._cast_float8_for_compare(torch_tensor.detach().cpu().contiguous())
-                    # numpy does not support bfloat16, cast to float32
-                    if _p.dtype == torch.bfloat16:
-                        _p = _p.float()
-                    if _t.dtype == torch.bfloat16:
-                        _t = _t.float()
-                    self.np_assert_accuracy(
-                        _p.numpy(),
-                        _t.numpy(),
-                        atol,
-                        rtol,
-                    )
-                else:
-                    raise RuntimeError(
-                        "[torch_assert_OOM] torch.testing.assert_close OOM on large tensor comparison"
-                    )
-            elif test_tol:
-                error_info = error_str.split("\n", maxsplit=2)[1] if "\n" in error_str else None
-                if error_info and (
-                    error_info.startswith("Tensor-likes") or error_info.startswith("Scalars")
-                ):
-                    api_name = self.api_config.api_name
-                    config = self.api_config.config[:120000]
-                    log_accuracy_tolerance(
-                        error_str,
-                        api_name,
-                        config,
-                        str(paddle_tensor.dtype),
-                        is_backward,
-                    )
-            else:
-                raise
-
-    def _torch_assert_accuracy_gpu(self, paddle_tensor, torch_tensor, atol, rtol, is_check_dtype):
-        converted_paddle_tensor, torch_tensor = self._prepare_torch_compare_tensors(
-            paddle_tensor, torch_tensor
+        print(
+            f"[chunk_compare] numel={actual_flat.numel()} chunk_numel={chunk_numel} "
+            f"dtype={actual.dtype}",
+            flush=True,
         )
-        if converted_paddle_tensor.shape != torch_tensor.shape:
-            raise AssertionError(
-                f"shape mismatch: paddle {converted_paddle_tensor.shape}, torch {torch_tensor.shape}"
-            )
-        if is_check_dtype and converted_paddle_tensor.dtype != torch_tensor.dtype:
-            raise AssertionError(
-                f"dtype mismatch: paddle {converted_paddle_tensor.dtype}, torch {torch_tensor.dtype}"
-            )
-
-        try:
-            self._assert_torch_close(
-                converted_paddle_tensor,
-                torch_tensor,
-                atol,
-                rtol,
-                is_check_dtype,
-            )
-        except Exception as e:
-            error_str = str(e)
-            if error_str.startswith("Comparing"):
-                if os.environ.get("PADDLEAPITEST_NP_FALLBACK", "0") == "1":
-                    print(
-                        "[torch_assert_OOM] torch.testing.assert_close OOM, fallback to np_assert",
-                        flush=True,
-                    )
-                    _p = converted_paddle_tensor.cpu()
-                    _t = torch_tensor.cpu()
-                    if _p.dtype == torch.bfloat16:
-                        _p = _p.float()
-                    if _t.dtype == torch.bfloat16:
-                        _t = _t.float()
-                    self.np_assert_accuracy(
-                        _p.numpy(),
-                        _t.numpy(),
-                        atol,
-                        rtol,
-                    )
-                else:
-                    raise RuntimeError(
-                        "[torch_assert_OOM] torch.testing.assert_close OOM on large tensor comparison"
-                    )
+        for start in range(0, actual_flat.numel(), chunk_numel):
+            end = min(actual_flat.numel(), start + chunk_numel)
+            actual_chunk = actual_flat[start:end]
+            expected_chunk = expected_flat[start:end]
+            if exact_compare:
+                equal = actual_chunk == expected_chunk
+                if actual_chunk.is_floating_point() or actual_chunk.is_complex():
+                    equal |= torch.isnan(actual_chunk) & torch.isnan(expected_chunk)
+                mismatch = ~equal
             else:
-                raise
+                if "float8" in str(actual_chunk.dtype):
+                    actual_chunk = actual_chunk.float()
+                if "float8" in str(expected_chunk.dtype):
+                    expected_chunk = expected_chunk.float()
+                mismatch = ~torch.isclose(
+                    actual_chunk,
+                    expected_chunk,
+                    rtol=rtol,
+                    atol=atol,
+                    equal_nan=True,
+                )
 
-    def torch_assert_accuracy(self, paddle_tensor, torch_tensor, atol=1e-2, rtol=1e-2):
-        is_check_dtype = self.api_config.api_name not in not_check_dtype
+            chunk_mismatch_count = int(mismatch.sum().item())
+            mismatch_count += chunk_mismatch_count
+            if chunk_mismatch_count == 0:
+                continue
+
+            if actual_chunk.is_complex() or expected_chunk.is_complex():
+                actual_for_diff = actual_chunk
+                expected_for_diff = expected_chunk
+            elif actual_chunk.dtype == torch.float64 or expected_chunk.dtype == torch.float64:
+                actual_for_diff = actual_chunk.to(torch.float64)
+                expected_for_diff = expected_chunk.to(torch.float64)
+            else:
+                actual_for_diff = actual_chunk.float()
+                expected_for_diff = expected_chunk.float()
+            abs_diff = torch.abs(actual_for_diff - expected_for_diff)
+            abs_diff = abs_diff.masked_fill(~mismatch, -1.0)
+            chunk_max_abs, chunk_abs_index = torch.max(abs_diff, dim=0)
+            chunk_max_abs_value = float(chunk_max_abs.item())
+            if chunk_max_abs_value > max_abs_diff:
+                max_abs_diff = chunk_max_abs_value
+                max_abs_index = start + int(chunk_abs_index.item())
+
+            rel_diff = abs_diff / torch.abs(expected_for_diff)
+            rel_diff = rel_diff.masked_fill(~mismatch, -1.0)
+            chunk_max_rel, chunk_rel_index = torch.max(rel_diff, dim=0)
+            chunk_max_rel_value = float(chunk_max_rel.item())
+            if chunk_max_rel_value > max_rel_diff:
+                max_rel_diff = chunk_max_rel_value
+                max_rel_index = start + int(chunk_rel_index.item())
+
+        if mismatch_count == 0:
+            return
+
+        abs_index = tuple(int(value) for value in numpy.unravel_index(max_abs_index, actual.shape))
+        rel_index = tuple(int(value) for value in numpy.unravel_index(max_rel_index, actual.shape))
+        mismatch_percent = 100.0 * mismatch_count / actual.numel()
+        raise AssertionError(
+            error_msg(
+                "Tensor-likes are not equal!\n\n"
+                f"Mismatched elements: {mismatch_count} / {actual.numel()} "
+                f"({mismatch_percent:.1f}%)\n"
+                f"Greatest absolute difference: {max_abs_diff} at index {abs_index}\n"
+                f"Greatest relative difference: {max_rel_diff} at index {rel_index}"
+            )
+        )
+
+    def torch_assert_accuracy(
+        self,
+        actual,
+        expected,
+        atol=1e-2,
+        rtol=1e-2,
+        check_dtype=None,
+        actual_name="ACTUAL",
+        expected_name="DESIRED",
+        apply_special_tolerance=True,
+    ):
+        is_check_dtype = self.should_check_dtype() if check_dtype is None else check_dtype
         bitwise_alignment = getattr(self, "bitwise_alignment", False)
 
-        if not bitwise_alignment and self.api_config.api_name in special_accuracy_atol_rtol:
+        if (
+            apply_special_tolerance
+            and not bitwise_alignment
+            and self.api_config.api_name in special_accuracy_atol_rtol
+        ):
             atol, rtol = special_accuracy_atol_rtol[self.api_config.api_name]
         test_tol = getattr(self, "test_tol", False)
         is_backward = getattr(self, "is_backward", False)
         if test_tol:
             atol, rtol = 0.0, 0.0
 
-        if test_tol or not self.gpu_mode_config.enabled:
-            self._torch_assert_accuracy_cpu(
-                paddle_tensor,
-                torch_tensor,
-                atol,
-                rtol,
-                is_check_dtype,
-                test_tol,
-                is_backward,
+        compare_on_cpu = test_tol or not self.gpu_mode_config.enabled
+        if isinstance(actual, paddle.Tensor):
+            if not actual.is_contiguous():
+                actual = actual.contiguous()
+            actual = actual.detach()
+            if compare_on_cpu:
+                actual = actual.cpu()
+            actual_tensor = torch.utils.dlpack.from_dlpack(
+                paddle.utils.dlpack.to_dlpack(actual)  # type: ignore[reportGeneralTypeIssues]
             )
-            return
-        self._torch_assert_accuracy_gpu(
-            paddle_tensor,
-            torch_tensor,
-            atol,
-            rtol,
-            is_check_dtype,
-        )
+        elif isinstance(actual, torch.Tensor):
+            if not actual.is_contiguous():
+                actual = actual.contiguous()
+            actual_tensor = actual.detach()
+            if compare_on_cpu:
+                actual_tensor = actual_tensor.cpu()
+        else:
+            raise TypeError(f"Expected Paddle or Torch tensor, but got {type(actual)}")
+
+        if isinstance(expected, paddle.Tensor):
+            if not expected.is_contiguous():
+                expected = expected.contiguous()
+            expected = expected.detach()
+            if compare_on_cpu:
+                expected = expected.cpu()
+            expected_tensor = torch.utils.dlpack.from_dlpack(
+                paddle.utils.dlpack.to_dlpack(expected)  # type: ignore[reportGeneralTypeIssues]
+            )
+        elif isinstance(expected, torch.Tensor):
+            if not expected.is_contiguous():
+                expected = expected.contiguous()
+            expected_tensor = expected.detach()
+            if compare_on_cpu:
+                expected_tensor = expected_tensor.cpu()
+        else:
+            raise TypeError(f"Expected Paddle or Torch tensor, but got {type(expected)}")
+
+        if actual_tensor.device != expected_tensor.device:
+            expected_tensor = expected_tensor.to(device=actual_tensor.device)
+
+        if actual_tensor.shape != expected_tensor.shape:
+            raise AssertionError(
+                f"shape mismatch: {actual_name} {actual_tensor.shape}, "
+                f"{expected_name} {expected_tensor.shape}"
+            )
+        if is_check_dtype and actual_tensor.dtype != expected_tensor.dtype:
+            raise AssertionError(
+                f"dtype mismatch: {actual_name} {actual_tensor.dtype}, "
+                f"{expected_name} {expected_tensor.dtype}"
+            )
+
+        exact_compare = atol == 0.0 and rtol == 0.0
+
+        def error_msg(msg):
+            return (
+                f"Not equal to tolerance rtol={rtol}, atol={atol}\n"
+                f"{msg}\n"
+                f"{actual_name}: (shape={actual_tensor.shape}, dtype={actual_tensor.dtype})\n"
+                f"{actual_tensor}\n"
+                f"{expected_name}: (shape={expected_tensor.shape}, dtype={expected_tensor.dtype})\n"
+                f"{expected_tensor}"
+            )
+
+        try:
+            working_bytes = 1024**3
+            if actual_tensor.is_cuda:
+                try:
+                    free_bytes, _ = torch.cuda.mem_get_info(actual_tensor.device)
+                    working_bytes = min(working_bytes, max(256 * 1024**2, free_bytes // 50))
+                except Exception:
+                    pass
+            estimated_temp_bytes = actual_tensor.numel() * max(
+                8, actual_tensor.element_size() + expected_tensor.element_size() + 4
+            )
+            if estimated_temp_bytes > working_bytes:
+                self._torch_assert_accuracy_in_chunks(
+                    actual_tensor,
+                    expected_tensor,
+                    atol,
+                    rtol,
+                    error_msg,
+                    working_bytes,
+                )
+                if test_tol:
+                    log_accuracy_tolerance(
+                        "Identical",
+                        self.api_config.api_name,
+                        self.api_config.config[:120000],
+                        str(actual.dtype),
+                        is_backward,
+                    )
+                return
+
+            # PyTorch supports direct FP8 comparison only for exact tolerances.
+            if not exact_compare:
+                if "float8" in str(actual_tensor.dtype):
+                    actual_tensor = actual_tensor.float()
+                if "float8" in str(expected_tensor.dtype):
+                    expected_tensor = expected_tensor.float()
+            torch.testing.assert_close(
+                actual_tensor,
+                expected_tensor,
+                rtol=rtol,
+                atol=atol,
+                equal_nan=True,
+                check_device=False,
+                check_dtype=is_check_dtype,
+                msg=error_msg,
+            )
+            if test_tol:
+                log_accuracy_tolerance(
+                    "Identical",
+                    self.api_config.api_name,
+                    self.api_config.config[:120000],
+                    str(actual.dtype),
+                    is_backward,
+                )
+        except Exception as err:
+            error_str = str(err)
+            if error_str.startswith("Comparing"):
+                if os.environ.get("PADDLEAPITEST_NP_FALLBACK", "0") != "1":
+                    raise RuntimeError(
+                        "[torch_assert_OOM] torch.testing.assert_close OOM on large tensor comparison"
+                    ) from err
+                print(
+                    "[torch_assert_OOM] torch.testing.assert_close OOM, fallback to np_assert",
+                    flush=True,
+                )
+                actual_cpu = actual_tensor.cpu()
+                expected_cpu = expected_tensor.cpu()
+                if actual_cpu.dtype == torch.bfloat16 or "float8" in str(actual_cpu.dtype):
+                    actual_cpu = actual_cpu.float()
+                if expected_cpu.dtype == torch.bfloat16 or "float8" in str(expected_cpu.dtype):
+                    expected_cpu = expected_cpu.float()
+                self.np_assert_accuracy(
+                    actual_cpu.numpy(), expected_cpu.numpy(), atol=atol, rtol=rtol
+                )
+                return
+            if test_tol:
+                error_info = error_str.split("\n", maxsplit=2)[1] if "\n" in error_str else None
+                if error_info and (
+                    error_info.startswith("Tensor-likes") or error_info.startswith("Scalars")
+                ):
+                    log_accuracy_tolerance(
+                        error_str,
+                        self.api_config.api_name,
+                        self.api_config.config[:120000],
+                        str(actual.dtype),
+                        is_backward,
+                    )
+                    return
+            raise
 
     def test(self):
         pass

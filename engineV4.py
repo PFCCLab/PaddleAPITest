@@ -1253,7 +1253,7 @@ def check_gpu_memory(gpu_ids, num_workers_per_gpu):
     return available_gpus, max_workers_per_gpu
 
 
-def run_test_case(api_config_str, options):
+def _execute_test_case(api_config_str, options):
     """Run a single test case for the given API configuration."""
     cuda_visible = os.environ.get("CUDA_VISIBLE_DEVICES", "0")
     gpu_id = int(cuda_visible.split(",")[0])
@@ -1334,9 +1334,12 @@ def run_test_case(api_config_str, options):
         # if not fatal error, subprocess will be alive and report error
         print(f"[test error] {api_config_str}: {err}", flush=True)
         raise
+
+
+def run_test_case(api_config_str, options):
+    try:
+        return _execute_test_case(api_config_str, options)
     finally:
-        del test_class, api_config, case
-        gc.collect()
         if not any(
             getattr(options, opt)
             for opt in (
@@ -1344,7 +1347,7 @@ def run_test_case(api_config_str, options):
                 "torch_gpu_performance",
                 "paddle_torch_gpu_performance",
             )
-        ) and not getattr(options, "use_gpu_mode", False):
+        ):
             _clear_device_cache(options)
 
 
@@ -1709,63 +1712,16 @@ def main():
         init_log(options.log_dir, worker_tmp_logs=True)
 
         options.api_config = options.api_config.strip()
-        print(
-            f"{datetime.now()} [paddle {paddle_version}] test begin: {options.api_config}",
-            flush=True,
-        )
         try:
-            api_config = APIConfig(options.api_config)
-        except Exception as err:
-            print(f"[config_parse] {options.api_config} {err!s}", flush=True)
-            return
-
-        test_class = _select_test_class(options)
-
-        if options.test_cpu:
-            import paddle
-
-            paddle.device.set_device("cpu")
-        if options.custom_device_vs_gpu:
-            # custom_device_vs_gpu 模式需要传递额外参数
-            case = test_class(
-                api_config,
-                operation_mode=options.operation_mode,
-                bos_path=options.bos_path,
-                bos_conf_path=options.bos_conf_path,
-                bcecmd_path=options.bcecmd_path,
-                random_seed=options.random_seed,
-                atol=options.atol,
-                rtol=options.rtol,
-            )
-        elif options.accuracy:
-            case = test_class(
-                api_config,
-                test_amp=options.test_amp,
-                atol=options.atol,
-                rtol=options.rtol,
-                manual_threshold_config_file=options.manual_threshold_config_file,
-                test_tol=options.test_tol,
-                bitwise_alignment=options.bitwise_alignment,
-                exit_on_error=options.exit_on_error,
-                use_gpu_mode=options.use_gpu_mode,
-                runtime_config=options.runtime_config,
-            )
-        else:
-            case = test_class(api_config, test_amp=options.test_amp)
-        try:
-            case.test()
+            run_test_case(options.api_config, options)
         except Exception as err:
             if (
                 "Tensor-likes are not equal" in str(err)
                 or "Mismatched elements" in str(err)
-                or "Tensor-likes are not equal" in str(err)
                 or "Error Message Summary" in str(err)
             ):
                 exit(1)
             print(f"[test error] {options.api_config}: {err}", flush=True)
-        finally:
-            case.clear_tensor()
-            del case
     elif options.api_config_file or options.api_config_file_pattern:
         # validate GPU options
         gpu_ids = validate_gpu_options(options)

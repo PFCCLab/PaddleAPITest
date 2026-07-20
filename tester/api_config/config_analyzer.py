@@ -3017,43 +3017,41 @@ class TensorConfig:
                             if tokens_per_expert is not None:
                                 tokens_per_expert[:] = [0] * num_experts
                         else:
-                            # Each row randomly assigns 1~min(topk, num_experts) experts
-                            max_assign = min(topk, num_experts)
-                            n_assigned = numpy.random.randint(1, max_assign + 1, size=seqlen)
-                            # For each possible n_assigned value, batch process all rows with that count
-                            for n in range(1, max_assign + 1):
-                                mask = n_assigned == n
-                                count = int(mask.sum())
-                                if count == 0:
-                                    continue
-                                # Generate random expert indices for these rows
-                                expert_indices = numpy.array(
-                                    [
-                                        numpy.random.choice(num_experts, size=n, replace=False)
-                                        for _ in range(count)
-                                    ],
-                                    dtype="int32",
-                                )
-                                # Generate random positions for these rows
-                                position_indices = numpy.array(
-                                    [
-                                        numpy.random.choice(topk, size=n, replace=False)
-                                        for _ in range(count)
-                                    ],
-                                    dtype="int32",
-                                )
-                                row_indices = numpy.where(mask)[0]
-                                for j in range(n):
-                                    routemap[row_indices, position_indices[:, j]] = expert_indices[
-                                        :, j
-                                    ]
-                            self.numpy_tensor = routemap
-                            # Update tokens_per_expert to match the generated routemap
-                            tokens_count = [
-                                int(numpy.sum(routemap == e)) for e in range(num_experts)
-                            ]
                             tokens_per_expert = self.get_arg(api_config, 5, "tokens_per_expert")
-                            tokens_per_expert[:] = tokens_count
+                            if (
+                                isinstance(tokens_per_expert, list)
+                                and len(tokens_per_expert) == num_experts
+                            ):
+                                total_assignments = sum(tokens_per_expert)
+                                if total_assignments > seqlen * topk or any(
+                                    count < 0 or count > seqlen for count in tokens_per_expert
+                                ):
+                                    raise ValueError(
+                                        "tokens_per_expert cannot be represented by the "
+                                        "expert_routemap_topk shape"
+                                    )
+                                cursor = 0
+                                for expert, count in enumerate(tokens_per_expert):
+                                    positions = numpy.arange(cursor, cursor + count, dtype="int64")
+                                    rows = positions % seqlen
+                                    columns = (positions // seqlen) % topk
+                                    routemap[rows, columns] = expert
+                                    cursor += count
+                            else:
+                                max_assign = min(topk, num_experts)
+                                n_assigned = numpy.random.randint(1, max_assign + 1, size=seqlen)
+                                for row, count in enumerate(n_assigned):
+                                    columns = numpy.random.choice(topk, size=count, replace=False)
+                                    routemap[row, columns] = numpy.random.choice(
+                                        num_experts, size=count, replace=False
+                                    )
+                                tokens_count = [
+                                    int(numpy.sum(routemap == expert))
+                                    for expert in range(num_experts)
+                                ]
+                                if tokens_per_expert is not None:
+                                    tokens_per_expert[:] = tokens_count
+                            self.numpy_tensor = routemap
                     # expert_prob_topk (arg3): float32, shape [seqlen, topk], value in [0, 1]
                     elif self.check_arg(api_config, 3, "expert_prob_topk"):
                         routemap_config = self.get_arg(api_config, 2, "expert_routemap_topk")

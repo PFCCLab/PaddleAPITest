@@ -4353,10 +4353,8 @@ if mat2.dtype == torch.float16 and input.dtype != torch.float16:
 class MoePermuteRule(BaseRule):
     def apply(self, paddle_api: str) -> ConvertResult:
         core = """
-_orig_hs_dtype = hidden_states.dtype
-# Compute in a supported dtype; cast gathered tokens back to the original dtype
-# so float8 inputs match paddle.nn.functional.moe_permute output dtype.
-hidden_states = hidden_states.to(torch.bfloat16) if hidden_states.dtype not in (torch.bfloat16, torch.float32, torch.float16) else hidden_states
+# FP8 zeros, advanced indexing, and assignment are supported on CUDA. Keep FP8
+# throughout this gather to avoid materializing a full BF16 copy of hidden_states.
 do_gather = locals().get('do_gather', True)
 using_ue8m0_scale = locals().get('using_ue8m0_scale', False)
 return_expert_indices = locals().get('return_expert_indices', False)
@@ -4456,8 +4454,6 @@ if do_gather:
     hidden_states_unzipped[_valid_mask_g] = hidden_states[_gather_src[_valid_mask_g]]
 else:
     hidden_states_unzipped = torch.empty(0, token_dim, dtype=hidden_states.dtype, device=_dev)
-if _orig_hs_dtype != hidden_states_unzipped.dtype:
-    hidden_states_unzipped = hidden_states_unzipped.to(_orig_hs_dtype)
 if return_expert_indices:
     expert_indices_out = _gather_expert_id
     result = (hidden_states_unzipped, rowmap, token_prob_unzipped, scale_unzipped, expert_indices_out)
