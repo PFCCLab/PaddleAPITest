@@ -72,6 +72,7 @@ import io
 import os
 import re
 import shutil
+from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
 from typing import Literal
@@ -140,8 +141,8 @@ COMP_TO_DIMENSION = {
 ALL_DIMENSIONS = sorted(set(COMP_TO_DIMENSION.values()))
 TOL_HEADER = ["API", "config", "dtype", "mode", "max_abs_diff", "max_rel_diff"]
 STABLE_HEADER = ["API", "config", "dtype", "comp", "max_abs_diff", "max_rel_diff"]
-CASE_BEGIN_TAG = "[CASE_BEGIN]"
-CASE_END_TAG = "[CASE_END]"
+CASE_BEGIN_TAG = ">>> CASE"
+CASE_END_TAG = "<<< CASE"
 
 _use_worker_tmp_logs = False
 
@@ -153,6 +154,7 @@ _inorder_completed_offsets = {}
 # 配置 -> 全局终态类型；comp 日志写入后也同步到这里，供 checkpoint 逻辑使用。
 _process_terminal_configs = {}
 _case_result_types: dict[str, set[str]] = {}
+_case_comparisons: list[tuple[str, str]] = []
 # dimension -> {config_line -> log_type}，只负责 comp 维度内去重。
 _comp_terminal_configs: dict[str, dict[str, str]] = {}
 
@@ -181,6 +183,7 @@ def _reset_runtime():
     _inorder_completed_offsets.clear()
     _process_terminal_configs.clear()
     _case_result_types.clear()
+    _case_comparisons.clear()
     _comp_terminal_configs.clear()
 
 
@@ -422,17 +425,19 @@ def get_case_id(api_config_str):
 def write_case_begin(api_config_str, *, worker_pid=None, slot=None, gpu=None, paddle_version=None):
     """写入包含执行元数据的 case 起始行并返回其 ID。"""
     case_id = get_case_id(api_config_str)
-    fields = [f"case_id={case_id}"]
-    if worker_pid is not None:
-        fields.append(f"worker_pid={worker_pid}")
-    if slot is not None:
-        fields.append(f"slot={slot}")
-    if gpu is not None:
-        fields.append(f"gpu={gpu}")
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+    fields = [f"{CASE_BEGIN_TAG} {case_id}", timestamp]
     if paddle_version is not None:
-        fields.append(f"paddle_version={paddle_version}")
-    fields.append(f"timestamp={datetime.now().isoformat()}")
-    print(f"{CASE_BEGIN_TAG} {' '.join(fields)}")
+        fields.append(f"Paddle {paddle_version}")
+    if gpu is not None:
+        fields.append(f"GPU {gpu}")
+    if worker_pid is not None:
+        fields.append(f"PID {worker_pid}")
+    if slot is not None:
+        fields.append(f"Slot {slot}")
+    print(" | ".join(fields), flush=True)
+    print(api_config_str, flush=True)
+    print(flush=True)
     return case_id
 
 
@@ -444,14 +449,27 @@ def write_case_end(status, case_id=None, api_config_str=None, duration_ms=None, 
     """为指定 ID 或配置写入 case 结束 tag，支持多个终态结果。"""
     if api_config_str is not None:
         case_id = get_case_id(api_config_str)
-    fields = [f"case_id={case_id}", f"status={status}"]
     if results is None and api_config_str is not None:
         results = _case_results(api_config_str)
-    if results:
-        fields.append(f"results={','.join(sorted(set(results)))}")
+    result_types = set(results or ())
+    if result_types == {"pass"}:
+        outcome = "PASS"
+    elif result_types == {"skip"}:
+        outcome = "SKIP"
+    elif result_types:
+        outcome = "FAIL"
+    else:
+        outcome = status.upper()
+    if _case_comparisons:
+        for start in range(0, len(_case_comparisons), 3):
+            values = _case_comparisons[start : start + 3]
+            print(" | ".join(f"{comp} {result}" for comp, result in values), flush=True)
+        _case_comparisons.clear()
+        print(flush=True)
+    fields = [f"{CASE_END_TAG} {case_id}", outcome]
     if duration_ms is not None:
-        fields.append(f"duration_ms={duration_ms}")
-    print(f"{CASE_END_TAG} {' '.join(fields)}", flush=True)
+        fields.append(f"{duration_ms} ms")
+    print(" | ".join(fields) + "\n\n", flush=True)
     return get_worker_log_offset()
 
 
@@ -468,19 +486,110 @@ def get_worker_log_offset(pid=None):
 
 def append_case_end_to_worker_log(pid, status, case_id=None, api_config_str=None):
     """worker 停止后补写 synthetic case 结束 tag。"""
-    end_line = (
-        f"{CASE_END_TAG} case_id={case_id or get_case_id(api_config_str)} "
-        f"status={status} results={status}"
-    )
+    end_line = f"{CASE_END_TAG} {case_id or get_case_id(api_config_str)} | {status.upper()}"
     try:
         log_file = TMP_LOG_PATH / f"log_{pid}.log"
         log_file.parent.mkdir(parents=True, exist_ok=True)
         with log_file.open("a", encoding="utf-8") as f:
-            f.write(f"{end_line}\n")
+            f.write(f"{end_line}\n\n\n")
         return log_file.stat().st_size
     except Exception as err:
         print(f"Error writing case end to worker log {pid}: {err}", flush=True)
         return None
+
+
+@contextmanager
+def suppress_startup_output():
+    """在 Paddle 和扩展初始化期间静默 stdout/stderr。"""
+    saved_stdout = os.dup(1)
+    saved_stderr = os.dup(2)
+    try:
+        with open(os.devnull, "w") as devnull:
+            os.dup2(devnull.fileno(), 1)
+            os.dup2(devnull.fileno(), 2)
+            yield
+    finally:
+        os.dup2(saved_stdout, 1)
+        os.dup2(saved_stderr, 2)
+        os.close(saved_stdout)
+        os.close(saved_stderr)
+
+
+def format_duration(seconds):
+    """按运行时长选择秒、分钟或小时单位。"""
+    if seconds >= 3600:
+        return f"{seconds / 3600:.2f} h"
+    if seconds >= 60:
+        return f"{seconds / 60:.2f} min"
+    return f"{seconds:.2f} s"
+
+
+def print_run_header(options, paddle_version):
+    """打印一次测试的紧凑启动信息和有效配置。"""
+    modes = (
+        "accuracy",
+        "paddle_only",
+        "paddle_cinn",
+        "paddle_gpu_performance",
+        "torch_gpu_performance",
+        "paddle_torch_gpu_performance",
+        "accuracy_stable",
+        "paddle_custom_device",
+        "custom_device_vs_gpu",
+    )
+    mode = next((name for name in modes if getattr(options, name, False)), "unknown")
+    source = options.api_config_file or options.api_config_file_pattern or "single config"
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+    print(f">>> TEST RUN | {timestamp} | Paddle {paddle_version} | PID {os.getpid()}\n")
+    print("--- OPTIONS")
+    print(f"{'Input':<11}{source}")
+    print(f"{'Output':<11}{options.log_dir or 'tester/api_config/test_log'}")
+    print(f"{'Mode':<11}{mode.replace('_', ' ').title()}")
+    device = "CPU" if options.test_cpu else "GPU " + (options.gpu_ids or "all")
+    print(f"{'Device':<11}{device}")
+    data_mode = (
+        "GPU mode"
+        if options.use_gpu_mode
+        else "Cached NumPy"
+        if options.use_cached_numpy
+        else "NumPy"
+    )
+    print(f"{'Data':<11}{data_mode}")
+    print(f"{'Tolerance':<11}atol {options.atol} | rtol {options.rtol}")
+    print(f"{'Timeout':<11}{options.timeout} s")
+    print(f"{'Runtime':<11}{'detailed' if options.show_runtime_status else 'errors only'}\n")
+
+
+def print_run_footer(total_case, tested_case, remaining_case, log_counts, elapsed, log_dir):
+    """打印统一结果摘要、结束时间和总用时。"""
+    counts = {key: value for key, value in (log_counts or {}).items() if not key.startswith("_")}
+    paddle_types = (
+        "paddle_error",
+        "paddle_accuracy",
+        "paddle_bitwise",
+        "paddle_cuda",
+        "paddle_crash",
+    )
+    test_types = ("torch_error", "config_input", "config_parse", "config_convert")
+    paddle_issues = sum(counts.get(key, 0) for key in paddle_types)
+    test_issues = sum(counts.get(key, 0) for key in test_types)
+    retest = sum(counts.get(key, 0) for key in ("oom", "timeout"))
+    outcome = (
+        "PASS" if remaining_case == 0 and paddle_issues + test_issues + retest == 0 else "DONE"
+    )
+    print("\n--- RESULT")
+    print(
+        f"{'Cases':<11}{tested_case} tested | {counts.get('pass', 0)} pass | "
+        f"{counts.get('skip', 0)} skip | {remaining_case} remaining"
+    )
+    print(f"{'Issues':<11}{paddle_issues} Paddle | {test_issues} test | {retest} retest")
+    print(f"{'Duration':<11}{format_duration(elapsed)}")
+    print(f"{'Logs':<11}{log_dir}")
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+    print(
+        f"\n<<< TEST RUN | {outcome} | {tested_case}/{total_case} completed | {timestamp} | {format_duration(elapsed)}",
+        flush=True,
+    )
 
 
 def _copy_inorder_range(file_path, out_f, start_offset, end_offset):
@@ -911,24 +1020,6 @@ def print_log_info(remaining_case, log_counts=None):
     ]
     test_types = ["torch_error", "config_input", "config_parse", "config_convert"]
 
-    print("\n" + "=" * 50)
-    print("Test Case Statistics".center(50))
-    print("=" * 50)
-    print(f"{'Remaining cases':<30}: {remaining_case:>8}")
-    print(f"{'Tested cases':<30}: {counts.get('checkpoint', 0):>8}")
-    print(f"{'Pass cases':<30}: {counts.get('pass', 0):>8}")
-    print(f"{'Skip cases':<30}: {counts.get('skip', 0):>8}")
-    print(f"{'Paddle issue cases':<30}: {sum(counts.get(key, 0) for key in paddle_types):>8}")
-    print(f"{'Test issue cases':<30}: {sum(counts.get(key, 0) for key in test_types):>8}")
-    print(f"{'Retest cases':<30}: {sum(counts.get(key, 0) for key in ('oom', 'timeout')):>8}")
-    if counts:
-        print("-" * 50)
-        print("Log Type Breakdown:")
-        if is_multi_classification and has_multi_result_overlap:
-            print("  Note: In accuracy_stable mode, one config may appear in multiple result sets.")
-        for log_type, count in counts.items():
-            print(f"  {log_type:<28}: {count:>8}")
-    print("=" * 50 + "\n")
     if is_multi_classification:
         _print_comp_duplicate_classifications(comp_integrity_errors)
     else:
@@ -1032,7 +1123,10 @@ def log_accuracy_tolerance(error_msg, api, config, dtype, is_backward=False):
 
 def log_accuracy_stable(error_msg, api, config, dtype, comp):
     """记录一个比较模式下的稳定性误差。"""
-    print(f"comp={comp} result={error_msg}", flush=True)
+    if "\n" in error_msg:
+        print(f"{comp} {error_msg}", flush=True)
+    else:
+        _case_comparisons.append((comp, error_msg))
     abs_pattern = (
         r"(?:Absolute|Greatest absolute|Max absolute) difference(?: among violations)?: "
         r"(\d+\.?\d*(?:[eE][+-]?\d+)?|nan|inf)\b"

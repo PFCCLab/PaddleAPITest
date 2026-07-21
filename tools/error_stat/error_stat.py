@@ -89,14 +89,16 @@ def _parse_tagged_logs(input_text):
             if current_content:
                 logs.append("\n".join(current_content))
             current_content = [line]
-            match = re.search(r"case_id=([^\s]+)", line)
+            match = re.match(rf"{re.escape(CASE_BEGIN_TAG)} ([^|\s]+)", line)
             current_case_id = match.group(1) if match else None
             continue
         if current_content:
-            current_content.append(line)
             if line.startswith(CASE_END_TAG):
+                while current_content and not current_content[-1].strip():
+                    current_content.pop()
+                current_content.append(line)
                 end_count += 1
-                match = re.search(r"case_id=([^\s]+)", line)
+                match = re.match(rf"{re.escape(CASE_END_TAG)} ([^|\s]+)", line)
                 end_case_id = match.group(1) if match else None
                 if current_case_id and end_case_id and current_case_id != end_case_id:
                     print(
@@ -106,6 +108,8 @@ def _parse_tagged_logs(input_text):
                 logs.append("\n".join(current_content))
                 current_content = []
                 current_case_id = None
+            else:
+                current_content.append(line)
     if current_content:
         logs.append("\n".join(current_content))
     if begin_count != end_count:
@@ -160,8 +164,10 @@ def parse_logs(input_path):
 
 
 def get_config_key(content):
-    # Structured logs are split at CASE_BEGIN; the config remains on the
-    # test-begin line inside each block. Legacy blocks use the same line.
+    # 新格式把 config 固定在 CASE 首行之后；旧日志继续识别 test begin。
+    lines = content.splitlines()
+    if lines and lines[0].startswith(CASE_BEGIN_TAG) and len(lines) > 1:
+        return lines[1].strip()
     match = re.search(r"test begin: ([^\r\n]*)", content)
     return match.group(1).strip() if match else ""
 

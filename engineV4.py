@@ -5,7 +5,6 @@ import gc
 import multiprocessing as mp
 import os
 import queue
-import re
 import shlex
 import shutil
 import signal
@@ -43,6 +42,7 @@ if TYPE_CHECKING:
     )
 
 from tester.api_config.log_writer import *
+from tester.api_config.sanitizer_output import analyze_sanitizer_output
 from tester.runtime_config import TestRuntimeConfig, runtime_config_for_gpu
 
 os.environ["FLAGS_use_system_allocator"] = "1"
@@ -146,19 +146,19 @@ def _init_worker_runtime(slot_index, gpu_id, options, *, redirect_output):
     if gpu_id is not None:
         os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
 
-    import paddle
+    with suppress_startup_output():
+        import paddle
 
-    try:
-        import paddlefleet_ops  # noqa: F401
-    except ImportError:
-        pass
-    try:
-        import FusedQuantOps  # noqa: F401
-    except ImportError:
-        pass
-
-    globals()["paddle"] = paddle
-    globals().update(_load_test_classes(options))
+        try:
+            import paddlefleet_ops  # noqa: F401
+        except ImportError:
+            pass
+        try:
+            import FusedQuantOps  # noqa: F401
+        except ImportError:
+            pass
+        globals()["paddle"] = paddle
+        globals().update(_load_test_classes(options))
 
     if options.test_cpu:
         paddle.device.set_device("cpu")
@@ -372,25 +372,26 @@ def _sanitizer_worker_loop(slot_index, gpu_id, input_queue, result_queue, option
                 child_process = None
                 output_file.seek(0)
                 if returncode == options.sanitizer_error_exitcode:
-                    analysis = _analyze_sanitizer_output(
+                    analysis = analyze_sanitizer_output(
                         output_file.read(), returncode, options.sanitizer_error_exitcode
                     )
-                    if analysis.filtered_output:
+                    if analysis.output:
                         print(
-                            analysis.filtered_output,
-                            end="" if analysis.filtered_output.endswith("\n") else "\n",
+                            analysis.output,
+                            end="" if analysis.output.endswith("\n") else "\n",
                             flush=True,
                         )
                 else:
-                    analysis = SanitizerOutputAnalysis("", False)
+                    analysis = None
                     shutil.copyfileobj(output_file, sys.stdout)
                     sys.stdout.flush()
 
-                if returncode in (0, 2) or analysis.ignore_error_exitcode:
+                ignored = analysis is not None and analysis.only_ignored_diagnostics
+                if returncode in (0, 2) or ignored:
                     merge_sanitizer_case_logs(case_log_dir)
                 shutil.rmtree(case_log_dir, ignore_errors=True)
 
-                if returncode == 0 or analysis.ignore_error_exitcode:
+                if returncode == 0 or ignored:
                     completed_offset = write_case_end("completed", case_id=case_id)
                     result_queue.put(
                         ("done", slot_index, api_config_str, os.getpid(), completed_offset)
@@ -1112,103 +1113,6 @@ def _prepare_single_config_gpu(options):
     return gpu_ids[0]
 
 
-SANITIZER_PREFIX = "========="
-SANITIZER_CUDA_API_ERROR = "CUDA API Error:"
-SANITIZER_PROGRAM_HIT = "Program hit"
-SANITIZER_ERROR_SUMMARY = "ERROR SUMMARY:"
-CUDA_VERSION_ERROR_RE = re.compile(
-    r"cudaVersion argument \(\d+\) exceeds the driver version \(\d+\)"
-)
-
-
-@dataclass(frozen=True)
-class SanitizerOutputAnalysis:
-    filtered_output: str
-    ignore_error_exitcode: bool
-
-
-def _is_sanitizer_block_boundary(line):
-    return line.startswith(SANITIZER_PREFIX) and (
-        SANITIZER_CUDA_API_ERROR in line
-        or SANITIZER_PROGRAM_HIT in line
-        or SANITIZER_ERROR_SUMMARY in line
-    )
-
-
-def _is_cuda_version_error_block(block_lines):
-    first_line = block_lines[0] if block_lines else ""
-    return (
-        SANITIZER_CUDA_API_ERROR in first_line
-        and CUDA_VERSION_ERROR_RE.search("\n".join(block_lines)) is not None
-    )
-
-
-def _is_cu_get_proc_address_invalid_value_block(block_lines):
-    first_line = block_lines[0] if block_lines else ""
-    return "CUDA_ERROR_INVALID_VALUE" in first_line and "cuGetProcAddress_v2" in first_line
-
-
-def _analyze_sanitizer_output(output, returncode, sanitizer_error_exitcode):
-    if returncode != sanitizer_error_exitcode:
-        return SanitizerOutputAnalysis(output, False)
-
-    lines = output.splitlines()
-    filtered_lines = []
-    ignored_line_indices = set()
-    ignored_any = False
-    saw_cuda_version_error = False
-    kept_sanitizer_error = False
-    index = 0
-
-    while index < len(lines):
-        line = lines[index]
-        if not _is_sanitizer_block_boundary(line):
-            index += 1
-            continue
-
-        block_end = index + 1
-        while block_end < len(lines) and not _is_sanitizer_block_boundary(lines[block_end]):
-            block_end += 1
-
-        block_lines = lines[index:block_end]
-        sanitizer_line_indices = [
-            line_index
-            for line_index in range(index, block_end)
-            if lines[line_index].startswith(SANITIZER_PREFIX)
-        ]
-        if _is_cuda_version_error_block(block_lines):
-            ignored_line_indices.update(sanitizer_line_indices)
-            ignored_any = True
-            saw_cuda_version_error = True
-        elif _is_cu_get_proc_address_invalid_value_block(block_lines):
-            ignored_line_indices.update(sanitizer_line_indices)
-            ignored_any = True
-        elif SANITIZER_PROGRAM_HIT in line or SANITIZER_CUDA_API_ERROR in line:
-            kept_sanitizer_error = True
-
-        index = block_end
-
-    ignore_error_exitcode = ignored_any and saw_cuda_version_error and not kept_sanitizer_error
-    for index, line in enumerate(lines):
-        if index in ignored_line_indices:
-            continue
-        if ignore_error_exitcode and SANITIZER_ERROR_SUMMARY in line:
-            continue
-        filtered_lines.append(line)
-
-    return SanitizerOutputAnalysis("\n".join(filtered_lines), ignore_error_exitcode)
-
-
-def _is_ignored_cuda_version_sanitizer_error(output, returncode, sanitizer_error_exitcode):
-    return _analyze_sanitizer_output(
-        output, returncode, sanitizer_error_exitcode
-    ).ignore_error_exitcode
-
-
-def _filter_sanitizer_output(output, returncode, sanitizer_error_exitcode):
-    return _analyze_sanitizer_output(output, returncode, sanitizer_error_exitcode).filtered_output
-
-
 def _validate_sanitizer_command(command):
     try:
         sanitizer_cmd = shlex.split(command)
@@ -1257,16 +1161,16 @@ def _run_single_config_with_sanitizer(options):
         errors="replace",
     )
     raw_output = f"{result.stdout or ''}{result.stderr or ''}"
-    analysis = _analyze_sanitizer_output(
+    analysis = analyze_sanitizer_output(
         raw_output, result.returncode, options.sanitizer_error_exitcode
     )
-    if analysis.filtered_output:
+    if analysis.output:
         print(
-            analysis.filtered_output,
-            end="" if analysis.filtered_output.endswith("\n") else "\n",
+            analysis.output,
+            end="" if analysis.output.endswith("\n") else "\n",
             flush=True,
         )
-    if analysis.ignore_error_exitcode:
+    if analysis.only_ignored_diagnostics:
         return 0
     if result.returncode == options.sanitizer_error_exitcode:
         print(
@@ -1309,7 +1213,6 @@ def run_test_case(api_config_str, options):
         )
     case_status = "done"
     try:
-        print(f"test begin: {api_config_str}", flush=True)
         runtime_config = runtime_config_for_gpu(options, gpu_id)
 
         try:
@@ -1640,9 +1543,7 @@ def main():
     options = parser.parse_args()
     options.paddle_version = paddle_version
     if not options._sanitizer_child:
-        print(f"Main process id: {os.getpid()}")
-        print(f"Options: {vars(options)}", flush=True)
-        print(f"PaddlePaddle version: {paddle_version}", flush=True)
+        print_run_header(options, paddle_version)
     if options.random_seed != parser.get_default("random_seed"):
         np.random.seed(options.random_seed)
 
@@ -1816,7 +1717,6 @@ def main():
 
         # read checkpoint
         finish_configs = read_log("checkpoint")
-        print(len(finish_configs), "cases in checkpoint.", flush=True)
 
         api_config_count = 0
         skipped_non_config = 0
@@ -1838,7 +1738,6 @@ def main():
                 return
         if skipped_non_config:
             print(f"{skipped_non_config} non-config lines skipped.", flush=True)
-        print(api_config_count, "cases in total.", flush=True)
         dup_case = api_config_count - len(api_configs)
         if dup_case > 0:
             print(dup_case, "cases are duplicates and removed.", flush=True)
@@ -1849,7 +1748,10 @@ def main():
         finish_case = api_config_count - all_case
         if finish_case:
             print(finish_case, "cases already tested.", flush=True)
-        print(all_case, "cases will be tested.", flush=True)
+        print("--- PREPARING")
+        print(
+            f"{'Cases':<11}{api_config_count} total | {len(finish_configs)} checkpointed | {all_case} pending"
+        )
         del api_config_count, dup_case, finish_case
 
         # validate GPU visibility and derive per-GPU worker counts
@@ -2011,14 +1913,11 @@ def main():
 
                 if options.show_runtime_status or tested_case % 10000 == 0:
                     print(
-                        f"[{tested_case}/{all_case}] Testing {config}",
+                        f"[{tested_case}/{all_case}] {msg_type.upper()} | {config}",
                         flush=True,
                     )
 
-                if msg_type == "done":
-                    if options.show_runtime_status or tested_case % 10000 == 0:
-                        print(f"[info] Test case succeeded for {config}", flush=True)
-                elif msg_type == "timeout":
+                if msg_type == "timeout":
                     write_to_log("timeout", config)
                     print(
                         f"[error] Test case timed out for {config}",
@@ -2087,19 +1986,22 @@ def main():
         except Exception as e:
             print(f"Unexpected error: {e}", flush=True)
             cleanup(pool)
-            total_time = time.time() - start_time
-            print(f"Test time: {round(total_time / 60, 3)} minutes.", flush=True)
         finally:
             pool.shutdown()
             if options.use_compute_sanitizer:
                 clean_sanitizer_case_logs()
-            print(f"{tested_case} cases have been tested.", flush=True)
             log_counts = aggregate_logs(end=True)
             print_log_info(max(all_case - tested_case, 0), log_counts)
             end_time = time.time()
             total_time = end_time - start_time
-            print(f"Test time: {round(total_time / 60, 3)} minutes.", flush=True)
-    print("Done.")
+            print_run_footer(
+                all_case,
+                tested_case,
+                max(all_case - tested_case, 0),
+                log_counts,
+                total_time,
+                options.log_dir,
+            )
 
 
 if __name__ == "__main__":
