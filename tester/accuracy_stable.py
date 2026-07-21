@@ -8,7 +8,6 @@ import paddle
 import torch
 
 from .accuracy import process_grad_output, process_output
-from .api_config.config_analyzer import TensorConfig
 from .api_config.log_writer import (
     ALL_DIMENSIONS,
     COMP_TO_DIMENSION,
@@ -128,20 +127,6 @@ class APITestAccuracyStable(APITestBase):
         else:
             paddle.device.cuda.empty_cache()
 
-    def _clear_config_tensor_cache(self):
-        def clear(value):
-            if isinstance(value, TensorConfig):
-                value.paddle_tensor = None
-                value.torch_tensor = None
-            elif isinstance(value, (list, tuple)):
-                for item in value:
-                    clear(item)
-
-        for value in self.api_config.args:
-            clear(value)
-        for value in self.api_config.kwargs.values():
-            clear(value)
-
     def _broadcast_to_comp_dimensions(self, log_type, affected_comps):
         """将执行阶段错误广播到所有受影响的 comp 维度"""
         for comp in affected_comps:
@@ -214,11 +199,6 @@ class APITestAccuracyStable(APITestBase):
             if fatal:
                 raise
             return
-
-        # GPU-mode input analysis may materialize a paired Paddle/Torch tensor.
-        # Discard that pre-seed cache so both stable-test iterations generate
-        # their input pair after _reset_random_state().
-        self._clear_config_tensor_cache()
 
         torch_output_pair = []
         torch_grad_pair = []
