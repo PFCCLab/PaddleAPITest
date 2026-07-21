@@ -144,9 +144,13 @@ def classify_runtime_error(error_msg):
     ):
         return "config_input", False
     # Torch-side equivalents of invalid configs (accuracy runs torch before paddle).
-    if "out of bounds for dimension" in error_msg_lower:
-        return "config_input", False
-    if "is invalid for input of size" in error_msg_lower:
+    torch_invalid_config_markers = (
+        "out of bounds for dimension",
+        "is invalid for input of size",
+        "must match the size of tensor b",
+        "does not match the shape of the indexed tensor",
+    )
+    if any(marker in error_msg_lower for marker in torch_invalid_config_markers):
         return "config_input", False
     return None, False
 

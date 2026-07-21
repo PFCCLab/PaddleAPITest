@@ -1908,15 +1908,18 @@ class Fp8QuantBlockwiseRule(BaseRule):
     quantized = cast(x * quant_scale, float8_e4m3fn).
 
     Reference implementation is selected via PADDLEAPITEST_IMPL env var:
-      - "te"    (default): Transformer Engine Float8BlockQuantizer
-      - "torch":           Manual torch scatter-op implementation
+      - "torch" (default): Shape-generic manual Torch implementation
+      - "te":              Transformer Engine Float8BlockQuantizer
     """
 
     def apply(self, paddle_api: str) -> ConvertResult:
         import os
 
         defaults_code, _map_code = self.apply_generic()
-        impl = os.environ.get("PADDLEAPITEST_IMPL", "te")
+        # TE's blockwise transpose kernel rejects valid very-large Paddle
+        # inputs with CUDA_INVALID_ARGUMENT. Use the shape-generic Torch
+        # reference by default; TE remains available for explicit testing.
+        impl = os.environ.get("PADDLEAPITEST_IMPL", "torch")
         if impl == "torch":
             core = self._torch_code()
         else:

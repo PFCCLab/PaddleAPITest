@@ -3005,52 +3005,101 @@ class TensorConfig:
                     # expert_routemap_topk (arg2): int32, shape [seqlen, topk], value in [-1, num_experts)
                     if self.check_arg(api_config, 2, "expert_routemap_topk"):
                         num_experts = self.get_arg(api_config, 4, "num_experts", 32)
-                        if isinstance(num_experts, TensorConfig):
-                            num_experts = 32
+                        hidden_states = self.get_arg(api_config, 0, "hidden_states")
+                        scale = self.get_arg(api_config, 1, "scale")
+                        expert_prob = self.get_arg(api_config, 3, "expert_prob_topk")
+                        tokens_per_expert = self.get_arg(api_config, 5, "tokens_per_expert")
+                        padding_alignment = self.get_arg(api_config, 6, "padding_alignment")
+                        using_ue8m0_scale = self.get_arg(api_config, 8, "using_ue8m0_scale", False)
+                        if (
+                            not isinstance(num_experts, int)
+                            or isinstance(num_experts, bool)
+                            or not 1 <= num_experts <= 64
+                        ):
+                            raise ValueError("num_experts must be an integer in [1, 64]")
+                        if (
+                            not isinstance(padding_alignment, int)
+                            or isinstance(padding_alignment, bool)
+                            or padding_alignment <= 0
+                            or padding_alignment & (padding_alignment - 1)
+                        ):
+                            raise ValueError("padding_alignment must be a positive power of 2")
+                        if not isinstance(hidden_states, TensorConfig) or (
+                            len(hidden_states.shape) != 2
+                            or hidden_states.dtype not in {"bfloat16", "float8_e4m3fn"}
+                        ):
+                            raise ValueError(
+                                "hidden_states must be a rank-2 bfloat16 or float8_e4m3fn tensor"
+                            )
+                        if self.dtype != "int32":
+                            raise ValueError("expert_routemap_topk dtype must be int32")
+                        if not isinstance(expert_prob, TensorConfig) or (
+                            len(expert_prob.shape) != 2 or expert_prob.dtype != "float32"
+                        ):
+                            raise ValueError("expert_prob_topk must be a rank-2 float32 tensor")
                         seqlen, topk = self.shape[0], self.shape[1]
-                        # Generate valid routemap vectorized for large seqlen
-                        routemap = numpy.full(self.shape, -1, dtype="int32")
-                        if topk == 0:
-                            # 0-size topk dimension: routemap stays all -1
-                            self.numpy_tensor = routemap
-                            tokens_per_expert = self.get_arg(api_config, 5, "tokens_per_expert")
-                            if tokens_per_expert is not None:
-                                tokens_per_expert[:] = [0] * num_experts
-                        else:
-                            tokens_per_expert = self.get_arg(api_config, 5, "tokens_per_expert")
-                            if (
-                                isinstance(tokens_per_expert, list)
-                                and len(tokens_per_expert) == num_experts
+                        if not (
+                            isinstance(hidden_states, TensorConfig)
+                            and isinstance(expert_prob, TensorConfig)
+                            and len(hidden_states.shape) == 2
+                            and len(expert_prob.shape) == 2
+                            and hidden_states.shape[0] == seqlen
+                            and tuple(expert_prob.shape) == (seqlen, topk)
+                        ):
+                            raise ValueError(
+                                "hidden_states, expert_routemap_topk, and expert_prob_topk "
+                                "must share sequence_length and top_k dimensions"
+                            )
+                        if hidden_states.dtype == "float8_e4m3fn":
+                            expected_scale_width = (hidden_states.shape[1] + 127) // 128
+                            expected_scale_dtype = "float32"
+                            if using_ue8m0_scale:
+                                expected_scale_width = (expected_scale_width + 3) // 4
+                                expected_scale_dtype = "int32"
+                            if not (
+                                isinstance(scale, TensorConfig)
+                                and tuple(scale.shape) == (seqlen, expected_scale_width)
+                                and scale.dtype == expected_scale_dtype
                             ):
-                                total_assignments = sum(tokens_per_expert)
-                                if total_assignments > seqlen * topk or any(
-                                    count < 0 or count > seqlen for count in tokens_per_expert
-                                ):
-                                    raise ValueError(
-                                        "tokens_per_expert cannot be represented by the "
-                                        "expert_routemap_topk shape"
-                                    )
-                                cursor = 0
-                                for expert, count in enumerate(tokens_per_expert):
-                                    positions = numpy.arange(cursor, cursor + count, dtype="int64")
-                                    rows = positions % seqlen
-                                    columns = (positions // seqlen) % topk
-                                    routemap[rows, columns] = expert
-                                    cursor += count
-                            else:
-                                max_assign = min(topk, num_experts)
-                                n_assigned = numpy.random.randint(1, max_assign + 1, size=seqlen)
-                                for row, count in enumerate(n_assigned):
-                                    columns = numpy.random.choice(topk, size=count, replace=False)
-                                    routemap[row, columns] = numpy.random.choice(
-                                        num_experts, size=count, replace=False
-                                    )
-                                tokens_count = [
-                                    int(numpy.sum(routemap == expert))
-                                    for expert in range(num_experts)
-                                ]
-                                if tokens_per_expert is not None:
-                                    tokens_per_expert[:] = tokens_count
+                                raise ValueError(
+                                    "float8 hidden_states requires scale with shape "
+                                    f"[{seqlen}, {expected_scale_width}] and dtype "
+                                    f"{expected_scale_dtype}"
+                                )
+                        elif scale is not None:
+                            raise ValueError(
+                                "scale must be None when hidden_states dtype is bfloat16"
+                            )
+                        # Generate valid routemap vectorized for large seqlen
+                        routemap = numpy.full((seqlen, topk), -1, dtype="int32")
+                        if topk == 0:
+                            raise ValueError("topk should be greater than 0")
+                        else:
+                            if not isinstance(tokens_per_expert, list):
+                                raise ValueError("tokens_per_expert must be a list of integers")
+                            if len(tokens_per_expert) != num_experts:
+                                raise ValueError("tokens_per_expert length must equal num_experts")
+                            if any(
+                                not isinstance(count, int) or isinstance(count, bool)
+                                for count in tokens_per_expert
+                            ):
+                                raise ValueError("tokens_per_expert must be a list of integers")
+                            total_assignments = sum(tokens_per_expert)
+                            representable = total_assignments <= seqlen * topk and not any(
+                                count < 0 or count > seqlen for count in tokens_per_expert
+                            )
+                            if not representable:
+                                raise ValueError(
+                                    "tokens_per_expert cannot be represented by the "
+                                    "expert_routemap_topk shape"
+                                )
+                            cursor = 0
+                            for expert, count in enumerate(tokens_per_expert):
+                                positions = numpy.arange(cursor, cursor + count, dtype="int64")
+                                rows = positions % seqlen
+                                columns = (positions // seqlen) % topk
+                                routemap[rows, columns] = expert
+                                cursor += count
                             self.numpy_tensor = routemap
                     # expert_prob_topk (arg3): float32, shape [seqlen, topk], value in [0, 1]
                     elif self.check_arg(api_config, 3, "expert_prob_topk"):
@@ -3059,6 +3108,7 @@ class TensorConfig:
                         if (
                             isinstance(routemap_config, TensorConfig)
                             and routemap_config.numpy_tensor is not None
+                            and routemap_config.numpy_tensor.shape == tuple(self.shape)
                         ):
                             mask = routemap_config.numpy_tensor >= 0
                             raw = numpy.random.random(self.shape).astype("float32") * mask
@@ -3081,50 +3131,79 @@ class TensorConfig:
                     # expert_routemap_topk (arg2): int32, shape [seqlen, topk], value in [-1, num_experts)
                     if self.check_arg(api_config, 2, "expert_routemap_topk"):
                         num_experts = self.get_arg(api_config, 5, "num_experts", 32)
-                        if isinstance(num_experts, TensorConfig):
-                            num_experts = 32
+                        total_zipped_tokens = self.get_arg(api_config, 4, "total_zipped_tokens")
+                        hidden_config = self.get_arg(api_config, 0, "hidden_states_unzipped")
+                        rowmap_config = self.get_arg(api_config, 1, "zipped_expertwise_rowmap")
+                        prob_config = self.get_arg(api_config, 3, "token_prob_unzipped")
+                        if (
+                            not isinstance(num_experts, int)
+                            or isinstance(num_experts, bool)
+                            or num_experts <= 0
+                        ):
+                            raise ValueError("num_experts must be a positive integer")
+                        if (
+                            not isinstance(total_zipped_tokens, int)
+                            or isinstance(total_zipped_tokens, bool)
+                            or total_zipped_tokens < 0
+                        ):
+                            raise ValueError("total_zipped_tokens must be a non-negative integer")
+                        if not (
+                            isinstance(hidden_config, TensorConfig)
+                            and len(hidden_config.shape) == 2
+                            and hidden_config.dtype == "bfloat16"
+                        ):
+                            raise ValueError(
+                                "hidden_states_unzipped must be a rank-2 bfloat16 tensor"
+                            )
+                        if not (
+                            isinstance(rowmap_config, TensorConfig)
+                            and len(rowmap_config.shape) == 2
+                            and rowmap_config.dtype == "int32"
+                            and tuple(rowmap_config.shape) == (total_zipped_tokens, num_experts)
+                        ):
+                            raise ValueError(
+                                "zipped_expertwise_rowmap must have shape "
+                                "[total_zipped_tokens, num_experts] and dtype int32"
+                            )
+                        if not (
+                            isinstance(prob_config, TensorConfig)
+                            and len(prob_config.shape) in (1, 2)
+                            and prob_config.shape[0] == hidden_config.shape[0]
+                            and (len(prob_config.shape) == 1 or prob_config.shape[1] == 1)
+                            and prob_config.dtype == "float32"
+                        ):
+                            raise ValueError(
+                                "token_prob_unzipped must have shape "
+                                "[seqlen_broadcasted] or [seqlen_broadcasted, 1] "
+                                "and dtype float32"
+                            )
+                        if self.dtype != "int32" or len(self.shape) != 2:
+                            raise ValueError("expert_routemap_topk must be a rank-2 int32 tensor")
                         seqlen, topk = self.shape[0], self.shape[1]
-                        # Generate valid routemap vectorized for large seqlen
+                        if seqlen != total_zipped_tokens:
+                            raise ValueError(
+                                "expert_routemap_topk sequence length must equal "
+                                "total_zipped_tokens"
+                            )
+                        if topk <= 0:
+                            raise ValueError("topk should be greater than 0")
+                        # Generate at most one route per (token, expert), bounded by
+                        # the number of available broadcast rows.
                         routemap = numpy.full(self.shape, -1, dtype="int32")
-                        if topk == 0:
-                            # 0-size topk dimension: routemap stays all -1
-                            self.numpy_tensor = routemap
-                        else:
-                            max_assign = min(topk, num_experts)
-                            n_assigned = numpy.random.randint(1, max_assign + 1, size=seqlen)
-                            for n in range(1, max_assign + 1):
-                                mask = n_assigned == n
-                                count = int(mask.sum())
-                                if count == 0:
-                                    continue
-                                expert_indices = numpy.array(
-                                    [
-                                        numpy.random.choice(num_experts, size=n, replace=False)
-                                        for _ in range(count)
-                                    ],
-                                    dtype="int32",
-                                )
-                                position_indices = numpy.array(
-                                    [
-                                        numpy.random.choice(topk, size=n, replace=False)
-                                        for _ in range(count)
-                                    ],
-                                    dtype="int32",
-                                )
-                                row_indices = numpy.where(mask)[0]
-                                for j in range(n):
-                                    routemap[row_indices, position_indices[:, j]] = expert_indices[
-                                        :, j
-                                    ]
-                            self.numpy_tensor = routemap
+                        max_assign = min(topk, num_experts)
+                        route_count = min(hidden_config.shape[0], seqlen * max_assign)
+                        positions = numpy.arange(route_count, dtype="int64")
+                        rows = positions % seqlen
+                        columns = positions // seqlen
+                        routemap[rows, columns] = (rows + columns) % num_experts
+                        self.numpy_tensor = routemap
                     # zipped_expertwise_rowmap (arg1): int32, shape [seqlen, num_experts]
                     # Needs to be valid rowmap based on routemap
                     elif self.check_arg(api_config, 1, "zipped_expertwise_rowmap"):
                         routemap_config = self.get_arg(api_config, 2, "expert_routemap_topk")
                         num_experts = self.get_arg(api_config, 5, "num_experts", 32)
-                        if isinstance(num_experts, TensorConfig):
-                            num_experts = 32
-                        seqlen = self.shape[0]
+                        total_zipped_tokens = self.get_arg(api_config, 4, "total_zipped_tokens")
+                        seqlen = total_zipped_tokens
                         # Fetch unzipped seqlen from hidden_states_unzipped (arg0) to
                         # bound expert_counters so fetch_row never exceeds the valid
                         # range of unzipped_token_probs / hidden_states_unzipped.
@@ -3137,6 +3216,14 @@ class TensorConfig:
                             unzipped_seqlen = hidden_config.shape[0]
                         else:
                             unzipped_seqlen = seqlen  # fallback
+                        if self.dtype != "int32" or tuple(self.shape) != (
+                            seqlen,
+                            num_experts,
+                        ):
+                            raise ValueError(
+                                "zipped_expertwise_rowmap must have shape "
+                                "[total_zipped_tokens, num_experts] and dtype int32"
+                            )
                         rowmap = numpy.full(self.shape, -1, dtype="int32")
                         if isinstance(routemap_config, TensorConfig):
                             if routemap_config.numpy_tensor is None:
@@ -3145,21 +3232,44 @@ class TensorConfig:
                                 # Build rowmap and keep routemap consistent: every
                                 # non-negative expert in routemap must map to a valid
                                 # fetch_row because moe_unpermute reads token_prob by it.
-                                expert_counters = numpy.zeros(num_experts, dtype="int32")
                                 routemap = routemap_config.numpy_tensor
+                                expert_counts = numpy.array(
+                                    [
+                                        numpy.count_nonzero(routemap == expert)
+                                        for expert in range(num_experts)
+                                    ],
+                                    dtype="int64",
+                                )
+                                if int(expert_counts.sum()) > unzipped_seqlen:
+                                    raise ValueError(
+                                        "routemap assignments exceed hidden_states_unzipped "
+                                        "capacity"
+                                    )
+                                expert_offsets = numpy.zeros(num_experts, dtype="int64")
+                                expert_offsets[1:] = numpy.cumsum(expert_counts[:-1])
+                                expert_counters = numpy.zeros(num_experts, dtype="int64")
                                 for i in range(seqlen):
                                     for e in range(num_experts):
                                         positions = numpy.where(routemap[i] == e)[0]
                                         if positions.size == 0:
                                             continue
-                                        if expert_counters[e] < unzipped_seqlen:
-                                            rowmap[i, e] = expert_counters[e]
-                                            expert_counters[e] += 1
-                                        else:
-                                            routemap[i, positions] = -1
+                                        rowmap[i, e] = expert_offsets[e] + expert_counters[e]
+                                        expert_counters[e] += 1
                         self.numpy_tensor = rowmap
                     # token_prob_unzipped (arg3): float32, value in [0, 1]
                     elif self.check_arg(api_config, 3, "token_prob_unzipped"):
+                        hidden_config = self.get_arg(api_config, 0, "hidden_states_unzipped")
+                        if not (
+                            self.dtype == "float32"
+                            and len(self.shape) in (1, 2)
+                            and isinstance(hidden_config, TensorConfig)
+                            and self.shape[0] == hidden_config.shape[0]
+                            and (len(self.shape) == 1 or self.shape[1] == 1)
+                        ):
+                            raise ValueError(
+                                "token_prob_unzipped must match the broadcasted sequence "
+                                "length and have dtype float32"
+                            )
                         self.numpy_tensor = numpy.random.random(self.shape).astype("float32")
 
             if self.numpy_tensor is None:
