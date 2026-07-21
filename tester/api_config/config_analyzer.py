@@ -175,6 +175,7 @@ class TensorConfig:
         self.numpy_tensor = None
         self.paddle_tensor = None
         self.torch_tensor = None
+        self.cpu_tensor = None
         self.shuffle_dims = None
 
     def __deepcopy__(self, memo):
@@ -186,6 +187,11 @@ class TensorConfig:
         result.place = copy.deepcopy(self.place)
         result.is_contiguous = self.is_contiguous
         result.strides = copy.deepcopy(self.strides)
+        result.numpy_tensor = None
+        result.paddle_tensor = None
+        result.torch_tensor = None
+        result.cpu_tensor = None
+        result.shuffle_dims = None
         return result
 
     def __str__(self):
@@ -569,9 +575,26 @@ class TensorConfig:
                     beta = self.get_arg(api_config, 10, "beta1")
                     if self.check_arg(api_config, 7, "beta2_pow"):
                         beta = self.get_arg(api_config, 11, "beta2")
+                    # The adamw kernel treats beta_pow as beta ** step. When
+                    # FLAGS_use_accuracy_compatible_kernel is ON, beta_pow is
+                    # kept in high precision, so float64 pow then cast matches
+                    # it. When the flag is OFF, recompute beta ** step with numpy
+                    # in float32 (instead of iterative float32 multiplication) so
+                    # the injected beta_pow lines up with the step-based
+                    # reconstruction used by the kernel and the torch reference.
+                    use_accuracy_compatible = paddle.get_flags(
+                        "FLAGS_use_accuracy_compatible_kernel"
+                    )["FLAGS_use_accuracy_compatible_kernel"]
+                    if use_accuracy_compatible:
+                        beta_pow_value = beta**api_config.adamw_step
+                    else:
+                        beta_pow_value = numpy.power(
+                            numpy.float32(beta),
+                            numpy.float32(api_config.adamw_step),
+                        ).item()
                     self.numpy_tensor = numpy.full(
                         self.shape,
-                        beta**api_config.adamw_step,
+                        beta_pow_value,
                         dtype=self.dtype,
                     )
 
@@ -3316,6 +3339,16 @@ class TensorConfig:
 
     def get_paddle_tensor(self, api_config):
         if self.paddle_tensor is None:
+            if self.cpu_tensor is not None:
+                torch_tensor = self.cpu_tensor.to(
+                    device=torch.device("cuda:0") if self._use_gpu(api_config) else "cpu",
+                    copy=True,
+                )
+                self.paddle_tensor = paddle.utils.dlpack.from_dlpack(
+                    torch.utils.dlpack.to_dlpack(torch_tensor)
+                )
+                self.paddle_tensor.stop_gradient = not self._requires_autograd(api_config)
+                return self.paddle_tensor
             if self.numpy_tensor is None and self._use_gpu(api_config):
                 return self.get_gpu_paddle_tensor(api_config)
             if not self.is_contiguous and self.strides is not None:
@@ -3395,6 +3428,11 @@ class TensorConfig:
         device = torch.device("cuda:0") if torch.cuda.is_available() else torch.device("cpu")
         torch.set_default_device(device)
         if self.torch_tensor is None:
+            if self.cpu_tensor is not None:
+                self.torch_tensor = self.cpu_tensor.to(device=device, copy=True)
+                if self._requires_autograd(api_config):
+                    self.torch_tensor = self.torch_tensor.detach().requires_grad_(True)
+                return self.torch_tensor
             if self.numpy_tensor is None and self._use_gpu(api_config):
                 return self.get_gpu_torch_tensor(api_config)
             if not self.is_contiguous and self.strides is not None:
@@ -3464,6 +3502,7 @@ class TensorConfig:
         self.torch_tensor = None
         self.paddle_tensor = None
         self.numpy_tensor = None
+        self.cpu_tensor = None
         if not is_gpu_mode():
             torch.cuda.empty_cache()
             paddle.device.cuda.empty_cache()
@@ -3483,6 +3522,18 @@ class TensorConfig:
         self.torch_tensor = None
         if not is_gpu_mode():
             torch.cuda.empty_cache()
+
+    def save_original_tensor_to_cpu(self, api_config):
+        """Keep one immutable CPU copy used to recreate isolated test inputs."""
+        if self.cpu_tensor is not None:
+            return
+        tensor = self.get_torch_tensor(api_config)
+        self.cpu_tensor = tensor.detach().to(device="cpu", copy=True)
+        self.paddle_tensor = None
+        self.torch_tensor = None
+
+    def clear_original_cpu_tensor(self):
+        self.cpu_tensor = None
 
     def fill_numpy_tensor(self, full_value):
         self.numpy_tensor = numpy.full(shape=self.shape, fill_value=full_value, dtype=self.dtype)

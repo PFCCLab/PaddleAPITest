@@ -1,10 +1,79 @@
+"""Paddle API 测试日志的写入、结构化边界和聚合。
+
+函数索引：
+- get_cfg：返回当前命令行配置。
+- set_cfg：保存命令行配置并规范化日志文件 ID 后缀。
+- _reset_runtime：关闭缓存句柄并清空进程内日志状态。
+- init_log：设置输出目录并初始化主进程或 worker 日志环境。
+- get_tmp_log_path：返回 worker 临时日志目录。
+- close_process_files：关闭当前进程缓存的所有结果日志句柄。
+- has_terminal_log：判断配置是否已有主终态分类。
+- get_terminal_log_type：返回配置当前的主终态类型。
+- write_checkpoint：记录配置完成并清理其主终态状态。
+- write_terminal_log：依次写入终态分类和 checkpoint。
+- _write_line：复用缓存句柄向指定结果文件追加一行。
+- write_to_log：写入主结果或 worker 结果分片并更新分类状态。
+- has_comp_terminal_log：判断配置在指定 comp 维度是否已有分类。
+- write_to_comp_log：写入 accuracy-stable comp 维度结果并更新状态。
+- read_log：读取一个聚合结果文件中的全部配置。
+- cleanup_uncheckpointed_result_logs：删除没有对应 checkpoint 的残留结果。
+- _read_pending_result_bytes：按结果 offset 读取新增完整行。
+- _save_result_offsets：提交结果 offset，并在 cleanup 时删除已消费分片。
+- get_sanitizer_case_log_dir：返回 sanitizer case 的隔离日志目录。
+- merge_sanitizer_case_logs：将 sanitizer child 结果分片合并回 worker 临时目录。
+- clean_sanitizer_case_logs：清理 sanitizer case 隔离目录。
+- get_case_id：从配置生成稳定的短 case ID。
+- write_case_begin：输出包含运行元数据的结构化 CASE_BEGIN。
+- _case_results：读取配置在当前进程产生的全部结果类型。
+- write_case_end：输出 CASE_END，flush 后返回 worker 安全 offset。
+- get_worker_log_offset：获取当前或指定 worker stdout 文件末尾。
+- append_case_end_to_worker_log：为已停止 worker 补写 synthetic CASE_END。
+- _copy_inorder_range：复制 worker stdout 的安全字节区间并截断超长行。
+- mark_inorder_case_complete：登记 worker 最后完成 case 的安全读取上界。
+- flush_completed_inorder_logs：批量追加所有 worker 已完成区间并提交 offset。
+- _aggregate_text_logs：合并、去重并排序 worker 文本结果分片。
+- _aggregate_result_logs：聚合所有主结果日志类型。
+- _aggregate_inorder_logs：结束或 cleanup 时聚合 worker stdout 剩余内容。
+- _aggregate_csv_logs：按 offset 合并 worker CSV 分片。
+- _sort_csv：按报告字段稳定排序最终 CSV。
+- _count_result_logs：统计分类数量并生成未完成配置文件。
+- _aggregate_comp_logs：按 accuracy-stable comp 维度聚合结果。
+- _find_duplicate_classifications：查找同一目录中的重复分类。
+- _read_log_lines：将单个结果文件读取为配置集合。
+- _sync_comp_main_summary：将 comp 维度分类合并到主结果摘要。
+- _check_log_integrity：检查主目录或 comp 维度的分类完整性。
+- aggregate_logs：编排结果、stdout、CSV 和 comp 聚合及最终统计。
+- _print_duplicate_classifications：打印主结果重复分类。
+- _print_comp_duplicate_classifications：打印 comp 维度重复分类。
+- print_log_info：打印最终测试统计和完整性告警。
+- redirect_stdio：将 worker stdout/stderr 行缓冲重定向到临时日志。
+- restore_stdio：恢复 worker 原始 stdout/stderr。
+- _get_diff：从精度错误消息提取最大绝对和相对误差。
+- _append_csv：向 worker CSV 分片追加表头和数据行。
+- log_accuracy_tolerance：记录 accuracy tolerance 比较结果。
+- log_accuracy_stable：记录 accuracy-stable comp 比较结果。
+
+关键状态：
+- _process_file_handlers：当前进程按路径缓存的结果日志句柄，避免每条结果重复
+  open/close；_write_line 统一复用句柄并处理写入错误。
+- _result_offsets：各 worker 结果文本/CSV 已聚合到的位置。
+- _inorder_offsets：各 worker stdout 已写入 log_inorder.log 的位置。
+- _inorder_completed_offsets：各 worker 最后一个完整 case 的安全读取上界。
+- _process_terminal_configs/_case_result_types：当前 case 的分类和结构化结果。
+- _comp_terminal_configs：各 accuracy-stable comp 维度内的分类状态。
+- stdout_fd/stderr_fd/orig_*：worker 标准流重定向和恢复所需描述符。
+"""
+
 from __future__ import annotations
 
 import csv
+import hashlib
 import io
 import os
 import re
 import shutil
+from contextlib import contextmanager
+from datetime import datetime
 from pathlib import Path
 from typing import Literal
 
@@ -56,14 +125,14 @@ TERMINAL_LOG_TYPES = frozenset(LOG_PREFIXES) - {"checkpoint"}
 
 # === comp 维度配置（accuracy_stable 模式） ===
 COMP_TO_DIMENSION = {
-    "T1P1": "accuracy",
-    "T2P2": "accuracy",
-    "T1P2": "accuracy",
-    "T2P1": "accuracy",
-    "T1P1B": "accuracy_backward",
-    "T2P2B": "accuracy_backward",
-    "T1P2B": "accuracy_backward",
-    "T2P1B": "accuracy_backward",
+    "P1T1": "accuracy",
+    "P2T2": "accuracy",
+    "P2T1": "accuracy",
+    "P1T2": "accuracy",
+    "P1T1B": "accuracy_backward",
+    "P2T2B": "accuracy_backward",
+    "P2T1B": "accuracy_backward",
+    "P1T2B": "accuracy_backward",
     "T1T2": "torch_stable",
     "T1T2B": "torch_stable_backward",
     "P1P2": "paddle_stable",
@@ -72,26 +141,34 @@ COMP_TO_DIMENSION = {
 ALL_DIMENSIONS = sorted(set(COMP_TO_DIMENSION.values()))
 TOL_HEADER = ["API", "config", "dtype", "mode", "max_abs_diff", "max_rel_diff"]
 STABLE_HEADER = ["API", "config", "dtype", "comp", "max_abs_diff", "max_rel_diff"]
+CASE_BEGIN_TAG = ">>> CASE"
+CASE_END_TAG = "<<< CASE"
 
 _use_worker_tmp_logs = False
 
 _process_file_handlers = {}
-_aggregated_offsets = {}
+# 普通结果日志和 inorder stdout 使用不同的 offset 命名空间。
+_result_offsets = {}
+_inorder_offsets = {}
+_inorder_completed_offsets = {}
+# 配置 -> 全局终态类型；comp 日志写入后也同步到这里，供 checkpoint 逻辑使用。
 _process_terminal_configs = {}
-# 每维度的 terminal configs 追踪: dimension -> {config_line -> log_type}
+_case_result_types: dict[str, set[str]] = {}
+_case_comparisons: list[tuple[str, str]] = []
+# dimension -> {config_line -> log_type}，只负责 comp 维度内去重。
 _comp_terminal_configs: dict[str, dict[str, str]] = {}
 
-# Command line arguments configuration
-# Used in engine.py
+# 命令行参数配置，由 engine.py 使用
 CMD_CONFIG = None
 
 
 def get_cfg():
-    global CMD_CONFIG
+    """返回当前命令行配置。"""
     return CMD_CONFIG
 
 
 def set_cfg(cfg):
+    """保存命令行配置，并规范化其文件名后缀。"""
     global CMD_CONFIG
     if cfg.id != "":
         cfg.id = "_" + cfg.id
@@ -99,13 +176,19 @@ def set_cfg(cfg):
 
 
 def _reset_runtime():
+    """清理进程内文件句柄和聚合状态。"""
     close_process_files()
-    _aggregated_offsets.clear()
+    _result_offsets.clear()
+    _inorder_offsets.clear()
+    _inorder_completed_offsets.clear()
     _process_terminal_configs.clear()
+    _case_result_types.clear()
+    _case_comparisons.clear()
     _comp_terminal_configs.clear()
 
 
 def init_log(log_dir=None, *, worker_tmp_logs=False):
+    """初始化日志路径并重置进程内状态。"""
     global TEST_LOG_PATH, TMP_LOG_PATH, _use_worker_tmp_logs
     _reset_runtime()
     if log_dir:
@@ -120,31 +203,12 @@ def init_log(log_dir=None, *, worker_tmp_logs=False):
 
 
 def get_tmp_log_path():
+    """返回当前临时日志目录。"""
     return TMP_LOG_PATH
 
 
-def get_sanitizer_case_log_dir(slot_index, pid):
-    return TMP_LOG_PATH / "sanitizer" / f"slot_{slot_index}_{pid}"
-
-
-def merge_sanitizer_case_logs(case_log_dir):
-    case_tmp_dir = case_log_dir / ".tmp"
-    if not case_tmp_dir.exists():
-        return
-    for child_log in case_tmp_dir.iterdir():
-        if not child_log.is_file():
-            continue
-        target_log = TMP_LOG_PATH / child_log.name
-        with child_log.open("rb") as in_f, target_log.open("ab") as out_f:
-            shutil.copyfileobj(in_f, out_f)
-
-
-def cleanup_sanitizer_tmp_dir():
-    shutil.rmtree(TMP_LOG_PATH / "sanitizer", ignore_errors=True)
-
-
 def close_process_files():
-    """关闭本进程持有的所有文件句柄"""
+    """关闭当前进程缓存的结果日志句柄。"""
     global _process_file_handlers
     for handler in _process_file_handlers.values():
         try:
@@ -155,43 +219,36 @@ def close_process_files():
 
 
 def has_terminal_log(line):
+    """判断当前进程是否已分类该配置。"""
     return line.strip() in _process_terminal_configs
 
 
 def get_terminal_log_type(line):
+    """返回当前进程对配置的终态分类。"""
     return _process_terminal_configs.get(line.strip())
 
 
 def write_checkpoint(line):
+    """写入已完成配置并清理进程内分类状态。"""
     line = line.strip()
     write_to_log("checkpoint", line)
     _process_terminal_configs.pop(line, None)
 
 
 def write_terminal_log(log_type: LogType, line):
+    """写入终态分类并随后写入 checkpoint。"""
     write_to_log(log_type, line)
     write_checkpoint(line)
 
 
-def _get_log_file(log_type: LogType):
-    prefix = LOG_PREFIXES[log_type]
-    if not _use_worker_tmp_logs:
-        cfg = get_cfg()
-        filename = f"{prefix}{cfg.id}.txt" if cfg else f"{prefix}.txt"
-        return TEST_LOG_PATH / filename
-    pid = os.getpid()
-    return TMP_LOG_PATH / f"{prefix}_{pid}.txt"
-
-
-def _open_handler(file_path):
-    if file_path not in _process_file_handlers:
-        _process_file_handlers[file_path] = file_path.open("a", buffering=1)
-    return _process_file_handlers[file_path]
-
-
 def _write_line(file_path, line):
+    """复用进程文件句柄写一行，集中处理句柄创建、缓存和写入错误。"""
     try:
-        _open_handler(file_path).write(line + "\n")
+        handler = _process_file_handlers.get(file_path)
+        if handler is None:
+            handler = file_path.open("a", buffering=1)
+            _process_file_handlers[file_path] = handler
+        handler.write(line + "\n")
         return True
     except Exception as err:
         print(f"Error writing to {file_path}: {err}", flush=True)
@@ -199,24 +256,28 @@ def _write_line(file_path, line):
 
 
 def write_to_log(log_type: LogType, line):
-    """添加单条日志到当前进程的日志文件"""
+    """向主结果日志或 worker 临时结果日志追加一个配置。"""
     line = line.strip()
     if not line:
         return
     terminal_log_type = _process_terminal_configs.get(line)
     if _use_worker_tmp_logs and log_type == "pass" and terminal_log_type not in (None, "pass"):
         return
-    try:
-        file_path = _get_log_file(log_type)
-    except Exception as err:
-        print(f"Error resolving log file for {log_type}: {err}", flush=True)
-        return
-    if _write_line(file_path, line) and log_type in TERMINAL_LOG_TYPES and _use_worker_tmp_logs:
-        _process_terminal_configs[line] = log_type
+    prefix = LOG_PREFIXES[log_type]
+    if _use_worker_tmp_logs:
+        file_path = TMP_LOG_PATH / f"{prefix}_{os.getpid()}.txt"
+    else:
+        cfg = get_cfg()
+        filename = f"{prefix}{cfg.id}.txt" if cfg else f"{prefix}.txt"
+        file_path = TEST_LOG_PATH / filename
+    if _write_line(file_path, line) and log_type in TERMINAL_LOG_TYPES:
+        _case_result_types.setdefault(line, set()).add(log_type)
+        if _use_worker_tmp_logs:
+            _process_terminal_configs[line] = log_type
 
 
 def has_comp_terminal_log(dimension, line):
-    """检查某个 comp 维度下是否已有终态分类"""
+    """判断 comp 维度是否已分类该配置。"""
     line = line.strip()
     dim_configs = _comp_terminal_configs.get(dimension)
     if dim_configs is None:
@@ -224,28 +285,18 @@ def has_comp_terminal_log(dimension, line):
     return line in dim_configs
 
 
-def _get_comp_file(dimension, log_type: LogType):
-    prefix = LOG_PREFIXES[log_type]
-    if _use_worker_tmp_logs:
-        comp_dir = TMP_LOG_PATH / "comp" / dimension
-        comp_dir.mkdir(parents=True, exist_ok=True)
-        return comp_dir / f"{prefix}_{os.getpid()}.txt"
-    comp_dir = TEST_LOG_PATH / "comp" / dimension
-    comp_dir.mkdir(parents=True, exist_ok=True)
-    cfg = get_cfg()
-    filename = f"{prefix}{cfg.id}.txt" if cfg else f"{prefix}.txt"
-    return comp_dir / filename
-
-
 def write_to_comp_log(comp, log_type: LogType, line):
-    """写入 comp 维度的日志文件，同时更新主 _process_terminal_configs"""
-    try:
-        dimension = COMP_TO_DIMENSION[comp]
-        file_path = _get_comp_file(dimension, log_type)
-    except Exception as err:
-        print(f"Error resolving comp log file for {comp}/{log_type}: {err}", flush=True)
-        return
-
+    """向一个 comp 维度写入配置并更新分类状态。"""
+    dimension = COMP_TO_DIMENSION[comp]
+    prefix = LOG_PREFIXES[log_type]
+    root = TMP_LOG_PATH if _use_worker_tmp_logs else TEST_LOG_PATH
+    comp_dir = root / "comp" / dimension
+    comp_dir.mkdir(parents=True, exist_ok=True)
+    if _use_worker_tmp_logs:
+        file_path = comp_dir / f"{prefix}_{os.getpid()}.txt"
+    else:
+        cfg = get_cfg()
+        file_path = comp_dir / (f"{prefix}{cfg.id}.txt" if cfg else f"{prefix}.txt")
     line = line.strip()
     if not line:
         return
@@ -260,14 +311,13 @@ def write_to_comp_log(comp, log_type: LogType, line):
 
     if log_type in TERMINAL_LOG_TYPES:
         dim_configs[line] = log_type
+    _case_result_types.setdefault(line, set()).add(log_type)
     if log_type in TERMINAL_LOG_TYPES and _use_worker_tmp_logs:
         _process_terminal_configs[line] = log_type
 
 
 def read_log(log_type: LogType):
-    """读取文件所有行，返回集合"""
-    if log_type not in LOG_PREFIXES:
-        raise ValueError(f"Invalid log type: {log_type}")
+    """读取一个聚合结果日志中的所有非空配置。"""
     cfg = get_cfg()
     prefix = LOG_PREFIXES[log_type]
     filename = f"{prefix}{cfg.id}.txt" if cfg else f"{prefix}.txt"
@@ -283,7 +333,7 @@ def read_log(log_type: LogType):
 
 
 def cleanup_uncheckpointed_result_logs():
-    """Remove result rows that were written before checkpoint during an interrupted run."""
+    """删除中断运行中先于 checkpoint 写入的结果记录。"""
     checkpoint_file = TEST_LOG_PATH / "checkpoint.txt"
     try:
         with checkpoint_file.open("r") as f:
@@ -314,8 +364,9 @@ def cleanup_uncheckpointed_result_logs():
     return removed
 
 
-def _read_pending_bytes(file_path, end=False):
-    offset = _aggregated_offsets.get(file_path, 0)
+def _read_pending_result_bytes(file_path, end=False):
+    """读取上次聚合后的新增字节，非 cleanup 模式只读完整行。"""
+    offset = _result_offsets.get(file_path, 0)
     file_size = file_path.stat().st_size
     if file_size < offset:
         offset = 0
@@ -333,95 +384,337 @@ def _read_pending_bytes(file_path, end=False):
     return data, offset, file_size
 
 
-def _save_offset(file_path, offset, clear=False):
-    if clear:
-        _aggregated_offsets.pop(file_path, None)
-    else:
-        _aggregated_offsets[file_path] = offset
-
-
-def _save_offsets(pending_offsets, cleanup):
+def _save_result_offsets(pending_offsets, cleanup):
+    """保存读取偏移，并按需删除已消费的临时文件。"""
     for file_path, offset in pending_offsets.items():
-        _save_offset(file_path, offset, clear=cleanup)
         if cleanup:
+            _result_offsets.pop(file_path, None)
             file_path.unlink()
+        else:
+            _result_offsets[file_path] = offset
 
 
-def _read_lines(log_files, cleanup):
-    all_lines = set()
-    pending_offsets = {}
-    for file_path in log_files:
-        try:
-            data, _, end_offset = _read_pending_bytes(file_path, end=cleanup)
-            pending_offsets[file_path] = end_offset
-            all_lines.update(line.strip() for line in data.decode().splitlines() if line.strip())
-        except Exception as err:
-            print(f"Error reading {file_path}: {err}", flush=True)
-            return set(), {}, False
-    return all_lines, pending_offsets, True
+def get_sanitizer_case_log_dir(slot_index, pid):
+    """返回一个 sanitizer worker slot 的隔离输出目录。"""
+    return TMP_LOG_PATH / "sanitizer" / f"slot_{slot_index}_{pid}"
 
 
-def _agg_text(log_files, out_file, cleanup):
+def merge_sanitizer_case_logs(case_log_dir):
+    """将一个 sanitizer case 的结果文件追加到 worker 临时日志。"""
+    case_tmp_dir = case_log_dir / ".tmp"
+    if not case_tmp_dir.exists():
+        return
+    for child_log in case_tmp_dir.iterdir():
+        if not child_log.is_file():
+            continue
+        target_log = TMP_LOG_PATH / child_log.name
+        with child_log.open("rb") as in_f, target_log.open("ab") as out_f:
+            shutil.copyfileobj(in_f, out_f)
+
+
+def clean_sanitizer_case_logs():
+    """删除所有隔离的 sanitizer case 目录。"""
+    shutil.rmtree(TMP_LOG_PATH / "sanitizer", ignore_errors=True)
+
+
+def get_case_id(api_config_str):
+    """生成 case 边界 tag 使用的稳定短 ID。"""
+    return hashlib.sha1(api_config_str.encode("utf-8", errors="replace")).hexdigest()[:12]
+
+
+def write_case_begin(api_config_str, *, worker_pid=None, slot=None, gpu=None, paddle_version=None):
+    """写入包含执行元数据的 case 起始行并返回其 ID。"""
+    case_id = get_case_id(api_config_str)
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+    fields = [f"{CASE_BEGIN_TAG} {case_id}", timestamp]
+    if paddle_version is not None:
+        fields.append(f"Paddle {paddle_version}")
+    if gpu is not None:
+        fields.append(f"GPU {gpu}")
+    if worker_pid is not None:
+        fields.append(f"PID {worker_pid}")
+    if slot is not None:
+        fields.append(f"Slot {slot}")
+    print(" | ".join(fields), flush=True)
+    print(api_config_str, flush=True)
+    print(flush=True)
+    return case_id
+
+
+def _case_results(api_config_str):
+    return sorted(_case_result_types.get(api_config_str, set()))
+
+
+def write_case_end(status, case_id=None, api_config_str=None, duration_ms=None, results=None):
+    """为指定 ID 或配置写入 case 结束 tag，支持多个终态结果。"""
+    if api_config_str is not None:
+        case_id = get_case_id(api_config_str)
+    if results is None and api_config_str is not None:
+        results = _case_results(api_config_str)
+    result_types = set(results or ())
+    if result_types == {"pass"}:
+        outcome = "PASS"
+    elif result_types == {"skip"}:
+        outcome = "SKIP"
+    elif result_types:
+        outcome = "FAIL"
+    else:
+        outcome = status.upper()
+    if _case_comparisons:
+        for start in range(0, len(_case_comparisons), 3):
+            values = _case_comparisons[start : start + 3]
+            print(" | ".join(f"{comp} {result}" for comp, result in values), flush=True)
+        _case_comparisons.clear()
+        print(flush=True)
+    fields = [f"{CASE_END_TAG} {case_id}", outcome]
+    if duration_ms is not None:
+        fields.append(f"{duration_ms} ms")
+    print(" | ".join(fields) + "\n\n", flush=True)
+    return get_worker_log_offset()
+
+
+def get_worker_log_offset(pid=None):
+    """返回 worker 日志当前安全文件末尾；当前 worker 优先避免路径 stat。"""
+    worker_pid = os.getpid() if pid is None else pid
+    try:
+        if worker_pid == os.getpid() and stdout_fd is not None:
+            return os.fstat(stdout_fd).st_size
+        return (TMP_LOG_PATH / f"log_{worker_pid}.log").stat().st_size
+    except (FileNotFoundError, OSError):
+        return None
+
+
+def append_case_end_to_worker_log(pid, status, case_id=None, api_config_str=None):
+    """worker 停止后补写 synthetic case 结束 tag。"""
+    end_line = f"{CASE_END_TAG} {case_id or get_case_id(api_config_str)} | {status.upper()}"
+    try:
+        log_file = TMP_LOG_PATH / f"log_{pid}.log"
+        log_file.parent.mkdir(parents=True, exist_ok=True)
+        with log_file.open("a", encoding="utf-8") as f:
+            f.write(f"{end_line}\n\n\n")
+        return log_file.stat().st_size
+    except Exception as err:
+        print(f"Error writing case end to worker log {pid}: {err}", flush=True)
+        return None
+
+
+@contextmanager
+def suppress_startup_output():
+    """在 Paddle 和扩展初始化期间静默 stdout/stderr。"""
+    saved_stdout = os.dup(1)
+    saved_stderr = os.dup(2)
+    try:
+        with open(os.devnull, "w") as devnull:
+            os.dup2(devnull.fileno(), 1)
+            os.dup2(devnull.fileno(), 2)
+            yield
+    finally:
+        os.dup2(saved_stdout, 1)
+        os.dup2(saved_stderr, 2)
+        os.close(saved_stdout)
+        os.close(saved_stderr)
+
+
+def format_duration(seconds):
+    """按运行时长选择秒、分钟或小时单位。"""
+    if seconds >= 3600:
+        return f"{seconds / 3600:.2f} h"
+    if seconds >= 60:
+        return f"{seconds / 60:.2f} min"
+    return f"{seconds:.2f} s"
+
+
+def print_run_header(options, paddle_version):
+    """打印一次测试的紧凑启动信息和有效配置。"""
+    modes = (
+        "accuracy",
+        "paddle_only",
+        "paddle_cinn",
+        "paddle_gpu_performance",
+        "torch_gpu_performance",
+        "paddle_torch_gpu_performance",
+        "accuracy_stable",
+        "paddle_custom_device",
+        "custom_device_vs_gpu",
+    )
+    mode = next((name for name in modes if getattr(options, name, False)), "unknown")
+    source = options.api_config_file or options.api_config_file_pattern or "single config"
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+    print(f">>> TEST RUN | {timestamp} | Paddle {paddle_version} | PID {os.getpid()}\n")
+    print("--- OPTIONS")
+    print(f"{'Input':<11}{source}")
+    print(f"{'Output':<11}{options.log_dir or 'tester/api_config/test_log'}")
+    print(f"{'Mode':<11}{mode.replace('_', ' ').title()}")
+    device = "CPU" if options.test_cpu else "GPU " + (options.gpu_ids or "all")
+    print(f"{'Device':<11}{device}")
+    data_mode = (
+        "GPU mode"
+        if options.use_gpu_mode
+        else "Cached NumPy"
+        if options.use_cached_numpy
+        else "NumPy"
+    )
+    print(f"{'Data':<11}{data_mode}")
+    print(f"{'Tolerance':<11}atol {options.atol} | rtol {options.rtol}")
+    print(f"{'Timeout':<11}{options.timeout} s")
+    print(f"{'Runtime':<11}{'detailed' if options.show_runtime_status else 'errors only'}\n")
+
+
+def print_run_footer(total_case, tested_case, remaining_case, log_counts, elapsed, log_dir):
+    """打印统一结果摘要、结束时间和总用时。"""
+    counts = {key: value for key, value in (log_counts or {}).items() if not key.startswith("_")}
+    paddle_types = (
+        "paddle_error",
+        "paddle_accuracy",
+        "paddle_bitwise",
+        "paddle_cuda",
+        "paddle_crash",
+    )
+    test_types = ("torch_error", "config_input", "config_parse", "config_convert")
+    paddle_issues = sum(counts.get(key, 0) for key in paddle_types)
+    test_issues = sum(counts.get(key, 0) for key in test_types)
+    retest = sum(counts.get(key, 0) for key in ("oom", "timeout"))
+    outcome = (
+        "PASS" if remaining_case == 0 and paddle_issues + test_issues + retest == 0 else "DONE"
+    )
+    print("\n--- RESULT")
+    print(
+        f"{'Cases':<11}{tested_case} tested | {counts.get('pass', 0)} pass | "
+        f"{counts.get('skip', 0)} skip | {remaining_case} remaining"
+    )
+    print(f"{'Issues':<11}{paddle_issues} Paddle | {test_issues} test | {retest} retest")
+    print(f"{'Duration':<11}{format_duration(elapsed)}")
+    print(f"{'Logs':<11}{log_dir}")
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+    print(
+        f"\n<<< TEST RUN | {outcome} | {tested_case}/{total_case} completed | {timestamp} | {format_duration(elapsed)}",
+        flush=True,
+    )
+
+
+def _copy_inorder_range(file_path, out_f, start_offset, end_offset):
+    """复制已完成字节区间，并限制每个物理行最多 200000 字节。"""
+    if end_offset > start_offset:
+        with file_path.open("rb") as in_f:
+            in_f.seek(start_offset)
+            remaining = end_offset - start_offset
+            while remaining:
+                line = in_f.readline(min(200001, remaining))
+                if not line:
+                    break
+                remaining -= len(line)
+                if len(line) <= 200000:
+                    out_f.write(line)
+                    continue
+                out_f.write(line[:200000] + b"\n")
+                while remaining and not line.endswith(b"\n"):
+                    line = in_f.readline(min(4 * 1024 * 1024, remaining))
+                    remaining -= len(line)
+
+
+def mark_inorder_case_complete(pid, completed_offset):
+    """记录 worker 最后一个已完成 case 的安全读取上界。"""
+    if not _use_worker_tmp_logs:
+        return True
+    if completed_offset is None:
+        return False
+    file_path = TMP_LOG_PATH / f"log_{pid}.log"
+    _inorder_completed_offsets[file_path] = max(
+        completed_offset, _inorder_completed_offsets.get(file_path, 0)
+    )
+    return True
+
+
+def flush_completed_inorder_logs():
+    """按 worker 一次读取所有已完成 case，并在成功后推进聚合 offset。"""
+    if not _inorder_completed_offsets:
+        return True
+    out_file = TEST_LOG_PATH / "log_inorder.log"
+    try:
+        with out_file.open("ab") as out_f:
+            for file_path, end_offset in list(_inorder_completed_offsets.items()):
+                start_offset = _inorder_offsets.get(file_path, 0)
+                if end_offset < start_offset:
+                    start_offset = 0
+                _copy_inorder_range(file_path, out_f, start_offset, end_offset)
+                out_f.flush()
+                _inorder_offsets[file_path] = end_offset
+                _inorder_completed_offsets.pop(file_path, None)
+        return True
+    except Exception as err:
+        print(f"Error flushing case blocks to {out_file}: {err}", flush=True)
+        return False
+
+
+def _aggregate_text_logs(log_files, out_file, cleanup):
+    """合并、去重并排序 worker 文本日志。"""
     if not log_files:
         return True
-    all_lines, pending_offsets, success = _read_lines(log_files, cleanup)
-    if not success:
-        return False
+    all_lines = set()
+    pending_offsets = {}
     try:
+        for file_path in log_files:
+            data, _, end_offset = _read_pending_result_bytes(file_path, end=cleanup)
+            pending_offsets[file_path] = end_offset
+            all_lines.update(line.strip() for line in data.decode().splitlines() if line.strip())
         if all_lines:
             with out_file.open("a") as f:
                 f.writelines(f"{line}\n" for line in sorted(all_lines))
     except Exception as err:
         print(f"Error writing to {out_file}: {err}", flush=True)
-        out_file.unlink(missing_ok=True)
         return False
-    _save_offsets(pending_offsets, cleanup)
+    _save_result_offsets(pending_offsets, cleanup)
     return True
 
 
-def _agg_results(cleanup, tmp_exists):
+def _aggregate_result_logs(cleanup, tmp_exists):
+    """聚合所有主结果日志类型。"""
     success = True
     for prefix in LOG_PREFIXES.values():
         log_files = list(TMP_LOG_PATH.glob(f"{prefix}_*.txt")) if tmp_exists else []
         out_file = TEST_LOG_PATH / f"{prefix}.txt"
-        success = _agg_text(log_files, out_file, cleanup) and success
+        success = _aggregate_text_logs(log_files, out_file, cleanup) and success
     return success
 
 
-def _agg_inorder(cleanup, tmp_exists):
-    log_files = sorted(TMP_LOG_PATH.glob("log_*.log")) if tmp_exists else []
+def _aggregate_inorder_logs(cleanup, tmp_exists):
+    """刷出安全 block，并聚合已停止 worker 的剩余输出。"""
+    if not tmp_exists:
+        return True
+    if not flush_completed_inorder_logs():
+        return False
+    log_files = sorted(TMP_LOG_PATH.glob("log_*.log"))
     if not log_files:
         return True
 
     out_file = TEST_LOG_PATH / "log_inorder.log"
-    pending_offsets = {}
     try:
         with out_file.open("ab") as out_f:
             for file_path in log_files:
                 try:
-                    data, _, end_offset = _read_pending_bytes(file_path, end=cleanup)
-                    pending_offsets[file_path] = end_offset
-                    in_f = io.BytesIO(data)
-                    while True:
-                        lines = in_f.readlines(4 * 1024 * 1024)
-                        if not lines:
-                            break
-                        for line in lines:
-                            out_f.write(line[:200000] + b"\n" if len(line) > 200000 else line)
+                    start_offset = _inorder_offsets.get(file_path, 0)
+                    end_offset = file_path.stat().st_size
+                    if end_offset < start_offset:
+                        start_offset = 0
+                    _copy_inorder_range(file_path, out_f, start_offset, end_offset)
+                    out_f.flush()
+                    if cleanup:
+                        _inorder_offsets.pop(file_path, None)
+                        _inorder_completed_offsets.pop(file_path, None)
+                        file_path.unlink()
+                    else:
+                        _inorder_offsets[file_path] = end_offset
                 except Exception as err:
                     print(f"Error reading {file_path}: {err}", flush=True)
-                    out_file.unlink(missing_ok=True)
                     return False
     except Exception as err:
         print(f"Error writing to {out_file}: {err}", flush=True)
-        out_file.unlink(missing_ok=True)
         return False
-
-    _save_offsets(pending_offsets, cleanup)
     return True
 
 
-def _agg_csv(log_files, out_file, header, cleanup):
+def _aggregate_csv_logs(log_files, out_file, header, cleanup):
+    """将 worker CSV 分片中的完整行聚合到一个文件。"""
     if not log_files:
         return True
 
@@ -434,7 +727,9 @@ def _agg_csv(log_files, out_file, header, cleanup):
                 writer.writerow(header)
             for file_path in log_files:
                 try:
-                    data, start_offset, end_offset = _read_pending_bytes(file_path, end=cleanup)
+                    data, start_offset, end_offset = _read_pending_result_bytes(
+                        file_path, end=cleanup
+                    )
                     pending_offsets[file_path] = end_offset
                     reader = csv.reader(io.StringIO(data.decode()))
                     if start_offset == 0:
@@ -444,18 +739,17 @@ def _agg_csv(log_files, out_file, header, cleanup):
                             writer.writerow(row)
                 except Exception as err:
                     print(f"Error reading {file_path}: {err}", flush=True)
-                    out_file.unlink(missing_ok=True)
                     return False
     except Exception as err:
         print(f"Error writing to {out_file}: {err}", flush=True)
-        out_file.unlink(missing_ok=True)
         return False
 
-    _save_offsets(pending_offsets, cleanup)
+    _save_result_offsets(pending_offsets, cleanup)
     return True
 
 
 def _sort_csv(file_path, columns):
+    """按稳定的报告字段排序聚合 CSV。"""
     if not file_path.exists():
         return
     try:
@@ -466,7 +760,8 @@ def _sort_csv(file_path, columns):
         print(f"Error arranging {file_path}: {err}", flush=True)
 
 
-def _count_logs():
+def _count_result_logs():
+    """统计结果分类并写出未完成配置列表。"""
     log_counts = {}
     checkpoint_file = TEST_LOG_PATH / "checkpoint.txt"
     api_configs = set()
@@ -504,7 +799,8 @@ def _count_logs():
     return log_counts
 
 
-def _agg_comp(cleanup, tmp_exists):
+def _aggregate_comp_logs(cleanup, tmp_exists):
+    """分别聚合每个 comp 维度的结果日志。"""
     comp_tmp_dir = TMP_LOG_PATH / "comp" if tmp_exists else None
     comp_out_dir = TEST_LOG_PATH / "comp"
     has_comp = (comp_tmp_dir and comp_tmp_dir.exists()) or comp_out_dir.exists()
@@ -518,7 +814,7 @@ def _agg_comp(cleanup, tmp_exists):
         out_dim_dir.mkdir(parents=True, exist_ok=True)
         for prefix in LOG_PREFIXES.values():
             log_files = list(dim_dir.glob(f"{prefix}_*.txt"))
-            _agg_text(log_files, out_dim_dir / f"{prefix}.txt", cleanup)
+            _aggregate_text_logs(log_files, out_dim_dir / f"{prefix}.txt", cleanup)
         if cleanup and dim_dir.exists() and not any(dim_dir.iterdir()):
             dim_dir.rmdir()
     if cleanup and comp_tmp_dir.exists() and not any(comp_tmp_dir.iterdir()):
@@ -526,7 +822,8 @@ def _agg_comp(cleanup, tmp_exists):
     return has_comp
 
 
-def _scan_dups(log_dir):
+def _find_duplicate_classifications(log_dir):
+    """查找同一目录中被多个结果类型分类的配置。"""
     config_to_types: dict[str, list[str]] = {}
     for log_type, prefix in LOG_PREFIXES.items():
         if log_type == "checkpoint":
@@ -545,14 +842,8 @@ def _scan_dups(log_dir):
     return {config: types for config, types in config_to_types.items() if len(types) > 1}
 
 
-def _add_dups(log_counts, scope, duplicates):
-    if duplicates:
-        log_counts.setdefault("_integrity_errors", []).append(
-            {"scope": scope, "duplicates": duplicates}
-        )
-
-
 def _read_log_lines(log_file):
+    """将结果文件读取为集合，文件不存在时返回空集合。"""
     if not log_file.exists():
         return set()
     try:
@@ -564,6 +855,7 @@ def _read_log_lines(log_file):
 
 
 def _sync_comp_main_summary():
+    """将各 comp 维度分类合并到主结果摘要。"""
     comp_out_dir = TEST_LOG_PATH / "comp"
     if not comp_out_dir.exists():
         return
@@ -593,31 +885,31 @@ def _sync_comp_main_summary():
             print(f"Error writing to {log_file}: {err}", flush=True)
 
 
-def _check_logs(log_counts, has_comp):
+def _check_log_integrity(log_counts, has_comp):
+    """检查重复分类并将诊断信息附加到统计结果。"""
     comp_out_dir = TEST_LOG_PATH / "comp"
     if has_comp:
         log_counts["_multi_classification"] = True
-        if _scan_dups(TEST_LOG_PATH):
+        if _find_duplicate_classifications(TEST_LOG_PATH):
             log_counts["_has_multi_result_overlap"] = True
         for dim_dir in sorted(comp_out_dir.iterdir()) if comp_out_dir.exists() else []:
             if not dim_dir.is_dir():
                 continue
-            duplicates = _scan_dups(dim_dir)
+            duplicates = _find_duplicate_classifications(dim_dir)
             if duplicates:
                 log_counts.setdefault("_comp_integrity_errors", []).append(
                     {"scope": f"comp/{dim_dir.name}", "duplicates": duplicates}
                 )
         return
-    _add_dups(log_counts, "main log directory", _scan_dups(TEST_LOG_PATH))
-
-
-def _clean_tmp(cleanup, all_success):
-    if cleanup and all_success and TMP_LOG_PATH.exists() and not any(TMP_LOG_PATH.iterdir()):
-        shutil.rmtree(TMP_LOG_PATH)
+    duplicates = _find_duplicate_classifications(TEST_LOG_PATH)
+    if duplicates:
+        log_counts["_integrity_errors"] = [
+            {"scope": "main log directory", "duplicates": duplicates}
+        ]
 
 
 def aggregate_logs(end=False, cleanup=False):
-    """聚合所有相同类型的日志文件"""
+    """聚合 worker 日志，并按需完成统计和完整性检查。"""
     cleanup_tmp = end or cleanup
     tmp_exists = TMP_LOG_PATH.exists()
     if not tmp_exists and not cleanup_tmp:
@@ -626,10 +918,13 @@ def aggregate_logs(end=False, cleanup=False):
 
     tol_file = TEST_LOG_PATH / "tol.csv"
     stable_file = TEST_LOG_PATH / "stable.csv"
-    all_success = _agg_results(cleanup_tmp, tmp_exists)
-    all_success = _agg_inorder(cleanup_tmp, tmp_exists) and all_success
+    all_success = _aggregate_result_logs(cleanup_tmp, tmp_exists)
+    if cleanup_tmp:
+        all_success = _aggregate_inorder_logs(cleanup_tmp, tmp_exists) and all_success
+    else:
+        all_success = flush_completed_inorder_logs() and all_success
     all_success = (
-        _agg_csv(
+        _aggregate_csv_logs(
             sorted(TMP_LOG_PATH.glob("tol_*.csv")) if tmp_exists else [],
             tol_file,
             TOL_HEADER,
@@ -638,7 +933,7 @@ def aggregate_logs(end=False, cleanup=False):
         and all_success
     )
     all_success = (
-        _agg_csv(
+        _aggregate_csv_logs(
             sorted(TMP_LOG_PATH.glob("stable_*.csv")) if tmp_exists else [],
             stable_file,
             STABLE_HEADER,
@@ -648,29 +943,29 @@ def aggregate_logs(end=False, cleanup=False):
     )
 
     if not end:
-        _clean_tmp(cleanup_tmp, all_success)
+        if (
+            cleanup_tmp
+            and all_success
+            and TMP_LOG_PATH.exists()
+            and not any(TMP_LOG_PATH.iterdir())
+        ):
+            shutil.rmtree(TMP_LOG_PATH)
         return
 
     _sort_csv(tol_file, ["API", "dtype", "config", "mode"])
     _sort_csv(stable_file, ["API", "dtype", "config", "comp"])
-    has_comp = _agg_comp(cleanup_tmp, tmp_exists)
-    _clean_tmp(cleanup_tmp, all_success)
+    has_comp = _aggregate_comp_logs(cleanup_tmp, tmp_exists)
+    if cleanup_tmp and all_success and TMP_LOG_PATH.exists() and not any(TMP_LOG_PATH.iterdir()):
+        shutil.rmtree(TMP_LOG_PATH)
     if has_comp:
         _sync_comp_main_summary()
-    log_counts = _count_logs()
-    _check_logs(log_counts, has_comp)
+    log_counts = _count_result_logs()
+    _check_log_integrity(log_counts, has_comp)
     return log_counts
 
 
-def _visible_counts(log_counts):
-    return {key: value for key, value in log_counts.items() if not key.startswith("_")}
-
-
-def _sum_counts(log_counts, log_types):
-    return sum(log_counts.get(log_type, 0) for log_type in log_types)
-
-
-def _print_dups(integrity_errors):
+def _print_duplicate_classifications(integrity_errors):
+    """打印主结果目录中的重复分类。"""
     for issue in integrity_errors:
         scope = issue["scope"]
         duplicates = issue["duplicates"]
@@ -688,7 +983,8 @@ def _print_dups(integrity_errors):
         print("!" * 50 + "\n")
 
 
-def _print_comp_dups(comp_integrity_errors):
+def _print_comp_duplicate_classifications(comp_integrity_errors):
+    """按 comp 维度打印重复分类。"""
     for issue in comp_integrity_errors:
         scope = issue["scope"]
         duplicates = issue["duplicates"]
@@ -707,14 +1003,14 @@ def _print_comp_dups(comp_integrity_errors):
 
 
 def print_log_info(remaining_case, log_counts=None):
-    """打印日志统计信息"""
+    """打印最终 case 统计和分类完整性告警。"""
     if log_counts is None:
         log_counts = {}
     integrity_errors = log_counts.get("_integrity_errors", [])
     comp_integrity_errors = log_counts.get("_comp_integrity_errors", [])
     is_multi_classification = log_counts.get("_multi_classification")
     has_multi_result_overlap = log_counts.get("_has_multi_result_overlap")
-    counts = _visible_counts(log_counts)
+    counts = {key: value for key, value in log_counts.items() if not key.startswith("_")}
     paddle_types = [
         "paddle_error",
         "paddle_accuracy",
@@ -724,28 +1020,10 @@ def print_log_info(remaining_case, log_counts=None):
     ]
     test_types = ["torch_error", "config_input", "config_parse", "config_convert"]
 
-    print("\n" + "=" * 50)
-    print("Test Case Statistics".center(50))
-    print("=" * 50)
-    print(f"{'Remaining cases':<30}: {remaining_case:>8}")
-    print(f"{'Tested cases':<30}: {counts.get('checkpoint', 0):>8}")
-    print(f"{'Pass cases':<30}: {counts.get('pass', 0):>8}")
-    print(f"{'Skip cases':<30}: {counts.get('skip', 0):>8}")
-    print(f"{'Paddle issue cases':<30}: {_sum_counts(counts, paddle_types):>8}")
-    print(f"{'Test issue cases':<30}: {_sum_counts(counts, test_types):>8}")
-    print(f"{'Retest cases':<30}: {_sum_counts(counts, ['oom', 'timeout']):>8}")
-    if counts:
-        print("-" * 50)
-        print("Log Type Breakdown:")
-        if is_multi_classification and has_multi_result_overlap:
-            print("  Note: In accuracy_stable mode, one config may appear in multiple result sets.")
-        for log_type, count in counts.items():
-            print(f"  {log_type:<28}: {count:>8}")
-    print("=" * 50 + "\n")
     if is_multi_classification:
-        _print_comp_dups(comp_integrity_errors)
+        _print_comp_duplicate_classifications(comp_integrity_errors)
     else:
-        _print_dups(integrity_errors)
+        _print_duplicate_classifications(integrity_errors)
 
 
 stdout_fd = None
@@ -756,7 +1034,7 @@ log_file = None
 
 
 def redirect_stdio():
-    """执行 stdout 和 stderr 的重定向"""
+    """将 worker 的 stdout 和 stderr 重定向到临时日志。"""
     global stdout_fd, stderr_fd, orig_stdout_fd, orig_stderr_fd, log_file
 
     log_path = TMP_LOG_PATH / f"log_{os.getpid()}.log"
@@ -781,7 +1059,7 @@ def redirect_stdio():
 
 
 def restore_stdio():
-    """恢复 stdout 和 stderr 的重定向"""
+    """恢复 redirect_stdio 保存的 stdout 和 stderr 文件描述符。"""
     global stdout_fd, stderr_fd, orig_stdout_fd, orig_stderr_fd, log_file
     if log_file is not None:
         log_file.close()
@@ -799,6 +1077,7 @@ def restore_stdio():
 
 
 def _get_diff(error_msg, abs_pattern, rel_pattern):
+    """从断言消息中提取绝对误差和相对误差。"""
     if error_msg == "Identical":
         return 0.0, 0.0
 
@@ -813,6 +1092,7 @@ def _get_diff(error_msg, abs_pattern, rel_pattern):
 
 
 def _append_csv(output_file, header, row):
+    """追加一行 CSV，并在需要时创建表头。"""
     try:
         is_new = not output_file.exists() or output_file.stat().st_size == 0
         with output_file.open("a", newline="") as f:
@@ -825,9 +1105,7 @@ def _append_csv(output_file, header, row):
 
 
 def log_accuracy_tolerance(error_msg, api, config, dtype, is_backward=False):
-    """从 torch.testing.assert_close 的异常消息中提取最大绝对误差和相对误差
-    将误差数据记录到 CSV 文件
-    """
+    """记录从 assert-close 失败消息中解析出的容差。"""
     mode = "backward" if is_backward else "forward"
     print(f"mode={mode} {config}\n{error_msg}", flush=True)
     abs_pattern = (
@@ -844,7 +1122,11 @@ def log_accuracy_tolerance(error_msg, api, config, dtype, is_backward=False):
 
 
 def log_accuracy_stable(error_msg, api, config, dtype, comp):
-    print(f"comp={comp} {config}\n{error_msg}", flush=True)
+    """记录一个比较模式下的稳定性误差。"""
+    if "\n" in error_msg:
+        print(f"{comp} {error_msg}", flush=True)
+    else:
+        _case_comparisons.append((comp, error_msg))
     abs_pattern = (
         r"(?:Absolute|Greatest absolute|Max absolute) difference(?: among violations)?: "
         r"(\d+\.?\d*(?:[eE][+-]?\d+)?|nan|inf)\b"

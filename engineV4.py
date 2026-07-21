@@ -5,7 +5,6 @@ import gc
 import multiprocessing as mp
 import os
 import queue
-import re
 import shlex
 import shutil
 import signal
@@ -43,6 +42,7 @@ if TYPE_CHECKING:
     )
 
 from tester.api_config.log_writer import *
+from tester.api_config.sanitizer_output import analyze_sanitizer_output
 from tester.runtime_config import TestRuntimeConfig, runtime_config_for_gpu
 
 os.environ["FLAGS_use_system_allocator"] = "1"
@@ -75,7 +75,6 @@ VALID_TEST_ARGS = {
     "use_gpu_mode",
     "runtime_config",
 }
-
 
 SANITIZER_FORWARD_ARGS = {
     "accuracy",
@@ -147,19 +146,19 @@ def _init_worker_runtime(slot_index, gpu_id, options, *, redirect_output):
     if gpu_id is not None:
         os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
 
-    import paddle
+    with suppress_startup_output():
+        import paddle
 
-    try:
-        import paddlefleet_ops  # noqa: F401
-    except ImportError:
-        pass
-    try:
-        import FusedQuantOps  # noqa: F401
-    except ImportError:
-        pass
-
-    globals()["paddle"] = paddle
-    globals().update(_load_test_classes(options))
+        try:
+            import paddlefleet_ops  # noqa: F401
+        except ImportError:
+            pass
+        try:
+            import FusedQuantOps  # noqa: F401
+        except ImportError:
+            pass
+        globals()["paddle"] = paddle
+        globals().update(_load_test_classes(options))
 
     if options.test_cpu:
         paddle.device.set_device("cpu")
@@ -168,10 +167,7 @@ def _init_worker_runtime(slot_index, gpu_id, options, *, redirect_output):
         redirect_stdio()
 
     if slot_index is not None and gpu_id is not None:
-        print(
-            f"{datetime.now()} Worker PID: {os.getpid()}, Slot: {slot_index}, GPU: {gpu_id}",
-            flush=True,
-        )
+        os.environ["PADDLEAPITEST_WORKER_SLOT"] = str(slot_index)
 
 
 def _worker_loop(slot_index, gpu_id, input_queue, result_queue, options):
@@ -215,15 +211,35 @@ def _worker_loop(slot_index, gpu_id, input_queue, result_queue, options):
 
         try:
             run_test_case(api_config_str, options)
-            result_queue.put(("done", slot_index, api_config_str))
+            result_queue.put(
+                ("done", slot_index, api_config_str, os.getpid(), get_worker_log_offset())
+            )
         except GpuMemoryDeferred as e:
-            result_queue.put(("deferred", slot_index, api_config_str, str(e)))
+            result_queue.put(
+                (
+                    "deferred",
+                    slot_index,
+                    api_config_str,
+                    str(e),
+                    os.getpid(),
+                    get_worker_log_offset(),
+                )
+            )
         except SystemExit:
             # run_test_case calls os._exit for CUDA errors, this shouldn't reach here
             # but if it does via sys.exit, let it propagate
             raise
         except Exception as e:
-            result_queue.put(("error", slot_index, api_config_str, str(e)))
+            result_queue.put(
+                (
+                    "error",
+                    slot_index,
+                    api_config_str,
+                    str(e),
+                    os.getpid(),
+                    get_worker_log_offset(),
+                )
+            )
 
     # Graceful exit
     try:
@@ -272,6 +288,7 @@ def _sanitizer_worker_loop(slot_index, gpu_id, input_queue, result_queue, option
     sanitizer_cmd = shlex.split(options.sanitizer_command)
     child_env = os.environ.copy()
     child_env["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
+    child_env["PADDLEAPITEST_SUPPRESS_CASE_TAGS"] = "1"
 
     def terminate_child(*args):
         if child_process is not None and child_process.poll() is None:
@@ -285,10 +302,6 @@ def _sanitizer_worker_loop(slot_index, gpu_id, input_queue, result_queue, option
     signal.signal(signal.SIGTERM, terminate_child)
 
     try:
-        print(
-            f"{datetime.now()} Sanitizer worker PID: {os.getpid()}, Slot: {slot_index}, GPU: {gpu_id}",
-            flush=True,
-        )
         result_queue.put(("ready", slot_index))
 
         while True:
@@ -301,6 +314,12 @@ def _sanitizer_worker_loop(slot_index, gpu_id, input_queue, result_queue, option
 
             api_config_str = task
             result_queue.put(("ack", slot_index, api_config_str))
+            case_id = write_case_begin(
+                api_config_str,
+                worker_pid=os.getpid(),
+                slot=slot_index,
+                gpu=gpu_id,
+            )
             case_log_dir = get_sanitizer_case_log_dir(slot_index, os.getpid())
             if case_log_dir.exists():
                 shutil.rmtree(case_log_dir)
@@ -311,13 +330,12 @@ def _sanitizer_worker_loop(slot_index, gpu_id, input_queue, result_queue, option
                 )
             except ValueError as err:
                 shutil.rmtree(case_log_dir, ignore_errors=True)
-                result_queue.put(("error", slot_index, api_config_str, str(err)))
+                completed_offset = write_case_end("error", case_id=case_id)
+                result_queue.put(
+                    ("error", slot_index, api_config_str, str(err), os.getpid(), completed_offset)
+                )
                 continue
 
-            print(
-                f"{datetime.now()} Sanitizer slot {slot_index} launch: {' '.join(shlex.quote(part) for part in cmd)}",
-                flush=True,
-            )
             try:
                 child_process = subprocess.Popen(
                     cmd,
@@ -332,7 +350,10 @@ def _sanitizer_worker_loop(slot_index, gpu_id, input_queue, result_queue, option
                 )
             except OSError as err:
                 shutil.rmtree(case_log_dir, ignore_errors=True)
-                result_queue.put(("error", slot_index, api_config_str, str(err)))
+                completed_offset = write_case_end("error", case_id=case_id)
+                result_queue.put(
+                    ("error", slot_index, api_config_str, str(err), os.getpid(), completed_offset)
+                )
                 continue
             result_queue.put(("child", slot_index, child_process.pid))
             output_tail = deque(maxlen=40)
@@ -351,36 +372,44 @@ def _sanitizer_worker_loop(slot_index, gpu_id, input_queue, result_queue, option
                 child_process = None
                 output_file.seek(0)
                 if returncode == options.sanitizer_error_exitcode:
-                    analysis = _analyze_sanitizer_output(
+                    analysis = analyze_sanitizer_output(
                         output_file.read(), returncode, options.sanitizer_error_exitcode
                     )
-                    if analysis.filtered_output:
+                    if analysis.output:
                         print(
-                            analysis.filtered_output,
-                            end="" if analysis.filtered_output.endswith("\n") else "\n",
+                            analysis.output,
+                            end="" if analysis.output.endswith("\n") else "\n",
                             flush=True,
                         )
                 else:
-                    analysis = SanitizerOutputAnalysis("", False)
+                    analysis = None
                     shutil.copyfileobj(output_file, sys.stdout)
                     sys.stdout.flush()
 
-                if returncode in (0, 2) or analysis.ignore_error_exitcode:
+                ignored = analysis is not None and analysis.only_ignored_diagnostics
+                if returncode in (0, 2) or ignored:
                     merge_sanitizer_case_logs(case_log_dir)
                 shutil.rmtree(case_log_dir, ignore_errors=True)
 
-                if returncode == 0 or analysis.ignore_error_exitcode:
-                    result_queue.put(("done", slot_index, api_config_str))
+                if returncode == 0 or ignored:
+                    completed_offset = write_case_end("completed", case_id=case_id)
+                    result_queue.put(
+                        ("done", slot_index, api_config_str, os.getpid(), completed_offset)
+                    )
                 elif returncode == 2:
+                    completed_offset = write_case_end("error", case_id=case_id)
                     result_queue.put(
                         (
                             "error",
                             slot_index,
                             api_config_str,
                             f"child exited with {returncode}",
+                            os.getpid(),
+                            completed_offset,
                         )
                     )
                 else:
+                    completed_offset = write_case_end("crashed", case_id=case_id)
                     result_queue.put(
                         (
                             "crashed",
@@ -389,6 +418,8 @@ def _sanitizer_worker_loop(slot_index, gpu_id, input_queue, result_queue, option
                             returncode,
                             "".join(output_tail),
                             "child",
+                            os.getpid(),
+                            completed_offset,
                         )
                     )
     finally:
@@ -609,15 +640,21 @@ class WorkerPool:
         if self._closed or self._shutdown_event.is_set():
             return
         config = slot.current_task
+        old_pid = slot.process.pid if slot.process else None
         print(
             f"{datetime.now()} Watchdog: slot {slot.index} timeout, killing PID {slot.process.pid}",
             flush=True,
         )
         self._kill_slot_child(slot)
         self._kill_process(slot.process)
+        if old_pid is not None and config is not None:
+            completed_offset = append_case_end_to_worker_log(
+                old_pid, "timeout", api_config_str=config
+            )
+            mark_inorder_case_complete(old_pid, completed_offset)
         if self._closed or self._shutdown_event.is_set():
             return
-        self.result_queue.put(("timeout", slot.index, config))
+        self.result_queue.put(("timeout", slot.index, config, old_pid))
         self._spawn_worker(slot)
 
     def _handle_crash(self, slot):
@@ -633,6 +670,10 @@ class WorkerPool:
         if self._closed or self._shutdown_event.is_set():
             return
         if config is not None:
+            completed_offset = append_case_end_to_worker_log(
+                slot.process.pid, "crashed", api_config_str=config
+            )
+            mark_inorder_case_complete(slot.process.pid, completed_offset)
             self.result_queue.put(("crashed", slot.index, config, exitcode))
         self._spawn_worker(slot)
 
@@ -1072,103 +1113,6 @@ def _prepare_single_config_gpu(options):
     return gpu_ids[0]
 
 
-SANITIZER_PREFIX = "========="
-SANITIZER_CUDA_API_ERROR = "CUDA API Error:"
-SANITIZER_PROGRAM_HIT = "Program hit"
-SANITIZER_ERROR_SUMMARY = "ERROR SUMMARY:"
-CUDA_VERSION_ERROR_RE = re.compile(
-    r"cudaVersion argument \(\d+\) exceeds the driver version \(\d+\)"
-)
-
-
-@dataclass(frozen=True)
-class SanitizerOutputAnalysis:
-    filtered_output: str
-    ignore_error_exitcode: bool
-
-
-def _is_sanitizer_block_boundary(line):
-    return line.startswith(SANITIZER_PREFIX) and (
-        SANITIZER_CUDA_API_ERROR in line
-        or SANITIZER_PROGRAM_HIT in line
-        or SANITIZER_ERROR_SUMMARY in line
-    )
-
-
-def _is_cuda_version_error_block(block_lines):
-    first_line = block_lines[0] if block_lines else ""
-    return (
-        SANITIZER_CUDA_API_ERROR in first_line
-        and CUDA_VERSION_ERROR_RE.search("\n".join(block_lines)) is not None
-    )
-
-
-def _is_cu_get_proc_address_invalid_value_block(block_lines):
-    first_line = block_lines[0] if block_lines else ""
-    return "CUDA_ERROR_INVALID_VALUE" in first_line and "cuGetProcAddress_v2" in first_line
-
-
-def _analyze_sanitizer_output(output, returncode, sanitizer_error_exitcode):
-    if returncode != sanitizer_error_exitcode:
-        return SanitizerOutputAnalysis(output, False)
-
-    lines = output.splitlines()
-    filtered_lines = []
-    ignored_line_indices = set()
-    ignored_any = False
-    saw_cuda_version_error = False
-    kept_sanitizer_error = False
-    index = 0
-
-    while index < len(lines):
-        line = lines[index]
-        if not _is_sanitizer_block_boundary(line):
-            index += 1
-            continue
-
-        block_end = index + 1
-        while block_end < len(lines) and not _is_sanitizer_block_boundary(lines[block_end]):
-            block_end += 1
-
-        block_lines = lines[index:block_end]
-        sanitizer_line_indices = [
-            line_index
-            for line_index in range(index, block_end)
-            if lines[line_index].startswith(SANITIZER_PREFIX)
-        ]
-        if _is_cuda_version_error_block(block_lines):
-            ignored_line_indices.update(sanitizer_line_indices)
-            ignored_any = True
-            saw_cuda_version_error = True
-        elif _is_cu_get_proc_address_invalid_value_block(block_lines):
-            ignored_line_indices.update(sanitizer_line_indices)
-            ignored_any = True
-        elif SANITIZER_PROGRAM_HIT in line or SANITIZER_CUDA_API_ERROR in line:
-            kept_sanitizer_error = True
-
-        index = block_end
-
-    ignore_error_exitcode = ignored_any and saw_cuda_version_error and not kept_sanitizer_error
-    for index, line in enumerate(lines):
-        if index in ignored_line_indices:
-            continue
-        if ignore_error_exitcode and SANITIZER_ERROR_SUMMARY in line:
-            continue
-        filtered_lines.append(line)
-
-    return SanitizerOutputAnalysis("\n".join(filtered_lines), ignore_error_exitcode)
-
-
-def _is_ignored_cuda_version_sanitizer_error(output, returncode, sanitizer_error_exitcode):
-    return _analyze_sanitizer_output(
-        output, returncode, sanitizer_error_exitcode
-    ).ignore_error_exitcode
-
-
-def _filter_sanitizer_output(output, returncode, sanitizer_error_exitcode):
-    return _analyze_sanitizer_output(output, returncode, sanitizer_error_exitcode).filtered_output
-
-
 def _validate_sanitizer_command(command):
     try:
         sanitizer_cmd = shlex.split(command)
@@ -1217,16 +1161,16 @@ def _run_single_config_with_sanitizer(options):
         errors="replace",
     )
     raw_output = f"{result.stdout or ''}{result.stderr or ''}"
-    analysis = _analyze_sanitizer_output(
+    analysis = analyze_sanitizer_output(
         raw_output, result.returncode, options.sanitizer_error_exitcode
     )
-    if analysis.filtered_output:
+    if analysis.output:
         print(
-            analysis.filtered_output,
-            end="" if analysis.filtered_output.endswith("\n") else "\n",
+            analysis.output,
+            end="" if analysis.output.endswith("\n") else "\n",
             flush=True,
         )
-    if analysis.ignore_error_exitcode:
+    if analysis.only_ignored_diagnostics:
         return 0
     if result.returncode == options.sanitizer_error_exitcode:
         print(
@@ -1245,7 +1189,7 @@ def check_gpu_memory(gpu_ids, num_workers_per_gpu):
         try:
             get_memory_info(gpu_id)
         except pynvml.NVMLError as e:
-            print(f"[WARNING] Failed to check GPU {gpu_id}: {e!s}", flush=True)
+            print(f"[warn] Failed to check GPU {gpu_id}: {e!s}", flush=True)
             continue
         available_gpus.append(gpu_id)
         max_workers_per_gpu[gpu_id] = 1 if num_workers_per_gpu == -1 else num_workers_per_gpu
@@ -1253,93 +1197,112 @@ def check_gpu_memory(gpu_ids, num_workers_per_gpu):
     return available_gpus, max_workers_per_gpu
 
 
-def _execute_test_case(api_config_str, options):
+def run_test_case(api_config_str, options):
     """Run a single test case for the given API configuration."""
-    cuda_visible = os.environ.get("CUDA_VISIBLE_DEVICES", "0")
-    gpu_id = int(cuda_visible.split(",")[0])
-
-    print(
-        f"{datetime.now()} GPU {gpu_id} {os.getpid()} [paddle {options.paddle_version}] test begin: {api_config_str}",
-        flush=True,
-    )
-
-    runtime_config = runtime_config_for_gpu(options, gpu_id)
-
-    try:
-        api_config = APIConfig(api_config_str)
-    except Exception as err:
-        print(f"[config_parse] {api_config_str} {err!s}", flush=True)
-        write_to_log("config_parse", api_config_str)
-        return
-
-    test_class = _select_test_class(options)
-    kwargs = {k: v for k, v in vars(options).items() if k in VALID_TEST_ARGS}
-    kwargs["runtime_config"] = runtime_config
-    case = test_class(api_config, **kwargs)
-    try:
-        case.test()
-    except Exception as err:
-        err_msg = str(err).lower()
-        terminal_log_type = get_terminal_log_type(api_config_str)
-        oom_markers = (
-            "cuda out of memory",
-            "out of memory error",
-            "resourceexhaustederror",
-            "out of memory",
-            "outofmemoryerror",
-            "cannot allocate memory",
-            "std::bad_alloc",
-            "bad allocation",
-            "memoryerror",
-            "cublas_status_alloc_failed",
+    started_at = time.monotonic()
+    gpu_id = int(os.environ.get("CUDA_VISIBLE_DEVICES", "0").split(",")[0])
+    suppress_case_tags = os.environ.get("PADDLEAPITEST_SUPPRESS_CASE_TAGS") == "1"
+    case_id = None
+    if not suppress_case_tags:
+        case_id = write_case_begin(
+            api_config_str,
+            worker_pid=os.getpid(),
+            slot=os.environ.get("PADDLEAPITEST_WORKER_SLOT"),
+            gpu=gpu_id,
+            paddle_version=options.paddle_version,
         )
-        cuda_markers = (
-            "cuda error",
-            "memory corruption",
-            "illegal memory access",
-            "invalid configuration argument",
-            "invalid resource handle",
-        )
-        exit_code = None
-        if any(marker in err_msg for marker in oom_markers):
-            exit_code = FATAL_OOM_EXIT_CODE
-        elif terminal_log_type == "torch_error" and any(
-            marker in err_msg for marker in cuda_markers
-        ):
-            exit_code = FATAL_TORCH_EXIT_CODE
-        elif any(marker in err_msg for marker in cuda_markers):
-            exit_code = FATAL_CUDA_EXIT_CODE
-        if exit_code is not None:
+    case_status = "done"
+    try:
+        runtime_config = runtime_config_for_gpu(options, gpu_id)
+
+        try:
+            api_config = APIConfig(api_config_str)
+        except Exception as err:
+            print(f"[config_parse] {api_config_str} {err!s}", flush=True)
+            write_to_log("config_parse", api_config_str)
+            case_status = "error"
+            return
+
+        test_class = _select_test_class(options)
+        kwargs = {k: v for k, v in vars(options).items() if k in VALID_TEST_ARGS}
+        kwargs["runtime_config"] = runtime_config
+        case = test_class(api_config, **kwargs)
+        try:
+            case.test()
+        except Exception as err:
+            err_msg = str(err).lower()
+            terminal_log_type = get_terminal_log_type(api_config_str)
+            oom_markers = (
+                "cuda out of memory",
+                "out of memory error",
+                "resourceexhaustederror",
+                "out of memory",
+                "outofmemoryerror",
+                "cannot allocate memory",
+                "std::bad_alloc",
+                "bad allocation",
+                "memoryerror",
+                "cublas_status_alloc_failed",
+            )
+            cuda_markers = (
+                "cuda error",
+                "memory corruption",
+                "illegal memory access",
+                "invalid configuration argument",
+                "invalid resource handle",
+            )
+            exit_code = None
+            if any(marker in err_msg for marker in oom_markers):
+                exit_code = FATAL_OOM_EXIT_CODE
+            elif terminal_log_type == "torch_error" and any(
+                marker in err_msg for marker in cuda_markers
+            ):
+                exit_code = FATAL_TORCH_EXIT_CODE
+            elif any(marker in err_msg for marker in cuda_markers):
+                exit_code = FATAL_CUDA_EXIT_CODE
+            if exit_code is not None:
+                if has_terminal_log(api_config_str):
+                    write_checkpoint(api_config_str)
+                try:
+                    close_process_files()
+                finally:
+                    try:
+                        restore_stdio()
+                    finally:
+                        os._exit(exit_code)
             if has_terminal_log(api_config_str):
                 write_checkpoint(api_config_str)
-            try:
-                close_process_files()
-            finally:
-                try:
-                    restore_stdio()
-                finally:
-                    os._exit(exit_code)
-        if has_terminal_log(api_config_str):
-            write_checkpoint(api_config_str)
-            return
-        # if not fatal error, subprocess will be alive and report error
-        print(f"[test error] {api_config_str}: {err}", flush=True)
+                return
+            # if not fatal error, subprocess will be alive and report error
+            print(f"[test error] {api_config_str}: {err}", flush=True)
+            raise
+        finally:
+            del test_class, api_config, case
+            gc.collect()
+            if not any(
+                getattr(options, opt)
+                for opt in (
+                    "paddle_gpu_performance",
+                    "torch_gpu_performance",
+                    "paddle_torch_gpu_performance",
+                )
+            ) and not getattr(options, "use_gpu_mode", False):
+                _clear_device_cache(options)
+
+    except GpuMemoryDeferred:
+        case_status = "deferred"
         raise
-
-
-def run_test_case(api_config_str, options):
-    try:
-        return _execute_test_case(api_config_str, options)
+    except BaseException:
+        case_status = "error"
+        raise
     finally:
-        if not any(
-            getattr(options, opt)
-            for opt in (
-                "paddle_gpu_performance",
-                "torch_gpu_performance",
-                "paddle_torch_gpu_performance",
+        if not suppress_case_tags:
+            write_case_end(
+                case_status,
+                case_id=case_id,
+                api_config_str=api_config_str,
+                duration_ms=round((time.monotonic() - started_at) * 1000),
             )
-        ):
-            _clear_device_cache(options)
 
 
 def main():
@@ -1580,9 +1543,7 @@ def main():
     options = parser.parse_args()
     options.paddle_version = paddle_version
     if not options._sanitizer_child:
-        print(f"Main process id: {os.getpid()}")
-        print(f"Options: {vars(options)}", flush=True)
-        print(f"PaddlePaddle version: {paddle_version}", flush=True)
+        print_run_header(options, paddle_version)
     if options.random_seed != parser.get_default("random_seed"):
         np.random.seed(options.random_seed)
 
@@ -1746,7 +1707,7 @@ def main():
         # when engineV2 was interrupted, resume from .tmp dir
         aggregate_logs(cleanup=True)
         if options.use_compute_sanitizer:
-            cleanup_sanitizer_tmp_dir()
+            clean_sanitizer_case_logs()
         removed_stale_logs = cleanup_uncheckpointed_result_logs()
         if removed_stale_logs:
             print(
@@ -1756,7 +1717,6 @@ def main():
 
         # read checkpoint
         finish_configs = read_log("checkpoint")
-        print(len(finish_configs), "cases in checkpoint.", flush=True)
 
         api_config_count = 0
         skipped_non_config = 0
@@ -1778,7 +1738,6 @@ def main():
                 return
         if skipped_non_config:
             print(f"{skipped_non_config} non-config lines skipped.", flush=True)
-        print(api_config_count, "cases in total.", flush=True)
         dup_case = api_config_count - len(api_configs)
         if dup_case > 0:
             print(dup_case, "cases are duplicates and removed.", flush=True)
@@ -1789,7 +1748,10 @@ def main():
         finish_case = api_config_count - all_case
         if finish_case:
             print(finish_case, "cases already tested.", flush=True)
-        print(all_case, "cases will be tested.", flush=True)
+        print("--- PREPARING")
+        print(
+            f"{'Cases':<11}{api_config_count} total | {len(finish_configs)} checkpointed | {all_case} pending"
+        )
         del api_config_count, dup_case, finish_case
 
         # validate GPU visibility and derive per-GPU worker counts
@@ -1887,7 +1849,29 @@ def main():
                 slot_idx = msg[1]
                 config = msg[2]
                 exitcode = msg[3] if msg_type == "crashed" and len(msg) > 3 else None
-                crash_source = msg[5] if msg_type == "crashed" and len(msg) > 5 else "worker"
+                crash_source = "worker"
+                worker_pid = None
+                completed_offset = None
+                if msg_type == "done":
+                    worker_pid = msg[3] if len(msg) > 3 else None
+                    completed_offset = msg[4] if len(msg) > 4 else None
+                elif msg_type == "error":
+                    worker_pid = msg[4] if len(msg) > 4 else None
+                    completed_offset = msg[5] if len(msg) > 5 else None
+                elif msg_type == "timeout":
+                    worker_pid = msg[3] if len(msg) > 3 else None
+                elif msg_type == "deferred":
+                    worker_pid = msg[4] if len(msg) > 4 else None
+                    completed_offset = msg[5] if len(msg) > 5 else None
+                elif msg_type == "crashed":
+                    if len(msg) > 5 and msg[5] == "child":
+                        crash_source = "child"
+                        worker_pid = msg[6] if len(msg) > 6 else None
+                        completed_offset = msg[7] if len(msg) > 7 else None
+                    else:
+                        worker_pid = msg[4] if len(msg) > 4 else None
+                if worker_pid is not None:
+                    mark_inorder_case_complete(worker_pid, completed_offset)
                 worker_reusable = msg_type in ("done", "error", "deferred") or (
                     msg_type == "crashed"
                     and options.use_compute_sanitizer
@@ -1922,24 +1906,18 @@ def main():
                 if msg_type == "deferred":
                     reason = msg[3] if len(msg) > 3 else "insufficient GPU memory"
                     pending_dispatch.append(config)
-                    print(
-                        f"[gpu_mode] Deferred {config}: {reason}",
-                        flush=True,
-                    )
+                    print(f"[gpu_mode] Deferred {config}: {reason}", flush=True)
                     continue
 
                 tested_case += 1
 
                 if options.show_runtime_status or tested_case % 10000 == 0:
                     print(
-                        f"[{tested_case}/{all_case}] Testing {config}",
+                        f"[{tested_case}/{all_case}] {msg_type.upper()} | {config}",
                         flush=True,
                     )
 
-                if msg_type == "done":
-                    if options.show_runtime_status or tested_case % 10000 == 0:
-                        print(f"[info] Test case succeeded for {config}", flush=True)
-                elif msg_type == "timeout":
+                if msg_type == "timeout":
                     write_to_log("timeout", config)
                     print(
                         f"[error] Test case timed out for {config}",
@@ -1989,18 +1967,16 @@ def main():
 
                 write_to_log("checkpoint", config)
 
-                # Get next config to dispatch
+                # 先派发下一项，再做周期日志聚合，避免空闲 worker 等待共享存储 I/O。
                 next_config = next(config_iter, None)
-                if next_config is None:
-                    continue
-
-                # For timeout/non-sanitizer crashed: worker is restarting, queue for later dispatch
-                if not worker_reusable:
-                    pending_dispatch.append(next_config)
-                else:
-                    # Worker is alive and ready for next task
-                    pool.dispatch(slot_idx, next_config)
-                    active_tasks += 1
+                if next_config is not None:
+                    # For timeout/non-sanitizer crashed: worker is restarting, queue for later dispatch
+                    if not worker_reusable:
+                        pending_dispatch.append(next_config)
+                    else:
+                        # Worker is alive and ready for next task
+                        pool.dispatch(slot_idx, next_config)
+                        active_tasks += 1
 
                 # Periodic log aggregation
                 if tested_case % 1000 == 0:
@@ -2010,19 +1986,22 @@ def main():
         except Exception as e:
             print(f"Unexpected error: {e}", flush=True)
             cleanup(pool)
-            total_time = time.time() - start_time
-            print(f"Test time: {round(total_time / 60, 3)} minutes.", flush=True)
         finally:
             pool.shutdown()
             if options.use_compute_sanitizer:
-                cleanup_sanitizer_tmp_dir()
-            print(f"{tested_case} cases have been tested.", flush=True)
+                clean_sanitizer_case_logs()
             log_counts = aggregate_logs(end=True)
             print_log_info(max(all_case - tested_case, 0), log_counts)
             end_time = time.time()
             total_time = end_time - start_time
-            print(f"Test time: {round(total_time / 60, 3)} minutes.", flush=True)
-    print("Done.")
+            print_run_footer(
+                all_case,
+                tested_case,
+                max(all_case - tested_case, 0),
+                log_counts,
+                total_time,
+                options.log_dir,
+            )
 
 
 if __name__ == "__main__":

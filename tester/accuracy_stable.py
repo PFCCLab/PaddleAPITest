@@ -24,12 +24,12 @@ from .paddle_to_torch import get_converter
 class APITestAccuracyStable(APITestBase):
     # 执行阶段错误广播映射: (iter_idx, source) -> 受影响的 comp 列表
     _TORCH_AFFECTED_COMPS = {
-        0: ["T1P1", "T1P2", "T1T2", "T1P1B", "T1P2B", "T1T2B"],
-        1: ["T2P2", "T2P1", "T1T2", "T2P2B", "T2P1B", "T1T2B"],
+        0: ["P1T1", "P2T1", "T1T2", "P1T1B", "P2T1B", "T1T2B"],
+        1: ["P2T2", "P1T2", "T1T2", "P2T2B", "P1T2B", "T1T2B"],
     }
     _PADDLE_AFFECTED_COMPS = {
-        0: ["T1P1", "T2P1", "P1P2", "T1P1B", "T2P1B", "P1P2B"],
-        1: ["T2P2", "T1P2", "P1P2", "T2P2B", "T1P2B", "P1P2B"],
+        0: ["P1T1", "P1T2", "P1P2", "P1T1B", "P1T2B", "P1P2B"],
+        1: ["P2T2", "P2T1", "P1P2", "P2T2B", "P2T1B", "P1P2B"],
     }
 
     def __init__(self, api_config, **kwargs):
@@ -40,119 +40,10 @@ class APITestAccuracyStable(APITestBase):
         torch.set_printoptions(profile="short", edgeitems=2, threshold=100, linewidth=120)
         torch.set_default_device("cuda")
 
-    def _detach_result(self, value):
-        if isinstance(value, (torch.Tensor, paddle.Tensor)):
-            return value.detach()
-        if isinstance(value, list):
-            return [self._detach_result(item) for item in value]
-        if isinstance(value, tuple):
-            return tuple(self._detach_result(item) for item in value)
-        if isinstance(value, dict):
-            return {key: self._detach_result(item) for key, item in value.items()}
-        return value
-
-    def _move_result_to_cpu(self, value):
-        if isinstance(value, torch.Tensor):
-            return value.cpu()
-        if isinstance(value, paddle.Tensor):
-            return value.cpu()
-        if isinstance(value, list):
-            return [self._move_result_to_cpu(item) for item in value]
-        if isinstance(value, tuple):
-            return tuple(self._move_result_to_cpu(item) for item in value)
-        if isinstance(value, dict):
-            return {key: self._move_result_to_cpu(item) for key, item in value.items()}
-        return value
-
-    def _result_num_bytes(self, value):
-        if isinstance(value, (torch.Tensor, paddle.Tensor)):
-            try:
-                return int(value.numel()) * int(value.element_size())
-            except Exception:
-                return 0
-        if isinstance(value, (list, tuple)):
-            return sum(self._result_num_bytes(item) for item in value)
-        if isinstance(value, dict):
-            return sum(self._result_num_bytes(item) for item in value.values())
-        return 0
-
-    def _move_result_to_gpu(self, value):
-        if isinstance(value, torch.Tensor):
-            return value.to(device="cuda", non_blocking=True)
-        if isinstance(value, paddle.Tensor):
-            return value.cuda()
-        if isinstance(value, list):
-            return [self._move_result_to_gpu(item) for item in value]
-        if isinstance(value, tuple):
-            return tuple(self._move_result_to_gpu(item) for item in value)
-        if isinstance(value, dict):
-            return {key: self._move_result_to_gpu(item) for key, item in value.items()}
-        return value
-
-    def _try_restore_spilled_results_to_gpu(self, results):
-        required_bytes = sum(self._result_num_bytes(value) for value in results)
-        if required_bytes <= 0:
-            return None
-        try:
-            free_bytes, _ = torch.cuda.mem_get_info()
-            available_bytes = free_bytes
-            memory_budget = float(getattr(self.gpu_mode_config, "memory_budget", 0.0) or 0.0)
-            if memory_budget > 0:
-                reserved_bytes = torch.cuda.memory_reserved()
-                budget_headroom = max(
-                    0,
-                    int(memory_budget * (1024**3)) - reserved_bytes,
-                )
-                available_bytes = min(available_bytes, budget_headroom)
-            # Leave 20% headroom for allocator and comparison temporaries.
-            if required_bytes * 5 > available_bytes * 4:
-                return None
-            restored = tuple(self._move_result_to_gpu(value) for value in results)
-            return restored
-        except Exception:
-            return None
-
-    def _clear_runtime_inputs(self, framework):
-        for attr_name in (f"{framework}_args", f"{framework}_kwargs"):
-            if hasattr(self, attr_name):
-                delattr(self, attr_name)
-        gc.collect()
-        if self.use_gpu_mode:
-            gpu_mode_maybe_empty_cache(
-                self.gpu_mode_config,
-                f"accuracy_stable_after_{framework}",
-            )
-        elif framework == "torch":
-            torch.cuda.empty_cache()
-        else:
-            paddle.device.cuda.empty_cache()
-
     def _broadcast_to_comp_dimensions(self, log_type, affected_comps):
         """将执行阶段错误广播到所有受影响的 comp 维度"""
         for comp in affected_comps:
             write_to_comp_log(comp, log_type, self.api_config.config)
-
-    def _reset_random_state(self, seed: int = 42):
-        """Reset numpy / paddle / torch (CPU+CUDA) RNGs so random APIs
-        (uniform, normal, randn, bernoulli, dropout, ...) produce
-        reproducible outputs across the torch run and the paddle run."""
-        numpy.random.seed(seed)
-        try:
-            paddle.seed(seed)
-            if paddle.device.is_compiled_with_cuda():
-                try:
-                    for i in range(paddle.device.cuda.device_count()):
-                        paddle.framework.core.default_cuda_generator(i).manual_seed(seed)
-                except Exception:
-                    pass
-        except Exception:
-            pass
-        try:
-            torch.manual_seed(seed)
-            if torch.cuda.is_available():
-                torch.cuda.manual_seed_all(seed)
-        except Exception:
-            pass
 
     def test(self):
         if self.need_skip():
@@ -200,32 +91,42 @@ class APITestAccuracyStable(APITestBase):
                 raise
             return
 
+        try:
+            self.save_original_inputs_to_cpu()
+        except Exception as err:
+            log_type, fatal = self.report_runtime_error(
+                err, "config_input", "save_original_inputs_to_cpu"
+            )
+            if fatal:
+                raise
+            return
+
         torch_output_pair = []
         torch_grad_pair = []
         paddle_output_pair = []
         paddle_grad_pair = []
 
-        # iter twice
+        # Every execution recreates its input from the same immutable CPU copy.
         for _i in range(2):
             # ======== torch ========
-            self._reset_random_state()
+            self.reset_random_state()
             torch_output, torch_out_grads, torch_grad_success = self.get_torch_output(
                 convert_result, _i
             )
             if torch_output is None:
                 return
-            torch_output = self._detach_result(torch_output)
-            torch_out_grads = self._detach_result(torch_out_grads)
-            self._clear_runtime_inputs("torch")
+            torch_output = self.detach_tensor_tree(torch_output)
+            torch_out_grads = self.detach_tensor_tree(torch_out_grads)
+            self.clear_runtime_inputs("torch", phase="accuracy_stable_after_torch")
 
             # ======== paddle ========
-            self._reset_random_state()
+            self.reset_random_state()
             paddle_output, paddle_out_grads = self.get_paddle_output(torch_grad_success, _i)
             if paddle_output is None:
                 return
-            paddle_output = self._detach_result(paddle_output)
-            paddle_out_grads = self._detach_result(paddle_out_grads)
-            self._clear_runtime_inputs("paddle")
+            paddle_output = self.detach_tensor_tree(paddle_output)
+            paddle_out_grads = self.detach_tensor_tree(paddle_out_grads)
+            self.clear_runtime_inputs("paddle", phase="accuracy_stable_after_paddle")
 
             # ======== format ========
             paddle_output, torch_output = process_output(
@@ -243,13 +144,13 @@ class APITestAccuracyStable(APITestBase):
             paddle_grad_pair.append(paddle_out_grads)
 
             if _i == 0:
-                self.compare(torch_output_pair[0], paddle_output_pair[0], "T1P1")
-                self.compare(torch_grad_pair[0], paddle_grad_pair[0], "T1P1B")
+                self.compare(paddle_output_pair[0], torch_output_pair[0], "P1T1", "Paddle", "Torch")
+                self.compare(paddle_grad_pair[0], torch_grad_pair[0], "P1T1B", "Paddle", "Torch")
                 if self.use_gpu_mode:
-                    torch_output_pair[0] = self._move_result_to_cpu(torch_output_pair[0])
-                    paddle_output_pair[0] = self._move_result_to_cpu(paddle_output_pair[0])
-                    torch_grad_pair[0] = self._move_result_to_cpu(torch_grad_pair[0])
-                    paddle_grad_pair[0] = self._move_result_to_cpu(paddle_grad_pair[0])
+                    torch_output_pair[0] = self.move_tensor_tree_to_cpu(torch_output_pair[0])
+                    paddle_output_pair[0] = self.move_tensor_tree_to_cpu(paddle_output_pair[0])
+                    torch_grad_pair[0] = self.move_tensor_tree_to_cpu(torch_grad_pair[0])
+                    paddle_grad_pair[0] = self.move_tensor_tree_to_cpu(paddle_grad_pair[0])
                     torch_output = None
                     paddle_output = None
                     torch_out_grads = None
@@ -261,33 +162,18 @@ class APITestAccuracyStable(APITestBase):
                         force=True,
                     )
 
-        if self.use_gpu_mode:
-            restored_results = self._try_restore_spilled_results_to_gpu(
-                (
-                    torch_output_pair[0],
-                    paddle_output_pair[0],
-                    torch_grad_pair[0],
-                    paddle_grad_pair[0],
-                )
-            )
-            if restored_results is not None:
-                (
-                    torch_output_pair[0],
-                    paddle_output_pair[0],
-                    torch_grad_pair[0],
-                    paddle_grad_pair[0],
-                ) = restored_results
+        self.clear_original_cpu_inputs()
 
         # ======== summary ========
-        self.compare(torch_output_pair[1], paddle_output_pair[1], "T2P2")
-        self.compare(torch_grad_pair[1], paddle_grad_pair[1], "T2P2B")
-        self.compare(torch_output_pair[0], paddle_output_pair[1], "T1P2")
-        self.compare(torch_grad_pair[0], paddle_grad_pair[1], "T1P2B")
-        self.compare(torch_output_pair[1], paddle_output_pair[0], "T2P1")
-        self.compare(torch_grad_pair[1], paddle_grad_pair[0], "T2P1B")
-        self.compare(torch_output_pair[0], torch_output_pair[1], "T1T2")
+        self.compare(paddle_output_pair[1], torch_output_pair[1], "P2T2", "Paddle", "Torch")
+        self.compare(paddle_grad_pair[1], torch_grad_pair[1], "P2T2B", "Paddle", "Torch")
+        self.compare(paddle_output_pair[1], torch_output_pair[0], "P2T1", "Paddle", "Torch")
+        self.compare(paddle_grad_pair[1], torch_grad_pair[0], "P2T1B", "Paddle", "Torch")
+        self.compare(paddle_output_pair[0], torch_output_pair[1], "P1T2", "Paddle", "Torch")
+        self.compare(paddle_grad_pair[0], torch_grad_pair[1], "P1T2B", "Paddle", "Torch")
+        self.compare(torch_output_pair[0], torch_output_pair[1], "T1T2", "Torch", "Torch")
         torch_output_pair.clear()
-        self.compare(torch_grad_pair[0], torch_grad_pair[1], "T1T2B")
+        self.compare(torch_grad_pair[0], torch_grad_pair[1], "T1T2B", "Torch", "Torch")
         torch_grad_pair.clear()
         gc.collect()
         if self.use_gpu_mode:
@@ -295,9 +181,9 @@ class APITestAccuracyStable(APITestBase):
                 self.gpu_mode_config,
                 "accuracy_stable_after_torch_compare",
             )
-        self.compare(paddle_output_pair[0], paddle_output_pair[1], "P1P2")
+        self.compare(paddle_output_pair[0], paddle_output_pair[1], "P1P2", "Paddle", "Paddle")
         paddle_output_pair.clear()
-        self.compare(paddle_grad_pair[0], paddle_grad_pair[1], "P1P2B")
+        self.compare(paddle_grad_pair[0], paddle_grad_pair[1], "P1P2B", "Paddle", "Paddle")
         paddle_grad_pair.clear()
 
         # 逐维度写 pass
@@ -585,11 +471,17 @@ class APITestAccuracyStable(APITestBase):
         paddle_out_grads = process_paddle_outputs(paddle_out_grads)
         return paddle_output, paddle_out_grads
 
-    def compare(self, input1, input2, comp):
+    def compare(self, input1, input2, comp, actual_source, expected_source):
         if isinstance(input1, (paddle.Tensor, torch.Tensor)):
             if isinstance(input2, (paddle.Tensor, torch.Tensor)):
                 try:
-                    self.assert_accuracy(input1, input2, comp)
+                    self.assert_accuracy(
+                        input1,
+                        input2,
+                        comp,
+                        actual_source=actual_source,
+                        expected_source=expected_source,
+                    )
                 except Exception as err:
                     self.report_compare_error(err, f"comp={comp}")
                     return
@@ -624,7 +516,9 @@ class APITestAccuracyStable(APITestBase):
                     item2, (paddle.Tensor, torch.Tensor)
                 ):
                     try:
-                        self.assert_accuracy(item1, item2, comp, idx)
+                        self.assert_accuracy(
+                            item1, item2, comp, idx, actual_source, expected_source
+                        )
                     except Exception as err:
                         self.report_compare_error(err, f"comp={comp} idx={idx}")
                         return
@@ -632,7 +526,14 @@ class APITestAccuracyStable(APITestBase):
                     item2, (paddle.Tensor, torch.Tensor)
                 ):
                     try:
-                        self.assert_accuracy(torch.tensor(item1), torch.tensor(item2), comp, idx)
+                        self.assert_accuracy(
+                            torch.tensor(item1),
+                            torch.tensor(item2),
+                            comp,
+                            idx,
+                            actual_source,
+                            expected_source,
+                        )
                     except Exception as err:
                         self.report_compare_error(err, f"comp={comp} idx={idx}")
                         return
@@ -646,19 +547,24 @@ class APITestAccuracyStable(APITestBase):
                     return
         else:
             try:
-                self.assert_accuracy(torch.tensor(input1), torch.tensor(input2), comp)
+                self.assert_accuracy(
+                    torch.tensor(input1),
+                    torch.tensor(input2),
+                    comp,
+                    actual_source=actual_source,
+                    expected_source=expected_source,
+                )
             except Exception as err:
                 self.report_compare_error(err, f"comp={comp}")
                 return
 
-    def assert_accuracy(self, tensor1, tensor2, comp, idx=0):
+    def assert_accuracy(
+        self, tensor1, tensor2, comp, idx=0, actual_source="ACTUAL", expected_source="DESIRED"
+    ):
         api_name = self.api_config.api_name
         config = self.api_config.config[:120000]
         dtype = self.api_config.dtype
         check_dtype = self.should_check_dtype()
-
-        first = "Paddle" if comp[0] == "P" else "Torch"
-        second = "Paddle" if comp[2] == "P" else "Torch"
 
         try:
             self.torch_assert_accuracy(
@@ -667,8 +573,8 @@ class APITestAccuracyStable(APITestBase):
                 atol=0.0,
                 rtol=0.0,
                 check_dtype=check_dtype,
-                actual_name=first,
-                expected_name=second,
+                actual_name=actual_source,
+                expected_name=expected_source,
                 apply_special_tolerance=False,
             )
             log_accuracy_stable(
