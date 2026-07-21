@@ -304,6 +304,45 @@ class APITestBase:
         write_to_log(log_type, self.api_config.config)
         return log_type, fatal
 
+    def reset_random_state(self, seed=42):
+        """Reset NumPy and framework RNGs for reproducible executions."""
+        numpy.random.seed(seed)
+        try:
+            paddle.seed(seed)
+            if paddle.device.is_compiled_with_cuda():
+                try:
+                    for device_id in range(paddle.device.cuda.device_count()):
+                        paddle.framework.core.default_cuda_generator(device_id).manual_seed(seed)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        try:
+            torch.manual_seed(seed)
+            if torch.cuda.is_available():
+                torch.cuda.manual_seed_all(seed)
+        except Exception:
+            pass
+
+    def clear_runtime_inputs(self, framework, phase=""):
+        """Release one framework's generated inputs after an execution."""
+        attr_names = [f"{framework}_args", f"{framework}_kwargs"]
+        if framework == "paddle":
+            attr_names.append("paddle_merged_kwargs")
+        for attr_name in attr_names:
+            if hasattr(self, attr_name):
+                delattr(self, attr_name)
+        gc.collect()
+        if self.gpu_mode_config.enabled:
+            gpu_mode_maybe_empty_cache(
+                self.gpu_mode_config,
+                phase or f"after_{framework}",
+            )
+        elif framework == "torch":
+            torch.cuda.empty_cache()
+        else:
+            paddle.device.cuda.empty_cache()
+
     def report_compare_error(self, err, phase="", default_log_type="paddle_accuracy"):
         log_type, fatal = self.report_runtime_error(err, default_log_type, phase)
         if fatal:
@@ -1524,7 +1563,19 @@ class APITestBase:
         if test_tol:
             atol, rtol = 0.0, 0.0
 
-        compare_on_cpu = test_tol or not self.gpu_mode_config.enabled
+        def is_cpu_tensor(value):
+            if isinstance(value, torch.Tensor):
+                return value.device.type == "cpu"
+            if isinstance(value, paddle.Tensor):
+                return value.place.is_cpu_place()
+            return False
+
+        compare_on_cpu = (
+            test_tol
+            or not self.gpu_mode_config.enabled
+            or is_cpu_tensor(actual)
+            or is_cpu_tensor(expected)
+        )
         if isinstance(actual, paddle.Tensor):
             if not actual.is_contiguous():
                 actual = actual.contiguous()
@@ -1713,6 +1764,67 @@ class APITestBase:
         else:
             torch.cuda.empty_cache()
             paddle.device.cuda.empty_cache()
+
+    def _for_each_tensor_config(self, callback):
+        """Apply callback to every TensorConfig in the parsed argument tree."""
+        seen = set()
+
+        def visit(value):
+            if isinstance(value, TensorConfig):
+                if id(value) not in seen:
+                    seen.add(id(value))
+                    callback(value)
+            elif isinstance(value, (list, tuple)):
+                for item in value:
+                    visit(item)
+            elif isinstance(value, dict):
+                for item in value.values():
+                    visit(item)
+
+        for value in getattr(self, "paddle_args_config", ()):
+            visit(value)
+        visit(getattr(self, "paddle_kwargs_config", {}))
+
+    def move_tensor_tree_to_cpu(self, value):
+        """Recursively move framework tensors to CPU without changing containers."""
+        if isinstance(value, (torch.Tensor, paddle.Tensor)):
+            return value.cpu()
+        if isinstance(value, list):
+            return [self.move_tensor_tree_to_cpu(item) for item in value]
+        if isinstance(value, tuple):
+            return tuple(self.move_tensor_tree_to_cpu(item) for item in value)
+        if isinstance(value, dict):
+            return type(value)(
+                (key, self.move_tensor_tree_to_cpu(item)) for key, item in value.items()
+            )
+        return value
+
+    def detach_tensor_tree(self, value):
+        """Detach every framework tensor while preserving the argument tree."""
+        if isinstance(value, (torch.Tensor, paddle.Tensor)):
+            return value.detach()
+        if isinstance(value, list):
+            return [self.detach_tensor_tree(item) for item in value]
+        if isinstance(value, tuple):
+            return tuple(self.detach_tensor_tree(item) for item in value)
+        if isinstance(value, dict):
+            return type(value)((key, self.detach_tensor_tree(item)) for key, item in value.items())
+        return value
+
+    def save_original_inputs_to_cpu(self):
+        """Save config inputs on CPU before either framework can mutate them."""
+        self._for_each_tensor_config(
+            lambda config: config.save_original_tensor_to_cpu(self.api_config)
+        )
+        gc.collect()
+        if self.gpu_mode_config.enabled:
+            gpu_mode_maybe_empty_cache(
+                self.gpu_mode_config, "save_original_inputs_to_cpu", force=True
+            )
+
+    def clear_original_cpu_inputs(self):
+        self._for_each_tensor_config(lambda config: config.clear_original_cpu_tensor())
+        gc.collect()
 
     def clear_paddle_tensor(self):
         if not hasattr(self, "torch_kwargs_config"):

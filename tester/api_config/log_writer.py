@@ -124,14 +124,14 @@ TERMINAL_LOG_TYPES = frozenset(LOG_PREFIXES) - {"checkpoint"}
 
 # === comp 维度配置（accuracy_stable 模式） ===
 COMP_TO_DIMENSION = {
-    "T1P1": "accuracy",
-    "T2P2": "accuracy",
-    "T1P2": "accuracy",
-    "T2P1": "accuracy",
-    "T1P1B": "accuracy_backward",
-    "T2P2B": "accuracy_backward",
-    "T1P2B": "accuracy_backward",
-    "T2P1B": "accuracy_backward",
+    "P1T1": "accuracy",
+    "P2T2": "accuracy",
+    "P2T1": "accuracy",
+    "P1T2": "accuracy",
+    "P1T1B": "accuracy_backward",
+    "P2T2B": "accuracy_backward",
+    "P2T1B": "accuracy_backward",
+    "P1T2B": "accuracy_backward",
     "T1T2": "torch_stable",
     "T1T2B": "torch_stable_backward",
     "P1P2": "paddle_stable",
