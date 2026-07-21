@@ -1276,26 +1276,19 @@ def _run_single_config_with_sanitizer(options):
     return result.returncode
 
 
-def check_gpu_memory(gpu_ids, num_workers_per_gpu, required_memory):  # required_memory in GB
+def check_gpu_memory(gpu_ids, num_workers_per_gpu):
     assert isinstance(gpu_ids, tuple) and len(gpu_ids) > 0
     available_gpus = []
     max_workers_per_gpu = {}
 
     for gpu_id in gpu_ids:
         try:
-            total_memory, used_memory = get_memory_info(gpu_id)
-            free_memory = total_memory - used_memory
-            max_workers = int(free_memory // required_memory)
-            if max_workers >= 1:
-                available_gpus.append(gpu_id)
-                max_workers_per_gpu[gpu_id] = (
-                    max_workers
-                    if num_workers_per_gpu == -1
-                    else min(max_workers, num_workers_per_gpu)
-                )
+            get_memory_info(gpu_id)
         except pynvml.NVMLError as e:
-            print(f"[WARNING] Failed to check GPU {gpu_id}: {e!s}", flush=True)
+            print(f"[warn] Failed to check GPU {gpu_id}: {e!s}", flush=True)
             continue
+        available_gpus.append(gpu_id)
+        max_workers_per_gpu[gpu_id] = 1 if num_workers_per_gpu == -1 else num_workers_per_gpu
 
     return available_gpus, max_workers_per_gpu
 
