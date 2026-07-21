@@ -569,9 +569,26 @@ class TensorConfig:
                     beta = self.get_arg(api_config, 10, "beta1")
                     if self.check_arg(api_config, 7, "beta2_pow"):
                         beta = self.get_arg(api_config, 11, "beta2")
+                    # The adamw kernel treats beta_pow as beta ** step. When
+                    # FLAGS_use_accuracy_compatible_kernel is ON, beta_pow is
+                    # kept in high precision, so float64 pow then cast matches
+                    # it. When the flag is OFF, recompute beta ** step with numpy
+                    # in float32 (instead of iterative float32 multiplication) so
+                    # the injected beta_pow lines up with the step-based
+                    # reconstruction used by the kernel and the torch reference.
+                    use_accuracy_compatible = paddle.get_flags(
+                        "FLAGS_use_accuracy_compatible_kernel"
+                    )["FLAGS_use_accuracy_compatible_kernel"]
+                    if use_accuracy_compatible:
+                        beta_pow_value = beta**api_config.adamw_step
+                    else:
+                        beta_pow_value = numpy.power(
+                            numpy.float32(beta),
+                            numpy.float32(api_config.adamw_step),
+                        ).item()
                     self.numpy_tensor = numpy.full(
                         self.shape,
-                        beta**api_config.adamw_step,
+                        beta_pow_value,
                         dtype=self.dtype,
                     )
 
