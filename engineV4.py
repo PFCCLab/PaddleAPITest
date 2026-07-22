@@ -49,7 +49,12 @@ from tester.api_config.dump_writer import (
 )
 from tester.api_config.log_writer import *
 from tester.api_config.sanitizer_output import analyze_sanitizer_output
-from tester.runtime_config import TestRuntimeConfig, runtime_config_for_gpu
+from tester.runtime_config import (
+    GPU_MEMORY_POLICY_ENV,
+    TestRuntimeConfig,
+    resolve_gpu_memory_policy,
+    runtime_config_for_gpu,
+)
 
 os.environ["FLAGS_use_system_allocator"] = "1"
 os.environ["NVIDIA_TF32_OVERRIDE"] = "0"
@@ -1300,7 +1305,8 @@ def run_test_case(api_config_str, options):
             raise
         finally:
             del test_class, api_config, case
-            gc.collect()
+            if not getattr(options, "use_gpu_mode", False):
+                gc.collect()
             if not any(
                 getattr(options, opt)
                 for opt in (
@@ -1575,6 +1581,11 @@ def main():
 
     options = parser.parse_args()
     options.paddle_version = paddle_version
+    _resolve_dump_options(parser, options)
+    try:
+        options.gpu_memory_policy = resolve_gpu_memory_policy()
+    except ValueError as err:
+        parser.error(str(err))
     if not options._sanitizer_child:
         print_run_header(options, paddle_version)
     if options.random_seed != parser.get_default("random_seed"):
@@ -1655,8 +1666,13 @@ def main():
         options.use_cached_numpy = False
     os.environ["USE_CACHED_NUMPY"] = str(options.use_cached_numpy)
     os.environ["USE_GPU_MODE"] = str(options.use_gpu_mode)
+    os.environ[GPU_MEMORY_POLICY_ENV] = options.gpu_memory_policy
     if options.use_gpu_mode:
-        print("[gpu_mode] enabled: use GPU tensors and comparison.", flush=True)
+        print(
+            f"[gpu_mode] enabled: use GPU tensors and comparison; "
+            f"memory policy={options.gpu_memory_policy}.",
+            flush=True,
+        )
     elif options.use_cached_numpy:
         print("[use_cached_numpy] enabled: reuse cached NumPy inputs.", flush=True)
     if options.bitwise_alignment:

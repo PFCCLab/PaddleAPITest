@@ -367,7 +367,7 @@ class APITestBase:
         except Exception:
             pass
 
-    def clear_runtime_inputs(self, framework, phase=""):
+    def clear_runtime_inputs(self, framework):
         """Release one framework's generated inputs after an execution."""
         attr_names = [f"{framework}_args", f"{framework}_kwargs"]
         if framework == "paddle":
@@ -375,15 +375,9 @@ class APITestBase:
         for attr_name in attr_names:
             if hasattr(self, attr_name):
                 delattr(self, attr_name)
-        gc.collect()
-        if self.gpu_mode_config.enabled:
-            gpu_mode_maybe_empty_cache(
-                self.gpu_mode_config,
-                phase or f"after_{framework}",
-            )
-        elif framework == "torch":
+        if not self.gpu_mode_config.enabled and framework == "torch":
             torch.cuda.empty_cache()
-        else:
+        elif not self.gpu_mode_config.enabled:
             paddle.device.cuda.empty_cache()
 
     def report_compare_error(self, err, phase="", default_log_type="paddle_accuracy"):
@@ -1368,9 +1362,7 @@ class APITestBase:
         ) or self.api_config.api_name == "paddle.Tensor.__setitem__":
             self.torch_args, self.torch_kwargs = self.copy_torch_input()
 
-        if self.gpu_mode_config.enabled:
-            gpu_mode_maybe_empty_cache(self.gpu_mode_config, "clear_torch_tensor")
-        else:
+        if not self.gpu_mode_config.enabled:
             torch.cuda.empty_cache()
         return True
 
@@ -1859,15 +1851,9 @@ class APITestBase:
         self._for_each_tensor_config(
             lambda config: config.save_original_tensor_to_cpu(self.api_config)
         )
-        gc.collect()
-        if self.gpu_mode_config.enabled:
-            gpu_mode_maybe_empty_cache(
-                self.gpu_mode_config, "save_original_inputs_to_cpu", force=True
-            )
 
     def clear_original_cpu_inputs(self):
         self._for_each_tensor_config(lambda config: config.clear_original_cpu_tensor())
-        gc.collect()
 
     def clear_paddle_tensor(self):
         if not hasattr(self, "torch_kwargs_config"):

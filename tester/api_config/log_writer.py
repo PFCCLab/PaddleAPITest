@@ -555,6 +555,8 @@ def print_run_header(options, paddle_version):
         else "NumPy"
     )
     print(f"{'Data':<11}{data_mode}")
+    if options.use_gpu_mode:
+        print(f"{'GPU memory':<11}{getattr(options, 'gpu_memory_policy', 'conservative')}")
     print(f"{'Tolerance':<11}atol {options.atol} | rtol {options.rtol}")
     print(f"{'Timeout':<11}{options.timeout} s")
     print(f"{'Runtime':<11}{'detailed' if options.show_runtime_status else 'errors only'}\n")

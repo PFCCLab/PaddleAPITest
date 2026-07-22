@@ -1,11 +1,29 @@
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass, field, replace
+
+GPU_MEMORY_POLICY_ENV = "PADDLEAPITEST_GPU_MEMORY_POLICY"
+GPU_MEMORY_POLICIES = frozenset({"conservative", "aggressive"})
+DEFAULT_GPU_MEMORY_POLICY = "conservative"
+
+
+def resolve_gpu_memory_policy(value=None):
+    """Resolve and validate the process-wide GPU memory policy."""
+    raw_value = os.environ.get(GPU_MEMORY_POLICY_ENV, "") if value is None else value
+    policy = str(raw_value or DEFAULT_GPU_MEMORY_POLICY).strip().lower()
+    if policy not in GPU_MEMORY_POLICIES:
+        choices = ", ".join(sorted(GPU_MEMORY_POLICIES))
+        raise ValueError(
+            f"invalid {GPU_MEMORY_POLICY_ENV}={raw_value!r}: expected one of {choices}"
+        )
+    return policy
 
 
 @dataclass(frozen=True)
 class GpuModeConfig:
     enabled: bool = False
+    memory_policy: str = DEFAULT_GPU_MEMORY_POLICY
     workers_on_gpu: int = 1
     total_memory: float = 0.0
     memory_budget: float = 0.0
@@ -25,6 +43,9 @@ class TestRuntimeConfig:
     def from_options(cls, options):
         gpu_mode = GpuModeConfig(
             enabled=bool(options.use_gpu_mode),
+            memory_policy=resolve_gpu_memory_policy(
+                getattr(options, "gpu_memory_policy", DEFAULT_GPU_MEMORY_POLICY)
+            ),
         )
         return cls(
             random_seed=int(options.random_seed),

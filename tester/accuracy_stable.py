@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import gc
 import traceback
 
 import numpy
@@ -36,9 +35,15 @@ class APITestAccuracyStable(APITestBase):
         super().__init__(api_config, runtime_config=kwargs.get("runtime_config"))
         self.test_amp = kwargs.get("test_amp", False)
         self.use_gpu_mode = self.gpu_mode_config.enabled
+        self.use_aggressive_gpu_memory = (
+            self.use_gpu_mode and self.gpu_mode_config.memory_policy == "aggressive"
+        )
         self.converter = get_converter()
         torch.set_printoptions(profile="short", edgeitems=2, threshold=100, linewidth=120)
         torch.set_default_device("cuda")
+
+    def should_spill_first_results(self):
+        return self.use_gpu_mode and not self.use_aggressive_gpu_memory
 
     def _broadcast_to_comp_dimensions(self, log_type, affected_comps):
         """将执行阶段错误广播到所有受影响的 comp 维度"""
@@ -117,7 +122,7 @@ class APITestAccuracyStable(APITestBase):
                 return
             torch_output = self.detach_tensor_tree(torch_output)
             torch_out_grads = self.detach_tensor_tree(torch_out_grads)
-            self.clear_runtime_inputs("torch", phase="accuracy_stable_after_torch")
+            self.clear_runtime_inputs("torch")
 
             # ======== paddle ========
             self.reset_random_state()
@@ -126,7 +131,7 @@ class APITestAccuracyStable(APITestBase):
                 return
             paddle_output = self.detach_tensor_tree(paddle_output)
             paddle_out_grads = self.detach_tensor_tree(paddle_out_grads)
-            self.clear_runtime_inputs("paddle", phase="accuracy_stable_after_paddle")
+            self.clear_runtime_inputs("paddle")
 
             # ======== format ========
             paddle_output, torch_output = process_output(
@@ -146,7 +151,7 @@ class APITestAccuracyStable(APITestBase):
             if _i == 0:
                 self.compare(paddle_output_pair[0], torch_output_pair[0], "P1T1", "Paddle", "Torch")
                 self.compare(paddle_grad_pair[0], torch_grad_pair[0], "P1T1B", "Paddle", "Torch")
-                if self.use_gpu_mode:
+                if self.should_spill_first_results():
                     torch_output_pair[0] = self.move_tensor_tree_to_cpu(torch_output_pair[0])
                     paddle_output_pair[0] = self.move_tensor_tree_to_cpu(paddle_output_pair[0])
                     torch_grad_pair[0] = self.move_tensor_tree_to_cpu(torch_grad_pair[0])
@@ -155,11 +160,9 @@ class APITestAccuracyStable(APITestBase):
                     paddle_output = None
                     torch_out_grads = None
                     paddle_out_grads = None
-                    gc.collect()
                     gpu_mode_maybe_empty_cache(
                         self.gpu_mode_config,
                         "accuracy_stable_after_first_compare_spill",
-                        force=True,
                     )
 
         self.clear_original_cpu_inputs()
@@ -175,12 +178,6 @@ class APITestAccuracyStable(APITestBase):
         torch_output_pair.clear()
         self.compare(torch_grad_pair[0], torch_grad_pair[1], "T1T2B", "Torch", "Torch")
         torch_grad_pair.clear()
-        gc.collect()
-        if self.use_gpu_mode:
-            gpu_mode_maybe_empty_cache(
-                self.gpu_mode_config,
-                "accuracy_stable_after_torch_compare",
-            )
         self.compare(paddle_output_pair[0], paddle_output_pair[1], "P1P2", "Paddle", "Paddle")
         paddle_output_pair.clear()
         self.compare(paddle_grad_pair[0], paddle_grad_pair[1], "P1P2B", "Paddle", "Paddle")
