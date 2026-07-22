@@ -9,7 +9,7 @@ import torch
 import yaml
 
 from .api_config.log_writer import write_to_log
-from .base import APITestBase
+from .base import APITestBase, gpu_mode_maybe_empty_cache
 from .paddle_to_torch import get_converter
 
 # from func_timeout import func_set_timeout
@@ -17,14 +17,16 @@ from .paddle_to_torch import get_converter
 
 class APITestAccuracy(APITestBase):
     def __init__(self, api_config, **kwargs):
-        super().__init__(api_config)
+        super().__init__(api_config, runtime_config=kwargs.get("runtime_config"))
         self.test_amp = kwargs.get("test_amp", False)
         self.atol = kwargs.get("atol", 0)
         self.rtol = kwargs.get("rtol", 0)
         self.test_tol = kwargs.get("test_tol", False)
-        self.exit_on_error = kwargs.get("exit_on_error", False)
-        self.bitwise_alignment = kwargs.get("bitwise_alignment", False)
-        self.use_gpu_mode = kwargs.get("use_gpu_mode", False)
+        self.exit_on_error = kwargs.get("exit_on_error", self.runtime_config.exit_on_error)
+        self.bitwise_alignment = kwargs.get(
+            "bitwise_alignment", self.runtime_config.bitwise_alignment
+        )
+        self.use_gpu_mode = self.gpu_mode_config.enabled
         self.manual_threshold_config_file = kwargs.get("manual_threshold_config_file", "")
         self.manual_threshold_config = self._load_manual_threshold_config(
             self.manual_threshold_config_file
@@ -61,30 +63,6 @@ class APITestAccuracy(APITestBase):
         if threshold is not None:
             return threshold[1]
         return self.rtol
-
-    def _reset_random_state(self, seed: int = 42):
-        """Reset numpy / paddle / torch (CPU+CUDA) RNGs so random APIs
-        (uniform, normal, randn, bernoulli, dropout, ...) produce
-        reproducible outputs across the torch run and the paddle run."""
-        numpy.random.seed(seed)
-        try:
-            paddle.seed(seed)
-            if paddle.device.is_compiled_with_cuda():
-                # paddle.seed already seeds the GPU default generator,
-                # but reset all device generators explicitly for safety.
-                try:
-                    for i in range(paddle.device.cuda.device_count()):
-                        paddle.framework.core.default_cuda_generator(i).manual_seed(seed)
-                except Exception:
-                    pass
-        except Exception:
-            pass
-        try:
-            torch.manual_seed(seed)
-            if torch.cuda.is_available():
-                torch.cuda.manual_seed_all(seed)
-        except Exception:
-            pass
 
     # @func_set_timeout(600)
     def test(self):
@@ -168,7 +146,8 @@ class APITestAccuracy(APITestBase):
             # Reseed before executing torch, so that random APIs
             # (e.g. torch.rand / uniform / normal / dropout) produce
             # deterministic outputs across runs when --random_seed is set.
-            self._reset_random_state()
+            self.reset_random_state()
+            self.dump_event("paddle_forward_start")
 
             # torch_args 与 torch_kwargs 是尚未映射的 torch 参数（即按 paddle 的参数顺序与关键字排列的 torch tensors）
             # (弃用)以下代码等价于:
@@ -284,7 +263,14 @@ class APITestAccuracy(APITestBase):
         else:
             del self.torch_args, self.torch_kwargs
 
-        keep_torch_outputs_on_device = self.use_gpu_mode
+        spill_torch_outputs = False
+        if self.use_gpu_mode:
+            spill_torch_outputs = gpu_mode_maybe_empty_cache(
+                self.gpu_mode_config,
+                "after_torch",
+                request_spill=True,
+            )
+        keep_torch_outputs_on_device = self.use_gpu_mode and not spill_torch_outputs
 
         def process_torch_outputs(obj):
             if isinstance(obj, (torch.return_types.max, torch.return_types.min)):
@@ -307,28 +293,26 @@ class APITestAccuracy(APITestBase):
             torch_out_grads = process_torch_outputs(torch_out_grads)
 
         gc.collect()
-        if not self.use_gpu_mode:
+        if self.use_gpu_mode:
+            self.clear_torch_tensor()
+            gpu_mode_maybe_empty_cache(
+                self.gpu_mode_config,
+                "before_paddle",
+                force=not keep_torch_outputs_on_device,
+            )
+        else:
             torch.cuda.empty_cache()
 
         try:
-            self.dump_event("paddle_input_start")
             if not self.gen_paddle_input():
                 print("gen_paddle_input failed")
                 write_to_log("paddle_error", self.api_config.config)
-                self.dump_finalize("paddle_error")
                 return
-            self.dump_save(
-                "paddle_inputs",
-                {"args": self.paddle_args, "kwargs": self.paddle_kwargs},
-                framework="paddle",
-            )
-            self.dump_event("paddle_input_done")
 
             # Reseed before executing paddle so that random APIs
             # (paddle.uniform / normal / randn / bernoulli / dropout ...)
             # match the torch run with the same seed.
-            self._reset_random_state()
-            self.dump_event("paddle_forward_start")
+            self.reset_random_state()
             if "paddle.Tensor." in self.api_config.api_name:
                 api = getattr(
                     self.paddle_args[0],
@@ -378,6 +362,8 @@ class APITestAccuracy(APITestBase):
 
         def compare_paddle_and_torch(paddle_tensor, torch_tensor, idx=0) -> bool:
             try:
+                if self.use_gpu_mode:
+                    gpu_mode_maybe_empty_cache(self.gpu_mode_config, "before_compare")
                 # if paddle_tensor.dtype == paddle.bfloat16:
                 #     paddle_tensor = paddle.cast(paddle_tensor, dtype="float32")
                 # if torch_tensor.dtype == torch.bfloat16:
@@ -503,6 +489,9 @@ class APITestAccuracy(APITestBase):
 
         # Forward check now pass.
         # Then do paddle backward and backward result check.
+        if self.use_gpu_mode:
+            del torch_output
+            gpu_mode_maybe_empty_cache(self.gpu_mode_config, "after_forward_compare")
         if torch_grad_success:
             self.is_backward = True
             try:

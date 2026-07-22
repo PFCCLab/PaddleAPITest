@@ -10,30 +10,14 @@ import re
 import shutil
 from pathlib import Path
 
+from tester.api_config.log_writer import (
+    CASE_BEGIN_TAG,
+    CASE_END_TAG,
+    LOG_PREFIXES,
+)
+
 DEFAULT_TEST_LOG_PATH = Path("tester/api_config/test_log_big_tensor")
 RESULT_DIR_NAME = "error_stat_result"
-
-# 终态分类到结果文件前缀的映射，与 tester/api_config/log_writer.py 中 LOG_PREFIXES 保持一致。
-# checkpoint 仅用于读取已完成 case 集合，不作为统计分类输出。
-LOG_PREFIXES = {
-    "checkpoint": "checkpoint",
-    "pass": "api_config_pass",
-    "skip": "api_config_skip",
-    # Paddle 问题：需重点定位 Paddle bug 或稳定性问题
-    "paddle_error": "api_config_paddle_error",
-    "paddle_accuracy": "api_config_paddle_accuracy",
-    "paddle_bitwise": "api_config_paddle_bitwise",
-    "paddle_cuda": "api_config_paddle_cuda",
-    "paddle_crash": "api_config_paddle_crash",
-    # 可重测：资源或超时，调整资源或放宽时间后可重试
-    "oom": "api_config_oom",
-    "timeout": "api_config_timeout",
-    # 测试侧问题：对照侧或配置问题，不代表 Paddle 本身有 bug
-    "torch_error": "api_config_torch_error",
-    "config_input": "api_config_config_input",
-    "config_parse": "api_config_config_parse",
-    "config_convert": "api_config_config_convert",
-}
 
 # 默认汇总模式下的输出分组（--split-errors 时按每个终态分类单独输出）：
 #   paddle_issue  — Paddle 问题，需重点定位
@@ -91,17 +75,52 @@ def load_config_sets(input_path):
     return config_sets
 
 
-def parse_logs(input_path):
-    # 从 log_inorder.log 中按 "test begin" 分割出每个 case 的完整日志块。
-    # 过滤掉 gpu_resources.cc 和内存等待行，避免干扰 case 边界识别。
-    # "Worker PID" 行标志上一个 case 日志块结束（worker 重启分隔符）。
-    log_path = Path(input_path) / "log_inorder.log"
-    if not log_path.exists():
-        print(f"{log_path} not exists", flush=True)
-        return []
-    with log_path.open("r") as f:
-        input_text = f.read()
+def _parse_tagged_logs(input_text):
+    logs = []
+    current_content = []
+    current_case_id = None
+    begin_count = 0
+    end_count = 0
+    for line in input_text.split("\n"):
+        if "gpu_resources.cc" in line or "Waiting for available memory" in line:
+            continue
+        if line.startswith(CASE_BEGIN_TAG):
+            begin_count += 1
+            if current_content:
+                logs.append("\n".join(current_content))
+            current_content = [line]
+            match = re.match(rf"{re.escape(CASE_BEGIN_TAG)} ([^|\s]+)", line)
+            current_case_id = match.group(1) if match else None
+            continue
+        if current_content:
+            if line.startswith(CASE_END_TAG):
+                while current_content and not current_content[-1].strip():
+                    current_content.pop()
+                current_content.append(line)
+                end_count += 1
+                match = re.match(rf"{re.escape(CASE_END_TAG)} ([^|\s]+)", line)
+                end_case_id = match.group(1) if match else None
+                if current_case_id and end_case_id and current_case_id != end_case_id:
+                    print(
+                        f"[WARNING] case_id mismatch: begin={current_case_id}, end={end_case_id}",
+                        flush=True,
+                    )
+                logs.append("\n".join(current_content))
+                current_content = []
+                current_case_id = None
+            else:
+                current_content.append(line)
+    if current_content:
+        logs.append("\n".join(current_content))
+    if begin_count != end_count:
+        print(
+            f"[WARNING] CASE tag count mismatch: begin={begin_count}, end={end_count}",
+            flush=True,
+        )
+    return logs
 
+
+def _parse_legacy_logs(input_text):
     logs = []
     in_test_block = False
     current_content = []
@@ -109,13 +128,13 @@ def parse_logs(input_path):
         if "gpu_resources.cc" in line or "Waiting for available memory" in line:
             continue
         if "test begin" in line:
-            if in_test_block and current_content:
+            if current_content:
                 logs.append("\n".join(current_content))
-            in_test_block = True
             current_content = [line]
+            in_test_block = True
             continue
         if "Worker PID" in line:
-            if in_test_block and current_content:
+            if current_content:
                 logs.append("\n".join(current_content))
             in_test_block = False
             current_content = []
@@ -124,12 +143,32 @@ def parse_logs(input_path):
             current_content.append(line)
     if current_content:
         logs.append("\n".join(current_content))
+    return logs
+
+
+def parse_logs(input_path):
+    # 新日志按 CASE tag 分割；无 tag 的存量日志按 test begin 分割。
+    log_path = Path(input_path) / "log_inorder.log"
+    if not log_path.exists():
+        print(f"{log_path} not exists", flush=True)
+        return []
+    with log_path.open("r") as f:
+        input_text = f.read()
+
+    if CASE_BEGIN_TAG in input_text or CASE_END_TAG in input_text:
+        logs = _parse_tagged_logs(input_text)
+    else:
+        logs = _parse_legacy_logs(input_text)
     print(f"Found {len(logs)} logs", flush=True)
     return logs
 
 
-def get_sort_key(content):
-    match = re.search(r"test begin: (.*)$", content.split("\n", 1)[0])
+def get_config_key(content):
+    # 新格式把 config 固定在 CASE 首行之后；旧日志继续识别 test begin。
+    lines = content.splitlines()
+    if lines and lines[0].startswith(CASE_BEGIN_TAG) and len(lines) > 1:
+        return lines[1].strip()
+    match = re.search(r"test begin: ([^\r\n]*)", content)
     return match.group(1).strip() if match else ""
 
 
@@ -138,7 +177,7 @@ def classify_by_config(logs, config_sets):
     # 同一 case 理论上只出现在一个终态文件中；checkpoint 不作为分类输出，跳过。
     classified_logs = {}
     for content in logs:
-        key = get_sort_key(content)
+        key = get_config_key(content)
         if not key:
             continue
         for log_type, configs in config_sets.items():

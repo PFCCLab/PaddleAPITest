@@ -25,7 +25,6 @@ torch = _LazyTorch()
 USE_CACHED_NUMPY = os.getenv("USE_CACHED_NUMPY", "False").lower() == "true"
 TEST_NON_CONTIGUOUS = os.getenv("TEST_NON_CONTIGUOUS", "0").lower() in ("true", "1")
 USE_GPU_MODE = os.getenv("USE_GPU_MODE", "False").lower() == "true"
-SKIP_GPU_CLEANUP = os.getenv("SKIP_GPU_CLEANUP", "False").lower() == "true"
 cached_numpy = {}
 AUTOGRAD_DTYPES = frozenset(
     ["float32", "float64", "float16", "complex64", "complex128", "bfloat16"]
@@ -43,21 +42,8 @@ def _load_forward_only_apis():
 FORWARD_ONLY_APIS = _load_forward_only_apis()
 
 
-def _env_bool(name, default=False):
-    return os.getenv(name, str(default)).lower() in ("true", "1", "yes", "y")
-
-
-def set_gpu_mode(enabled):
-    os.environ["USE_GPU_MODE"] = str(bool(enabled))
-    os.environ["SKIP_GPU_CLEANUP"] = str(bool(enabled))
-
-
 def is_gpu_mode():
-    return _env_bool("USE_GPU_MODE", USE_GPU_MODE)
-
-
-def should_skip_gpu_cleanup():
-    return _env_bool("SKIP_GPU_CLEANUP", SKIP_GPU_CLEANUP)
+    return os.getenv("USE_GPU_MODE", str(USE_GPU_MODE)).lower() in ("true", "1", "yes", "y")
 
 
 def _shape_tuple(shape):
@@ -189,7 +175,7 @@ class TensorConfig:
         self.numpy_tensor = None
         self.paddle_tensor = None
         self.torch_tensor = None
-        self.gpu_source_tensor = None
+        self.cpu_tensor = None
         self.shuffle_dims = None
 
     def __deepcopy__(self, memo):
@@ -201,6 +187,11 @@ class TensorConfig:
         result.place = copy.deepcopy(self.place)
         result.is_contiguous = self.is_contiguous
         result.strides = copy.deepcopy(self.strides)
+        result.numpy_tensor = None
+        result.paddle_tensor = None
+        result.torch_tensor = None
+        result.cpu_tensor = None
+        result.shuffle_dims = None
         return result
 
     def __str__(self):
@@ -249,7 +240,7 @@ class TensorConfig:
     def get_cached_numpy(self, dtype, shape, generation_kind="input", scale=1.2):
         return get_cached_numpy_array(dtype, shape, generation_kind=generation_kind, scale=scale)
 
-    def _use_gpu(self, dtype=None):
+    def _use_gpu(self, api_config=None, dtype=None):
         if not is_gpu_mode():
             return False
         if self.place is not None and "cpu" in str(self.place).lower():
@@ -293,6 +284,35 @@ class TensorConfig:
         base_dtype = "float16" if dtype in FLOAT8_DTYPES else "float32"
         return ((paddle.rand(shape, dtype=base_dtype) - 0.5) * 1.2).cast(dtype)
 
+    def _make_gpu_torch_low_temp_dense_tensor(self, dtype, pattern_dtype=None):
+        pattern_dtype = pattern_dtype or torch.float32
+        torch_dtype = self.convert_dtype_to_torch_type(dtype)
+        shape = tuple(self.shape)
+        device = torch.device("cuda", torch.cuda.current_device())
+        tensor = torch.empty(shape, device=device, dtype=torch_dtype)
+        flat_tensor = tensor.reshape(-1)
+        numel = self.numel()
+        if numel == 0:
+            return tensor
+
+        chunk_elems = min(numel, 8 * 1024 * 1024)
+        pattern_elems = min(chunk_elems, 1024 * 1024)
+        pattern = torch.linspace(
+            -0.6,
+            0.6,
+            steps=pattern_elems,
+            device=device,
+            dtype=pattern_dtype,
+        ).to(dtype=torch_dtype)
+        for start in range(0, numel, chunk_elems):
+            end = min(start + chunk_elems, numel)
+            offset = start
+            while offset < end:
+                next_offset = min(offset + pattern_elems, end)
+                flat_tensor[offset:next_offset] = pattern[: next_offset - offset]
+                offset = next_offset
+        return tensor
+
     def _make_gpu_torch_dense_tensor(self, dtype=None):
         dtype = dtype or self.dtype
         torch_dtype = self.convert_dtype_to_torch_type(dtype)
@@ -309,8 +329,11 @@ class TensorConfig:
             real_part = (torch.rand(shape, device=device, dtype=real_dtype) - 0.5) * 1.2
             imag_part = (torch.rand(shape, device=device, dtype=real_dtype) - 0.5) * 1.2
             return (real_part + 1j * imag_part).to(dtype=torch_dtype)
-        base_dtype = torch.float16 if dtype in FLOAT8_DTYPES else torch.float32
-        return ((torch.rand(shape, device=device, dtype=base_dtype) - 0.5) * 1.2).to(
+        if dtype in FLOAT8_DTYPES:
+            return self._make_gpu_torch_low_temp_dense_tensor(dtype, pattern_dtype=torch.float16)
+        if dtype in ("float16", "bfloat16"):
+            return self._make_gpu_torch_low_temp_dense_tensor(dtype, pattern_dtype=torch.float32)
+        return ((torch.rand(shape, device=device, dtype=torch.float32) - 0.5) * 1.2).to(
             dtype=torch_dtype
         )
 
@@ -370,26 +393,29 @@ class TensorConfig:
     def _make_gpu_tensor_pair(self, api_config, dtype=None):
         dtype = dtype or self.dtype
         source_dtype = "float16" if dtype in FLOAT8_DTYPES else dtype
-        if self.gpu_source_tensor is None:
-            self.gpu_source_tensor = self._make_gpu_torch_dense_tensor(source_dtype)
-        torch_source = self.gpu_source_tensor
+        torch_source = self._make_gpu_torch_dense_tensor(source_dtype)
         paddle_source = paddle.utils.dlpack.from_dlpack(
-            torch.utils.dlpack.to_dlpack(torch_source.detach().clone())
+            torch.utils.dlpack.to_dlpack(torch_source.detach())
         )
         if not self.is_contiguous and self.strides is not None:
-            paddle_tensor = self._make_gpu_strided_paddle_tensor_from_values(
-                paddle_source, api_config, dtype
-            )
-            torch_tensor = self._make_gpu_strided_torch_tensor_from_values(
-                torch_source, api_config, dtype
-            )
-            return paddle_tensor, torch_tensor
+            try:
+                paddle_tensor = self._make_gpu_strided_paddle_tensor_from_values(
+                    paddle_source, api_config, dtype
+                )
+                torch_tensor = self._make_gpu_strided_torch_tensor_from_values(
+                    torch_source, api_config, dtype
+                )
+                return paddle_tensor, torch_tensor
+            finally:
+                del torch_source, paddle_source
         if dtype in FLOAT8_DTYPES:
             paddle_tensor = paddle_source.cast(dtype)
             torch_tensor = torch_source.to(dtype=self.convert_dtype_to_torch_type(dtype))
+            del torch_source, paddle_source
         else:
             paddle_tensor = paddle_source
-            torch_tensor = torch_source.detach().clone()
+            torch_tensor = torch_source
+            del torch_source
         paddle_tensor = self._set_paddle_autograd(paddle_tensor, api_config, dtype)
         torch_tensor = self._set_torch_autograd(torch_tensor, api_config, dtype)
         return paddle_tensor, torch_tensor
@@ -549,9 +575,26 @@ class TensorConfig:
                     beta = self.get_arg(api_config, 10, "beta1")
                     if self.check_arg(api_config, 7, "beta2_pow"):
                         beta = self.get_arg(api_config, 11, "beta2")
+                    # The adamw kernel treats beta_pow as beta ** step. When
+                    # FLAGS_use_accuracy_compatible_kernel is ON, beta_pow is
+                    # kept in high precision, so float64 pow then cast matches
+                    # it. When the flag is OFF, recompute beta ** step with numpy
+                    # in float32 (instead of iterative float32 multiplication) so
+                    # the injected beta_pow lines up with the step-based
+                    # reconstruction used by the kernel and the torch reference.
+                    use_accuracy_compatible = paddle.get_flags(
+                        "FLAGS_use_accuracy_compatible_kernel"
+                    )["FLAGS_use_accuracy_compatible_kernel"]
+                    if use_accuracy_compatible:
+                        beta_pow_value = beta**api_config.adamw_step
+                    else:
+                        beta_pow_value = numpy.power(
+                            numpy.float32(beta),
+                            numpy.float32(api_config.adamw_step),
+                        ).item()
                     self.numpy_tensor = numpy.full(
                         self.shape,
-                        beta**api_config.adamw_step,
+                        beta_pow_value,
                         dtype=self.dtype,
                     )
 
@@ -2985,55 +3028,102 @@ class TensorConfig:
                     # expert_routemap_topk (arg2): int32, shape [seqlen, topk], value in [-1, num_experts)
                     if self.check_arg(api_config, 2, "expert_routemap_topk"):
                         num_experts = self.get_arg(api_config, 4, "num_experts", 32)
-                        if isinstance(num_experts, TensorConfig):
-                            num_experts = 32
+                        hidden_states = self.get_arg(api_config, 0, "hidden_states")
+                        scale = self.get_arg(api_config, 1, "scale")
+                        expert_prob = self.get_arg(api_config, 3, "expert_prob_topk")
+                        tokens_per_expert = self.get_arg(api_config, 5, "tokens_per_expert")
+                        padding_alignment = self.get_arg(api_config, 6, "padding_alignment")
+                        using_ue8m0_scale = self.get_arg(api_config, 8, "using_ue8m0_scale", False)
+                        if (
+                            not isinstance(num_experts, int)
+                            or isinstance(num_experts, bool)
+                            or not 1 <= num_experts <= 64
+                        ):
+                            raise ValueError("num_experts must be an integer in [1, 64]")
+                        if (
+                            not isinstance(padding_alignment, int)
+                            or isinstance(padding_alignment, bool)
+                            or padding_alignment <= 0
+                            or padding_alignment & (padding_alignment - 1)
+                        ):
+                            raise ValueError("padding_alignment must be a positive power of 2")
+                        if not isinstance(hidden_states, TensorConfig) or (
+                            len(hidden_states.shape) != 2
+                            or hidden_states.dtype not in {"bfloat16", "float8_e4m3fn"}
+                        ):
+                            raise ValueError(
+                                "hidden_states must be a rank-2 bfloat16 or float8_e4m3fn tensor"
+                            )
+                        if self.dtype != "int32":
+                            raise ValueError("expert_routemap_topk dtype must be int32")
+                        if not isinstance(expert_prob, TensorConfig) or (
+                            len(expert_prob.shape) != 2 or expert_prob.dtype != "float32"
+                        ):
+                            raise ValueError("expert_prob_topk must be a rank-2 float32 tensor")
                         seqlen, topk = self.shape[0], self.shape[1]
+                        if not (
+                            isinstance(hidden_states, TensorConfig)
+                            and isinstance(expert_prob, TensorConfig)
+                            and len(hidden_states.shape) == 2
+                            and len(expert_prob.shape) == 2
+                            and hidden_states.shape[0] == seqlen
+                            and tuple(expert_prob.shape) == (seqlen, topk)
+                        ):
+                            raise ValueError(
+                                "hidden_states, expert_routemap_topk, and expert_prob_topk "
+                                "must share sequence_length and top_k dimensions"
+                            )
+                        if hidden_states.dtype == "float8_e4m3fn":
+                            expected_scale_width = (hidden_states.shape[1] + 127) // 128
+                            expected_scale_dtype = "float32"
+                            if using_ue8m0_scale:
+                                expected_scale_width = (expected_scale_width + 3) // 4
+                                expected_scale_dtype = "int32"
+                            if not (
+                                isinstance(scale, TensorConfig)
+                                and tuple(scale.shape) == (seqlen, expected_scale_width)
+                                and scale.dtype == expected_scale_dtype
+                            ):
+                                raise ValueError(
+                                    "float8 hidden_states requires scale with shape "
+                                    f"[{seqlen}, {expected_scale_width}] and dtype "
+                                    f"{expected_scale_dtype}"
+                                )
+                        elif scale is not None:
+                            raise ValueError(
+                                "scale must be None when hidden_states dtype is bfloat16"
+                            )
                         # Generate valid routemap vectorized for large seqlen
-                        routemap = numpy.full(self.shape, -1, dtype="int32")
+                        routemap = numpy.full((seqlen, topk), -1, dtype="int32")
                         if topk == 0:
-                            # 0-size topk dimension: routemap stays all -1
-                            self.numpy_tensor = routemap
-                            tokens_per_expert = self.get_arg(api_config, 5, "tokens_per_expert")
-                            if tokens_per_expert is not None:
-                                tokens_per_expert[:] = [0] * num_experts
+                            raise ValueError("topk should be greater than 0")
                         else:
-                            # Each row randomly assigns 1~min(topk, num_experts) experts
-                            max_assign = min(topk, num_experts)
-                            n_assigned = numpy.random.randint(1, max_assign + 1, size=seqlen)
-                            # For each possible n_assigned value, batch process all rows with that count
-                            for n in range(1, max_assign + 1):
-                                mask = n_assigned == n
-                                count = int(mask.sum())
-                                if count == 0:
-                                    continue
-                                # Generate random expert indices for these rows
-                                expert_indices = numpy.array(
-                                    [
-                                        numpy.random.choice(num_experts, size=n, replace=False)
-                                        for _ in range(count)
-                                    ],
-                                    dtype="int32",
+                            if not isinstance(tokens_per_expert, list):
+                                raise ValueError("tokens_per_expert must be a list of integers")
+                            if len(tokens_per_expert) != num_experts:
+                                raise ValueError("tokens_per_expert length must equal num_experts")
+                            if any(
+                                not isinstance(count, int) or isinstance(count, bool)
+                                for count in tokens_per_expert
+                            ):
+                                raise ValueError("tokens_per_expert must be a list of integers")
+                            total_assignments = sum(tokens_per_expert)
+                            representable = total_assignments <= seqlen * topk and not any(
+                                count < 0 or count > seqlen for count in tokens_per_expert
+                            )
+                            if not representable:
+                                raise ValueError(
+                                    "tokens_per_expert cannot be represented by the "
+                                    "expert_routemap_topk shape"
                                 )
-                                # Generate random positions for these rows
-                                position_indices = numpy.array(
-                                    [
-                                        numpy.random.choice(topk, size=n, replace=False)
-                                        for _ in range(count)
-                                    ],
-                                    dtype="int32",
-                                )
-                                row_indices = numpy.where(mask)[0]
-                                for j in range(n):
-                                    routemap[row_indices, position_indices[:, j]] = expert_indices[
-                                        :, j
-                                    ]
+                            cursor = 0
+                            for expert, count in enumerate(tokens_per_expert):
+                                positions = numpy.arange(cursor, cursor + count, dtype="int64")
+                                rows = positions % seqlen
+                                columns = (positions // seqlen) % topk
+                                routemap[rows, columns] = expert
+                                cursor += count
                             self.numpy_tensor = routemap
-                            # Update tokens_per_expert to match the generated routemap
-                            tokens_count = [
-                                int(numpy.sum(routemap == e)) for e in range(num_experts)
-                            ]
-                            tokens_per_expert = self.get_arg(api_config, 5, "tokens_per_expert")
-                            tokens_per_expert[:] = tokens_count
                     # expert_prob_topk (arg3): float32, shape [seqlen, topk], value in [0, 1]
                     elif self.check_arg(api_config, 3, "expert_prob_topk"):
                         routemap_config = self.get_arg(api_config, 2, "expert_routemap_topk")
@@ -3041,6 +3131,7 @@ class TensorConfig:
                         if (
                             isinstance(routemap_config, TensorConfig)
                             and routemap_config.numpy_tensor is not None
+                            and routemap_config.numpy_tensor.shape == tuple(self.shape)
                         ):
                             mask = routemap_config.numpy_tensor >= 0
                             raw = numpy.random.random(self.shape).astype("float32") * mask
@@ -3063,50 +3154,79 @@ class TensorConfig:
                     # expert_routemap_topk (arg2): int32, shape [seqlen, topk], value in [-1, num_experts)
                     if self.check_arg(api_config, 2, "expert_routemap_topk"):
                         num_experts = self.get_arg(api_config, 5, "num_experts", 32)
-                        if isinstance(num_experts, TensorConfig):
-                            num_experts = 32
+                        total_zipped_tokens = self.get_arg(api_config, 4, "total_zipped_tokens")
+                        hidden_config = self.get_arg(api_config, 0, "hidden_states_unzipped")
+                        rowmap_config = self.get_arg(api_config, 1, "zipped_expertwise_rowmap")
+                        prob_config = self.get_arg(api_config, 3, "token_prob_unzipped")
+                        if (
+                            not isinstance(num_experts, int)
+                            or isinstance(num_experts, bool)
+                            or num_experts <= 0
+                        ):
+                            raise ValueError("num_experts must be a positive integer")
+                        if (
+                            not isinstance(total_zipped_tokens, int)
+                            or isinstance(total_zipped_tokens, bool)
+                            or total_zipped_tokens < 0
+                        ):
+                            raise ValueError("total_zipped_tokens must be a non-negative integer")
+                        if not (
+                            isinstance(hidden_config, TensorConfig)
+                            and len(hidden_config.shape) == 2
+                            and hidden_config.dtype == "bfloat16"
+                        ):
+                            raise ValueError(
+                                "hidden_states_unzipped must be a rank-2 bfloat16 tensor"
+                            )
+                        if not (
+                            isinstance(rowmap_config, TensorConfig)
+                            and len(rowmap_config.shape) == 2
+                            and rowmap_config.dtype == "int32"
+                            and tuple(rowmap_config.shape) == (total_zipped_tokens, num_experts)
+                        ):
+                            raise ValueError(
+                                "zipped_expertwise_rowmap must have shape "
+                                "[total_zipped_tokens, num_experts] and dtype int32"
+                            )
+                        if not (
+                            isinstance(prob_config, TensorConfig)
+                            and len(prob_config.shape) in (1, 2)
+                            and prob_config.shape[0] == hidden_config.shape[0]
+                            and (len(prob_config.shape) == 1 or prob_config.shape[1] == 1)
+                            and prob_config.dtype == "float32"
+                        ):
+                            raise ValueError(
+                                "token_prob_unzipped must have shape "
+                                "[seqlen_broadcasted] or [seqlen_broadcasted, 1] "
+                                "and dtype float32"
+                            )
+                        if self.dtype != "int32" or len(self.shape) != 2:
+                            raise ValueError("expert_routemap_topk must be a rank-2 int32 tensor")
                         seqlen, topk = self.shape[0], self.shape[1]
-                        # Generate valid routemap vectorized for large seqlen
+                        if seqlen != total_zipped_tokens:
+                            raise ValueError(
+                                "expert_routemap_topk sequence length must equal "
+                                "total_zipped_tokens"
+                            )
+                        if topk <= 0:
+                            raise ValueError("topk should be greater than 0")
+                        # Generate at most one route per (token, expert), bounded by
+                        # the number of available broadcast rows.
                         routemap = numpy.full(self.shape, -1, dtype="int32")
-                        if topk == 0:
-                            # 0-size topk dimension: routemap stays all -1
-                            self.numpy_tensor = routemap
-                        else:
-                            max_assign = min(topk, num_experts)
-                            n_assigned = numpy.random.randint(1, max_assign + 1, size=seqlen)
-                            for n in range(1, max_assign + 1):
-                                mask = n_assigned == n
-                                count = int(mask.sum())
-                                if count == 0:
-                                    continue
-                                expert_indices = numpy.array(
-                                    [
-                                        numpy.random.choice(num_experts, size=n, replace=False)
-                                        for _ in range(count)
-                                    ],
-                                    dtype="int32",
-                                )
-                                position_indices = numpy.array(
-                                    [
-                                        numpy.random.choice(topk, size=n, replace=False)
-                                        for _ in range(count)
-                                    ],
-                                    dtype="int32",
-                                )
-                                row_indices = numpy.where(mask)[0]
-                                for j in range(n):
-                                    routemap[row_indices, position_indices[:, j]] = expert_indices[
-                                        :, j
-                                    ]
-                            self.numpy_tensor = routemap
+                        max_assign = min(topk, num_experts)
+                        route_count = min(hidden_config.shape[0], seqlen * max_assign)
+                        positions = numpy.arange(route_count, dtype="int64")
+                        rows = positions % seqlen
+                        columns = positions // seqlen
+                        routemap[rows, columns] = (rows + columns) % num_experts
+                        self.numpy_tensor = routemap
                     # zipped_expertwise_rowmap (arg1): int32, shape [seqlen, num_experts]
                     # Needs to be valid rowmap based on routemap
                     elif self.check_arg(api_config, 1, "zipped_expertwise_rowmap"):
                         routemap_config = self.get_arg(api_config, 2, "expert_routemap_topk")
                         num_experts = self.get_arg(api_config, 5, "num_experts", 32)
-                        if isinstance(num_experts, TensorConfig):
-                            num_experts = 32
-                        seqlen = self.shape[0]
+                        total_zipped_tokens = self.get_arg(api_config, 4, "total_zipped_tokens")
+                        seqlen = total_zipped_tokens
                         # Fetch unzipped seqlen from hidden_states_unzipped (arg0) to
                         # bound expert_counters so fetch_row never exceeds the valid
                         # range of unzipped_token_probs / hidden_states_unzipped.
@@ -3119,6 +3239,14 @@ class TensorConfig:
                             unzipped_seqlen = hidden_config.shape[0]
                         else:
                             unzipped_seqlen = seqlen  # fallback
+                        if self.dtype != "int32" or tuple(self.shape) != (
+                            seqlen,
+                            num_experts,
+                        ):
+                            raise ValueError(
+                                "zipped_expertwise_rowmap must have shape "
+                                "[total_zipped_tokens, num_experts] and dtype int32"
+                            )
                         rowmap = numpy.full(self.shape, -1, dtype="int32")
                         if isinstance(routemap_config, TensorConfig):
                             if routemap_config.numpy_tensor is None:
@@ -3127,25 +3255,48 @@ class TensorConfig:
                                 # Build rowmap and keep routemap consistent: every
                                 # non-negative expert in routemap must map to a valid
                                 # fetch_row because moe_unpermute reads token_prob by it.
-                                expert_counters = numpy.zeros(num_experts, dtype="int32")
                                 routemap = routemap_config.numpy_tensor
+                                expert_counts = numpy.array(
+                                    [
+                                        numpy.count_nonzero(routemap == expert)
+                                        for expert in range(num_experts)
+                                    ],
+                                    dtype="int64",
+                                )
+                                if int(expert_counts.sum()) > unzipped_seqlen:
+                                    raise ValueError(
+                                        "routemap assignments exceed hidden_states_unzipped "
+                                        "capacity"
+                                    )
+                                expert_offsets = numpy.zeros(num_experts, dtype="int64")
+                                expert_offsets[1:] = numpy.cumsum(expert_counts[:-1])
+                                expert_counters = numpy.zeros(num_experts, dtype="int64")
                                 for i in range(seqlen):
                                     for e in range(num_experts):
                                         positions = numpy.where(routemap[i] == e)[0]
                                         if positions.size == 0:
                                             continue
-                                        if expert_counters[e] < unzipped_seqlen:
-                                            rowmap[i, e] = expert_counters[e]
-                                            expert_counters[e] += 1
-                                        else:
-                                            routemap[i, positions] = -1
+                                        rowmap[i, e] = expert_offsets[e] + expert_counters[e]
+                                        expert_counters[e] += 1
                         self.numpy_tensor = rowmap
                     # token_prob_unzipped (arg3): float32, value in [0, 1]
                     elif self.check_arg(api_config, 3, "token_prob_unzipped"):
+                        hidden_config = self.get_arg(api_config, 0, "hidden_states_unzipped")
+                        if not (
+                            self.dtype == "float32"
+                            and len(self.shape) in (1, 2)
+                            and isinstance(hidden_config, TensorConfig)
+                            and self.shape[0] == hidden_config.shape[0]
+                            and (len(self.shape) == 1 or self.shape[1] == 1)
+                        ):
+                            raise ValueError(
+                                "token_prob_unzipped must match the broadcasted sequence "
+                                "length and have dtype float32"
+                            )
                         self.numpy_tensor = numpy.random.random(self.shape).astype("float32")
 
             if self.numpy_tensor is None:
-                if self._use_gpu(original_dtype):
+                if self._use_gpu(api_config, original_dtype):
                     self.get_gpu_paddle_tensor(api_config, original_dtype)
                 elif self.shape == []:
                     if "int" in self.dtype:
@@ -3188,7 +3339,17 @@ class TensorConfig:
 
     def get_paddle_tensor(self, api_config):
         if self.paddle_tensor is None:
-            if self.numpy_tensor is None and self._use_gpu():
+            if self.cpu_tensor is not None:
+                torch_tensor = self.cpu_tensor.to(
+                    device=torch.device("cuda:0") if self._use_gpu(api_config) else "cpu",
+                    copy=True,
+                )
+                self.paddle_tensor = paddle.utils.dlpack.from_dlpack(
+                    torch.utils.dlpack.to_dlpack(torch_tensor)
+                )
+                self.paddle_tensor.stop_gradient = not self._requires_autograd(api_config)
+                return self.paddle_tensor
+            if self.numpy_tensor is None and self._use_gpu(api_config):
                 return self.get_gpu_paddle_tensor(api_config)
             if not self.is_contiguous and self.strides is not None:
                 self.paddle_tensor = self._create_strided_paddle_tensor(api_config)
@@ -3267,7 +3428,12 @@ class TensorConfig:
         device = torch.device("cuda:0") if torch.cuda.is_available() else torch.device("cpu")
         torch.set_default_device(device)
         if self.torch_tensor is None:
-            if self.numpy_tensor is None and self._use_gpu():
+            if self.cpu_tensor is not None:
+                self.torch_tensor = self.cpu_tensor.to(device=device, copy=True)
+                if self._requires_autograd(api_config):
+                    self.torch_tensor = self.torch_tensor.detach().requires_grad_(True)
+                return self.torch_tensor
+            if self.numpy_tensor is None and self._use_gpu(api_config):
                 return self.get_gpu_torch_tensor(api_config)
             if not self.is_contiguous and self.strides is not None:
                 self.torch_tensor = self._create_strided_torch_tensor(api_config)
@@ -3336,14 +3502,15 @@ class TensorConfig:
         self.torch_tensor = None
         self.paddle_tensor = None
         self.numpy_tensor = None
-        if not should_skip_gpu_cleanup():
+        self.cpu_tensor = None
+        if not is_gpu_mode():
             torch.cuda.empty_cache()
             paddle.device.cuda.empty_cache()
 
     def clear_paddle_tensor(self):
         del self.paddle_tensor
         self.paddle_tensor = None
-        if not should_skip_gpu_cleanup():
+        if not is_gpu_mode():
             paddle.device.cuda.empty_cache()
 
     def clear_numpy_tensor(self):
@@ -3353,8 +3520,20 @@ class TensorConfig:
     def clear_torch_tensor(self):
         del self.torch_tensor
         self.torch_tensor = None
-        if not should_skip_gpu_cleanup():
+        if not is_gpu_mode():
             torch.cuda.empty_cache()
+
+    def save_original_tensor_to_cpu(self, api_config):
+        """Keep one immutable CPU copy used to recreate isolated test inputs."""
+        if self.cpu_tensor is not None:
+            return
+        tensor = self.get_torch_tensor(api_config)
+        self.cpu_tensor = tensor.detach().to(device="cpu", copy=True)
+        self.paddle_tensor = None
+        self.torch_tensor = None
+
+    def clear_original_cpu_tensor(self):
+        self.cpu_tensor = None
 
     def fill_numpy_tensor(self, full_value):
         self.numpy_tensor = numpy.full(shape=self.shape, fill_value=full_value, dtype=self.dtype)

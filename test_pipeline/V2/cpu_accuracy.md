@@ -80,7 +80,6 @@ LOG_DIR="tester/api_config/test_log_cpu_accuracy" # 测试日志目录
 NUM_GPUS=-1 # 指定 GPU 数量，-1 表示使用所有 GPU
 NUM_WORKERS_PER_GPU=-1 # 指定每个 GPU 的工作进程数，-1 表示使用最大进程数
 GPU_IDS="-1" # 指定 GPU 列表，-1 表示使用所有 GPU
-# REQUIRED_MEMORY=10 # 可通过调整单个工作进程预估显存 GB，修改最大进程数
 
 TEST_MODE_ARGS=(
 	--accuracy=True
@@ -101,7 +100,6 @@ PARALLEL_ARGS=(
     --num_gpus="$NUM_GPUS"
     --num_workers_per_gpu="$NUM_WORKERS_PER_GPU"
     --gpu_ids="$GPU_IDS"
-    # --required_memory="$REQUIRED_MEMORY"
 )
 
 mkdir -p "$LOG_DIR" || {

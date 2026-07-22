@@ -126,7 +126,6 @@ engine_args:
   num_gpus: -1
   num_workers_per_gpu: -1
   gpu_ids: "4-7"
-  # required_memory: 10.0
 
   # ========== 运行控制 ==========
   timeout: 600
