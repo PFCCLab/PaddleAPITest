@@ -42,8 +42,9 @@ if TYPE_CHECKING:
     )
 
 from tester.api_config.dump_writer import (
-    finalize_from_parent,
+    dump_enabled,
     parse_strict_bool,
+    record_dump_terminal_status,
     resolve_dump_options,
 )
 from tester.api_config.log_writer import *
@@ -1244,7 +1245,10 @@ def run_test_case(api_config_str, options):
         kwargs["runtime_config"] = runtime_config
         case = test_class(api_config, **kwargs)
         try:
-            case.run()
+            if dump_enabled():
+                case.run_with_dump()
+            else:
+                case.test()
         except Exception as err:
             err_msg = str(err).lower()
             terminal_log_type = get_terminal_log_type(api_config_str)
@@ -1277,7 +1281,8 @@ def run_test_case(api_config_str, options):
             elif any(marker in err_msg for marker in cuda_markers):
                 exit_code = FATAL_CUDA_EXIT_CODE
             if exit_code is not None:
-                finalize_from_parent("engine_fatal", exit_code=exit_code, error=str(err))
+                if dump_enabled():
+                    record_dump_terminal_status("engine_fatal", exit_code=exit_code, error=str(err))
                 if has_terminal_log(api_config_str):
                     write_checkpoint(api_config_str)
                 try:

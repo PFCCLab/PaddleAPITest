@@ -603,7 +603,7 @@ def dump_enabled() -> bool:
     return parse_strict_bool(os.environ.get("USE_DUMP", "false"))
 
 
-def finalize_from_parent(status: str, **data: Any) -> None:
+def record_dump_terminal_status(status: str, **data: Any) -> None:
     if not dump_enabled():
         return
     ctx = DumpContext(

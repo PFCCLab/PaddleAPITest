@@ -300,15 +300,15 @@ class APITestBase:
             torch.set_num_threads(8)
             torch.set_printoptions(threshold=100, linewidth=120)
 
-    def run(self):
-        output_context = (
-            self.dump_context.tee_output() if self.dump_context else contextlib.nullcontext()
-        )
-        with output_context:
+    def run_with_dump(self):
+        """Execute the test with dump output capture and lifecycle reporting."""
+        if self.dump_context is None:
+            raise RuntimeError("run_with_dump() requires dump mode to be enabled")
+        with self.dump_context.tee_output():
             try:
                 return self.test()
             except Exception as err:
-                if self.dump_context and self.dump_context._data.get("status") is None:
+                if self.dump_context._data.get("status") is None:
                     self.dump_finalize("engine_error", error=str(err))
                 raise
 

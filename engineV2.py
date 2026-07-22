@@ -38,8 +38,9 @@ if TYPE_CHECKING:
     )
 
 from tester.api_config.dump_writer import (
-    finalize_from_parent,
+    dump_enabled,
     parse_strict_bool,
+    record_dump_terminal_status,
     resolve_dump_options,
 )
 from tester.api_config.log_writer import *
@@ -612,7 +613,10 @@ def run_test_case(api_config_str, options):
         kwargs["runtime_config"] = runtime_config
         case = test_class(api_config, **kwargs)
         try:
-            case.run()
+            if dump_enabled():
+                case.run_with_dump()
+            else:
+                case.test()
             if has_terminal_log(api_config_str):
                 write_checkpoint(api_config_str)
         except Exception as err:
@@ -647,7 +651,8 @@ def run_test_case(api_config_str, options):
             elif any(marker in err_msg for marker in cuda_markers):
                 exit_code = FATAL_CUDA_EXIT_CODE
             if exit_code is not None:
-                finalize_from_parent("engine_fatal", exit_code=exit_code, error=str(err))
+                if dump_enabled():
+                    record_dump_terminal_status("engine_fatal", exit_code=exit_code, error=str(err))
                 if has_terminal_log(api_config_str):
                     write_checkpoint(api_config_str)
                 try:
@@ -1032,7 +1037,8 @@ def main():
             api_config = APIConfig(options.api_config)
         except Exception as err:
             print(f"[config_parse] {options.api_config} {err!s}", flush=True)
-            finalize_from_parent("config_parse", error=str(err))
+            if dump_enabled():
+                record_dump_terminal_status("config_parse", error=str(err))
             return
 
         test_class = _select_test_class(options)
@@ -1069,7 +1075,10 @@ def main():
         else:
             case = test_class(api_config, test_amp=options.test_amp)
         try:
-            case.run()
+            if dump_enabled():
+                case.run_with_dump()
+            else:
+                case.test()
         except Exception as err:
             if (
                 "Tensor-likes are not equal" in str(err)
