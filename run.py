@@ -4,6 +4,7 @@ import argparse
 import copy
 import os
 import shlex
+import shutil
 import signal
 import subprocess
 import sys
@@ -17,16 +18,17 @@ import yaml
 PROJECT_ROOT = Path(__file__).resolve().parent
 DEFAULT_CONFIG = Path("test_pipeline/run_config.yaml")
 DEFAULT_RETEST_ERROR_CONFIGS = [
-    "api_config_accuracy_error.txt",
     "api_config_paddle_error.txt",
-    "api_config_timeout.txt",
-    "api_config_crash.txt",
+    "api_config_paddle_accuracy.txt",
+    "api_config_paddle_bitwise.txt",
+    "api_config_paddle_cuda.txt",
+    "api_config_paddle_crash.txt",
     "api_config_oom.txt",
-    "api_config_cuda_error.txt",
-    "api_config_match_error.txt",
-    "api_config_numpy_error.txt",
+    "api_config_timeout.txt",
     "api_config_torch_error.txt",
-    "api_config_paddle_to_torch_failed.txt",
+    "api_config_config_input.txt",
+    "api_config_config_parse.txt",
+    "api_config_config_convert.txt",
 ]
 
 TOP_LEVEL_KEYS = {"name", "runner", "env", "input", "output", "retest", "engine_args"}
@@ -559,6 +561,7 @@ def run_foreground(command: list[str], env: dict[str, str], log_file: Path) -> i
         stderr=subprocess.STDOUT,
         text=True,
         bufsize=1,
+        start_new_session=True,
     )
     with log_file.open("a", encoding="utf-8") as log_handle:
         assert process.stdout is not None
@@ -567,9 +570,32 @@ def run_foreground(command: list[str], env: dict[str, str], log_file: Path) -> i
                 print(line, end="")
                 log_handle.write(line)
         except KeyboardInterrupt:
-            for line in process.stdout:
-                print(line, end="")
-                log_handle.write(line)
+            print("\n[中断] 正在停止测试进程并清理临时日志...", flush=True)
+            try:
+                try:
+                    os.killpg(process.pid, signal.SIGINT)
+                except ProcessLookupError:
+                    pass
+                remaining_output, _ = process.communicate(timeout=30)
+            except subprocess.TimeoutExpired:
+                try:
+                    os.killpg(process.pid, signal.SIGTERM)
+                except ProcessLookupError:
+                    pass
+                try:
+                    remaining_output, _ = process.communicate(timeout=10)
+                except subprocess.TimeoutExpired:
+                    try:
+                        os.killpg(process.pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+                    remaining_output, _ = process.communicate()
+            if remaining_output:
+                print(remaining_output, end="")
+                log_handle.write(remaining_output)
+            shutil.rmtree(log_file.parent / ".tmp", ignore_errors=True)
+            return_code = process.returncode
+            return 130 if return_code is None or return_code < 0 else return_code
     return process.wait()
 
 
@@ -617,13 +643,12 @@ def run_background(
         "    except FileNotFoundError:\n"
         "        pass\n"
     )
-    cleaner = subprocess.Popen(
+    subprocess.Popen(
         [sys.executable, "-c", cleaner_code, str(process.pid), str(pid_file)],
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
         start_new_session=True,
     )
-    cleaner.wait()
 
     time.sleep(1)
     if not process_running(process.pid):

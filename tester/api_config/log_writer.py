@@ -585,6 +585,17 @@ def print_run_footer(total_case, tested_case, remaining_case, log_counts, elapse
         f"{counts.get('skip', 0)} skip | {remaining_case} remaining"
     )
     print(f"{'Issues':<11}{paddle_issues} Paddle | {test_issues} test | {retest} retest")
+    print("\n--- BREAKDOWN")
+    if (log_counts or {}).get("_multi_classification") and (log_counts or {}).get(
+        "_has_multi_result_overlap"
+    ):
+        print("  Note: In accuracy_stable mode, one config may appear in multiple result sets.")
+    ordered_types = [*LOG_PREFIXES, "incomplete"]
+    for log_type in ordered_types:
+        if log_type in counts:
+            print(f"  {log_type:<28}{counts[log_type]:>8}")
+    for log_type in sorted(set(counts) - set(ordered_types)):
+        print(f"  {log_type:<28}{counts[log_type]:>8}")
     print(f"{'Duration':<11}{format_duration(elapsed)}")
     print(f"{'Logs':<11}{log_dir}")
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]

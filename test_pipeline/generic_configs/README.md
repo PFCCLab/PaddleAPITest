@@ -45,14 +45,14 @@ python run.py -c test_pipeline/generic_configs/run_1M_accuracy.yaml \
 
 ## num_workers_per_gpu 配置
 
-| 配置 | num_workers_per_gpu |
-| --- | --- |
-| 0size accuracy | 16 |
-| 0size paddleonly | 16 |
-| 4096 accuracy | 8 |
-| 4096 paddleonly | 8 |
-| 1M accuracy/paddleonly | 2 |
-| accuracy_compatible / accuracy_manual_threshold | 2 |
+| 配置 | num_workers_per_gpu | GPU memory policy |
+| --- | --- | --- |
+| 0size accuracy | 8 | aggressive |
+| 0size paddleonly | 8 | aggressive |
+| 4096 accuracy | 4 | aggressive |
+| 4096 paddleonly | 4 | aggressive |
+| 1M accuracy/paddleonly | 1 | conservative（默认） |
+| accuracy_compatible / accuracy_manual_threshold | 1 | aggressive |
 
 ## 依赖的 run.py 能力
 

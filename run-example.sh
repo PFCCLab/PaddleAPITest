@@ -23,6 +23,12 @@ export FLAGS_alloc_fill_value=255
 export FLAGS_check_nan_inf=true
 # export FLAGS_use_accuracy_compatible_kernel=true
 
+# ── PaddleAPITest 运行策略 ────────────────────────────────────
+# PADDLEAPITEST_IMPL: FP8 blockwise 参考实现，torch（默认）| te。
+# PADDLEAPITEST_GPU_MEMORY_POLICY: GPU mode 显存策略，conservative（默认）| aggressive。
+# export PADDLEAPITEST_IMPL=torch
+# export PADDLEAPITEST_GPU_MEMORY_POLICY=conservative
+
 # ── 输入输出 ──────────────────────────────────────────────────
 # input 三选一：--api_config / --api_config_file / --api_config_file_pattern
 # API_CONFIG=""
