@@ -150,19 +150,31 @@ class APITestAccuracyStable(APITestBase):
             if _i == 0:
                 self.compare(paddle_output_pair[0], torch_output_pair[0], "P1T1")
                 self.compare(paddle_grad_pair[0], torch_grad_pair[0], "P1T1B")
-                if self.should_spill_first_results():
-                    torch_output_pair[0] = self.move_tensor_tree_to_cpu(torch_output_pair[0])
-                    paddle_output_pair[0] = self.move_tensor_tree_to_cpu(paddle_output_pair[0])
-                    torch_grad_pair[0] = self.move_tensor_tree_to_cpu(torch_grad_pair[0])
-                    paddle_grad_pair[0] = self.move_tensor_tree_to_cpu(paddle_grad_pair[0])
-                    torch_output = None
-                    paddle_output = None
-                    torch_out_grads = None
-                    paddle_out_grads = None
-                    gpu_mode_maybe_empty_cache(
+                if self.use_gpu_mode:
+                    # Keep the first pair on GPU while the configured budget has
+                    # headroom. Spill only when the existing GPU-mode policy says
+                    # the next execution needs relief; this avoids forcing later
+                    # summary comparisons through CPU for very large outputs.
+                    should_spill = gpu_mode_maybe_empty_cache(
                         self.gpu_mode_config,
-                        "accuracy_stable_after_first_compare_spill",
+                        "accuracy_stable_after_first_compare",
+                        request_spill=True,
                     )
+                    if should_spill:
+                        torch_output_pair[0] = self.move_tensor_tree_to_cpu(torch_output_pair[0])
+                        paddle_output_pair[0] = self.move_tensor_tree_to_cpu(paddle_output_pair[0])
+                        torch_grad_pair[0] = self.move_tensor_tree_to_cpu(torch_grad_pair[0])
+                        paddle_grad_pair[0] = self.move_tensor_tree_to_cpu(paddle_grad_pair[0])
+                        torch_output = None
+                        paddle_output = None
+                        torch_out_grads = None
+                        paddle_out_grads = None
+                        gc.collect()
+                        gpu_mode_maybe_empty_cache(
+                            self.gpu_mode_config,
+                            "accuracy_stable_after_first_compare_spill",
+                            force=True,
+                        )
 
         self.clear_original_cpu_inputs()
 
