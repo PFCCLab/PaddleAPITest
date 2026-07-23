@@ -1144,11 +1144,6 @@ def main():
         # when engineV2 was interrupted, resume from .tmp dir
         aggregate_logs(cleanup=True)
         removed_stale_logs = cleanup_uncheckpointed_result_logs()
-        if removed_stale_logs:
-            print(
-                f"{removed_stale_logs} stale result log entries without checkpoint were removed.",
-                flush=True,
-            )
 
         # read checkpoint
         finish_configs = read_log("checkpoint")
@@ -1184,6 +1179,7 @@ def main():
             api_config_count,
             finish_case,
             all_case,
+            removed_stale_logs=removed_stale_logs,
         )
         del api_config_count, dup_case, finish_case, read_count
 
@@ -1206,7 +1202,9 @@ def main():
         print_compute_summary(available_gpus, max_workers_per_gpu)
 
         if options.test_cpu:
-            print(f"{'CPU':<11}{cpu_count()} available | Paddle CPU mode", flush=True)
+            print(f"CPU: {cpu_count()} available | Paddle CPU mode", flush=True)
+
+        print_running_header()
 
         # initialize process pool
         manager = Manager()

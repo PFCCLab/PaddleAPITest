@@ -185,7 +185,7 @@ def _worker_loop(slot_index, gpu_id, input_queue, result_queue, options):
     """Long-running worker process. Receives tasks from input_queue, sends results to result_queue.
 
     Exit behavior:
-        - Normal exit: receives None (poison pill) from input_queue, returns gracefully.
+        - Normal exit: receives None, releases device resources, and returns gracefully.
         - Fatal CUDA error: run_test_case calls os._exit(99) for unrecoverable CUDA errors
           (corruption, device-side asserts). This bypasses Python cleanup — the main process
           Watchdog detects the dead process via is_alive() check and respawns a new worker.
@@ -251,8 +251,10 @@ def _worker_loop(slot_index, gpu_id, input_queue, result_queue, options):
                 )
             )
 
-    # Graceful exit
+    # Graceful exit. GPU mode skips per-case collection, so collect its cyclic
+    # tensor graphs before framework atexit handlers tear down the device manager.
     try:
+        gc.collect()
         close_process_files()
         restore_stdio()
     except Exception:
@@ -1760,11 +1762,6 @@ def main():
         if options.use_compute_sanitizer:
             clean_sanitizer_case_logs()
         removed_stale_logs = cleanup_uncheckpointed_result_logs()
-        if removed_stale_logs:
-            print(
-                f"{removed_stale_logs} stale result log entries without checkpoint were removed.",
-                flush=True,
-            )
 
         # read checkpoint
         finish_configs = read_log("checkpoint")
@@ -1800,6 +1797,7 @@ def main():
             api_config_count,
             finish_case,
             all_case,
+            removed_stale_logs=removed_stale_logs,
         )
         del api_config_count, dup_case, finish_case, read_count
 
@@ -1819,7 +1817,9 @@ def main():
         print_compute_summary(available_gpus, max_workers_per_gpu)
 
         if options.test_cpu:
-            print(f"{'CPU':<11}{cpu_count()} available | Paddle CPU mode", flush=True)
+            print(f"CPU: {cpu_count()} available | Paddle CPU mode", flush=True)
+
+        print_running_header()
 
         # initialize worker pool (per-worker queue architecture)
         pool = WorkerPool(available_gpus, max_workers_per_gpu, options)
@@ -1832,13 +1832,13 @@ def main():
         signal.signal(signal.SIGTERM, cleanup_handler)
 
         worker_start_time = time.monotonic()
-        print(f"{'Workers':<11}starting | {total_workers} requested", flush=True)
+        print(f"Workers: starting | {total_workers} requested", flush=True)
         pool.start()
         ready_workers = pool.warmup(timeout=180)
         requested_field = f" | {total_workers} requested" if ready_workers != total_workers else ""
         print(
-            f"{'Workers':<11}ready | {ready_workers} online{requested_field} | "
-            f"{format_duration(time.monotonic() - worker_start_time)}\n",
+            f"Workers: ready | {ready_workers} online{requested_field} | "
+            f"{format_duration(time.monotonic() - worker_start_time)}",
             flush=True,
         )
 

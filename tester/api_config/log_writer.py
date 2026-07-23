@@ -138,6 +138,14 @@ COMP_TO_DIMENSION = {
     "P1P2": "paddle_stable",
     "P1P2B": "paddle_stable_backward",
 }
+COMP_SUMMARY_PAIRS = (
+    ("P1T1", "P1T1B"),
+    ("P2T2", "P2T2B"),
+    ("P2T1", "P2T1B"),
+    ("P1T2", "P1T2B"),
+    ("T1T2", "T1T2B"),
+    ("P1P2", "P1P2B"),
+)
 ALL_DIMENSIONS = sorted(set(COMP_TO_DIMENSION.values()))
 TOL_HEADER = ["API", "config", "dtype", "mode", "max_abs_diff", "max_rel_diff"]
 STABLE_HEADER = ["API", "config", "dtype", "comp", "max_abs_diff", "max_rel_diff"]
@@ -367,8 +375,11 @@ def cleanup_uncheckpointed_result_logs():
             new_lines = [line for line in lines if line.strip() in checkpoints]
             removed += len(lines) - len(new_lines)
             if len(new_lines) != len(lines):
-                with log_file.open("w") as f:
-                    f.writelines(new_lines)
+                if new_lines:
+                    with log_file.open("w") as f:
+                        f.writelines(new_lines)
+                else:
+                    log_file.unlink()
         except Exception as err:
             print(f"Error cleaning {log_file}: {err}", flush=True)
     return removed
@@ -454,6 +465,27 @@ def _case_results(api_config_str):
     return sorted(_case_result_types.get(api_config_str, set()))
 
 
+def _record_case_comparison(comp, result, matched, total):
+    summary = _case_comparisons.setdefault((comp, result), [0, total])
+    summary[0] += matched
+    summary[1] = max(summary[1], total)
+
+
+def _format_case_comparison_summary(comp):
+    entries = [
+        (result, matched, total)
+        for (entry_comp, result), (matched, total) in _case_comparisons.items()
+        if entry_comp == comp
+    ]
+    if not entries:
+        return None
+    total = max(total for _, _, total in entries)
+    matched = sum(matched for _, matched, _ in entries)
+    failures = list(dict.fromkeys(result for result, _, _ in entries if result != "Identical"))
+    result = "+".join(failures) if failures else "Identical"
+    return f"{comp} {result} {matched}/{total}"
+
+
 def write_case_end(status, case_id=None, api_config_str=None, duration_ms=None, results=None):
     """为指定 ID 或配置写入 case 结束 tag，支持多个终态结果。"""
     global _case_has_comp_output
@@ -471,14 +503,21 @@ def write_case_end(status, case_id=None, api_config_str=None, duration_ms=None, 
     else:
         outcome = status.upper()
     if _case_comparisons:
-        summaries = [
-            f"{comp} {result} {matched}/{total}"
-            for (comp, result), (matched, total) in _case_comparisons.items()
-        ]
-        summary_lines = [
-            "COMP SUMMARY | " + " | ".join(summaries[start : start + 3])
-            for start in range(0, len(summaries), 3)
-        ]
+        ordered_comps = [comp for pair in COMP_SUMMARY_PAIRS for comp in pair]
+        known_comps = {comp for comp, _ in _case_comparisons}
+        ordered_comps.extend(sorted(known_comps - set(ordered_comps)))
+        summaries = {
+            comp: summary
+            for comp in ordered_comps
+            if (summary := _format_case_comparison_summary(comp)) is not None
+        }
+        summary_lines = []
+        for pair in COMP_SUMMARY_PAIRS:
+            pair_summaries = [summaries.pop(comp) for comp in pair if comp in summaries]
+            if pair_summaries:
+                summary_lines.append("> COMP SUMMARY | " + " | ".join(pair_summaries))
+        for summary in summaries.values():
+            summary_lines.append("> COMP SUMMARY | " + summary)
         print("\n" + "\n".join(summary_lines), flush=True)
         _case_has_comp_output = True
         _case_comparisons.clear()
@@ -607,15 +646,11 @@ def print_run_header(options, paddle_version):
             compute.append(("--use_cached_numpy", True))
         compute.append(("--num_workers_per_gpu", options.num_workers_per_gpu))
     groups.append(("Compute", compute))
-    option_width = max(len(name) for _, group_options in groups for name, _ in group_options)
-    for group_index, (group_name, group_options) in enumerate(groups):
-        if group_index:
-            print()
+    for group_name, group_options in groups:
         print(group_name)
         for name, value in group_options:
             display_value = str(value).lower() if isinstance(value, bool) else value
-            print(f"  {name:<{option_width}}  {display_value}")
-    print()
+            print(f"  {name}: {display_value}")
 
 
 def print_preparing_summary(
@@ -625,36 +660,40 @@ def print_preparing_summary(
     total_case,
     checkpointed_case,
     pending_case,
+    *,
+    removed_stale_logs=0,
 ):
     """打印配置读取和断点续跑摘要。"""
     print("--- PREPARING")
+    if removed_stale_logs:
+        print(f"Cleanup: {removed_stale_logs} stale result entries removed (not in checkpoint)")
     print(
-        f"{'Configs':<11}{read_count} read | {non_config_count} non-config | "
-        f"{duplicate_count} duplicate"
+        f"Configs: {read_count} read | {non_config_count} non-config | {duplicate_count} duplicate"
     )
-    print(
-        f"{'Cases':<11}{total_case} total | {checkpointed_case} checkpointed | "
-        f"{pending_case} pending"
-    )
+    print(f"Cases: {total_case} total | {checkpointed_case} checkpointed | {pending_case} pending")
 
 
 def print_compute_summary(available_gpus, max_workers_per_gpu):
     """打印实际选中的 GPU 和 worker 布局。"""
     total_workers = sum(max_workers_per_gpu.values())
-    print(f"{'Compute':<11}{len(available_gpus)} GPUs | {total_workers} workers")
+    print(f"Compute: {len(available_gpus)} GPUs | {total_workers} workers")
     layout = " | ".join(
         f"GPU {gpu_id}: {workers}" for gpu_id, workers in sorted(max_workers_per_gpu.items())
     )
-    print(f"{'Layout':<11}{layout}")
+    print(f"Layout: {layout}")
+
+
+def print_running_header():
+    """标记测试由准备阶段进入实际运行阶段。"""
+    print("--- RUNNING")
 
 
 def print_case_progress(current, total, status, config, detail=None):
-    """打印固定列宽、包含进度百分比的单行 case 状态。"""
-    width = max(1, len(str(total)))
+    """打印紧凑的单行 case 状态和进度百分比。"""
     percent = current / total * 100 if total else 100.0
     detail_field = f"{_single_line(detail)} | " if detail else ""
     print(
-        f"[{current:>{width}}/{total} {percent:6.1f}%] {status:<12} | {detail_field}{config}",
+        f"[{current}/{total} {percent:.1f}%] {status} | {detail_field}{config}",
         flush=True,
     )
 
@@ -666,7 +705,7 @@ def _single_line(value):
 def print_case_notice(status, config, detail=None):
     """打印不推进完成计数的单行 case 事件。"""
     detail_field = f"{_single_line(detail)} | " if detail else ""
-    print(f"[case] {status:<12} | {detail_field}{config}", flush=True)
+    print(f"[case] {status} | {detail_field}{config}", flush=True)
 
 
 def classify_worker_exit(exitcode, cuda_exit_code, oom_exit_code, torch_exit_code):
@@ -699,14 +738,14 @@ def print_run_footer(total_case, tested_case, remaining_case, log_counts, elapse
     overall_total = max(total_case, completed_case + remaining_case)
     failed_case = max(completed_case - counts.get("pass", 0) - counts.get("skip", 0), 0)
     progress = completed_case / overall_total * 100 if overall_total else 100.0
-    print("\n--- RESULT")
-    print(f"{'Progress':<11}{completed_case} / {overall_total} | {progress:.1f}%")
+    print("--- RESULT")
+    print(f"Progress: {completed_case} / {overall_total} | {progress:.1f}%")
     print(
-        f"{'Cases':<11}{counts.get('pass', 0)} pass | {failed_case} fail | "
+        f"Cases: {counts.get('pass', 0)} pass | {failed_case} fail | "
         f"{counts.get('skip', 0)} skip | {remaining_case} remaining"
     )
-    print(f"{'Issues':<11}{paddle_issues} Paddle | {test_issues} test | {retest} retest")
-    print(f"\n{'Classification':<31}Count")
+    print(f"Issues: {paddle_issues} Paddle | {test_issues} test | {retest} retest")
+    print("Classification")
     if (log_counts or {}).get("_multi_classification") and (log_counts or {}).get(
         "_has_multi_result_overlap"
     ):
@@ -714,15 +753,14 @@ def print_run_footer(total_case, tested_case, remaining_case, log_counts, elapse
     ordered_types = [*LOG_PREFIXES, "incomplete"]
     for log_type in ordered_types:
         if log_type in counts:
-            print(f"  {log_type:<28}{counts[log_type]:>8}")
+            print(f"  {log_type}: {counts[log_type]}")
     for log_type in sorted(set(counts) - set(ordered_types)):
-        print(f"  {log_type:<28}{counts[log_type]:>8}")
-    print()
-    print(f"{'Duration':<11}{format_duration(elapsed)}")
-    print(f"{'Logs':<11}{log_dir}")
+        print(f"  {log_type}: {counts[log_type]}")
+    print(f"Duration: {format_duration(elapsed)}")
+    print(f"Logs: {log_dir}")
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
     print(
-        f"\n<<< TEST RUN | {outcome} | {completed_case}/{overall_total} completed | "
+        f"<<< TEST RUN | {outcome} | {completed_case}/{overall_total} completed | "
         f"{timestamp} | {format_duration(elapsed)}",
         flush=True,
     )
@@ -1286,7 +1324,7 @@ def format_comp_line(
     framework_names = {"P": "Paddle", "T": "Torch"}
     actual_source = f"{framework_names[actual_kind]}#{actual_run}"
     expected_source = f"{framework_names[expected_kind]}#{expected_run}"
-    fields = [f"COMP {comp}", result]
+    fields = [f"> COMP {comp}", result]
     if tensor_index is not None and tensor_count is not None:
         fields.append(f"tensor {tensor_index + 1}/{tensor_count}")
     fields.extend(
@@ -1308,6 +1346,10 @@ def print_comp_issue(comp, result, **kwargs):
     """打印非 bitwise 比较问题，格式与详细精度误差保持一致。"""
     global _case_has_comp_output
     print("\n" + format_comp_line(comp, result, **kwargs), flush=True)
+    tensor_count = kwargs.get("tensor_count")
+    if tensor_count is None:
+        tensor_count = max(kwargs.get("actual_count", 1), kwargs.get("expected_count", 1))
+    _record_case_comparison(comp, result, 0, tensor_count)
     _case_has_comp_output = True
 
 
@@ -1331,11 +1373,10 @@ def log_accuracy_stable(
             tensor_count=tensor_count,
         )
         print(f"\n{header}\n{error_msg}", flush=True)
+        _record_case_comparison(comp, "paddle_bitwise", 0, tensor_count)
         _case_has_comp_output = True
     else:
-        summary = _case_comparisons.setdefault((comp, error_msg), [0, tensor_count])
-        summary[0] += 1
-        summary[1] = max(summary[1], tensor_count)
+        _record_case_comparison(comp, error_msg, 1, tensor_count)
     abs_pattern = (
         r"(?:Absolute|Greatest absolute|Max absolute) difference(?: among violations)?: "
         r"(\d+\.?\d*(?:[eE][+-]?\d+)?|nan|inf)\b"

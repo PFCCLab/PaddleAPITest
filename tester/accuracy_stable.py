@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import gc
 import traceback
 
 import numpy
@@ -241,15 +242,9 @@ class APITestAccuracyStable(APITestBase):
             torch_output = exec_locals[output_var]
             paddle.base.core.eager._for_test_check_cuda_error()
         except Exception as err:
-            err_str = str(err)
-            if any(cuda_err in err_str for cuda_err in CUDA_OOM):
-                print(f"[oom] {self.api_config.config}\n{err_str}", flush=True)
-                self._broadcast_to_comp_dimensions("oom", self._TORCH_AFFECTED_COMPS[iter_idx])
-                raise
-            print(f"[torch_error] {self.api_config.config}\n{err_str}", flush=True)
-            traceback.print_exc()
-            self._broadcast_to_comp_dimensions("torch_error", self._TORCH_AFFECTED_COMPS[iter_idx])
-            if any(cuda_err in err_str for cuda_err in CUDA_ERROR):
+            log_type, fatal = self.report_runtime_error(err, "torch_error", "forward")
+            self._broadcast_to_comp_dimensions(log_type, self._TORCH_AFFECTED_COMPS[iter_idx])
+            if fatal:
                 raise
             return None, None, None
 
@@ -372,26 +367,15 @@ class APITestAccuracyStable(APITestBase):
             ) or self.api_config.api_name == "paddle.Tensor.__setitem__":
                 paddle_output = first_arg
         except Exception as err:
-            err_str = str(err)
-            if self.should_ignore_paddle_error(err_str):
-                print(f"[pass] {self.api_config.config}", flush=True)
-                self._broadcast_to_comp_dimensions("pass", self._PADDLE_AFFECTED_COMPS[iter_idx])
-                return None, None
-            if any(cuda_err in err_str for cuda_err in CUDA_ERROR):
-                print(f"[paddle_cuda] {self.api_config.config}\n{err_str}", flush=True)
-                self._broadcast_to_comp_dimensions(
-                    "paddle_cuda", self._PADDLE_AFFECTED_COMPS[iter_idx]
-                )
-                raise
-            if any(cuda_err in err_str for cuda_err in CUDA_OOM):
-                print(f"[oom] {self.api_config.config}\n{err_str}", flush=True)
-                self._broadcast_to_comp_dimensions("oom", self._PADDLE_AFFECTED_COMPS[iter_idx])
-                raise
-            print(f"[paddle_error] {self.api_config.config}\n{err_str}", flush=True)
-            traceback.print_exc()
-            self._broadcast_to_comp_dimensions(
-                "paddle_error", self._PADDLE_AFFECTED_COMPS[iter_idx]
+            log_type, fatal = self.report_runtime_error(
+                err,
+                "paddle_error",
+                "forward",
+                allow_ignore_paddle=True,
             )
+            self._broadcast_to_comp_dimensions(log_type, self._PADDLE_AFFECTED_COMPS[iter_idx])
+            if fatal:
+                raise
             return None, None
 
         try:
