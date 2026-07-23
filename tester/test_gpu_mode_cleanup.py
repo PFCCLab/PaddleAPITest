@@ -57,6 +57,7 @@ class GpuModeCleanupTest(unittest.TestCase):
             accuracy_stable=True,
             paddle_custom_device=False,
             custom_device_vs_gpu=False,
+            api_config="",
             api_config_file="configs.txt",
             api_config_file_pattern="",
             log_dir="logs",
@@ -65,6 +66,7 @@ class GpuModeCleanupTest(unittest.TestCase):
             use_gpu_mode=True,
             use_cached_numpy=False,
             gpu_memory_policy="aggressive",
+            num_workers_per_gpu=8,
             atol=0.0,
             rtol=0.0,
             timeout=60,
@@ -75,29 +77,8 @@ class GpuModeCleanupTest(unittest.TestCase):
         with mock.patch("sys.stdout", output):
             print_run_header(options, "test-version")
 
-        self.assertIn("GPU memory aggressive", output.getvalue())
-
-    def test_run_header_defaults_policy_for_legacy_engine_options(self):
-        options = SimpleNamespace(
-            accuracy_stable=True,
-            api_config_file="configs.txt",
-            api_config_file_pattern="",
-            log_dir="logs",
-            test_cpu=False,
-            gpu_ids="0",
-            use_gpu_mode=True,
-            use_cached_numpy=False,
-            atol=0.0,
-            rtol=0.0,
-            timeout=60,
-            show_runtime_status=False,
-        )
-        output = io.StringIO()
-
-        with mock.patch("sys.stdout", output):
-            print_run_header(options, "test-version")
-
-        self.assertIn("GPU memory conservative", output.getvalue())
+        self.assertIn("--gpu_memory_policy", output.getvalue())
+        self.assertIn("aggressive", output.getvalue())
 
     def test_gen_torch_input_does_not_run_gpu_mode_cleanup(self):
         case = object.__new__(APITestBase)

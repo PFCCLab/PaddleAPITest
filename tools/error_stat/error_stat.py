@@ -40,6 +40,9 @@ SUMMARY_GROUPS = {
     ),
 }
 
+CASE_BEGIN_RE = re.compile(rf"^{re.escape(CASE_BEGIN_TAG)}\s+(?P<case_id>[^|\s]+)")
+CASE_END_RE = re.compile(rf"^{re.escape(CASE_END_TAG)}\s+(?P<case_id>[^|\s]+)")
+
 
 def check_count_consistency(parsed_keys, config_keys, prefix):
     # 校验从 log_inorder.log 解析到的 case 数量与结果文件一致，不一致说明日志不完整或被截断
@@ -81,37 +84,41 @@ def _parse_tagged_logs(input_text):
     current_case_id = None
     begin_count = 0
     end_count = 0
-    for line in input_text.split("\n"):
-        if "gpu_resources.cc" in line or "Waiting for available memory" in line:
+    for line in input_text.splitlines():
+        if (
+            "gpu_resources.cc:" in line
+            and "Please NOTE: device:" in line
+            or "Waiting for available memory" in line
+        ):
             continue
-        if line.startswith(CASE_BEGIN_TAG):
+        begin_match = CASE_BEGIN_RE.match(line)
+        if begin_match:
             begin_count += 1
             if current_content:
-                logs.append("\n".join(current_content))
+                logs.append("\n".join(current_content).rstrip())
             current_content = [line]
-            match = re.match(rf"{re.escape(CASE_BEGIN_TAG)} ([^|\s]+)", line)
-            current_case_id = match.group(1) if match else None
+            current_case_id = begin_match.group("case_id")
             continue
         if current_content:
-            if line.startswith(CASE_END_TAG):
-                while current_content and not current_content[-1].strip():
+            end_match = CASE_END_RE.match(line)
+            if end_match:
+                while len(current_content) > 2 and not current_content[-1].strip():
                     current_content.pop()
                 current_content.append(line)
                 end_count += 1
-                match = re.match(rf"{re.escape(CASE_END_TAG)} ([^|\s]+)", line)
-                end_case_id = match.group(1) if match else None
-                if current_case_id and end_case_id and current_case_id != end_case_id:
+                end_case_id = end_match.group("case_id")
+                if current_case_id != end_case_id:
                     print(
                         f"[WARNING] case_id mismatch: begin={current_case_id}, end={end_case_id}",
                         flush=True,
                     )
-                logs.append("\n".join(current_content))
+                logs.append("\n".join(current_content).rstrip())
                 current_content = []
                 current_case_id = None
             else:
                 current_content.append(line)
     if current_content:
-        logs.append("\n".join(current_content))
+        logs.append("\n".join(current_content).rstrip())
     if begin_count != end_count:
         print(
             f"[WARNING] CASE tag count mismatch: begin={begin_count}, end={end_count}",
@@ -120,34 +127,8 @@ def _parse_tagged_logs(input_text):
     return logs
 
 
-def _parse_legacy_logs(input_text):
-    logs = []
-    in_test_block = False
-    current_content = []
-    for line in input_text.split("\n"):
-        if "gpu_resources.cc" in line or "Waiting for available memory" in line:
-            continue
-        if "test begin" in line:
-            if current_content:
-                logs.append("\n".join(current_content))
-            current_content = [line]
-            in_test_block = True
-            continue
-        if "Worker PID" in line:
-            if current_content:
-                logs.append("\n".join(current_content))
-            in_test_block = False
-            current_content = []
-            continue
-        if in_test_block:
-            current_content.append(line)
-    if current_content:
-        logs.append("\n".join(current_content))
-    return logs
-
-
 def parse_logs(input_path):
-    # 新日志按 CASE tag 分割；无 tag 的存量日志按 test begin 分割。
+    # 当前日志按 CASE tag 分割。
     log_path = Path(input_path) / "log_inorder.log"
     if not log_path.exists():
         print(f"{log_path} not exists", flush=True)
@@ -155,21 +136,14 @@ def parse_logs(input_path):
     with log_path.open("r") as f:
         input_text = f.read()
 
-    if CASE_BEGIN_TAG in input_text or CASE_END_TAG in input_text:
-        logs = _parse_tagged_logs(input_text)
-    else:
-        logs = _parse_legacy_logs(input_text)
+    logs = _parse_tagged_logs(input_text)
     print(f"Found {len(logs)} logs", flush=True)
     return logs
 
 
 def get_config_key(content):
-    # 新格式把 config 固定在 CASE 首行之后；旧日志继续识别 test begin。
-    lines = content.splitlines()
-    if lines and lines[0].startswith(CASE_BEGIN_TAG) and len(lines) > 1:
-        return lines[1].strip()
-    match = re.search(r"test begin: ([^\r\n]*)", content)
-    return match.group(1).strip() if match else ""
+    # CASE block 的第二行固定为 config。
+    return content.splitlines()[1].strip()
 
 
 def classify_by_config(logs, config_sets):
@@ -221,7 +195,7 @@ def write_logs_and_meta(output_path, logs_dict, prefix):
 
     with open(log_file, "w") as f:
         for key in sorted(logs_dict.keys()):
-            f.write(logs_dict[key] + "\n")
+            f.write(logs_dict[key].rstrip("\n") + "\n\n")
     with open(api_file, "w") as f:
         f.writelines(f"{api}\n" for api in sorted(apis))
     with open(config_file, "w") as f:

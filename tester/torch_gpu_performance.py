@@ -89,7 +89,7 @@ class APITestTorchGPUPerformance(APITestBase):
                 print("gen_numpy_input failed")
                 return
         except Exception as err:
-            log_type, fatal = self.report_runtime_error(err, "config_input", "gen_numpy_input")
+            log_type, fatal = self.report_runtime_error(err, "config_input", "input")
             if fatal:
                 raise
             return

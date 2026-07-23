@@ -201,7 +201,6 @@ def _worker_loop(slot_index, gpu_id, input_queue, result_queue, options):
     try:
         _init_worker_runtime(slot_index, gpu_id, options, redirect_output=True)
     except Exception as e:
-        print(f"{datetime.now()} Worker {os.getpid()} init failed: {e}", flush=True)
         result_queue.put(("init_failed", slot_index, str(e)))
         return
 
@@ -543,11 +542,10 @@ class WorkerPool:
 
     def warmup(self, timeout=180):
         """Wait for all workers to report ready."""
-        ready_count = 0
+        ready_slots = set()
         deadline = time.time() + timeout
-        failed_slots = []
 
-        while ready_count < self.total_workers and time.time() < deadline:
+        while len(ready_slots) < self.total_workers and time.time() < deadline:
             try:
                 remaining = max(0.1, deadline - time.time())
                 msg = self.result_queue.get(timeout=min(5.0, remaining))
@@ -556,31 +554,36 @@ class WorkerPool:
                     slot_idx = msg[1]
                     with self._lock:
                         self.slots[slot_idx].state = "idle"
-                    ready_count += 1
+                    ready_slots.add(slot_idx)
                 elif msg_type == "init_failed":
                     slot_idx = msg[1]
                     error_msg = msg[2]
-                    failed_slots.append((slot_idx, error_msg))
-                    ready_count += 1  # count as handled
                     print(
-                        f"{datetime.now()} Worker slot {slot_idx} init failed: {error_msg}",
+                        f"[worker] INIT_FAILED | slot {slot_idx} | {error_msg}",
                         flush=True,
                     )
+                    slot = self.slots[slot_idx]
+                    self._join_process(slot.process, timeout=1)
+                    self._spawn_worker(slot)
             except queue.Empty:
                 # Check for dead processes
                 for slot in self.slots:
                     if slot.state == "starting" and slot.process and not slot.process.is_alive():
                         print(
-                            f"{datetime.now()} Worker slot {slot.index} died during init (exit={slot.process.exitcode})",
+                            f"[worker] INIT_CRASH | slot {slot.index} | "
+                            f"exit {slot.process.exitcode}",
                             flush=True,
                         )
                         self._spawn_worker(slot)
 
+        ready_count = len(ready_slots)
         if ready_count < self.total_workers:
             print(
-                f"{datetime.now()} WARNING: Only {ready_count}/{self.total_workers} workers ready after {timeout}s",
+                f"[workers] READY_TIMEOUT | {ready_count}/{self.total_workers} ready | "
+                f"timeout {timeout} s",
                 flush=True,
             )
+        return ready_count
 
     def dispatch(self, slot_index, config):
         """Send a task to a specific worker slot."""
@@ -652,10 +655,6 @@ class WorkerPool:
             return
         config = slot.current_task
         old_pid = slot.process.pid if slot.process else None
-        print(
-            f"{datetime.now()} Watchdog: slot {slot.index} timeout, killing PID {slot.process.pid}",
-            flush=True,
-        )
         self._kill_slot_child(slot)
         self._kill_process(slot.process)
         if old_pid is not None and config is not None:
@@ -674,10 +673,6 @@ class WorkerPool:
             return
         exitcode = slot.process.exitcode if slot.process else None
         config = slot.current_task
-        print(
-            f"{datetime.now()} Watchdog: slot {slot.index} died (exit={exitcode})",
-            flush=True,
-        )
         if self._closed or self._shutdown_event.is_set():
             return
         if config is not None:
@@ -686,6 +681,11 @@ class WorkerPool:
             )
             mark_inorder_case_complete(slot.process.pid, completed_offset)
             self.result_queue.put(("crashed", slot.index, config, exitcode))
+        else:
+            print(
+                f"[worker] PADDLE_CRASH | slot {slot.index} | exit {exitcode}",
+                flush=True,
+            )
         self._spawn_worker(slot)
 
     def _kill_process_group(self, pid):
@@ -1196,7 +1196,8 @@ def _run_single_config_with_sanitizer(options):
         return 0
     if result.returncode == options.sanitizer_error_exitcode:
         print(
-            f"[error] compute-sanitizer reported errors for {api_config} (exit={result.returncode})",
+            f"[error] compute-sanitizer reported errors for {api_config} "
+            f"(exit {result.returncode})",
             flush=True,
         )
     return result.returncode
@@ -1586,8 +1587,6 @@ def main():
         options.gpu_memory_policy = resolve_gpu_memory_policy()
     except ValueError as err:
         parser.error(str(err))
-    if not options._sanitizer_child:
-        print_run_header(options, paddle_version)
     if options.random_seed != parser.get_default("random_seed"):
         np.random.seed(options.random_seed)
 
@@ -1605,6 +1604,8 @@ def main():
     if len([m for m in mode if m is True]) != 1:
         _print_argument(ARGUMENT_ERROR_PREFIX, TEST_MODE_ERROR)
         return
+    if not options._sanitizer_child:
+        print_run_header(options, paddle_version)
     if options.use_dump:
         if not options.api_config or options.api_config_file or options.api_config_file_pattern:
             _print_argument(ARGUMENT_ERROR_PREFIX, "dump only supports single --api_config runs")
@@ -1658,23 +1659,15 @@ def main():
             ARGUMENT_WARNING_PREFIX, "--test_backward takes effect only when --paddle_cinn=True"
         )
     if options.use_gpu_mode and options.use_cached_numpy:
-        print(
-            "[gpu_mode] --use_cached_numpy=True is ignored because "
-            "--use_gpu_mode=True uses GPU tensor generation.",
-            flush=True,
+        _print_argument(
+            ARGUMENT_WARNING_PREFIX,
+            "--use_cached_numpy=True is ignored because --use_gpu_mode=True uses GPU "
+            "tensor generation",
         )
         options.use_cached_numpy = False
     os.environ["USE_CACHED_NUMPY"] = str(options.use_cached_numpy)
     os.environ["USE_GPU_MODE"] = str(options.use_gpu_mode)
     os.environ[GPU_MEMORY_POLICY_ENV] = options.gpu_memory_policy
-    if options.use_gpu_mode:
-        print(
-            f"[gpu_mode] enabled: use GPU tensors and comparison; "
-            f"memory policy={options.gpu_memory_policy}.",
-            flush=True,
-        )
-    elif options.use_cached_numpy:
-        print("[use_cached_numpy] enabled: reuse cached NumPy inputs.", flush=True)
     if options.bitwise_alignment:
         options.atol = 0.0
         options.rtol = 0.0
@@ -1794,23 +1787,21 @@ def main():
             except Exception as e:
                 print(f"Failed to read config file {config_file}: {e}", flush=True)
                 return
-        if skipped_non_config:
-            print(f"{skipped_non_config} non-config lines skipped.", flush=True)
         dup_case = api_config_count - len(api_configs)
-        if dup_case > 0:
-            print(dup_case, "cases are duplicates and removed.", flush=True)
-
+        read_count = api_config_count + skipped_non_config
         api_config_count = len(api_configs)
         api_configs = sorted(api_configs - finish_configs)
         all_case = len(api_configs)
         finish_case = api_config_count - all_case
-        if finish_case:
-            print(finish_case, "cases already tested.", flush=True)
-        print("--- PREPARING")
-        print(
-            f"{'Cases':<11}{api_config_count} total | {len(finish_configs)} checkpointed | {all_case} pending"
+        print_preparing_summary(
+            read_count,
+            skipped_non_config,
+            dup_case,
+            api_config_count,
+            finish_case,
+            all_case,
         )
-        del api_config_count, dup_case, finish_case
+        del api_config_count, dup_case, finish_case, read_count
 
         # validate GPU visibility and derive per-GPU worker counts
         available_gpus, max_workers_per_gpu = check_gpu_memory(gpu_ids, options.num_workers_per_gpu)
@@ -1825,13 +1816,10 @@ def main():
             return
 
         total_workers = sum(max_workers_per_gpu.values())
-        print(
-            f"Using {len(available_gpus)} GPU(s) with max workers per GPU: {max_workers_per_gpu}. Total workers: {total_workers}.",
-            flush=True,
-        )
+        print_compute_summary(available_gpus, max_workers_per_gpu)
 
         if options.test_cpu:
-            print(f"Using {cpu_count()} CPU(s) for paddle in CPU mode.", flush=True)
+            print(f"{'CPU':<11}{cpu_count()} available | Paddle CPU mode", flush=True)
 
         # initialize worker pool (per-worker queue architecture)
         pool = WorkerPool(available_gpus, max_workers_per_gpu, options)
@@ -1843,10 +1831,16 @@ def main():
         signal.signal(signal.SIGINT, cleanup_handler)
         signal.signal(signal.SIGTERM, cleanup_handler)
 
-        print(f"{datetime.now()} Starting {total_workers} workers...", flush=True)
+        worker_start_time = time.monotonic()
+        print(f"{'Workers':<11}starting | {total_workers} requested", flush=True)
         pool.start()
-        pool.warmup(timeout=180)
-        print(f"{datetime.now()} All workers ready.", flush=True)
+        ready_workers = pool.warmup(timeout=180)
+        requested_field = f" | {total_workers} requested" if ready_workers != total_workers else ""
+        print(
+            f"{'Workers':<11}ready | {ready_workers} online{requested_field} | "
+            f"{format_duration(time.monotonic() - worker_start_time)}\n",
+            flush=True,
+        )
 
         # dispatch tasks using per-worker queue round-robin
         tested_case = 0
@@ -1942,11 +1936,7 @@ def main():
                 active_tasks -= 1
 
                 if external_kill:
-                    print(
-                        f"[warn] Worker was externally killed for {config} "
-                        f"(exit={exitcode}); case will be retried on next run.",
-                        flush=True,
-                    )
+                    print_case_notice("RETRY", config, f"exit {exitcode}")
                     if worker_reusable:
                         pool.mark_idle(slot_idx)
                     next_config = next(config_iter, None)
@@ -1964,63 +1954,51 @@ def main():
                 if msg_type == "deferred":
                     reason = msg[3] if len(msg) > 3 else "insufficient GPU memory"
                     pending_dispatch.append(config)
-                    print(f"[gpu_mode] Deferred {config}: {reason}", flush=True)
+                    print_case_notice("DEFERRED", config, reason)
                     continue
 
                 tested_case += 1
-
-                if options.show_runtime_status or tested_case % 10000 == 0:
-                    print(
-                        f"[{tested_case}/{all_case}] {msg_type.upper()} | {config}",
-                        flush=True,
-                    )
+                progress_status = "DONE"
+                progress_detail = None
 
                 if msg_type == "timeout":
                     write_to_log("timeout", config)
-                    print(
-                        f"[error] Test case timed out for {config}",
-                        flush=True,
-                    )
+                    progress_status = "TIMEOUT"
                 elif msg_type == "crashed":
-                    if exitcode == FATAL_CUDA_EXIT_CODE:
-                        write_to_log("paddle_cuda", config)
-                        print(
-                            f"[paddle_cuda] {config}: worker exited with CUDA error",
-                            flush=True,
-                        )
-                    elif exitcode == FATAL_OOM_EXIT_CODE:
-                        write_to_log("oom", config)
-                        print(
-                            f"[oom] {config}: worker exited with OOM",
-                            flush=True,
-                        )
-                    elif exitcode == FATAL_TORCH_EXIT_CODE:
-                        write_to_log("torch_error", config)
-                        print(
-                            f"[torch_error] {config}: worker exited with torch CUDA error",
-                            flush=True,
-                        )
-                    elif (
-                        options.use_compute_sanitizer
+                    log_type, progress_status = classify_worker_exit(
+                        exitcode,
+                        FATAL_CUDA_EXIT_CODE,
+                        FATAL_OOM_EXIT_CODE,
+                        FATAL_TORCH_EXIT_CODE,
+                    )
+                    if (
+                        progress_status == "PADDLE_CRASH"
+                        and options.use_compute_sanitizer
                         and exitcode == options.sanitizer_error_exitcode
                     ):
-                        write_to_log("paddle_cuda", config)
-                        print(
-                            f"[error] compute-sanitizer reported errors for {config} (exit={exitcode})",
-                            flush=True,
-                        )
-                    else:
-                        write_to_log("paddle_crash", config)
-                        print(
-                            f"[fatal] Worker crashed for {config} (exit={exitcode})",
-                            flush=True,
-                        )
+                        log_type = "paddle_cuda"
+                        progress_status = "PADDLE_CUDA"
+                        progress_detail = f"sanitizer exit {exitcode}"
+                    elif progress_status == "PADDLE_CRASH":
+                        progress_detail = f"exit {exitcode}"
+                    write_to_log(log_type, config)
                 elif msg_type == "error":
                     error_msg = msg[3] if len(msg) > 3 else ""
                     write_to_log("config_parse", config)
-                    print(
-                        f"[config_parse] {config}: {error_msg}",
-                        flush=True,
+                    progress_status = "CONFIG_PARSE"
+                    progress_detail = error_msg
+
+                if (
+                    options.show_runtime_status
+                    or tested_case % 10000 == 0
+                    or progress_status != "DONE"
+                ):
+                    print_case_progress(
+                        tested_case,
+                        all_case,
+                        progress_status,
+                        config,
+                        progress_detail,
                     )
 
                 write_to_log("checkpoint", config)

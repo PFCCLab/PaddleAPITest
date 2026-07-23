@@ -328,7 +328,15 @@ class APITestBase:
         if self.dump_context:
             self.dump_context.finalize(status, **data)
 
-    def report_runtime_error(self, err, default_log_type, phase="", allow_ignore_paddle=False):
+    def report_runtime_error(
+        self,
+        err,
+        default_log_type,
+        phase,
+        allow_ignore_paddle=False,
+        *,
+        tensor_position=None,
+    ):
         err_msg = str(err)
         if phase:
             self.dump_error(f"{phase}_error", err)
@@ -339,9 +347,19 @@ class APITestBase:
             return "pass", False
         if log_type is None:
             log_type = default_log_type
-        phase_text = f" phase={phase}" if phase else ""
+        head = f"[{log_type}]"
+        if phase:
+            head += f" {phase}"
+        fields = []
+        if tensor_position:
+            fields.append(f"tensor {tensor_position}")
+        prefix = " | ".join([head, *fields])
         print(
-            f"[{log_type}]{phase_text} {self.api_config.config}\n{err_msg}",
+            (
+                f"{prefix} | {self.api_config.config}\n{err_msg}"
+                if phase or fields
+                else f"{prefix} {self.api_config.config}\n{err_msg}"
+            ),
             flush=True,
         )
         write_to_log(log_type, self.api_config.config)
@@ -380,8 +398,20 @@ class APITestBase:
         elif not self.gpu_mode_config.enabled:
             paddle.device.cuda.empty_cache()
 
-    def report_compare_error(self, err, phase="", default_log_type="paddle_accuracy"):
-        log_type, fatal = self.report_runtime_error(err, default_log_type, phase)
+    def report_compare_error(
+        self,
+        err,
+        phase,
+        default_log_type="paddle_accuracy",
+        *,
+        tensor_position=None,
+    ):
+        log_type, fatal = self.report_runtime_error(
+            err,
+            default_log_type,
+            phase,
+            tensor_position=tensor_position,
+        )
         if fatal:
             raise err
         return log_type, fatal
@@ -1583,6 +1613,8 @@ class APITestBase:
         actual_name="ACTUAL",
         expected_name="DESIRED",
         apply_special_tolerance=True,
+        tensor_index=0,
+        tensor_count=1,
     ):
         is_check_dtype = self.should_check_dtype() if check_dtype is None else check_dtype
         bitwise_alignment = getattr(self, "bitwise_alignment", False)
@@ -1718,6 +1750,8 @@ class APITestBase:
                         self.api_config.config[:120000],
                         str(actual.dtype),
                         is_backward,
+                        tensor_index=tensor_index,
+                        tensor_count=tensor_count,
                     )
                 return
 
@@ -1744,6 +1778,8 @@ class APITestBase:
                     self.api_config.config[:120000],
                     str(actual.dtype),
                     is_backward,
+                    tensor_index=tensor_index,
+                    tensor_count=tensor_count,
                 )
         except Exception as err:
             error_str = str(err)
@@ -1777,6 +1813,8 @@ class APITestBase:
                         self.api_config.config[:120000],
                         str(actual.dtype),
                         is_backward,
+                        tensor_index=tensor_index,
+                        tensor_count=tensor_count,
                     )
                     return
             raise

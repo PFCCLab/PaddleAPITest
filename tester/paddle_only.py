@@ -38,7 +38,7 @@ class APITestPaddleOnly(APITestBase):
                 return
             self.dump_event("numpy_input_done")
         except Exception as err:
-            log_type, fatal = self.report_runtime_error(err, "config_input", "numpy_input")
+            log_type, fatal = self.report_runtime_error(err, "config_input", "input")
             self.dump_finalize(log_type or "config_input")
             if fatal:
                 raise
@@ -109,7 +109,7 @@ class APITestPaddleOnly(APITestBase):
         try:
             paddle.base.core.eager._for_test_check_cuda_error()
         except Exception as err:
-            self.report_runtime_error(err, "paddle_cuda", "paddle_only_cuda_check")
+            self.report_runtime_error(err, "paddle_cuda", "paddle_only cuda check")
             self.dump_finalize("paddle_cuda")
             raise
 

@@ -577,7 +577,7 @@ def init_worker_gpu(gpu_worker_list, lock, available_gpus, max_workers_per_gpu, 
         redirect_stdio()
 
     except Exception as e:
-        print(f"{datetime.now()} Worker {my_pid} initialization failed: {e}", flush=True)
+        print(f"[worker] INIT_FAILED | PID {my_pid} | {e}", flush=True)
         raise
 
 
@@ -941,7 +941,6 @@ def main():
         options.gpu_memory_policy = resolve_gpu_memory_policy()
     except ValueError as err:
         parser.error(str(err))
-    print_run_header(options, paddle_version)
     if options.random_seed != parser.get_default("random_seed"):
         np.random.seed(options.random_seed)
 
@@ -959,6 +958,7 @@ def main():
     if len([m for m in mode if m is True]) != 1:
         _print_argument(ARGUMENT_ERROR_PREFIX, TEST_MODE_ERROR)
         return
+    print_run_header(options, paddle_version)
     if options.use_dump:
         if not options.api_config or options.api_config_file or options.api_config_file_pattern:
             _print_argument(ARGUMENT_ERROR_PREFIX, "dump only supports single --api_config runs")
@@ -1012,23 +1012,15 @@ def main():
             ARGUMENT_WARNING_PREFIX, "--test_backward takes effect only when --paddle_cinn=True"
         )
     if options.use_gpu_mode and options.use_cached_numpy:
-        print(
-            "[gpu_mode] --use_cached_numpy=True is ignored because "
-            "--use_gpu_mode=True uses GPU tensor generation.",
-            flush=True,
+        _print_argument(
+            ARGUMENT_WARNING_PREFIX,
+            "--use_cached_numpy=True is ignored because --use_gpu_mode=True uses GPU "
+            "tensor generation",
         )
         options.use_cached_numpy = False
     os.environ["USE_CACHED_NUMPY"] = str(options.use_cached_numpy)
     os.environ["USE_GPU_MODE"] = str(options.use_gpu_mode)
     os.environ[GPU_MEMORY_POLICY_ENV] = options.gpu_memory_policy
-    if options.use_gpu_mode:
-        print(
-            f"[gpu_mode] enabled: use GPU tensors and comparison; "
-            f"memory policy={options.gpu_memory_policy}.",
-            flush=True,
-        )
-    elif options.use_cached_numpy:
-        print("[use_cached_numpy] enabled: reuse cached NumPy inputs.", flush=True)
     if options.bitwise_alignment:
         options.atol = 0.0
         options.rtol = 0.0
@@ -1179,23 +1171,21 @@ def main():
             except Exception as e:
                 print(f"Failed to read config file {config_file}: {e}", flush=True)
                 return
-        if skipped_non_config:
-            print(f"{skipped_non_config} non-config lines skipped.", flush=True)
         dup_case = api_config_count - len(api_configs)
-        if dup_case > 0:
-            print(dup_case, "cases are duplicates and removed.", flush=True)
-
+        read_count = api_config_count + skipped_non_config
         api_config_count = len(api_configs)
         api_configs = sorted(api_configs - finish_configs)
         all_case = len(api_configs)
         finish_case = api_config_count - all_case
-        if finish_case:
-            print(finish_case, "cases already tested.", flush=True)
-        print("--- PREPARING")
-        print(
-            f"{'Cases':<11}{api_config_count} total | {len(finish_configs)} checkpointed | {all_case} pending"
+        print_preparing_summary(
+            read_count,
+            skipped_non_config,
+            dup_case,
+            api_config_count,
+            finish_case,
+            all_case,
         )
-        del api_config_count, dup_case, finish_case
+        del api_config_count, dup_case, finish_case, read_count
 
         # validate GPU visibility and derive per-GPU worker counts
         available_gpus, max_workers_per_gpu = check_gpu_memory(gpu_ids, options.num_workers_per_gpu)
@@ -1213,13 +1203,10 @@ def main():
         options.gpu_workers_per_gpu_map = dict(max_workers_per_gpu)
         options.gpu_total_memory_map = gpu_total_memory_map
         options.runtime_config = TestRuntimeConfig.from_options(options)
-        print(
-            f"Using {len(available_gpus)} GPU(s) with max workers per GPU: {max_workers_per_gpu}. Total workers: {total_workers}.",
-            flush=True,
-        )
+        print_compute_summary(available_gpus, max_workers_per_gpu)
 
         if options.test_cpu:
-            print(f"Using {cpu_count()} CPU(s) for paddle in CPU mode.", flush=True)
+            print(f"{'CPU':<11}{cpu_count()} available | Paddle CPU mode", flush=True)
 
         # initialize process pool
         manager = Manager()
@@ -1271,47 +1258,37 @@ def main():
                         config = futures.pop(future)
                         checkpoint_ready = True
                         worker_pid = None
+                        progress_status = "DONE"
+                        progress_detail = None
                         try:
                             worker_pid, completed_offset = future.result()
                             mark_inorder_case_complete(worker_pid, completed_offset)
                         except TimeoutError as err:
                             write_terminal_log("timeout", config)
+                            progress_status = "TIMEOUT"
                             worker_pid = getattr(err, "pid", None)
                             if worker_pid is not None:
                                 completed_offset = append_case_end_to_worker_log(
                                     worker_pid, "timeout", api_config_str=config
                                 )
                                 mark_inorder_case_complete(worker_pid, completed_offset)
-                            print(
-                                f"[timeout] {config}: {err}",
-                                flush=True,
-                            )
                         except ProcessExpired as err:
                             worker_pid = getattr(err, "pid", None)
-                            expired_status = "paddle_crash"
-                            if err.exitcode == FATAL_CUDA_EXIT_CODE:
-                                expired_status = "paddle_cuda"
-                                write_terminal_log("paddle_cuda", config)
-                                print(f"[paddle_cuda] {config}: {err}", flush=True)
-                            elif err.exitcode == FATAL_OOM_EXIT_CODE:
-                                expired_status = "oom"
-                                write_terminal_log("oom", config)
-                                print(f"[oom] {config}: {err}", flush=True)
-                            elif err.exitcode == FATAL_TORCH_EXIT_CODE:
-                                expired_status = "torch_error"
-                                write_terminal_log("torch_error", config)
-                                print(f"[torch_error] {config}: {err}", flush=True)
-                            elif err.exitcode in (-signal.SIGKILL, -signal.SIGTERM):
+                            if err.exitcode in (-signal.SIGKILL, -signal.SIGTERM):
                                 expired_status = "timeout"
                                 checkpoint_ready = False
-                                print(
-                                    f"[warn] Worker was externally killed for {config} "
-                                    f"(exit={err.exitcode}); case will be retried on next run.",
-                                    flush=True,
-                                )
+                                progress_status = "RETRY"
+                                progress_detail = f"exit {err.exitcode}"
                             else:
-                                write_terminal_log("paddle_crash", config)
-                                print(f"[paddle_crash] {config}: {err}", flush=True)
+                                expired_status, progress_status = classify_worker_exit(
+                                    err.exitcode,
+                                    FATAL_CUDA_EXIT_CODE,
+                                    FATAL_OOM_EXIT_CODE,
+                                    FATAL_TORCH_EXIT_CODE,
+                                )
+                                write_terminal_log(expired_status, config)
+                                if progress_status == "PADDLE_CRASH":
+                                    progress_detail = f"exit {err.exitcode}"
                             if worker_pid is not None:
                                 completed_offset = append_case_end_to_worker_log(
                                     worker_pid, expired_status, api_config_str=config
@@ -1319,25 +1296,30 @@ def main():
                                 mark_inorder_case_complete(worker_pid, completed_offset)
                         except GpuMemoryDeferred as err:
                             checkpoint_ready = False
-                            print(
-                                f"[gpu_mode] Deferred {config}: {err}",
-                                flush=True,
-                            )
+                            progress_status = "DEFERRED"
+                            progress_detail = str(err)
                             schedule_config(config)
                         except Exception as err:
                             write_terminal_log("config_parse", config)
-                            print(
-                                f"[config_parse] {config}: {err}",
-                                flush=True,
-                            )
                             checkpoint_ready = False
+                            progress_status = "CONFIG_PARSE"
+                            progress_detail = str(err)
                         if checkpoint_ready:
                             tested_case += 1
-                            if options.show_runtime_status or tested_case % 10000 == 0:
-                                print(
-                                    f"[{tested_case}/{all_case}] DONE | {config}",
-                                    flush=True,
+                            if (
+                                options.show_runtime_status
+                                or tested_case % 10000 == 0
+                                or progress_status != "DONE"
+                            ):
+                                print_case_progress(
+                                    tested_case,
+                                    all_case,
+                                    progress_status,
+                                    config,
+                                    progress_detail,
                                 )
+                        elif progress_status in ("RETRY", "DEFERRED", "CONFIG_PARSE"):
+                            print_case_notice(progress_status, config, progress_detail)
                 aggregate_logs()
             pool.close()
             pool.join()
