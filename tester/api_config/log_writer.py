@@ -790,7 +790,7 @@ def print_run_header(options, paddle_version):
 
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
     print(f">>> TEST RUN | {timestamp} | Paddle {paddle_version} | PID {os.getpid()}\n")
-    print("--- OPTIONS")
+    print("\n--- OPTIONS")
     files = [
         source_option,
         ("--log_dir", options.log_dir),
@@ -850,7 +850,7 @@ def print_preparing_summary(
     retest_types=(),
 ):
     """打印配置读取和断点续跑摘要。"""
-    print("--- PREPARING")
+    print("\n--- PREPARING")
     if removed_stale_logs:
         print(f"Cleanup: {removed_stale_logs} stale result entries removed (not in checkpoint)")
     if retest_types:
@@ -895,7 +895,7 @@ def limit_worker_layout(available_gpus, max_workers_per_gpu, pending_cases):
 
 def print_running_header():
     """标记测试由准备阶段进入实际运行阶段。"""
-    print("--- RUNNING")
+    print("\n--- RUNNING")
 
 
 def print_case_progress(current, total, status, config, detail=None):
@@ -948,7 +948,7 @@ def print_run_footer(total_case, tested_case, remaining_case, log_counts, elapse
     overall_total = max(total_case, completed_case + remaining_case)
     failed_case = max(completed_case - counts.get("pass", 0) - counts.get("skip", 0), 0)
     progress = completed_case / overall_total * 100 if overall_total else 100.0
-    print("--- RESULT")
+    print("\n--- RESULT")
     print(f"Progress: {completed_case} / {overall_total} | {progress:.1f}%")
     print(
         f"Cases: {counts.get('pass', 0)} pass | {failed_case} fail | "
@@ -970,7 +970,7 @@ def print_run_footer(total_case, tested_case, remaining_case, log_counts, elapse
     print(f"Logs: {log_dir}")
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
     print(
-        f"<<< TEST RUN | {outcome} | {completed_case}/{overall_total} completed | "
+        f"\n<<< TEST RUN | {outcome} | {completed_case}/{overall_total} completed | "
         f"{timestamp} | {format_duration(elapsed)}",
         flush=True,
     )

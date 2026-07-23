@@ -554,10 +554,15 @@ def init_worker_gpu(gpu_worker_list, lock, available_gpus, max_workers_per_gpu, 
             gpu_worker_list[assigned_gpu].append(my_pid)
 
         os.environ["CUDA_VISIBLE_DEVICES"] = str(assigned_gpu)
-
         with suppress_startup_output():
             import paddle
 
+            globals()["paddle"] = paddle
+            if options.test_cpu:
+                paddle.device.set_device("cpu")
+            elif not getattr(options, "paddle_custom_device", False):
+                # CUDA_VISIBLE_DEVICES assigns the worker slot; Paddle still needs an explicit device.
+                paddle.set_device("gpu")
             try:
                 import paddlefleet_ops
             except ImportError:
@@ -566,22 +571,18 @@ def init_worker_gpu(gpu_worker_list, lock, available_gpus, max_workers_per_gpu, 
                 import FusedQuantOps
             except ImportError:
                 pass
-            globals()["paddle"] = paddle
             globals().update(_load_test_classes(options))
 
-        def signal_handler(*args):
-            _clear_device_cache(options)
-            restore_stdio()
-            close_process_files()
-            sys.exit(0)
+            def signal_handler(*args):
+                _clear_device_cache(options)
+                restore_stdio()
+                close_process_files()
+                sys.exit(0)
 
-        signal.signal(signal.SIGINT, signal_handler)
-        signal.signal(signal.SIGTERM, signal_handler)
+            signal.signal(signal.SIGINT, signal_handler)
+            signal.signal(signal.SIGTERM, signal_handler)
 
-        if options.test_cpu:
-            paddle.device.set_device("cpu")
-
-        redirect_stdio()
+            redirect_stdio()
 
     except Exception as e:
         print(f"[worker] INIT_FAILED | PID {my_pid} | {e}", flush=True)
@@ -1069,6 +1070,15 @@ def main():
             return
 
         # Single config execution
+        import paddle
+
+        globals()["paddle"] = paddle
+        if options.test_cpu:
+            paddle.device.set_device("cpu")
+        elif not getattr(options, "paddle_custom_device", False):
+            # CUDA_VISIBLE_DEVICES assigns the worker slot; Paddle still needs an explicit device.
+            paddle.set_device("gpu")
+
         # Load custom ops from paddlefleet to register _run_custom_op operators
         try:
             import paddlefleet_ops
@@ -1098,10 +1108,6 @@ def main():
 
         test_class = _select_test_class(options)
 
-        if options.test_cpu:
-            import paddle
-
-            paddle.device.set_device("cpu")
         if options.custom_device_vs_gpu:
             # custom_device_vs_gpu 模式需要传递额外参数
             case = test_class(

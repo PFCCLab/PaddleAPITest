@@ -160,6 +160,12 @@ def _init_worker_runtime(slot_index, gpu_id, options, *, redirect_output):
     with suppress_startup_output():
         import paddle
 
+        globals()["paddle"] = paddle
+        if options.test_cpu:
+            paddle.device.set_device("cpu")
+        elif not getattr(options, "paddle_custom_device", False):
+            # CUDA_VISIBLE_DEVICES assigns the worker slot; Paddle still needs an explicit device.
+            paddle.set_device("gpu")
         try:
             import paddlefleet_ops  # noqa: F401
         except ImportError:
@@ -168,11 +174,7 @@ def _init_worker_runtime(slot_index, gpu_id, options, *, redirect_output):
             import FusedQuantOps  # noqa: F401
         except ImportError:
             pass
-        globals()["paddle"] = paddle
         globals().update(_load_test_classes(options))
-
-    if options.test_cpu:
-        paddle.device.set_device("cpu")
 
     if redirect_output:
         redirect_stdio()
@@ -1737,6 +1739,15 @@ def main():
             return
 
         # Single config execution
+        import paddle
+
+        globals()["paddle"] = paddle
+        if options.test_cpu:
+            paddle.device.set_device("cpu")
+        elif not getattr(options, "paddle_custom_device", False):
+            # CUDA_VISIBLE_DEVICES assigns the worker slot; Paddle still needs an explicit device.
+            paddle.set_device("gpu")
+
         # Load custom ops from paddlefleet to register _run_custom_op operators
         try:
             import paddlefleet_ops
