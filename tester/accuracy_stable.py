@@ -594,7 +594,7 @@ class APITestAccuracyStable(APITestBase):
         tensor_count=1,
     ):
         api_name = self.api_config.api_name
-        config = self.api_config.config[:120000]
+        config = self.api_config.config
         dtype = self.api_config.dtype
         check_dtype = self.should_check_dtype()
         framework_names = {"P": "Paddle", "T": "Torch"}

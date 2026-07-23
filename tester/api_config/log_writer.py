@@ -16,6 +16,9 @@
 - has_comp_terminal_log：判断配置在指定 comp 维度是否已有分类。
 - write_to_comp_log：写入 accuracy-stable comp 维度结果并更新状态。
 - read_log：读取一个聚合结果文件中的全部配置。
+- parse_retest_types：解析并验证命令行复测分类。
+- prepare_retest：加载复测集合并清理其旧结构化结果。
+- finish_retest：清除已完成复测的恢复 manifest。
 - cleanup_uncheckpointed_result_logs：删除没有对应 checkpoint 的残留结果。
 - _read_pending_result_bytes：按结果 offset 读取新增完整行。
 - _save_result_offsets：提交结果 offset，并在 cleanup 时删除已消费分片。
@@ -46,6 +49,7 @@
 - _print_duplicate_classifications：打印主结果重复分类。
 - _print_comp_duplicate_classifications：打印 comp 维度重复分类。
 - print_log_info：打印最终测试统计和完整性告警。
+- limit_worker_layout：按 pending case 数裁剪实际 worker 布局。
 - redirect_stdio：将 worker stdout/stderr 行缓冲重定向到临时日志。
 - restore_stdio：恢复 worker 原始 stdout/stderr。
 - _get_diff：从精度错误消息提取最大绝对和相对误差。
@@ -167,6 +171,9 @@ _case_comparisons: dict[tuple[str, str], list[int]] = {}
 _case_has_comp_output = False
 # dimension -> {config_line -> log_type}，只负责 comp 维度内去重。
 _comp_terminal_configs: dict[str, dict[str, str]] = {}
+RETEST_PENDING_FILENAME = ".retest_pending.txt"
+RETEST_TYPES_FILENAME = ".retest_types.txt"
+MAX_CSV_CONFIG_LENGTH = 120000
 
 # 命令行参数配置，由 engine.py 使用
 CMD_CONFIG = None
@@ -348,6 +355,182 @@ def read_log(log_type: LogType):
     except Exception as err:
         print(f"Error reading {file_path}: {err}", flush=True)
         return set()
+
+
+def parse_retest_types(value):
+    """解析逗号分隔的复测分类，并保持用户给定顺序。"""
+    if not value:
+        return ()
+    valid_types = set(LOG_PREFIXES) - {"checkpoint"}
+    retest_types = []
+    for raw_type in value.split(","):
+        log_type = raw_type.strip().lower().replace("-", "_").replace(" ", "_")
+        if not log_type:
+            raise ValueError("--retest contains an empty classification")
+        if log_type not in valid_types:
+            choices = ", ".join(sorted(valid_types))
+            raise ValueError(
+                f"invalid --retest classification '{raw_type.strip()}'; choose: {choices}"
+            )
+        if log_type not in retest_types:
+            retest_types.append(log_type)
+    return tuple(retest_types)
+
+
+def _current_result_file(prefix, root=None):
+    root = TEST_LOG_PATH if root is None else root
+    cfg = get_cfg()
+    suffix = cfg.id if cfg else ""
+    return root / f"{prefix}{suffix}.txt"
+
+
+def _write_lines_atomic(file_path, lines):
+    temp_file = file_path.with_name(f".{file_path.name}.tmp")
+    try:
+        with temp_file.open("w") as target:
+            target.writelines(lines)
+        os.replace(temp_file, file_path)
+    finally:
+        temp_file.unlink(missing_ok=True)
+
+
+def _rewrite_text_excluding(file_path, excluded_lines):
+    if not file_path.exists():
+        return
+    temp_file = file_path.with_name(f".{file_path.name}.retest.tmp")
+    try:
+        changed = False
+        kept = 0
+        with file_path.open() as source, temp_file.open("w") as target:
+            for line in source:
+                if line.strip() in excluded_lines:
+                    changed = True
+                    continue
+                target.write(line)
+                kept += 1
+        if not changed:
+            return
+        if kept:
+            os.replace(temp_file, file_path)
+        else:
+            file_path.unlink()
+    finally:
+        temp_file.unlink(missing_ok=True)
+
+
+def _rewrite_csv_excluding(file_path, excluded_configs):
+    if not file_path.exists():
+        return
+    temp_file = file_path.with_name(f".{file_path.name}.retest.tmp")
+    try:
+        with file_path.open(newline="") as source, temp_file.open("w", newline="") as target:
+            reader = csv.DictReader(source)
+            if not reader.fieldnames or "config" not in reader.fieldnames:
+                return
+            writer = csv.DictWriter(target, fieldnames=reader.fieldnames)
+            writer.writeheader()
+            changed = False
+            for row in reader:
+                if row.get("config") in excluded_configs:
+                    changed = True
+                    continue
+                writer.writerow(row)
+        if not changed:
+            return
+        os.replace(temp_file, file_path)
+    finally:
+        temp_file.unlink(missing_ok=True)
+
+
+def _restore_truncated_retest_configs(configs, checkpoints):
+    truncated = {config for config in configs if len(config) == MAX_CSV_CONFIG_LENGTH}
+    if not truncated:
+        return set(configs)
+
+    matches_by_prefix = {config: [] for config in truncated}
+    for checkpoint in checkpoints:
+        if len(checkpoint) < MAX_CSV_CONFIG_LENGTH:
+            continue
+        prefix = checkpoint[:MAX_CSV_CONFIG_LENGTH]
+        if prefix in matches_by_prefix:
+            matches_by_prefix[prefix].append(checkpoint)
+
+    restored = set(configs) - truncated
+    for config, matches in matches_by_prefix.items():
+        if len(matches) > 1:
+            raise ValueError(
+                "cannot restore truncated retest config: multiple checkpoint entries "
+                f"share its {MAX_CSV_CONFIG_LENGTH}-character prefix"
+            )
+        restored.add(matches[0] if matches else config)
+    return restored
+
+
+def prepare_retest(retest_types):
+    """读取复测分类，并清除这些配置的当前结构化结果。"""
+    pending_file = TEST_LOG_PATH / RETEST_PENDING_FILENAME
+    types_file = TEST_LOG_PATH / RETEST_TYPES_FILENAME
+    if pending_file.exists():
+        stored_types_text = types_file.read_text().strip() if types_file.exists() else ""
+        try:
+            stored_types = parse_retest_types(stored_types_text)
+        except ValueError:
+            stored_types = ()
+        if set(stored_types) != set(retest_types):
+            expected_types = ",".join(retest_types)
+            raise ValueError(
+                f"unfinished retest uses '{stored_types_text or 'unknown'}'; "
+                f"resume it before starting '{expected_types}'"
+            )
+        with pending_file.open() as source:
+            retest_configs = {line.strip() for line in source if line.strip()}
+        retest_configs -= read_log("checkpoint")
+        cleanup_configs = set(retest_configs)
+        if not retest_configs:
+            finish_retest()
+            return set()
+    else:
+        raw_retest_configs = set()
+        for log_type in retest_types:
+            raw_retest_configs.update(read_log(log_type))
+        retest_configs = _restore_truncated_retest_configs(
+            raw_retest_configs, read_log("checkpoint")
+        )
+        cleanup_configs = raw_retest_configs | retest_configs
+        if retest_configs:
+            _write_lines_atomic(types_file, (",".join(retest_types) + "\n",))
+            _write_lines_atomic(
+                pending_file,
+                (f"{config}\n" for config in sorted(retest_configs)),
+            )
+    if not retest_configs:
+        return set()
+
+    close_process_files()
+    for prefix in LOG_PREFIXES.values():
+        _rewrite_text_excluding(_current_result_file(prefix), cleanup_configs)
+
+    comp_dir = TEST_LOG_PATH / "comp"
+    if comp_dir.exists():
+        for dimension_dir in comp_dir.iterdir():
+            if not dimension_dir.is_dir():
+                continue
+            for prefix in LOG_PREFIXES.values():
+                _rewrite_text_excluding(
+                    _current_result_file(prefix, root=dimension_dir), cleanup_configs
+                )
+
+    _rewrite_text_excluding(TEST_LOG_PATH / "api_config_incomplete.txt", cleanup_configs)
+    csv_configs = cleanup_configs | {config[:MAX_CSV_CONFIG_LENGTH] for config in cleanup_configs}
+    _rewrite_csv_excluding(TEST_LOG_PATH / "tol.csv", csv_configs)
+    _rewrite_csv_excluding(TEST_LOG_PATH / "stable.csv", csv_configs)
+    return retest_configs
+
+
+def finish_retest():
+    """清除已完成复测的恢复 manifest。"""
+    (TEST_LOG_PATH / RETEST_PENDING_FILENAME).unlink(missing_ok=True)
+    (TEST_LOG_PATH / RETEST_TYPES_FILENAME).unlink(missing_ok=True)
 
 
 def cleanup_uncheckpointed_result_logs():
@@ -600,6 +783,8 @@ def print_run_header(options, paddle_version):
         source_option = ("--api_config", options.api_config)
     elif options.api_config_file:
         source_option = ("--api_config_file", options.api_config_file)
+    elif getattr(options, "retest", ""):
+        source_option = ("--retest", options.retest)
     else:
         source_option = ("--api_config_file_pattern", options.api_config_file_pattern)
 
@@ -662,11 +847,14 @@ def print_preparing_summary(
     pending_case,
     *,
     removed_stale_logs=0,
+    retest_types=(),
 ):
     """打印配置读取和断点续跑摘要。"""
     print("--- PREPARING")
     if removed_stale_logs:
         print(f"Cleanup: {removed_stale_logs} stale result entries removed (not in checkpoint)")
+    if retest_types:
+        print(f"Retest: {', '.join(retest_types)} | {total_case} selected")
     print(
         f"Configs: {read_count} read | {non_config_count} non-config | {duplicate_count} duplicate"
     )
@@ -681,6 +869,28 @@ def print_compute_summary(available_gpus, max_workers_per_gpu):
         f"GPU {gpu_id}: {workers}" for gpu_id, workers in sorted(max_workers_per_gpu.items())
     )
     print(f"Layout: {layout}")
+
+
+def limit_worker_layout(available_gpus, max_workers_per_gpu, pending_cases):
+    """按 pending 数 breadth-first 裁剪每张 GPU 的 worker 数。"""
+    if pending_cases <= 0:
+        return [], {}
+    limited = dict.fromkeys(available_gpus, 0)
+    remaining = pending_cases
+    while remaining > 0:
+        allocated = False
+        for gpu_id in available_gpus:
+            if limited[gpu_id] >= max_workers_per_gpu[gpu_id]:
+                continue
+            limited[gpu_id] += 1
+            remaining -= 1
+            allocated = True
+            if remaining == 0:
+                break
+        if not allocated:
+            break
+    limited = {gpu_id: workers for gpu_id, workers in limited.items() if workers}
+    return list(limited), limited
 
 
 def print_running_header():
@@ -1386,5 +1596,12 @@ def log_accuracy_stable(
         r"(\d+\.?\d*(?:[eE][+-]?\d+)?|nan|inf)\b"
     )
     max_abs_diff, max_rel_diff = _get_diff(error_msg, abs_pattern, rel_pattern)
-    row = [api, config, dtype, comp, str(max_abs_diff), str(max_rel_diff)]
+    row = [
+        api,
+        config[:MAX_CSV_CONFIG_LENGTH],
+        dtype,
+        comp,
+        str(max_abs_diff),
+        str(max_rel_diff),
+    ]
     _append_csv(TMP_LOG_PATH / f"stable_{os.getpid()}.csv", STABLE_HEADER, row)

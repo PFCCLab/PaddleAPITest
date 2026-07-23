@@ -16,7 +16,11 @@ from .api_config.config_analyzer import (
     get_cached_numpy_array,
 )
 from .api_config.dump_writer import DEFAULT_DUMP_DIR, DumpContext, dump_enabled
-from .api_config.log_writer import log_accuracy_tolerance, write_to_log
+from .api_config.log_writer import (
+    MAX_CSV_CONFIG_LENGTH,
+    log_accuracy_tolerance,
+    write_to_log,
+)
 from .runtime_config import TestRuntimeConfig
 
 with open("tester/base_config.yaml", encoding="utf-8") as f:
@@ -1764,7 +1768,7 @@ class APITestBase:
                     log_accuracy_tolerance(
                         "Identical",
                         self.api_config.api_name,
-                        self.api_config.config[:120000],
+                        self.api_config.config[:MAX_CSV_CONFIG_LENGTH],
                         str(actual.dtype),
                         is_backward,
                         tensor_index=tensor_index,
@@ -1792,7 +1796,7 @@ class APITestBase:
                 log_accuracy_tolerance(
                     "Identical",
                     self.api_config.api_name,
-                    self.api_config.config[:120000],
+                    self.api_config.config[:MAX_CSV_CONFIG_LENGTH],
                     str(actual.dtype),
                     is_backward,
                     tensor_index=tensor_index,
@@ -1827,7 +1831,7 @@ class APITestBase:
                     log_accuracy_tolerance(
                         error_str,
                         self.api_config.api_name,
-                        self.api_config.config[:120000],
+                        self.api_config.config[:MAX_CSV_CONFIG_LENGTH],
                         str(actual.dtype),
                         is_backward,
                         tensor_index=tensor_index,

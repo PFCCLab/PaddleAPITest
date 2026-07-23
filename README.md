@@ -53,7 +53,7 @@ python engineV4.py \
   --num_gpus=1
 ```
 
-配置包含双引号时用单引号包裹 `--api_config`；单配置模式最多使用一块 GPU。
+配置包含双引号时用单引号包裹 `--api_config`；单配置模式最多使用一块 GPU。未指定 `--gpu_ids` 和 `--num_gpus` 时默认使用 GPU 0。
 
 ### 批量运行
 
@@ -76,7 +76,24 @@ python engineV4.py \
   --log_dir=tester/api_config/test_log
 ```
 
-`--api_config`、`--api_config_file` 和 `--api_config_file_pattern` 必须且只能选择一个。完整参数以 `python engineV4.py --help` 为准。
+`--api_config`、`--api_config_file`、`--api_config_file_pattern` 和下文的 `--retest` 必须且只能选择一个。完整参数以 `python engineV4.py --help` 为准。
+
+### 快速复测分类
+
+已有日志目录可以直接按分类复测，无需修改 checkpoint，也无需再次指定原始配置文件。例如复测全部 `config_input`：
+
+```bash
+python engineV4.py \
+  --accuracy_stable=True \
+  --retest=config_input \
+  --log_dir=tester/api_config/test_log \
+  --num_gpus=4 \
+  --gpu_ids=0-3
+```
+
+多个分类用逗号分隔，例如 `--retest=config_input,timeout`。可用分类与 `api_config_*.txt` 对应，包括 `pass`、`skip`、`paddle_error`、`paddle_accuracy`、`paddle_bitwise`、`paddle_cuda`、`paddle_crash`、`oom`、`timeout`、`torch_error`、`config_input`、`config_parse` 和 `config_convert`。
+
+复测开始时，引擎会从 checkpoint、主分类、`comp/` 分类和 stable/tolerance CSV 中移除所选配置的旧结构化结果；`log_inorder.log` 保留历史 case。复测中断后，重新执行相同命令只运行尚未 checkpoint 的配置；全部完成后恢复文件自动删除。`engineV2.py` 支持相同参数。不要让多个进程同时复测同一日志目录。
 
 ## 测试模式
 
@@ -161,7 +178,7 @@ python engineV4.py \
 
 - `--num_gpus=-1` 使用全部选定 GPU；也可指定明确数量。
 - `--gpu_ids` 支持 `0`、`0,2`、`0-3` 和 `-1`。
-- `--num_workers_per_gpu` 控制每张 GPU 的 worker 数；GPU mode 和大 Tensor 通常从 1 开始。
+- `--num_workers_per_gpu` 控制每张 GPU 的 worker 上限；实际 worker 总数不会超过 pending case 数，0 pending 时不会启动 worker。
 - `--timeout` 是单 case 超时时间，单位为秒。
 - `--show_runtime_status=True` 输出实时进度和运行状态。
 
@@ -172,7 +189,7 @@ python engineV4.py \
 - `api_config_*.txt`：按 pass、Paddle error、accuracy error、OOM、timeout 等终态分类的配置。
 - `comp/`、`stable*.csv` 等：精度稳定性各比较维度的结果。
 
-并发任务必须使用不同日志目录。失败重测可用 `run.py` 的 `retest`，或使用 [工具文档](tools/README.md) 中的 checkpoint/错误配置工具。
+并发任务必须使用不同日志目录。单次分类复测优先使用 `--retest`；多轮分支复测可用 `run.py` 的 `retest`。
 
 ## 调试能力
 

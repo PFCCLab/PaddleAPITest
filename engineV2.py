@@ -478,6 +478,12 @@ def parse_bool(value):
         raise ValueError(f"Invalid boolean value: {value} parsed from command line")
 
 
+def _apply_single_config_gpu_defaults(options):
+    if not options.gpu_ids and options.num_gpus == -1:
+        options.gpu_ids = "0"
+        options.num_gpus = 1
+
+
 def _prepare_single_config_gpu(options):
     if options.test_cpu:
         options.gpu_workers_per_gpu_map = {}
@@ -485,6 +491,7 @@ def _prepare_single_config_gpu(options):
         options.runtime_config = TestRuntimeConfig.from_options(options)
         return None
 
+    _apply_single_config_gpu_defaults(options)
     gpu_ids = validate_gpu_options(options)
     if len(gpu_ids) != 1:
         raise ValueError(
@@ -734,7 +741,7 @@ def main():
         default="",
         help=(
             "Path to a config file. Mutually exclusive with "
-            "--api_config_file_pattern and --api_config."
+            "--api_config_file_pattern, --api_config, and --retest."
         ),
     )
     parser.add_argument(
@@ -746,6 +753,14 @@ def main():
         "--api_config",
         default="",
         help="Run one API config string directly. Single-case mode supports at most one GPU.",
+    )
+    parser.add_argument(
+        "--retest",
+        default="",
+        help=(
+            "Retest classifications from --log_dir, e.g. config_input or "
+            "config_input,timeout. Mutually exclusive with other config inputs."
+        ),
     )
     parser.add_argument(
         "--paddle_only",
@@ -943,6 +958,27 @@ def main():
         parser.error(str(err))
     if options.random_seed != parser.get_default("random_seed"):
         np.random.seed(options.random_seed)
+    try:
+        options.retest_types = parse_retest_types(options.retest)
+    except ValueError as err:
+        _print_argument(ARGUMENT_ERROR_PREFIX, str(err))
+        return
+
+    input_sources = (
+        bool(options.api_config),
+        bool(options.api_config_file),
+        bool(options.api_config_file_pattern),
+        bool(options.retest),
+    )
+    if sum(input_sources) != 1:
+        _print_argument(
+            ARGUMENT_ERROR_PREFIX,
+            "exactly one of --api_config, --api_config_file, "
+            "--api_config_file_pattern, or --retest is required",
+        )
+        return
+    if options.api_config and not options.test_cpu:
+        _apply_single_config_gpu_defaults(options)
 
     mode = [
         options.accuracy,
@@ -1110,12 +1146,11 @@ def main():
         finally:
             case.clear_tensor()
             del case
-    elif options.api_config_file or options.api_config_file_pattern:
-        # validate GPU options
-        gpu_ids = validate_gpu_options(options)
-
+    elif options.api_config_file or options.api_config_file_pattern or options.retest:
         # get config files
-        if options.api_config_file_pattern:
+        if options.retest:
+            config_files = []
+        elif options.api_config_file_pattern:
             import glob
 
             config_files = []
@@ -1143,29 +1178,38 @@ def main():
 
         # when engineV2 was interrupted, resume from .tmp dir
         aggregate_logs(cleanup=True)
-        removed_stale_logs = cleanup_uncheckpointed_result_logs()
+        removed_stale_logs = 0 if options.retest else cleanup_uncheckpointed_result_logs()
 
-        # read checkpoint
-        finish_configs = read_log("checkpoint")
-
-        api_config_count = 0
-        skipped_non_config = 0
-        api_configs = set()
-        for config_file in config_files:
+        if options.retest:
             try:
-                with open(config_file) as f:
-                    for line in f:
-                        line = line.strip()
-                        if not line:
-                            continue
-                        if not line.startswith("paddle."):
-                            skipped_non_config += 1
-                            continue
-                        api_config_count += 1
-                        api_configs.add(line)
-            except Exception as e:
-                print(f"Failed to read config file {config_file}: {e}", flush=True)
+                api_configs = prepare_retest(options.retest_types)
+            except (OSError, ValueError) as err:
+                _print_argument(ARGUMENT_ERROR_PREFIX, str(err))
                 return
+            removed_stale_logs = cleanup_uncheckpointed_result_logs()
+            api_config_count = len(api_configs)
+            skipped_non_config = 0
+            finish_configs = read_log("checkpoint")
+        else:
+            finish_configs = read_log("checkpoint")
+            api_config_count = 0
+            skipped_non_config = 0
+            api_configs = set()
+            for config_file in config_files:
+                try:
+                    with open(config_file) as f:
+                        for line in f:
+                            line = line.strip()
+                            if not line:
+                                continue
+                            if not line.startswith("paddle."):
+                                skipped_non_config += 1
+                                continue
+                            api_config_count += 1
+                            api_configs.add(line)
+                except Exception as e:
+                    print(f"Failed to read config file {config_file}: {e}", flush=True)
+                    return
         dup_case = api_config_count - len(api_configs)
         read_count = api_config_count + skipped_non_config
         api_config_count = len(api_configs)
@@ -1180,14 +1224,36 @@ def main():
             finish_case,
             all_case,
             removed_stale_logs=removed_stale_logs,
+            retest_types=options.retest_types,
         )
         del api_config_count, dup_case, finish_case, read_count
 
+        if not api_configs:
+            if options.retest:
+                finish_retest()
+            print_running_header()
+            print("Workers: skipped | 0 pending", flush=True)
+            log_counts = aggregate_logs(end=True)
+            print_log_info(0, log_counts)
+            print_run_footer(
+                0,
+                0,
+                0,
+                log_counts,
+                time.time() - start_time,
+                options.log_dir,
+            )
+            return
+
         # validate GPU visibility and derive per-GPU worker counts
+        gpu_ids = validate_gpu_options(options)
         available_gpus, max_workers_per_gpu = check_gpu_memory(gpu_ids, options.num_workers_per_gpu)
         if not available_gpus:
             print("No usable GPUs available.", flush=True)
             return
+        available_gpus, max_workers_per_gpu = limit_worker_layout(
+            available_gpus, max_workers_per_gpu, all_case
+        )
 
         total_workers = sum(max_workers_per_gpu.values())
         gpu_total_memory_map = {}
@@ -1326,6 +1392,8 @@ def main():
             cleanup(pool)
         finally:
             log_counts = aggregate_logs(end=True)
+            if options.retest and tested_case == all_case:
+                finish_retest()
             print_log_info(max(all_case - tested_case, 0), log_counts)
             end_time = time.time()
             total_time = end_time - start_time
