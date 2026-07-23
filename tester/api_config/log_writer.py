@@ -701,7 +701,7 @@ def write_case_end(status, case_id=None, api_config_str=None, duration_ms=None, 
                 summary_lines.append("> COMP SUMMARY | " + " | ".join(pair_summaries))
         for summary in summaries.values():
             summary_lines.append("> COMP SUMMARY | " + summary)
-        print("\n" + "\n".join(summary_lines), flush=True)
+        print("\n".join(summary_lines), flush=True)
         _case_has_comp_output = True
         _case_comparisons.clear()
     if _case_has_comp_output:
@@ -710,7 +710,7 @@ def write_case_end(status, case_id=None, api_config_str=None, duration_ms=None, 
     fields = [f"{CASE_END_TAG} {case_id}", outcome]
     if duration_ms is not None:
         fields.append(f"{duration_ms} ms")
-    print(" | ".join(fields) + "\n", flush=True)
+    print(" | ".join(fields), flush=True)
     return get_worker_log_offset()
 
 
@@ -732,7 +732,7 @@ def append_case_end_to_worker_log(pid, status, case_id=None, api_config_str=None
         log_file = TMP_LOG_PATH / f"log_{pid}.log"
         log_file.parent.mkdir(parents=True, exist_ok=True)
         with log_file.open("a", encoding="utf-8") as f:
-            f.write(f"{end_line}\n\n")
+            f.write(f"{end_line}\n")
         return log_file.stat().st_size
     except Exception as err:
         print(f"Error writing case end to worker log {pid}: {err}", flush=True)
@@ -789,7 +789,7 @@ def print_run_header(options, paddle_version):
         source_option = ("--api_config_file_pattern", options.api_config_file_pattern)
 
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
-    print(f">>> TEST RUN | {timestamp} | Paddle {paddle_version} | PID {os.getpid()}\n")
+    print(f">>> TEST RUN | {timestamp} | Paddle {paddle_version} | PID {os.getpid()}")
     print("\n--- OPTIONS")
     files = [
         source_option,

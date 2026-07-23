@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import gc
+import importlib
 import multiprocessing as mp
 import os
 import queue
@@ -13,6 +14,7 @@ import sys
 import tempfile
 import threading
 import time
+import warnings
 from collections import deque
 from dataclasses import dataclass
 from datetime import datetime
@@ -22,8 +24,15 @@ from types import SimpleNamespace
 from typing import TYPE_CHECKING
 
 import numpy as np
-import pynvml
 import yaml
+
+with warnings.catch_warnings():
+    warnings.filterwarnings(
+        "ignore",
+        message="The pynvml package is deprecated.*",
+        category=FutureWarning,
+    )
+    import pynvml
 
 if TYPE_CHECKING:
     import paddle
@@ -151,12 +160,14 @@ class WorkerSlot:
     state: str = "dead"  # dead, starting, idle, busy
 
 
-def _init_worker_runtime(slot_index, gpu_id, options, *, redirect_output):
-    init_log(options.log_dir, worker_tmp_logs=True)
+def _import_optional_runtime_module(module_name):
+    try:
+        importlib.import_module(module_name)
+    except Exception:
+        pass
 
-    if gpu_id is not None:
-        os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
 
+def _init_runtime_modules(options):
     with suppress_startup_output():
         import paddle
 
@@ -166,15 +177,18 @@ def _init_worker_runtime(slot_index, gpu_id, options, *, redirect_output):
         elif not getattr(options, "paddle_custom_device", False):
             # CUDA_VISIBLE_DEVICES assigns the worker slot; Paddle still needs an explicit device.
             paddle.set_device("gpu")
-        try:
-            import paddlefleet_ops  # noqa: F401
-        except ImportError:
-            pass
-        try:
-            import FusedQuantOps  # noqa: F401
-        except ImportError:
-            pass
+        _import_optional_runtime_module("paddlefleet_ops")
+        _import_optional_runtime_module("FusedQuantOps")
         globals().update(_load_test_classes(options))
+
+
+def _init_worker_runtime(slot_index, gpu_id, options, *, redirect_output):
+    init_log(options.log_dir, worker_tmp_logs=True)
+
+    if gpu_id is not None:
+        os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
+
+    _init_runtime_modules(options)
 
     if redirect_output:
         redirect_stdio()
@@ -1738,27 +1752,8 @@ def main():
             _print_argument(ARGUMENT_ERROR_PREFIX, str(err))
             return
 
-        # Single config execution
-        import paddle
-
-        globals()["paddle"] = paddle
-        if options.test_cpu:
-            paddle.device.set_device("cpu")
-        elif not getattr(options, "paddle_custom_device", False):
-            # CUDA_VISIBLE_DEVICES assigns the worker slot; Paddle still needs an explicit device.
-            paddle.set_device("gpu")
-
-        # Load custom ops from paddlefleet to register _run_custom_op operators
-        try:
-            import paddlefleet_ops
-        except ImportError:
-            pass
-        try:
-            import FusedQuantOps
-        except ImportError:
-            pass
-
-        globals().update(_load_test_classes(options))
+        # Single config execution uses the same quiet Paddle/bootstrap path as workers.
+        _init_runtime_modules(options)
 
         init_log(options.log_dir, worker_tmp_logs=True)
 

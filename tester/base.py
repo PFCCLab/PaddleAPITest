@@ -33,7 +33,7 @@ rand_apis = frozenset(config.get("rand_apis", []))
 stochastic_behavior_apis = frozenset(config.get("stochastic_behavior_apis", []))
 single_op_no_signature_apis = frozenset(config.get("single_op_no_signature_apis", []))
 
-paddle_error_dismiss = {}  # disabled: covered by classify_runtime_error()
+paddle_error_dismiss = {}  # disabled: covered by the unified runtime error reporter
 # paddle_error_dismiss = config.get("paddle_error_dismiss", {})
 special_accuracy_atol_rtol = config.get("special_accuracy_atol_rtol", {})
 
@@ -123,6 +123,7 @@ def gpu_mode_maybe_empty_cache(gpu_config, phase="", force=False, request_spill=
 
 
 def classify_runtime_error(error_msg):
+    """Classify runtime errors without printing or mutating log state."""
     error_msg_lower = error_msg.lower()
     if error_msg.startswith("[torch_assert_OOM]"):
         return "oom", False
