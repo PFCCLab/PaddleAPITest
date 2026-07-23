@@ -79,20 +79,26 @@ def gpu_mode_maybe_empty_cache(gpu_config, phase="", force=False, request_spill=
         torch_reserved = torch.cuda.memory_reserved() / (1024**3)
     except Exception:
         torch_reserved = 0.0
-    try:
-        torch_allocated = torch.cuda.memory_allocated() / (1024**3)
-    except Exception:
+    if request_spill:
         torch_allocated = 0.0
+    else:
+        try:
+            torch_allocated = torch.cuda.memory_allocated() / (1024**3)
+        except Exception:
+            torch_allocated = 0.0
 
-    memory_budget = float(getattr(gpu_config, "memory_budget", 0.0) or 0.0)
-    pressure_ratio = float(getattr(gpu_config, "cleanup_pressure_ratio", 0.25) or 0.25)
-    used_ratio = float(getattr(gpu_config, "cleanup_used_ratio", 0.90) or 0.90)
+    memory_budget = gpu_config.memory_budget
+    pressure_ratio = gpu_config.cleanup_pressure_ratio
+    used_ratio = gpu_config.cleanup_used_ratio
     idle_reserved = max(0.0, torch_reserved - torch_allocated)
     over_budget = memory_budget > 0 and torch_reserved >= memory_budget * used_ratio
     should_spill = bool(request_spill and over_budget)
 
+    # A spill probe should be side-effect free while under budget. The previous
+    # idle-cache branch could empty both allocators without returning a spill
+    # request, adding synchronization/allocator overhead to hot paths.
     should_cleanup = bool(force or should_spill)
-    if not should_cleanup:
+    if not should_cleanup and not request_spill:
         if memory_budget <= 0:
             should_cleanup = (
                 torch_reserved > 0 and torch_allocated / max(torch_reserved, 1e-6) < 0.5
@@ -1444,25 +1450,36 @@ class APITestBase:
         chunk_numel = max(1, working_bytes // temp_bytes_per_element)
         actual_flat = actual.reshape(-1)
         expected_flat = expected.reshape(-1)
+        actual_numel = actual_flat.numel()
+        actual_dtype = actual.dtype
+        expected_dtype = expected.dtype
+        actual_is_complex = actual_dtype.is_complex
+        expected_is_complex = expected_dtype.is_complex
+        actual_is_float64 = actual_dtype == torch.float64
+        expected_is_float64 = expected_dtype == torch.float64
+        actual_is_float8 = "float8" in str(actual_dtype)
+        expected_is_float8 = "float8" in str(expected_dtype)
+        actual_is_integer = not actual_dtype.is_floating_point and not actual_is_complex
+        actual_supports_nan = actual_dtype.is_floating_point or actual_is_complex
         mismatch_count = 0
         max_abs_diff = -1.0
         max_abs_index = 0
         max_rel_diff = -1.0
         max_rel_index = 0
         exact_compare = atol == 0.0 and rtol == 0.0
-        for start in range(0, actual_flat.numel(), chunk_numel):
-            end = min(actual_flat.numel(), start + chunk_numel)
+        for start in range(0, actual_numel, chunk_numel):
+            end = min(actual_numel, start + chunk_numel)
             actual_chunk = actual_flat[start:end]
             expected_chunk = expected_flat[start:end]
             if exact_compare:
                 equal = actual_chunk == expected_chunk
-                if actual_chunk.is_floating_point() or actual_chunk.is_complex():
+                if actual_supports_nan:
                     equal |= torch.isnan(actual_chunk) & torch.isnan(expected_chunk)
                 mismatch = equal.logical_not_()
             else:
-                if "float8" in str(actual_chunk.dtype):
+                if actual_is_float8:
                     actual_chunk = actual_chunk.float()
-                if "float8" in str(expected_chunk.dtype):
+                if expected_is_float8:
                     expected_chunk = expected_chunk.float()
                 mismatch = torch.isclose(
                     actual_chunk,
@@ -1477,16 +1494,16 @@ class APITestBase:
             if chunk_mismatch_count == 0:
                 continue
 
-            if actual_chunk.is_complex() or expected_chunk.is_complex():
+            if actual_is_complex or expected_is_complex:
                 actual_for_diff = actual_chunk
                 expected_for_diff = expected_chunk
-            elif actual_chunk.dtype == torch.float64 or expected_chunk.dtype == torch.float64:
+            elif actual_is_float64 or expected_is_float64:
                 actual_for_diff = actual_chunk.to(torch.float64)
                 expected_for_diff = expected_chunk.to(torch.float64)
-            elif "float8" in str(actual_chunk.dtype) or "float8" in str(expected_chunk.dtype):
+            elif actual_is_float8 or expected_is_float8:
                 actual_for_diff = actual_chunk.float()
                 expected_for_diff = expected_chunk.float()
-            elif not actual_chunk.dtype.is_floating_point and not actual_chunk.dtype.is_complex:
+            elif actual_is_integer:
                 actual_for_diff = actual_chunk.to(torch.int64)
                 expected_for_diff = expected_chunk.to(torch.int64)
             else:
@@ -1652,7 +1669,7 @@ class APITestBase:
             if actual_tensor.is_cuda and needs_chunk_budget:
                 try:
                     free_bytes, _ = torch.cuda.mem_get_info(actual_tensor.device)
-                    max_working_bytes = 16 * 1024**3
+                    max_working_bytes = 32 * 1024**3
                     min_working_bytes = 256 * 1024**2
                     working_bytes = min(max_working_bytes, max(min_working_bytes, free_bytes // 5))
 

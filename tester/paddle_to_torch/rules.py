@@ -2108,9 +2108,9 @@ def _fp8_quant_blockwise_impl(inp, eps, power2, scale_transpose, ue8m0, method, 
             q = (x_blk * q_scale.unsqueeze(-1)).to(torch.float8_e4m3fn).reshape(m, -1)[:, :n]
             scale = deq_scale.transpose(0, 1).contiguous() if scale_transpose else deq_scale.contiguous()
         else:
-            _bytes_budget = 512 * 1024 * 1024
+            _workspace_bytes = 32 << 30
             _per_row = max(1, n * 4 * 2)
-            _chunk = max(1, min(m, _bytes_budget // _per_row))
+            _chunk = max(1, min(m, _workspace_bytes // _per_row))
             q = torch.empty((m, n), dtype=torch.float8_e4m3fn, device=inp.device)
             deq_scale = torch.empty((m, scale_cols), dtype=torch.float32, device=inp.device)
             for _rs in range(0, m, _chunk):
@@ -2259,7 +2259,7 @@ else:
 
     # One FP32 activation chunk plus its BF16 cast can coexist. Account for the
     # BF16 cast explicitly and never expand scales to [M, N].
-    _workspace_bytes = 8 << 30
+    _workspace_bytes = 32 << 30
     _bytes_per_row = max(1, _cols * (4 + 2))
     _row_chunk = max(1, min(_rows, _workspace_bytes // _bytes_per_row))
 
@@ -4375,14 +4375,80 @@ if mat2.dtype == torch.float16 and input.dtype != torch.float16:
 
 
 class MoePermuteRule(BaseRule):
-    """Torch reference for expert-wise token permutation.
+    """Expert-wise token permutation with selectable Torch or TE reference.
 
-    Routing metadata remains vectorized because it is small relative to the
-    hidden-state payload. Only payload gathers are chunked to bound their peak.
+    ``PADDLEAPITEST_IMPL=torch`` (the default) preserves the shape-generic
+    Torch composition; ``PADDLEAPITEST_IMPL=te`` uses TE's mask/padded path.
     """
 
     def apply(self, paddle_api: str) -> ConvertResult:
-        core = """
+        import os
+
+        impl = os.environ.get("PADDLEAPITEST_IMPL", "torch")
+        core = self._torch_code() if impl == "torch" else self._te_code()
+        code = Code(core=core.splitlines())
+        return ConvertResult.success(paddle_api, code, is_torch_corresponding=False)
+
+    @staticmethod
+    def _te_code() -> str:
+        return """
+from transformer_engine.pytorch.permutation import moe_permute_and_pad_with_probs
+
+if hidden_states.dtype != torch.bfloat16 or locals().get('scale') is not None:
+    raise ValueError('TE reference is limited to BF16 hidden_states with scale=None')
+if not locals().get('do_gather', True):
+    raise ValueError('TE reference requires do_gather=True')
+if locals().get('using_ue8m0_scale', False):
+    raise ValueError('TE reference does not support ue8m0 scale')
+if locals().get('return_expert_indices', False):
+    raise ValueError('TE reference does not expose expert_indices')
+if locals().get('override_buffer_size', -1) != -1:
+    raise ValueError('TE reference does not support override_buffer_size')
+
+_tokens, _topk = expert_routemap_topk.shape
+_dev = hidden_states.device
+_route = expert_routemap_topk.to(torch.int32)
+_prob = expert_prob_topk.to(torch.float32)
+_dense_route = torch.zeros((_tokens, num_experts), dtype=torch.int32, device=_dev)
+_dense_prob = torch.zeros((_tokens, num_experts), dtype=torch.float32, device=_dev)
+_rows = torch.arange(_tokens, device=_dev)
+for _k in range(_topk):
+    _expert = _route[:, _k]
+    _valid = _expert >= 0
+    _dense_route[_rows[_valid], _expert[_valid]] = 1
+    _dense_prob[_rows[_valid], _expert[_valid]] = _prob[:, _k][_valid]
+
+_counts = torch.as_tensor(tokens_per_expert, dtype=torch.int64, device=_dev)
+if int(_dense_route.sum().item()) != int((_route >= 0).sum().item()):
+    raise ValueError('TE dense route cannot represent duplicate token/expert assignments')
+if not torch.equal(_dense_route.sum(dim=0).to(torch.int64), _counts):
+    raise ValueError('tokens_per_expert must exactly match expert_routemap_topk')
+_out, _te_probs, _te_map, _pad_offsets, _target = moe_permute_and_pad_with_probs(
+    hidden_states, _dense_prob, _dense_route, _counts, padding_alignment
+)
+
+# TE stores unpadded expert-local rows in its map. Paddle exposes padded rows.
+_n = _te_map[:, 2 * num_experts].to(torch.int64)
+_valid = torch.arange(num_experts, device=_dev).unsqueeze(0) < _n.unsqueeze(1)
+_te_rows = _te_map[:, :num_experts].to(torch.int64)
+_te_experts = _te_map[:, num_experts : 2 * num_experts].to(torch.int64)
+if _pad_offsets is not None:
+    _padded_rows = _te_rows.clone()
+    _padded_rows[_valid] += _pad_offsets[_te_experts[_valid]].to(torch.int64)
+else:
+    _padded_rows = _te_rows
+_paddle_rowmap = torch.full(
+    (_tokens, num_experts), -1, dtype=torch.int32, device=_dev
+)
+_token_ids = torch.arange(_tokens, device=_dev).unsqueeze(1).expand(-1, num_experts)
+_paddle_rowmap[_token_ids[_valid], _te_experts[_valid]] = _padded_rows[_valid].to(torch.int32)
+_scale_out = torch.empty(0, dtype=torch.float32, device=_dev)
+result = (_out, _paddle_rowmap, _te_probs, _scale_out)
+"""
+
+    @staticmethod
+    def _torch_code() -> str:
+        return """
 # FP8 zeros, advanced indexing, and assignment are supported on CUDA. Keep FP8
 # throughout this gather to avoid materializing a full BF16 copy of hidden_states.
 do_gather = locals().get('do_gather', True)
@@ -4477,8 +4543,8 @@ else:
 if do_gather:
     hidden_states_unzipped = torch.zeros(total_rows, token_dim, dtype=hidden_states.dtype, device=_dev)
     # Advanced indexing materializes the gathered payload before assignment.
-    # Bound that temporary to 8 GiB while leaving routing fully vectorized.
-    _workspace_bytes = 8 << 30
+    # Bound that temporary to 32 GiB while leaving routing fully vectorized.
+    _workspace_bytes = 32 << 30
     _payload_bytes_per_row = max(1, token_dim * hidden_states.element_size())
     _payload_chunk = max(1, _workspace_bytes // _payload_bytes_per_row)
     with torch.no_grad():
@@ -4503,19 +4569,77 @@ if return_expert_indices:
 else:
     result = (hidden_states_unzipped, rowmap, token_prob_unzipped, scale_unzipped)
 """
-        code = Code(core=core.splitlines())
-        return ConvertResult.success(paddle_api, code, is_torch_corresponding=False)
 
 
 class MoeUnpermuteRule(BaseRule):
-    """Torch reference for combining expert-wise token outputs.
+    """Expert output merge with selectable Torch or TE reference.
 
-    Routing tensors stay vectorized, while hidden-state accumulation is split
-    by token rows so no full FP32 copy of the expert payload is materialized.
+    ``PADDLEAPITEST_IMPL=torch`` (the default) preserves the existing Torch
+    implementation; ``PADDLEAPITEST_IMPL=te`` converts Paddle's row map to
+    TE's mask map and calls Transformer Engine.
     """
 
     def apply(self, paddle_api: str) -> ConvertResult:
-        core = """
+        import os
+
+        impl = os.environ.get("PADDLEAPITEST_IMPL", "torch")
+        core = self._torch_code() if impl == "torch" else self._te_code()
+        code = Code(core=core.splitlines())
+        return ConvertResult.success(paddle_api, code, is_torch_corresponding=False)
+
+    @staticmethod
+    def _te_code() -> str:
+        return """
+from transformer_engine.pytorch.permutation import moe_unpermute
+
+if hidden_states_unzipped.dtype != torch.bfloat16:
+    raise ValueError('TE reference requires BF16 hidden_states_unzipped')
+_dev = hidden_states_unzipped.device
+_tokens, _topk = expert_routemap_topk.shape
+_rowmap = zipped_expertwise_rowmap.to(torch.int64)
+_valid = _rowmap >= 0
+_slot = _valid.to(torch.int64).cumsum(dim=1) - 1
+_te_map = torch.zeros((_tokens, 2 * num_experts + 1), dtype=torch.int32, device=_dev)
+_te_map[:, :num_experts].fill_(-1)
+_te_map[:, num_experts : 2 * num_experts].fill_(-1)
+_token_ids = torch.arange(_tokens, device=_dev).unsqueeze(1).expand(-1, num_experts)
+_te_map[_token_ids[_valid], _slot[_valid]] = _rowmap[_valid].to(torch.int32)
+_expert_ids = torch.arange(num_experts, dtype=torch.int64, device=_dev).expand(_tokens, -1)
+_te_map[_token_ids[_valid], num_experts + _slot[_valid]] = _expert_ids[_valid].to(torch.int32)
+_te_map[:, 2 * num_experts] = _valid.sum(dim=1).to(torch.int32)
+
+_prob_flat = token_prob_unzipped.to(torch.float32).reshape(-1)
+_safe_rows = _rowmap.clamp_min(0)
+_dense_probs = torch.zeros((_tokens, num_experts), dtype=torch.float32, device=_dev)
+_dense_probs[_valid] = _prob_flat[_safe_rows[_valid]]
+if locals().get('using_weighted_combine', False):
+    # Paddle bypasses weighting for a token routed to one expert.
+    _single = _valid.sum(dim=1) == 1
+    _dense_probs[_single] = torch.where(_valid[_single], torch.ones_like(_dense_probs[_single]), _dense_probs[_single])
+    _merge = _dense_probs
+else:
+    _merge = None
+
+_zipped_tokens = moe_unpermute(
+    hidden_states_unzipped,
+    _te_map,
+    merging_probs=_merge,
+    restore_shape=(total_zipped_tokens, hidden_states_unzipped.shape[1]),
+    map_type='mask',
+    pad_offsets=None,
+)
+_zipped_probs = torch.zeros((_tokens, _topk), dtype=torch.float32, device=_dev)
+_route = expert_routemap_topk.to(torch.int64)
+for _k in range(_topk):
+    _expert = _route[:, _k]
+    _ok = _expert >= 0
+    _zipped_probs[_ok, _k] = _prob_flat[_rowmap[_ok, _expert[_ok]]]
+result = (_zipped_tokens, _zipped_probs)
+"""
+
+    @staticmethod
+    def _torch_code() -> str:
+        return """
 using_weighted_combine = locals().get('using_weighted_combine', False)
 seqlen = expert_routemap_topk.shape[0]
 topk = expert_routemap_topk.shape[1]
@@ -4531,8 +4655,8 @@ _aggreg_counts = _valid_mask.sum(dim=1)
 zipped_tokens = torch.empty(seqlen, token_dim, dtype=out_dtype, device=_dev)
 
 # The FP32 accumulator and gathered payload can overlap. Process token rows in
-# an 8 GiB workspace and preserve expert-column accumulation order per token.
-_workspace_bytes = 8 << 30
+# a 32 GiB workspace and preserve expert-column accumulation order per token.
+_workspace_bytes = 32 << 30
 _bytes_per_token = max(1, token_dim * (4 * 2 + out_dtype.itemsize))
 _token_chunk = max(1, min(seqlen, _workspace_bytes // _bytes_per_token))
 with torch.no_grad():
@@ -4589,8 +4713,6 @@ with torch.no_grad():
     zipped_probs[_vt, _vk] = _prob_1d[_vrows]
 result = (zipped_tokens, zipped_probs)
 """
-        code = Code(core=core.splitlines())
-        return ConvertResult.success(paddle_api, code, is_torch_corresponding=False)
 
 
 # n
@@ -7933,7 +8055,7 @@ if op_name == "fused_swiglu_bwd":
     _dy_2d = dy.reshape(_outer, _hidden)
     _x_2d = x.reshape(_outer, _hidden * 2)
     _dx = torch.empty_like(_x_2d)
-    _workspace_bytes = 8 << 30
+    _workspace_bytes = 32 << 30
     _bytes_per_row = max(1, _hidden * (4 * 7 + x.element_size() * 2))
     _row_chunk = max(1, min(_outer, _workspace_bytes // _bytes_per_row))
     with torch.no_grad():
@@ -7962,7 +8084,7 @@ elif op_name == "fused_swiglu_scale_clamp":
     _out = torch.empty((_outer, _hidden), dtype=x.dtype, device=x.device)
     if torch.is_tensor(scale):
         scale = scale.view(*scale.shape[:-1], 1) if scale.dim() > 1 else scale.unsqueeze(-1)
-    _workspace_bytes = 8 << 30
+    _workspace_bytes = 32 << 30
     _bytes_per_row = max(1, _hidden * (4 * 4 + x.element_size()))
     _row_chunk = max(1, min(_outer, _workspace_bytes // _bytes_per_row))
     with torch.no_grad():
@@ -7995,7 +8117,7 @@ elif op_name == "fused_swiglu_scale_clamp_bwd":
         scale_v = scale.view(*scale.shape[:-1], 1) if scale.dim() > 1 else scale.unsqueeze(-1)
     else:
         scale_v = float(scale)
-    _workspace_bytes = 8 << 30
+    _workspace_bytes = 32 << 30
     _bytes_per_row = max(1, _hidden * (4 * 10 + x.element_size() * 2))
     _row_chunk = max(1, min(_outer, _workspace_bytes // _bytes_per_row))
     with torch.no_grad():
@@ -8070,10 +8192,10 @@ elif op_name in ("fused_swiglu_probs_bwd", "paddlefleet_fused_swiglu_probs_bwd")
         o2_s_out = torch.empty_like(do2_2d)
         pg_out = torch.empty([outer], dtype=torch.float32, device=o1.device)
         # At most nine FP32 [chunk, H] buffers overlap below. Include BF16
-        # casts so the temporary working set remains within 8 GiB.
-        workspace_bytes = 8 << 30
+        # casts so the temporary working set remains within 32 GiB.
+        _workspace_bytes = 32 << 30
         bytes_per_row = max(1, H * (4 * 9 + o1.element_size() * 3))
-        row_chunk = max(1, min(outer, workspace_bytes // bytes_per_row))
+        row_chunk = max(1, min(outer, _workspace_bytes // bytes_per_row))
         # 切片原地写入会触发 autograd 对叶子张量的报错（尤其 fp32 叶子节点），
         # 这里整体走 no_grad：本算子是 bwd kernel 的数值复刻，不需要再次求导。
         with torch.no_grad():
@@ -8126,8 +8248,8 @@ elif op_name == "fuse_weighted_swiglu_fp8_quant":
     _full_blocks = _half_cols // _TILE
     _full_cols = _full_blocks * _TILE
     # LHS, RHS, and the sigmoid temporary can overlap. Include the FP8 cast
-    # temporary so the per-chunk working set stays within 8 GiB.
-    _workspace_bytes = 8 << 30
+    # temporary and use a 32 GiB single-worker workspace to reduce row chunks.
+    _workspace_bytes = 32 << 30
     _bytes_per_row = max(1, _half_cols * (4 * 3 + 1))
     _row_chunk = max(1, min(_rows, _workspace_bytes // _bytes_per_row))
 
@@ -8217,7 +8339,7 @@ elif op_name in ("fuse_stack_fp8_quant", "fuse_stack_transpose_fp8_quant"):
     _inv_scale = torch.empty(
         (_num_row_blocks, _num_col_blocks), dtype=torch.float32, device=_dev
     )
-    _workspace_bytes = 8 << 30
+    _workspace_bytes = 32 << 30
     _bytes_per_row = max(1, _out_cols * (4 * 2 + 1) + _out_cols * 4)
     _row_blocks_per_chunk = max(
         1, min(_num_row_blocks, _workspace_bytes // _bytes_per_row // _TILE)
