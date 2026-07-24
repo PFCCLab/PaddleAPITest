@@ -1269,7 +1269,7 @@ def run_test_case(api_config_str, options):
             api_config = APIConfig(api_config_str)
         except Exception as err:
             print(f"[config_parse] {api_config_str} {err!s}", flush=True)
-            write_to_log("config_parse", api_config_str)
+            write_terminal_log("config_parse", api_config_str)
             case_status = "error"
             return
 
@@ -1282,6 +1282,8 @@ def run_test_case(api_config_str, options):
                 case.run_with_dump()
             else:
                 case.test()
+            if has_terminal_log(api_config_str):
+                write_checkpoint(api_config_str)
         except Exception as err:
             err_msg = str(err).lower()
             terminal_log_type = get_terminal_log_type(api_config_str)
@@ -1760,16 +1762,28 @@ def main():
         init_log(options.log_dir, worker_tmp_logs=True)
 
         options.api_config = options.api_config.strip()
+        single_case_error = None
         try:
             run_test_case(options.api_config, options)
         except Exception as err:
-            if (
-                "Tensor-likes are not equal" in str(err)
-                or "Mismatched elements" in str(err)
-                or "Error Message Summary" in str(err)
-            ):
-                exit(1)
+            single_case_error = err
             print(f"[test error] {options.api_config}: {err}", flush=True)
+        finally:
+            close_process_files()
+            log_counts = aggregate_logs(end=True)
+            completed_case = (log_counts or {}).get("checkpoint", 0)
+            remaining_case = max(1 - completed_case, 0)
+            print_log_info(remaining_case, log_counts)
+            print_run_footer(
+                1,
+                completed_case,
+                remaining_case,
+                log_counts,
+                time.time() - start_time,
+                options.log_dir,
+            )
+        if single_case_error is not None:
+            sys.exit(1)
     elif options.api_config_file or options.api_config_file_pattern or options.retest:
         # get config files
         if options.retest:

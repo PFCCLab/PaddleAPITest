@@ -118,6 +118,7 @@ if [[ ! -f "$ENGINE.py" || ! -d "tester" ]]; then
     echo "[错误] 请在 PaddleAPITest 项目根目录执行 | 缺少 $ENGINE.py 或 tester/"
     exit 1
 fi
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SCRIPT_FILE="${BASH_SOURCE[0]##*/}"
 SCRIPT_NAME="${SCRIPT_FILE%.sh}"
 RUN_COMMAND="./${SCRIPT_FILE}"
