@@ -1094,64 +1094,28 @@ def main():
         init_log(options.log_dir, worker_tmp_logs=True)
 
         options.api_config = options.api_config.strip()
-        print(
-            f"{datetime.now()} [paddle {paddle_version}] test begin: {options.api_config}",
-            flush=True,
-        )
+        single_case_error = None
         try:
-            api_config = APIConfig(options.api_config)
+            run_test_case(options.api_config, options)
         except Exception as err:
-            print(f"[config_parse] {options.api_config} {err!s}", flush=True)
-            if dump_enabled():
-                record_dump_terminal_status("config_parse", error=str(err))
-            return
-
-        test_class = _select_test_class(options)
-
-        if options.custom_device_vs_gpu:
-            # custom_device_vs_gpu 模式需要传递额外参数
-            case = test_class(
-                api_config,
-                operation_mode=options.operation_mode,
-                bos_path=options.bos_path,
-                bos_conf_path=options.bos_conf_path,
-                bcecmd_path=options.bcecmd_path,
-                random_seed=options.random_seed,
-                atol=options.atol,
-                rtol=options.rtol,
-            )
-        elif options.accuracy:
-            case = test_class(
-                api_config,
-                test_amp=options.test_amp,
-                atol=options.atol,
-                rtol=options.rtol,
-                manual_threshold_config_file=options.manual_threshold_config_file,
-                test_tol=options.test_tol,
-                bitwise_alignment=options.bitwise_alignment,
-                exit_on_error=options.exit_on_error,
-                use_gpu_mode=options.use_gpu_mode,
-                runtime_config=options.runtime_config,
-            )
-        else:
-            case = test_class(api_config, test_amp=options.test_amp)
-        try:
-            if dump_enabled():
-                case.run_with_dump()
-            else:
-                case.test()
-        except Exception as err:
-            if (
-                "Tensor-likes are not equal" in str(err)
-                or "Mismatched elements" in str(err)
-                or "Tensor-likes are not equal" in str(err)
-                or "Error Message Summary" in str(err)
-            ):
-                exit(1)
+            single_case_error = err
             print(f"[error] {options.api_config}: {err}", flush=True)
         finally:
-            case.clear_tensor()
-            del case
+            close_process_files()
+            log_counts = aggregate_logs(end=True)
+            completed_case = (log_counts or {}).get("checkpoint", 0)
+            remaining_case = max(1 - completed_case, 0)
+            print_log_info(remaining_case, log_counts)
+            print_run_footer(
+                1,
+                completed_case,
+                remaining_case,
+                log_counts,
+                time.time() - start_time,
+                options.log_dir,
+            )
+        if single_case_error is not None:
+            sys.exit(1)
     elif options.api_config_file or options.api_config_file_pattern or options.retest:
         # get config files
         if options.retest:

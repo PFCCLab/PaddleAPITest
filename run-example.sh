@@ -7,6 +7,7 @@ if [[ ! -f "engineV2.py" || ! -d "tester" ]]; then
     echo "[错误] 请在 PaddleAPITest 项目根目录执行 | 缺少 engineV2.py 或 tester/"
     exit 1
 fi
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # ── Paddle Flags ──────────────────────────────────────────────
 # 这些环境变量在启动 Paddle 前生效，用于控制 Paddle 运行时行为。
