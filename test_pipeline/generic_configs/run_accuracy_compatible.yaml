@@ -7,6 +7,7 @@ runner:
   engine: engineV4
   foreground: true
 env:
+  PADDLEAPITEST_GPU_MEMORY_POLICY: aggressive
   FLAGS_use_accuracy_compatible_kernel: "1"
 input:
   api_config_file: "${APITEST_MODEL}/accuracy_compatible/accuracy_compatible.txt"
@@ -14,7 +15,7 @@ output:
   log_dir: "test_${APITEST_MODEL}_log_accuracy_compatible"
 engine_args:
   accuracy_stable: true
-  use_cached_numpy: true
+  use_gpu_mode: true
   num_gpus: -1
-  num_workers_per_gpu: 2
+  num_workers_per_gpu: 1
   timeout: 1200

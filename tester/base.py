@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import collections
+import contextlib
 import gc
 import inspect
 import os
@@ -14,7 +15,12 @@ from .api_config.config_analyzer import (
     TensorConfig,
     get_cached_numpy_array,
 )
-from .api_config.log_writer import log_accuracy_tolerance, write_to_log
+from .api_config.dump_writer import DEFAULT_DUMP_DIR, DumpContext, dump_enabled
+from .api_config.log_writer import (
+    MAX_CSV_CONFIG_LENGTH,
+    log_accuracy_tolerance,
+    write_to_log,
+)
 from .runtime_config import TestRuntimeConfig
 
 with open("tester/base_config.yaml", encoding="utf-8") as f:
@@ -27,7 +33,7 @@ rand_apis = frozenset(config.get("rand_apis", []))
 stochastic_behavior_apis = frozenset(config.get("stochastic_behavior_apis", []))
 single_op_no_signature_apis = frozenset(config.get("single_op_no_signature_apis", []))
 
-paddle_error_dismiss = {}  # disabled: covered by classify_runtime_error()
+paddle_error_dismiss = {}  # disabled: covered by the unified runtime error reporter
 # paddle_error_dismiss = config.get("paddle_error_dismiss", {})
 special_accuracy_atol_rtol = config.get("special_accuracy_atol_rtol", {})
 
@@ -79,20 +85,26 @@ def gpu_mode_maybe_empty_cache(gpu_config, phase="", force=False, request_spill=
         torch_reserved = torch.cuda.memory_reserved() / (1024**3)
     except Exception:
         torch_reserved = 0.0
-    try:
-        torch_allocated = torch.cuda.memory_allocated() / (1024**3)
-    except Exception:
+    if request_spill:
         torch_allocated = 0.0
+    else:
+        try:
+            torch_allocated = torch.cuda.memory_allocated() / (1024**3)
+        except Exception:
+            torch_allocated = 0.0
 
-    memory_budget = float(getattr(gpu_config, "memory_budget", 0.0) or 0.0)
-    pressure_ratio = float(getattr(gpu_config, "cleanup_pressure_ratio", 0.25) or 0.25)
-    used_ratio = float(getattr(gpu_config, "cleanup_used_ratio", 0.90) or 0.90)
+    memory_budget = gpu_config.memory_budget
+    pressure_ratio = gpu_config.cleanup_pressure_ratio
+    used_ratio = gpu_config.cleanup_used_ratio
     idle_reserved = max(0.0, torch_reserved - torch_allocated)
     over_budget = memory_budget > 0 and torch_reserved >= memory_budget * used_ratio
     should_spill = bool(request_spill and over_budget)
 
+    # A spill probe should be side-effect free while under budget. The previous
+    # idle-cache branch could empty both allocators without returning a spill
+    # request, adding synchronization/allocator overhead to hot paths.
     should_cleanup = bool(force or should_spill)
-    if not should_cleanup:
+    if not should_cleanup and not request_spill:
         if memory_budget <= 0:
             should_cleanup = (
                 torch_reserved > 0 and torch_allocated / max(torch_reserved, 1e-6) < 0.5
@@ -111,6 +123,7 @@ def gpu_mode_maybe_empty_cache(gpu_config, phase="", force=False, request_spill=
 
 
 def classify_runtime_error(error_msg):
+    """Classify runtime errors without printing or mutating log state."""
     error_msg_lower = error_msg.lower()
     if error_msg.startswith("[torch_assert_OOM]"):
         return "oom", False
@@ -285,14 +298,59 @@ class APITestBase:
         self.api_config.use_torch = use_torch
         self.runtime_config = runtime_config or TestRuntimeConfig()
         self.gpu_mode_config = self.runtime_config.gpu_mode
+        self.dump_context = (
+            DumpContext(
+                os.environ.get("DUMP_DIR") or DEFAULT_DUMP_DIR, api_config=api_config.config
+            )
+            if dump_enabled()
+            else None
+        )
         self.outputs_grad_numpy = []
         self.outputs_grad_paddleonly = []
         if use_torch:
             torch.set_num_threads(8)
             torch.set_printoptions(threshold=100, linewidth=120)
 
-    def report_runtime_error(self, err, default_log_type, phase="", allow_ignore_paddle=False):
+    def run_with_dump(self):
+        """Execute the test with dump output capture and lifecycle reporting."""
+        if self.dump_context is None:
+            raise RuntimeError("run_with_dump() requires dump mode to be enabled")
+        with self.dump_context.tee_output():
+            try:
+                return self.test()
+            except Exception as err:
+                if self.dump_context._data.get("status") is None:
+                    self.dump_finalize("engine_error", error=str(err))
+                raise
+
+    def dump_event(self, name, **data):
+        if self.dump_context:
+            self.dump_context.event(name, **data)
+
+    def dump_error(self, name, err):
+        if self.dump_context:
+            self.dump_context.error_event(name, err)
+
+    def dump_save(self, stem, obj, framework=None):
+        if self.dump_context:
+            self.dump_context.save_tensors(stem, obj, framework=framework)
+
+    def dump_finalize(self, status, **data):
+        if self.dump_context:
+            self.dump_context.finalize(status, **data)
+
+    def report_runtime_error(
+        self,
+        err,
+        default_log_type,
+        phase,
+        allow_ignore_paddle=False,
+        *,
+        tensor_position=None,
+    ):
         err_msg = str(err)
+        if phase:
+            self.dump_error(f"{phase}_error", err)
         log_type, fatal = classify_runtime_error(err_msg)
         if log_type is None and allow_ignore_paddle and self.should_ignore_paddle_error(err_msg):
             print(f"[pass] {self.api_config.config}", flush=True)
@@ -300,9 +358,19 @@ class APITestBase:
             return "pass", False
         if log_type is None:
             log_type = default_log_type
-        phase_text = f" phase={phase}" if phase else ""
+        head = f"[{log_type}]"
+        if phase:
+            head += f" {phase}"
+        fields = []
+        if tensor_position:
+            fields.append(f"tensor {tensor_position}")
+        prefix = " | ".join([head, *fields])
         print(
-            f"[{log_type}]{phase_text} {self.api_config.config}\n{err_msg}",
+            (
+                f"{prefix} | {self.api_config.config}\n{err_msg}"
+                if phase or fields
+                else f"{prefix} {self.api_config.config}\n{err_msg}"
+            ),
             flush=True,
         )
         write_to_log(log_type, self.api_config.config)
@@ -328,7 +396,7 @@ class APITestBase:
         except Exception:
             pass
 
-    def clear_runtime_inputs(self, framework, phase=""):
+    def clear_runtime_inputs(self, framework):
         """Release one framework's generated inputs after an execution."""
         attr_names = [f"{framework}_args", f"{framework}_kwargs"]
         if framework == "paddle":
@@ -336,19 +404,25 @@ class APITestBase:
         for attr_name in attr_names:
             if hasattr(self, attr_name):
                 delattr(self, attr_name)
-        gc.collect()
-        if self.gpu_mode_config.enabled:
-            gpu_mode_maybe_empty_cache(
-                self.gpu_mode_config,
-                phase or f"after_{framework}",
-            )
-        elif framework == "torch":
+        if not self.gpu_mode_config.enabled and framework == "torch":
             torch.cuda.empty_cache()
-        else:
+        elif not self.gpu_mode_config.enabled:
             paddle.device.cuda.empty_cache()
 
-    def report_compare_error(self, err, phase="", default_log_type="paddle_accuracy"):
-        log_type, fatal = self.report_runtime_error(err, default_log_type, phase)
+    def report_compare_error(
+        self,
+        err,
+        phase,
+        default_log_type="paddle_accuracy",
+        *,
+        tensor_position=None,
+    ):
+        log_type, fatal = self.report_runtime_error(
+            err,
+            default_log_type,
+            phase,
+            tensor_position=tensor_position,
+        )
         if fatal:
             raise err
         return log_type, fatal
@@ -1329,9 +1403,7 @@ class APITestBase:
         ) or self.api_config.api_name == "paddle.Tensor.__setitem__":
             self.torch_args, self.torch_kwargs = self.copy_torch_input()
 
-        if self.gpu_mode_config.enabled:
-            gpu_mode_maybe_empty_cache(self.gpu_mode_config, "clear_torch_tensor")
-        else:
+        if not self.gpu_mode_config.enabled:
             torch.cuda.empty_cache()
         return True
 
@@ -1444,25 +1516,36 @@ class APITestBase:
         chunk_numel = max(1, working_bytes // temp_bytes_per_element)
         actual_flat = actual.reshape(-1)
         expected_flat = expected.reshape(-1)
+        actual_numel = actual_flat.numel()
+        actual_dtype = actual.dtype
+        expected_dtype = expected.dtype
+        actual_is_complex = actual_dtype.is_complex
+        expected_is_complex = expected_dtype.is_complex
+        actual_is_float64 = actual_dtype == torch.float64
+        expected_is_float64 = expected_dtype == torch.float64
+        actual_is_float8 = "float8" in str(actual_dtype)
+        expected_is_float8 = "float8" in str(expected_dtype)
+        actual_is_integer = not actual_dtype.is_floating_point and not actual_is_complex
+        actual_supports_nan = actual_dtype.is_floating_point or actual_is_complex
         mismatch_count = 0
         max_abs_diff = -1.0
         max_abs_index = 0
         max_rel_diff = -1.0
         max_rel_index = 0
         exact_compare = atol == 0.0 and rtol == 0.0
-        for start in range(0, actual_flat.numel(), chunk_numel):
-            end = min(actual_flat.numel(), start + chunk_numel)
+        for start in range(0, actual_numel, chunk_numel):
+            end = min(actual_numel, start + chunk_numel)
             actual_chunk = actual_flat[start:end]
             expected_chunk = expected_flat[start:end]
             if exact_compare:
                 equal = actual_chunk == expected_chunk
-                if actual_chunk.is_floating_point() or actual_chunk.is_complex():
+                if actual_supports_nan:
                     equal |= torch.isnan(actual_chunk) & torch.isnan(expected_chunk)
                 mismatch = equal.logical_not_()
             else:
-                if "float8" in str(actual_chunk.dtype):
+                if actual_is_float8:
                     actual_chunk = actual_chunk.float()
-                if "float8" in str(expected_chunk.dtype):
+                if expected_is_float8:
                     expected_chunk = expected_chunk.float()
                 mismatch = torch.isclose(
                     actual_chunk,
@@ -1477,16 +1560,16 @@ class APITestBase:
             if chunk_mismatch_count == 0:
                 continue
 
-            if actual_chunk.is_complex() or expected_chunk.is_complex():
+            if actual_is_complex or expected_is_complex:
                 actual_for_diff = actual_chunk
                 expected_for_diff = expected_chunk
-            elif actual_chunk.dtype == torch.float64 or expected_chunk.dtype == torch.float64:
+            elif actual_is_float64 or expected_is_float64:
                 actual_for_diff = actual_chunk.to(torch.float64)
                 expected_for_diff = expected_chunk.to(torch.float64)
-            elif "float8" in str(actual_chunk.dtype) or "float8" in str(expected_chunk.dtype):
+            elif actual_is_float8 or expected_is_float8:
                 actual_for_diff = actual_chunk.float()
                 expected_for_diff = expected_chunk.float()
-            elif not actual_chunk.dtype.is_floating_point and not actual_chunk.dtype.is_complex:
+            elif actual_is_integer:
                 actual_for_diff = actual_chunk.to(torch.int64)
                 expected_for_diff = expected_chunk.to(torch.int64)
             else:
@@ -1552,6 +1635,8 @@ class APITestBase:
         actual_name="ACTUAL",
         expected_name="DESIRED",
         apply_special_tolerance=True,
+        tensor_index=0,
+        tensor_count=1,
     ):
         is_check_dtype = self.should_check_dtype() if check_dtype is None else check_dtype
         bitwise_alignment = getattr(self, "bitwise_alignment", False)
@@ -1652,7 +1737,7 @@ class APITestBase:
             if actual_tensor.is_cuda and needs_chunk_budget:
                 try:
                     free_bytes, _ = torch.cuda.mem_get_info(actual_tensor.device)
-                    max_working_bytes = 16 * 1024**3
+                    max_working_bytes = 32 * 1024**3
                     min_working_bytes = 256 * 1024**2
                     working_bytes = min(max_working_bytes, max(min_working_bytes, free_bytes // 5))
 
@@ -1684,9 +1769,11 @@ class APITestBase:
                     log_accuracy_tolerance(
                         "Identical",
                         self.api_config.api_name,
-                        self.api_config.config[:120000],
+                        self.api_config.config[:MAX_CSV_CONFIG_LENGTH],
                         str(actual.dtype),
                         is_backward,
+                        tensor_index=tensor_index,
+                        tensor_count=tensor_count,
                     )
                 return
 
@@ -1710,9 +1797,11 @@ class APITestBase:
                 log_accuracy_tolerance(
                     "Identical",
                     self.api_config.api_name,
-                    self.api_config.config[:120000],
+                    self.api_config.config[:MAX_CSV_CONFIG_LENGTH],
                     str(actual.dtype),
                     is_backward,
+                    tensor_index=tensor_index,
+                    tensor_count=tensor_count,
                 )
         except Exception as err:
             error_str = str(err)
@@ -1743,9 +1832,11 @@ class APITestBase:
                     log_accuracy_tolerance(
                         error_str,
                         self.api_config.api_name,
-                        self.api_config.config[:120000],
+                        self.api_config.config[:MAX_CSV_CONFIG_LENGTH],
                         str(actual.dtype),
                         is_backward,
+                        tensor_index=tensor_index,
+                        tensor_count=tensor_count,
                     )
                     return
             raise
@@ -1820,15 +1911,9 @@ class APITestBase:
         self._for_each_tensor_config(
             lambda config: config.save_original_tensor_to_cpu(self.api_config)
         )
-        gc.collect()
-        if self.gpu_mode_config.enabled:
-            gpu_mode_maybe_empty_cache(
-                self.gpu_mode_config, "save_original_inputs_to_cpu", force=True
-            )
 
     def clear_original_cpu_inputs(self):
         self._for_each_tensor_config(lambda config: config.clear_original_cpu_tensor())
-        gc.collect()
 
     def clear_paddle_tensor(self):
         if not hasattr(self, "torch_kwargs_config"):

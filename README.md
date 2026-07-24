@@ -1,211 +1,270 @@
 # PaddleAPITest
 
-## 1. 项目背景
+PaddleAPITest 是面向 PaddlePaddle API 的配置驱动测试框架。它将真实业务、Paddle CI/CE 和专项场景中的 API 调用序列化为 `api config`，统一执行 API 可用性、Paddle/Torch 精度、重复稳定性、CINN、性能、大 Tensor、0-size Tensor 和自定义设备测试。
 
-正确性是 PaddlePaddle 框架质量的基石，影响业务训练、推理的效果，影响用户对 Paddle 的信赖。如何主动发现 Paddle 存在的质量问题并及时修复，而不是被动等用户反馈后再修复，是一个亟待解决的质量难题。
+一条配置包含 API、参数、Tensor shape、dtype、place 等执行信息，例如：
 
-API 是 Paddle 的 “窗口”，PaddleAPITest 通过整理超过 300 万条 API 级别的测试用例（本项目称为配置 / api config），利用这些用例驱动 Paddle 的不同内核机制执行 API，从而成为 Paddle 内核机制和算子正确性的 “扫描仪”。
-
-PaddleAPITest 主要工作思路如下：
-
-1. 在 Paddle 中开发 Trace API 机制（具体实现见 [PR#70752](https://github.com/PaddlePaddle/Paddle/pull/70752)），用于抓取 API 调用配置。以下是一个配置示例：
-```
+```text
 paddle.concat(tuple(Tensor([31376, 768],"float32"),Tensor([1, 768],"float32"),), axis=0, )
 ```
 
-2. 在所有 Paddle 单元测试（CI）和集成测试（CE）流水线中，抓取所有 Paddle API 的调用配置，形成了 `PaddleAPITest/tester/api_config` 下的 `CI_CE_config` 的配置集。对配置集进行去重、排序，并对测试结果进行梳理，得到了 `api_config` 下各个目录的配置集。
+配置可由 Paddle Trace API 或 `tools/api_tracer/` 采集；`tester/paddle_to_torch/` 提供 Paddle 到 Torch 的等价转换。
 
-3. 在 PaddleAPITest 中开发一套 **引擎**，用于加载配置集，初始化相应 Tensor，并调用相应的 API 执行前/反向测试。
+## 快速开始
 
-4. 对采集到的配置集进行 shape 篡改，生成了以 `"big_tensor"` 和 `"0_size"` 开头的配置集。
+### 环境要求
 
-5. 对于精度正确性，在 PaddleAPITest 中开发一套 **转换工具**，在调用 Paddle API 测试的同时，等效地调用 Torch API，进行精度对比测试。
+- Linux、Python 3.10+、CUDA 13.0
+- PaddlePaddle develop；精度、稳定性和 Torch 性能测试使用 PyTorch 2.12.0
 
-6. 对于内核测试，可通过继承 `APITestBase`，开发针对特定内核的测试引擎。测试对象包括：Kernel 精度、Kernel 性能、Kernel 显存、动态图、静态图、动转静、组合算子、CINN、Paddle2ONNX、GPU、CPU、XPU、NPU、OneDNN、TRT 等等。
-
-## 2. 项目结构
+使用 [uv](https://docs.astral.sh/uv/) 创建虚拟环境，随后依次安装 CUDA 13.0 的 Paddle develop、PyTorch 和其余依赖：
 
 ```bash
-├── report/
-├── test_pipeline/
+uv venv --python 3.12
+source .venv/bin/activate
+uv pip install --pre paddlepaddle-gpu -i https://www.paddlepaddle.org.cn/packages/nightly/cu130/
+uv pip install torch==2.12.0 torchvision torchaudio -i https://download.pytorch.org/whl/cu130
+uv pip install -r requirements.txt
+```
+
+Transformer Engine（TE）仅在相关 FP8/MoE 配置中需要，可选安装：
+
+```bash
+uv pip install --no-build-isolation "transformer_engine[pytorch]"
+```
+
+### 运行单条配置
+
+推荐使用 `engineV4.py`。Paddle-only 单配置：
+
+```bash
+python engineV4.py \
+  --paddle_only=True \
+  --api_config='paddle.abs(Tensor([1, 100],"float64"), )' \
+  --num_gpus=1
+```
+
+Paddle/Torch 精度单配置：
+
+```bash
+python engineV4.py \
+  --accuracy=True \
+  --api_config='paddle.abs(Tensor([1, 100],"float64"), )' \
+  --num_gpus=1
+```
+
+配置包含双引号时用单引号包裹 `--api_config`；单配置模式最多使用一块 GPU。未指定 `--gpu_ids` 和 `--num_gpus` 时默认使用 GPU 0。
+
+### 批量运行
+
+```bash
+python engineV4.py \
+  --accuracy=True \
+  --api_config_file=tester/api_config/7_0_size/0_size_tensor_1_8_1.txt \
+  --log_dir=tester/api_config/test_log \
+  --num_gpus=4 \
+  --num_workers_per_gpu=1 \
+  --gpu_ids=0-3
+```
+
+多个 glob 用逗号分隔：
+
+```bash
+python engineV4.py \
+  --paddle_only=True \
+  --api_config_file_pattern='tester/api_config/7_0_size/*.txt,tester/api_config/8_big_tensor/*.txt' \
+  --log_dir=tester/api_config/test_log
+```
+
+`--api_config`、`--api_config_file`、`--api_config_file_pattern` 和下文的 `--retest` 必须且只能选择一个。完整参数以 `python engineV4.py --help` 为准。
+
+### 快速复测分类
+
+已有日志目录可以直接按分类复测，无需修改 checkpoint，也无需再次指定原始配置文件。例如复测全部 `config_input`：
+
+```bash
+python engineV4.py \
+  --accuracy_stable=True \
+  --retest=config_input \
+  --log_dir=tester/api_config/test_log \
+  --num_gpus=4 \
+  --gpu_ids=0-3
+```
+
+多个分类用逗号分隔，例如 `--retest=config_input,timeout`。可用分类与 `api_config_*.txt` 对应，包括 `pass`、`skip`、`paddle_error`、`paddle_accuracy`、`paddle_bitwise`、`paddle_cuda`、`paddle_crash`、`oom`、`timeout`、`torch_error`、`config_input`、`config_parse` 和 `config_convert`。
+
+复测开始时，引擎会从 checkpoint、主分类、`comp/` 分类和 stable/tolerance CSV 中移除所选配置的旧结构化结果；`log_inorder.log` 保留历史 case。复测中断后，重新执行相同命令只运行尚未 checkpoint 的配置；全部完成后恢复文件自动删除。`engineV2.py` 支持相同参数。不要让多个进程同时复测同一日志目录。
+
+## 测试模式
+
+每次运行必须且只能启用一种主模式：
+
+| 参数 | 用途 |
+| --- | --- |
+| `--paddle_only=True` | 执行 Paddle API，检查配置解析和 Paddle 支持情况 |
+| `--accuracy=True` | 比较 Paddle 与等价 Torch API 的前向输出和梯度 |
+| `--accuracy_stable=True` | Paddle/Torch 分别执行两轮，同时检查跨框架精度与框架内稳定性 |
+| `--paddle_cinn=True` | 比较 Paddle 动态图与 CINN；可配合 `--test_backward=True` |
+| `--paddle_gpu_performance=True` | 测量 Paddle GPU 性能 |
+| `--torch_gpu_performance=True` | 测量 Torch GPU 性能 |
+| `--paddle_torch_gpu_performance=True` | 对比 Paddle 与 Torch GPU 性能 |
+| `--paddle_custom_device=True` | 比较自定义设备与 CPU |
+| `--custom_device_vs_gpu=True` | 通过 upload/download 流程比较自定义设备与 GPU |
+
+常用附加参数包括 `--test_amp`、`--test_cpu`、`--atol`、`--rtol`、`--manual_threshold_config_file`、`--bitwise_alignment`、`--timeout`、`--random_seed`、`--generate_failed_tests` 和 `--exit_on_error`。
+
+## 引擎与运行入口
+
+### engineV4
+
+`engineV4.py` 是推荐入口，提供多 GPU worker slot、异常恢复、结构化日志和 compute-sanitizer。
+
+### engineV2
+
+`engineV2.py` 使用 Pebble `ProcessPool`。除调度方式和 engineV4 专属 compute-sanitizer 外，其测试模式、GPU mode、显存策略、dump 和主要参数与 engineV4 对齐。详见 [engineV2 文档](engineV2-README.md)。
+
+### 其他入口
+
+- `engine.py`、`engineV3.py`：历史或专项兼容入口，新任务优先使用 engineV4。
+- `run-v4.sh`：可编辑的 shell 模板，支持前后台启动、状态查询和停止。
+- `run.py`：YAML runner，负责环境变量、命令行参数、后台进程和多轮失败重测编排。
+- `test_pipeline/V4/`：0-size、1M、big tensor 等标准流水线脚本。
+
+```bash
+python run.py -c test_pipeline/run_config.yaml --dry-run
+python run.py -c test_pipeline/run_config.yaml
+```
+
+模型配置集可以使用 `${APITEST_MODEL}` 占位，示例见 [generic configs 文档](test_pipeline/generic_configs/README.md)。
+
+## GPU Mode 与显存策略
+
+`--use_gpu_mode=True` 在 GPU 上生成 Tensor 并进行比较，复用 CUDA allocator，适用于大规模 `accuracy_stable` 测试。此模式会忽略 `--use_cached_numpy=True`。
+
+进程级环境变量 `PADDLEAPITEST_GPU_MEMORY_POLICY` 控制显存使用的激进程度：
+
+| 值 | 行为 | 建议场景 |
+| --- | --- | --- |
+| `conservative` | 默认值；首轮输出和梯度转移到 CPU，并在显存压力下释放缓存 | 大 Tensor、未知 shape、优先避免 OOM |
+| `aggressive` | 首轮输出和梯度继续驻留 GPU，减少同步和 D2H 开销 | 已知的小 shape 配置集、优先吞吐 |
+
+策略在启动时固定，不按 case 切换或 OOM 自动重试。大 Tensor 使用 `conservative`：
+
+```bash
+PADDLEAPITEST_GPU_MEMORY_POLICY=conservative \
+python engineV4.py \
+  --accuracy_stable=True \
+  --use_gpu_mode=True \
+  --api_config_file=tester/api_config/8_big_tensor/big_tensor_merged.txt \
+  --num_gpus=1 \
+  --num_workers_per_gpu=1 \
+  --log_dir=tester/api_config/test_log_big_tensor
+```
+
+小 shape 配置可用 `aggressive`：
+
+```bash
+PADDLEAPITEST_GPU_MEMORY_POLICY=aggressive \
+python engineV4.py \
+  --accuracy_stable=True \
+  --use_gpu_mode=True \
+  --api_config_file=tester/api_config/7_0_size/0_size_tensor_1_8_1.txt \
+  --log_dir=tester/api_config/test_log_0size
+```
+
+两种策略都保留 CPU 输入快照和大结果分块比较。
+
+## 并行、日志与恢复
+
+- `--num_gpus=-1` 使用全部选定 GPU；也可指定明确数量。
+- `--gpu_ids` 支持 `0`、`0,2`、`0-3` 和 `-1`。
+- `--num_workers_per_gpu` 控制每张 GPU 的 worker 上限；实际 worker 总数不会超过 pending case 数，0 pending 时不会启动 worker。
+- `--timeout` 是单 case 超时时间，单位为秒。
+- `--show_runtime_status=True` 输出实时进度和运行状态。
+
+`--log_dir` 中会保存：
+
+- `checkpoint.txt`：已完成配置，用于续跑时跳过。
+- `log_inorder.log`：按完成顺序聚合的 case 日志。
+- `api_config_*.txt`：按 pass、Paddle error、accuracy error、OOM、timeout 等终态分类的配置。
+- `comp/`、`stable*.csv` 等：精度稳定性各比较维度的结果。
+
+并发任务必须使用不同日志目录。单次分类复测优先使用 `--retest`；多轮分支复测可用 `run.py` 的 `retest`。
+
+## 调试能力
+
+### 单 API Dump
+
+Dump 保留单条配置的阶段、环境、日志和 Tensor；仅支持 `--api_config` 与 `accuracy`/`paddle_only`：
+
+```bash
+python engineV4.py \
+  --accuracy=True \
+  --api_config='paddle.abs(Tensor([1, 100],"float32"), )' \
+  --use_dump=True \
+  --dump_dir=tester/api_config/test_log/dump_case \
+  --num_gpus=1
+```
+
+也可设置 `USE_DUMP=True` 和 `DUMP_DIR=<path>`；优先级为命令行、环境变量、默认值。只设置目录不会启用 dump。
+
+### Compute Sanitizer
+
+engineV4 可为 case 启动 compute-sanitizer，定位 CUDA 非法访存、race 和同步错误：
+
+```bash
+python engineV4.py \
+  --paddle_only=True \
+  --api_config_file=configs.txt \
+  --use_compute_sanitizer=True \
+  --sanitizer_command='compute-sanitizer --target-processes all --error-exitcode=86'
+```
+
+该能力仅由 engineV4 提供。`--_sanitizer_child` 是内部参数，不应手工设置。
+
+## 配置集
+
+`tester/api_config/` 保存配置集、配置处理脚本和默认日志目录。主要分类包括：
+
+| 目录 | 内容 |
+| --- | --- |
+| `1_not_support/` | 当前不支持的配置 |
+| `2_paddle_only_random/` | 具有随机创建或随机计算行为的 Paddle-only 配置 |
+| `3_paddle_only/` | 可由 Paddle 执行但尚不支持 Paddle/Torch 精度转换的配置 |
+| `4_paddle_only_amp/`、`6_accuracy_amp/` | AMP 专项配置 |
+| `monitor_config/accuracy/` | Paddle/Torch 精度巡检配置 |
+| `7_0_size/` | 含 0 维 shape 的配置 |
+| `8_big_tensor/` | 派生的大 Tensor 配置 |
+| `9_getset_item/` | Tensor getitem/setitem 专项配置 |
+| `10_performance/` | 性能测试配置 |
+| `CI_CE_config/` | 从 Paddle CI/CE 采集的配置 |
+| `big_and_0size/` | 大 Tensor 与 0-size 综合配置 |
+
+配置文件每行一个 api config；派生、合并、去重和筛选脚本位于 `tester/api_config/` 与 `tools/`。
+
+## 项目结构
+
+```text
+PaddleAPITest/
+├── engineV4.py                 # 推荐测试引擎
+├── engineV2.py                 # Pebble ProcessPool 引擎
+├── run.py                      # YAML runner
+├── run-v4.sh                   # shell 运行模板
+├── test_pipeline/              # 标准流水线、YAML 配置和脚本
 ├── tester/
-│   ├── api_config/
-│   ├── paddle_to_torch/
-│   ├── accuracy.py
-│   ├── base.py
-│   ├── paddle_cinn_vs_dygraph.py
-│   └── paddle_only.py
-├── tools/
-├── engine.py
-├── engineV2.py
-├── engineV3.py
-└── run-example.sh
+│   ├── api_config/             # 配置集、解析、日志和 dump
+│   ├── paddle_to_torch/        # Paddle API 到 Torch 的转换规则
+│   ├── accuracy.py             # Paddle/Torch 精度测试
+│   ├── accuracy_stable.py      # 跨框架精度和重复执行稳定性
+│   ├── base.py                 # 测试基类、输入生成与比较
+│   ├── runtime_config.py       # worker 运行配置和 GPU 显存策略
+│   └── *_performance.py        # 性能测试实现
+└── tools/                      # 配置集、日志和错误分析工具
 ```
 
-项目结构主要分为 `report` 和 `tester` 文件夹，`report` 用于存储内核报错的 api 信息，`tester` 用于测试配置的正确性和存放配置测试结果。
+## 开发与扩展
 
-**`engineV2.py`** 及配套的 `run-example.sh` 是目前运行本项目的主要工具；**`engineV3.py`** 目前由百度内部开发测试使用；**`engine.py`** 是最早的引擎，相较 `engineV2.py` 吞吐量低，在少量配置时可使用。
-
-1. report 介绍
-   - 0size_tensor_cpu 存放进行在 cpu 上进行精度测试/引擎解析能力测试（accuracy / paddle_only）结果。
-   - 0size_tensor_gpu 存放进行在 gpu 上进行 accuracy / paddle_only 测试结果。
-   - big_tensor_gpu 存放大形状张量（big tensor）在 gpu/cpu 上进行 accuracy / paddle_only 测试结果。
-   - ci_ce_cpu 存放 CI/CE 流水线抓取的配置在 cpu 上进行 accuracy / paddle_only 测试结果。
-   - ci_ce_gpu 存放 CI/CE 流水线抓取的配置在 gpu 上进行 accuracy / paddle_only 测试结果。
-   - cinn 存放 paddle 静态编译器与动态图方式进行精度对比测试结果。
-   - fresh_report 存放引擎补齐（paddle_only）和精度转换（accuracy）两个任务中，出现的内核报错或者精度报错。
-
-2. tester 介绍
-
-   * api_config 目录存放配置目录的管理情况和相关脚本工具，各配置目录下的文本命名语义一致，参考 5_accuracy 中的 txt 命名含义：
-     * 1_not_support 目录下的配置为 paddle 不支持的配置，例如数据类型对应的算子未实现。
-     * 2_paddle_only_random 为 PaddleAPITest 引擎支持对配置的解析（--paddle_only=True），但是配置输出随机，也就无法继续进行精度测试的配置。random_creation.txt 为创建随机数的配置，random_calculation.txt 为具有随机行为的函数。
-     * 3_paddle_only 支持引擎解析（本项目称为 merged），但是无法进行精度测试（也称为 merged_not_support）的配置。
-     * 4_paddle_only_amp 在混合精度模式下支持引擎解析的配置（--paddle_only=True --test_amp=True）。
-     * 5_accuracy 支持精度测试的配置，不同的命名对应不同的测试结果：
-       * accuracy_*.txt 为测试通过。
-       * accuracy_cpu_error.txt 为 **在 cpu 上运行精度测试不通过（--test_cpu=True）** 的配置集。
-       * accuracy_cpu_kernel.txt 为 **paddle 内核抛出错误** 的配置集。
-       * accuracy_gpu_error.txt 为 **在 gpu 上运行精度测试不通过** 的配置集。
-       * accuracy_gpu_error_dtype_diff.txt 为回归测试中发现精度错误，但是检查精度时 **不强制对齐 dtype 后能够通过** 的配置（base.py 中的 not_check_dtype 列表中的 api）。
-       * accuracy_gpu_error_grads_diff.txt 为 **paddle 和 torch api 反向梯度结果不同，无法进行比较，输出 [not compare]** 的配置集。
-       * accuracy_gpu_error_uncertain.txt 为 **不确定是因为 PaddleAPITest 引擎转化能力 还是 Paddle 内核实现** 导致的 accuracy error 的配置集。
-     * 6_accuracy_amp 类似 5_accuracy，只是需要混合精度运行测试（--test_amp=True）的配置集。
-     * 7_0_size 张量形状含有 0（0-size）的配置集。
-     * 8_big_tensor 对配置的张量形状基于 to_big_size_config.py 进行篡改的配置集。
-     * 9_getset_item 为测试 paddle.Tensor.\_\_getitem__ 和 paddle.Tensor.\_\_getitem__ 使用的配置集。
-     * big_and_0size 为含有大形状张量和 0-size 张量使用的配置集。
-     * CI_CE_config 为 CI，CE 抓取的配置集。
-     * 脚本工具
-       * config_analyzer.py 是引擎对配置解析并针对 api 初始化合适张量的代码（引擎补齐任务产物）
-       * log_writer.py 是 engine 写入日志的工具
-       * to_0_size*.py 是篡改为 0-size 配置的工具
-       * to_big_size\*.py 是篡改为大形状张量的配置的工具。 
-
-   * tester/paddle_to_torch/ 是转换能力的核心代码。介绍详见 [4. paddle2torch转换](#4-paddle2torch转换)
-
-3. tools 文件夹中存放了一些实用的工具，例如 move_config.py 可以用来批量的移动配置，error_stat.py 可以一键解析错误日志等。
-
-## 3. 使用介绍
-
-### 3.1 环境配置
-
-1. 建议在虚拟环境或 docker 中进行开发，并正确安装 python 与 nvidia 驱动。
-
-2. PaddlePaddle 框架运行环境分为 **CPU** 环境与 **GPU** 环境，CPU 和 GPU 上运行的结果 **可能存在差异**，即存在 GPU 上能够正确运行，但 CPU 上报错的情况。请正确安装 *paddlepaddle-gpu* 环境，选择 develop 版本：
-   - [使用 pip 快速安装 paddle](https://www.paddlepaddle.org.cn/install/quick?docurl=/documentation/docs/zh/develop/install/pip/linux-pip.html)，或者运行命令 (cuda>=11.8):
-   ```bash
-   pip install --pre paddlepaddle-gpu -i https://www.paddlepaddle.org.cn/packages/nightly/cu118/
-   ```
-   - 若需要本地编译 Paddle，可参考链接：[Linux 下使用 ninja 从源码编译](https://www.paddlepaddle.org.cn/documentation/docs/zh/develop/install/compile/linux-compile-by-ninja.html)
-
-3. 安装 PaddleAPITest 项目其他依赖项：
-   - [使用 pip 快速安装 torch](https://pytorch.org/get-started/locally/)，或者运行命令 (cuda>=11.8):
-   ```bash
-   pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu118
-   ```
-   - 安装第三方库：
-   ```bash
-   pip install func_timeout pandas pebble nvidia-ml-py pyyaml typer
-   ```
-
-4. PaddlePaddle 与 PyTorch 的部分依赖项可能发生冲突，请先安装 *paddlepaddle-gpu* 再安装 *torch*，重新安装请在 pip 后添加 `--force-reinstall` 参数，仅更新 paddle 请添加 `--no-deps` 参数；engineV2 建议使用 python>=3.10
-
-### 3.2 使用说明
-
-#### A. engineV1
-
-测试时，`tester/api_config/test_log` 文件夹用于存放测试所产生的测试结果和 checkpoint。
-
-PaddleAPITest 目前支持 `paddle_only`、`accuracy`、`paddle_cinn` 三种测试：
-
-- **paddle_only**，用于单独将 Paddle 动态图跑一遍，验证 paddle 框架以及 PaddleAPITest 引擎**是否支持**该配置。
-- **accuracy**，用于将 Paddle API 的前反向与 **Torch** 的前反向做精度对比测试。
-- **paddle_cinn**，用于将 Paddle 动态图与 Paddle 静态图编译器做精度对比测试。
-- **paddle_custom_device**, 用于将Custom Device或者XPU的API与CPU做精度对比。
-当测试**单个配置**时，可使用下面的代码，`--api_config` 中输入待测试的配置内容：
-
-- 仅测试 paddle **是否支持**：
-```bash
-python engine.py --paddle_only=True --api_config='paddle.abs(Tensor([1, 100],"float64"), )'
-```
-
-- 测试输出**是否准确**：
-```bash
-python engine.py --accuracy=True --api_config='paddle.abs(Tensor([1, 100],"float64"), )'
-```
-- 动态图和静态图测试：
-
-```bash
-python engine.py --paddle_cinn=True --api_config='paddle.abs(Tensor([1, 100],"float64"), )'
-```
-
-> [!NOTE]
-> **注意**: 配置 txt 中统一使用双引号 `"`，因此建议 `--api_config=''` 使用单引号，或在配置中手动添加转义斜杠 `\`
-
-当需要测试的配置数目较多时，手动单次输入将**非常低效**，这种情况下可以使用如下所示的**批量测试**指令，将配置保存在一个 txt 中，并将指令中的路径设置为 txt 的路径即可：
-```bash
-python engine.py --api_config_file=/host_home/wanghuan29/PaddleAPITest/tester/api_config/api_config.txt --accuracy=True > tester/api_config/test_log/log.log 2>&1
-
-python engine.py --api_config_file=/host_home/wanghuan29/PaddleAPITest/tester/api_config/api_config.txt --paddle_only=True > tester/api_config/test_log/log.log 2>&1
-
-python engine.py --api_config_file=/host_home/wanghuan29/PaddleAPITest/tester/api_config/api_config.txt --paddle_cinn=True > tester/api_config/test_log/log.log 2>&1
-```
-
-当测试配置中有**精度不统一**的情况，需要精度转换时，直接运行测试可能会报错，可加入`--test_amp=True`。  
-
-如果希望在引发`paddle_error`或者`accuracy_error` 错误时退出测试，可加入`--exit_on_error=True`,此时测试进程`exit_code`为1。
-
-#### B. engineV2
-
-`engineV2.py` 是为 PaddleAPITest 项目设计的高性能测试框架，支持多 GPU 并行执行，具备负载均衡、超时处理和崩溃恢复能力。相比原始的 `engine.py` 实现，它能显著提升 Paddle API 配置测试效率，加速比约为 5-10 倍。
-
-功能特性:
-- **多 GPU 并行**：拥有灵活的 *gpus 相关参数*，可配置多 GPU 并行测试，支持任务跨 GPU 动态分发
-- **进程级并行**：基于 Pebble 库的 ProcessPool 进程池实现，支持进程的高效并行，每张 GPU 可拥有多个 worker
-- **动态负载均衡**：新的子进程自动分配至负载最轻 GPU，计算资源最优利用
-- **超时/崩溃恢复**：由张量大小推断执行时限（梯度阈值），主动杀死 coredump 进程，自动检测并重启死亡进程
-
-以精度测试为例，配置文件路径为 `tester/api_config/api_config_tmp.txt`，输出日志路径为 `tester/api_config/test_log`：
-
-**多 GPU 多进程模式**：
-```bash
-python engineV2.py --accuracy=True --api_config_file="tester/api_config/api_config_tmp.txt" >> "tester/api_config/test_log/log.log" 2>&1
-```
-
-**多 GPU 单进程模式**：
-```bash
-python engineV2.py --accuracy=True --api_config_file="tester/api_config/api_config_tmp.txt" --gpu_ids="0,1" >> "tester/api_config/test_log/log.log" 2>&1
-```
-
-**单 GPU 单进程模式**：
-```bash
-python engineV2.py --accuracy=True --api_config_file="tester/api_config/api_config_tmp.txt" --num_gpus=1 >> "tester/api_config/test_log/log.log" 2>&1
-```
-
-**使用 run.sh 脚本**：
-```bash
-# chmod +x run.sh
-./run.sh
-```
-该脚本使用参数：`NUM_GPUS=-1, NUM_WORKERS_PER_GPU=-1, GPU_IDS="4,5,6,7"`，在后台运行程序，可在修改 `run.sh` 参数后使用。说明文档详见：[engineV2-README.md](engineV2-README.md)
-
-#### C. engineV3
-
-暂无介绍
-
-## 4. paddle2torch转换
-
-Paddle2Torch 是一个专注于将 PaddlePaddle API 转换为 PyTorch 对应实现的知识工具库，属于 [PaddleAPITest](https://github.com/PFCCLab/PaddleAPITest) 项目的核心组成模块。本模块通过解析 PaddlePaddle API 调用，使用预定义的转换规则与动态代码生成，实现从 PaddlePaddle 到 PyTorch 的自动转换。转换过程将确保代码的语义一致性。
-
-本模块具有精简强悍的架构，仅由三个组件构成：
-- *转换引擎 converter.py*
-- *转换配置 mapping.json*
-- *转换规则 rules.py*
-
-代码已完全进行解耦，可以非常容易地迁移至其他代码中。本模块通过 **转换配置** 与 **转换规则** 管理 API 映射关系，因此支持开发者灵活扩展新的 API 转换能力。
-
-本模块的典型应用场景包括：模型迁移、跨框架验证、混合编程等，可为深度学习开发者提供跨框架的互操作性解决方案。现在转换工具已基本完成对PaddleAPI的转换。说明文档详见：[paddle_to_torch/README.md](tester/paddle_to_torch/README.md)
-
-> [!TIP]
-> 本 README 已经过 ***文心一言 4.5 Turbo*** 润色
+- 新增 Paddle/Torch 映射或 Rule：参见 [Paddle2Torch 文档](tester/paddle_to_torch/README.md)。
+- 采集 API 调用配置：参见 [API Tracer 文档](tools/api_tracer/README.md)。
+- 整理配置、checkpoint 或错误日志：参见 [Tools 文档](tools/README.md)。
+- CINN 专项流水线：参见 [CINN 测试文档](test_pipeline/CINN/README_test_cinn.md)。

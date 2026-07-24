@@ -8,6 +8,8 @@ name: run_accuracy_manual_threshold
 runner:
   engine: engineV4
   foreground: true
+env:
+  PADDLEAPITEST_GPU_MEMORY_POLICY: aggressive
 input:
   api_config_file: "${APITEST_MODEL}/accuracy_manual_threshold/accuracy_manual_threshold.txt"
 output:
@@ -15,7 +17,7 @@ output:
 engine_args:
   accuracy: true
   manual_threshold_config_file: "${APITEST_MODEL}/accuracy_manual_threshold/accuracy_manual_threshold_config.yaml"
-  use_cached_numpy: true
+  use_gpu_mode: true
   num_gpus: -1
-  num_workers_per_gpu: 2
+  num_workers_per_gpu: 1
   timeout: 1200
