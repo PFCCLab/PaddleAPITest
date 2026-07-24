@@ -9,7 +9,7 @@ from func_timeout import func_set_timeout
 from .api_config.config_analyzer import TensorConfig
 from .api_config.log_writer import write_to_log
 from .base import APITestBase
-from .paddle_to_torch import get_converter
+from .paddle_to_torch import adaptive_workspace_bytes, get_converter
 
 
 def tensor_numel(tensor_config):
@@ -827,7 +827,7 @@ class APITestPaddleTorchGPUPerformance(APITestBase):
             # (弃用)以下代码等价于:
             # torch_output = Paddle2TorchConverter.execute(convert_result, self.torch_args, self.torch_kwargs)
             # 准备执行环境，将参数(torch tensors)直接映射至locals()
-            exec_globals = {"torch": torch}
+            exec_globals = {"torch": torch, "_adaptive_workspace_bytes": adaptive_workspace_bytes}
             exec_locals = {
                 "args": self.torch_args,
                 "kwargs": self.torch_kwargs,

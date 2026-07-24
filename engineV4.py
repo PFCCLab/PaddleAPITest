@@ -134,7 +134,7 @@ _MEM_SNAPSHOT_TTL = 2.0  # seconds — snapshot cache ttl
 
 
 def cleanup(pool):
-    print(f"{datetime.now()} Cleanup started", flush=True)
+    print(f"\n{datetime.now()} Cleanup started", flush=True)
     if pool is not None:
         try:
             pool.shutdown(force=True)
@@ -187,6 +187,8 @@ def _init_worker_runtime(slot_index, gpu_id, options, *, redirect_output):
 
     if gpu_id is not None:
         os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
+        workers_on_gpu = (getattr(options, "gpu_workers_per_gpu_map", {}) or {}).get(gpu_id, 1)
+        os.environ["PADDLEAPITEST_WORKERS_ON_GPU"] = str(workers_on_gpu)
 
     _init_runtime_modules(options)
 

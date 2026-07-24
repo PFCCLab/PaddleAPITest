@@ -10,7 +10,7 @@ import yaml
 
 from .api_config.log_writer import write_to_log
 from .base import APITestBase, gpu_mode_maybe_empty_cache
-from .paddle_to_torch import get_converter
+from .paddle_to_torch import adaptive_workspace_bytes, get_converter
 
 # from func_timeout import func_set_timeout
 
@@ -127,6 +127,8 @@ class APITestAccuracy(APITestBase):
                 raise
             return
 
+        probe_bytes = self.estimate_input_bytes()
+
         try:
             device = torch.device("cuda:0")
             torch.set_default_device(device)
@@ -154,7 +156,7 @@ class APITestAccuracy(APITestBase):
             # torch_output = Paddle2TorchConverter.execute(convert_result, self.torch_args, self.torch_kwargs)
             # 准备执行环境，将参数(torch tensors)直接映射至locals()
             self.dump_event("torch_forward_start")
-            exec_globals = {"torch": torch}
+            exec_globals = {"torch": torch, "_adaptive_workspace_bytes": adaptive_workspace_bytes}
             exec_locals = {
                 "args": self.torch_args,
                 "kwargs": self.torch_kwargs,
@@ -267,8 +269,8 @@ class APITestAccuracy(APITestBase):
         if self.use_gpu_mode:
             spill_torch_outputs = gpu_mode_maybe_empty_cache(
                 self.gpu_mode_config,
-                "after_torch",
                 request_spill=True,
+                probe_bytes=probe_bytes,
             )
         keep_torch_outputs_on_device = self.use_gpu_mode and not spill_torch_outputs
 
@@ -294,11 +296,11 @@ class APITestAccuracy(APITestBase):
 
         gc.collect()
         if self.use_gpu_mode:
-            self.clear_torch_tensor()
+            self.clear_torch_tensor(probe_bytes=probe_bytes)
             gpu_mode_maybe_empty_cache(
                 self.gpu_mode_config,
-                "before_paddle",
                 force=not keep_torch_outputs_on_device,
+                probe_bytes=probe_bytes,
             )
         else:
             torch.cuda.empty_cache()
@@ -396,7 +398,10 @@ class APITestAccuracy(APITestBase):
         ) -> bool:
             try:
                 if self.use_gpu_mode:
-                    gpu_mode_maybe_empty_cache(self.gpu_mode_config, "before_compare")
+                    gpu_mode_maybe_empty_cache(
+                        self.gpu_mode_config,
+                        probe_bytes=probe_bytes,
+                    )
                 # if paddle_tensor.dtype == paddle.bfloat16:
                 #     paddle_tensor = paddle.cast(paddle_tensor, dtype="float32")
                 # if torch_tensor.dtype == torch.bfloat16:
@@ -544,7 +549,10 @@ class APITestAccuracy(APITestBase):
         # Then do paddle backward and backward result check.
         if self.use_gpu_mode:
             del torch_output
-            gpu_mode_maybe_empty_cache(self.gpu_mode_config, "after_forward_compare")
+            gpu_mode_maybe_empty_cache(
+                self.gpu_mode_config,
+                probe_bytes=probe_bytes,
+            )
         if torch_grad_success:
             self.is_backward = True
             try:

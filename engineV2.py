@@ -91,7 +91,7 @@ class GpuMemoryDeferred(Exception):
 
 
 def cleanup(pool):
-    print(f"{datetime.now()} Cleanup started", flush=True)
+    print(f"\n{datetime.now()} Cleanup started", flush=True)
     if pool is not None:
         try:
             if pool.active:

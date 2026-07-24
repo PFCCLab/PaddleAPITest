@@ -1,10 +1,40 @@
 from __future__ import annotations
 
+import os
+import re
+import time
 import types
 from abc import ABC, abstractmethod
 from collections import OrderedDict
 from collections.abc import Sequence
 from dataclasses import dataclass, field
+
+_WORKSPACE_BYTES_RE = re.compile(r"^(?P<indent>[ \t]*)_workspace_bytes = \d+ << 30$", re.MULTILINE)
+_WORKSPACE_PROBE_TTL = 0.25
+# Engine workers are single-device processes, so this cache is intentionally
+# process-local and needs neither a device map nor an inter-process lock.
+_WORKSPACE_PROBE_CACHE = None
+
+
+def adaptive_workspace_bytes(torch_module) -> int:
+    """Return a cached, free-memory-aware workspace size for generated code."""
+    global _WORKSPACE_PROBE_CACHE
+    workers_on_gpu = int(os.environ.get("PADDLEAPITEST_WORKERS_ON_GPU", "1"))
+    now = time.monotonic()
+    if _WORKSPACE_PROBE_CACHE is not None:
+        cached_at, cached_workspace = _WORKSPACE_PROBE_CACHE
+        if now - cached_at < _WORKSPACE_PROBE_TTL:
+            return cached_workspace
+    try:
+        free_bytes, _ = torch_module.cuda.mem_get_info()
+        workspace = min(
+            32 << 30,
+            max(256 << 20, int(free_bytes) // (5 * workers_on_gpu)),
+        )
+    except Exception:
+        workspace = 8 << 30
+    _WORKSPACE_PROBE_CACHE = (now, workspace)
+    return workspace
 
 
 @dataclass
@@ -53,7 +83,13 @@ class Code:
         """代码编译方法"""
         if not code_lines:
             return None
-        return compile("\n".join(code_lines), "<string>", "exec")
+        source = _WORKSPACE_BYTES_RE.sub(
+            lambda match: (
+                f"{match.group('indent')}_workspace_bytes = _adaptive_workspace_bytes(torch)"
+            ),
+            "\n".join(code_lines),
+        )
+        return compile(source, "<string>", "exec")
 
     def is_valid(self) -> bool:
         """检查代码是否编译成功"""
@@ -4543,7 +4579,7 @@ else:
 if do_gather:
     hidden_states_unzipped = torch.zeros(total_rows, token_dim, dtype=hidden_states.dtype, device=_dev)
     # Advanced indexing materializes the gathered payload before assignment.
-    # Bound that temporary to 32 GiB while leaving routing fully vectorized.
+    # Bound that temporary while leaving routing fully vectorized.
     _workspace_bytes = 32 << 30
     _payload_bytes_per_row = max(1, token_dim * hidden_states.element_size())
     _payload_chunk = max(1, _workspace_bytes // _payload_bytes_per_row)
@@ -8248,7 +8284,7 @@ elif op_name == "fuse_weighted_swiglu_fp8_quant":
     _full_blocks = _half_cols // _TILE
     _full_cols = _full_blocks * _TILE
     # LHS, RHS, and the sigmoid temporary can overlap. Include the FP8 cast
-    # temporary and use a 32 GiB single-worker workspace to reduce row chunks.
+    # temporary.
     _workspace_bytes = 32 << 30
     _bytes_per_row = max(1, _half_cols * (4 * 3 + 1))
     _row_chunk = max(1, min(_rows, _workspace_bytes // _bytes_per_row))

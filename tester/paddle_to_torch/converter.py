@@ -9,7 +9,7 @@ from typing import Any
 import torch
 
 from . import rules
-from .rules import BaseRule, ConvertResult, ErrorRule, GenericRule
+from .rules import BaseRule, ConvertResult, ErrorRule, GenericRule, adaptive_workspace_bytes
 
 PADDLE2TORCH_WRONG_CONFIG = frozenset([])
 
@@ -102,7 +102,7 @@ class Paddle2TorchConverter:
             return None
 
         # 准备执行环境，将参数(torch tensors)直接映射至locals
-        exec_globals = {"torch": torch}
+        exec_globals = {"torch": torch, "_adaptive_workspace_bytes": adaptive_workspace_bytes}
         exec_locals = {
             "args": torch_args,
             "kwargs": torch_kwargs,

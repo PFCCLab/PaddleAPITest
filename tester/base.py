@@ -72,52 +72,82 @@ CUDA_OOM = frozenset(
 )
 
 
-def gpu_mode_maybe_empty_cache(gpu_config, phase="", force=False, request_spill=False):
+GPU_MEMORY_PROBE_MIN_BYTES = 256 << 20
+
+
+def gpu_mode_maybe_empty_cache(
+    gpu_config,
+    force=False,
+    request_spill=False,
+    probe_bytes=None,
+):
     if not gpu_config.enabled:
         return False
-    try:
-        if "gpu" not in paddle.device.get_device():
-            return False
-    except Exception:
+    if not force and probe_bytes is not None and probe_bytes < GPU_MEMORY_PROBE_MIN_BYTES:
         return False
 
     try:
-        torch_reserved = torch.cuda.memory_reserved() / (1024**3)
-    except Exception:
-        torch_reserved = 0.0
-    if request_spill:
-        torch_allocated = 0.0
-    else:
-        try:
-            torch_allocated = torch.cuda.memory_allocated() / (1024**3)
-        except Exception:
-            torch_allocated = 0.0
+        import torch as torch_module
+    except (ImportError, OSError):
+        # Paddle-only installations do not need Torch allocator management.
+        # Keep forced Paddle cleanup available without importing an optional
+        # dependency, while reporting no Torch spill decision.
+        if force:
+            gc.collect()
+            try:
+                paddle.device.cuda.empty_cache()
+            except Exception:
+                pass
+        return False
 
     memory_budget = gpu_config.memory_budget
     pressure_ratio = gpu_config.cleanup_pressure_ratio
     used_ratio = gpu_config.cleanup_used_ratio
-    idle_reserved = max(0.0, torch_reserved - torch_allocated)
-    over_budget = memory_budget > 0 and torch_reserved >= memory_budget * used_ratio
-    should_spill = bool(request_spill and over_budget)
+    try:
+        free_bytes, total_bytes = torch_module.cuda.mem_get_info()
+        free_bytes = float(free_bytes) / (1024**3)
+        total_bytes = float(total_bytes) / (1024**3)
+    except Exception:
+        if not force:
+            return False
+        free_bytes = total_bytes = 0.0
 
-    # A spill probe should be side-effect free while under budget. The previous
-    # idle-cache branch could empty both allocators without returning a spill
-    # request, adding synchronization/allocator overhead to hot paths.
-    should_cleanup = bool(force or should_spill)
-    if not should_cleanup and not request_spill:
-        if memory_budget <= 0:
-            should_cleanup = (
-                torch_reserved > 0 and torch_allocated / max(torch_reserved, 1e-6) < 0.5
-            )
-        else:
-            should_cleanup = over_budget or idle_reserved >= max(
-                1.0, memory_budget * pressure_ratio
-            )
+    # mem_get_info observes both framework allocators and avoids a second
+    # allocator-specific query that can contend when several workers share GPU.
+    device_used = max(0.0, total_bytes - free_bytes)
+    workers_on_gpu = gpu_config.workers_on_gpu
+    device_budget = memory_budget * workers_on_gpu if memory_budget > 0 else total_bytes
+    over_budget = device_budget > 0 and device_used >= device_budget * used_ratio
+    process_over_budget = True
+    if request_spill and workers_on_gpu > 1 and memory_budget > 0:
+        try:
+            process_reserved = torch_module.cuda.memory_reserved() / (1024**3)
+            process_over_budget = process_reserved >= memory_budget * used_ratio
+        except Exception:
+            # If the process-local query is unavailable, prefer spilling under
+            # a confirmed global pressure condition over risking another OOM.
+            process_over_budget = True
+    should_spill = bool(request_spill and over_budget and process_over_budget)
+    pressure_budget = device_budget
+    global_pressure = free_bytes > 0 and free_bytes <= pressure_budget * pressure_ratio
+
+    # A spill probe remains side-effect free while the device has headroom. At
+    # global pressure we do release both allocator caches, but keep live result
+    # tensors on device unless the separate spill budget is exceeded.
+    should_cleanup = bool(
+        force or should_spill or global_pressure or (over_budget and not request_spill)
+    )
 
     if should_cleanup:
         gc.collect()
-        torch.cuda.empty_cache()
-        paddle.device.cuda.empty_cache()
+        try:
+            torch_module.cuda.empty_cache()
+        except Exception:
+            pass
+        try:
+            paddle.device.cuda.empty_cache()
+        except Exception:
+            pass
 
     return should_spill if request_spill else should_cleanup
 
@@ -1855,7 +1885,7 @@ class APITestBase:
                     if isinstance(arg_config[i], TensorConfig):
                         arg_config[i].clear_tensor()
         if self.gpu_mode_config.enabled:
-            gpu_mode_maybe_empty_cache(self.gpu_mode_config, "clear_tensor")
+            gpu_mode_maybe_empty_cache(self.gpu_mode_config)
         else:
             torch.cuda.empty_cache()
             paddle.device.cuda.empty_cache()
@@ -1915,6 +1945,32 @@ class APITestBase:
     def clear_original_cpu_inputs(self):
         self._for_each_tensor_config(lambda config: config.clear_original_cpu_tensor())
 
+    def estimate_input_bytes(self):
+        """Estimate total configured input bytes for memory probe gating."""
+        total_bytes = 0
+
+        def visit(config):
+            nonlocal total_bytes
+            dtype = str(getattr(config, "dtype", "float32")).split(".")[-1]
+            element_size = {
+                "float8_e4m3fn": 1,
+                "float8_e5m2": 1,
+                "bfloat16": 2,
+                "float16": 2,
+                "int8": 1,
+                "uint8": 1,
+                "bool": 1,
+                "int16": 2,
+                "int32": 4,
+                "int64": 8,
+                "float32": 4,
+                "float64": 8,
+            }.get(dtype, 4)
+            total_bytes += int(config.numel()) * element_size
+
+        self._for_each_tensor_config(visit)
+        return total_bytes
+
     def clear_paddle_tensor(self):
         if not hasattr(self, "torch_kwargs_config"):
             return
@@ -1926,11 +1982,11 @@ class APITestBase:
                     if isinstance(arg_config[i], TensorConfig):
                         arg_config[i].clear_paddle_tensor()
         if self.gpu_mode_config.enabled:
-            gpu_mode_maybe_empty_cache(self.gpu_mode_config, "clear_paddle_tensor")
+            gpu_mode_maybe_empty_cache(self.gpu_mode_config)
         else:
             paddle.device.cuda.empty_cache()
 
-    def clear_torch_tensor(self):
+    def clear_torch_tensor(self, probe_bytes=None):
         if not hasattr(self, "torch_kwargs_config"):
             return
         for _key, arg_config in self.torch_kwargs_config.items():
@@ -1941,7 +1997,10 @@ class APITestBase:
                     if isinstance(arg_config[i], TensorConfig):
                         arg_config[i].clear_torch_tensor()
         if self.gpu_mode_config.enabled:
-            gpu_mode_maybe_empty_cache(self.gpu_mode_config, "clear_torch_tensor")
+            gpu_mode_maybe_empty_cache(
+                self.gpu_mode_config,
+                probe_bytes=probe_bytes,
+            )
         else:
             torch.cuda.empty_cache()
 

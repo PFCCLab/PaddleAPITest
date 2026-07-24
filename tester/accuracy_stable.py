@@ -19,7 +19,7 @@ from .api_config.log_writer import (
     write_to_log,
 )
 from .base import CUDA_ERROR, CUDA_OOM, APITestBase, gpu_mode_maybe_empty_cache
-from .paddle_to_torch import get_converter
+from .paddle_to_torch import adaptive_workspace_bytes, get_converter
 
 
 class APITestAccuracyStable(APITestBase):
@@ -106,6 +106,8 @@ class APITestAccuracyStable(APITestBase):
                 raise
             return
 
+        probe_bytes = self.estimate_input_bytes()
+
         torch_output_pair = []
         torch_grad_pair = []
         paddle_output_pair = []
@@ -123,6 +125,13 @@ class APITestAccuracyStable(APITestBase):
             torch_output = self.detach_tensor_tree(torch_output)
             torch_out_grads = self.detach_tensor_tree(torch_out_grads)
             self.clear_runtime_inputs("torch")
+            if self.use_gpu_mode:
+                # Release idle Torch blocks before the next Paddle execution;
+                # the two frameworks do not share caching allocators.
+                gpu_mode_maybe_empty_cache(
+                    self.gpu_mode_config,
+                    probe_bytes=probe_bytes,
+                )
 
             # ======== paddle ========
             self.reset_random_state()
@@ -132,6 +141,11 @@ class APITestAccuracyStable(APITestBase):
             paddle_output = self.detach_tensor_tree(paddle_output)
             paddle_out_grads = self.detach_tensor_tree(paddle_out_grads)
             self.clear_runtime_inputs("paddle")
+            if self.use_gpu_mode:
+                gpu_mode_maybe_empty_cache(
+                    self.gpu_mode_config,
+                    probe_bytes=probe_bytes,
+                )
 
             # ======== format ========
             paddle_output, torch_output = process_output(
@@ -158,8 +172,8 @@ class APITestAccuracyStable(APITestBase):
                     # summary comparisons through CPU for very large outputs.
                     should_spill = gpu_mode_maybe_empty_cache(
                         self.gpu_mode_config,
-                        "accuracy_stable_after_first_compare",
                         request_spill=True,
+                        probe_bytes=probe_bytes,
                     )
                     if should_spill:
                         torch_output_pair[0] = self.move_tensor_tree_to_cpu(torch_output_pair[0])
@@ -173,7 +187,6 @@ class APITestAccuracyStable(APITestBase):
                         gc.collect()
                         gpu_mode_maybe_empty_cache(
                             self.gpu_mode_config,
-                            "accuracy_stable_after_first_compare_spill",
                             force=True,
                         )
 
@@ -214,7 +227,7 @@ class APITestAccuracyStable(APITestBase):
                 print("gen_torch_input failed", flush=True)
                 return None, None, None
 
-            exec_globals = {"torch": torch}
+            exec_globals = {"torch": torch, "_adaptive_workspace_bytes": adaptive_workspace_bytes}
             exec_locals = {
                 "args": self.torch_args,
                 "kwargs": self.torch_kwargs,

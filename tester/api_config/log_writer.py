@@ -151,6 +151,21 @@ COMP_SUMMARY_PAIRS = (
     ("P1P2", "P1P2B"),
 )
 ALL_DIMENSIONS = sorted(set(COMP_TO_DIMENSION.values()))
+FINAL_RESULT_PRIORITY = (
+    "paddle_cuda",
+    "paddle_crash",
+    "oom",
+    "timeout",
+    "paddle_error",
+    "paddle_accuracy",
+    "paddle_bitwise",
+    "torch_error",
+    "config_input",
+    "config_parse",
+    "config_convert",
+    "skip",
+    "pass",
+)
 TOL_HEADER = ["API", "config", "dtype", "mode", "max_abs_diff", "max_rel_diff"]
 STABLE_HEADER = ["API", "config", "dtype", "comp", "max_abs_diff", "max_rel_diff"]
 CASE_BEGIN_TAG = ">>> CASE"
@@ -669,6 +684,20 @@ def _format_case_comparison_summary(comp):
     return f"{comp} {result} {matched}/{total}"
 
 
+def _get_final_case_result(api_config_str, result_types):
+    final_result = next(
+        (log_type for log_type in FINAL_RESULT_PRIORITY if log_type in result_types), None
+    )
+    if final_result is None or api_config_str is None:
+        return None, []
+    dimensions = [
+        dimension
+        for dimension in ALL_DIMENSIONS
+        if _comp_terminal_configs.get(dimension, {}).get(api_config_str) == final_result
+    ]
+    return final_result, dimensions
+
+
 def write_case_end(status, case_id=None, api_config_str=None, duration_ms=None, results=None):
     """为指定 ID 或配置写入 case 结束 tag，支持多个终态结果。"""
     global _case_has_comp_output
@@ -685,6 +714,7 @@ def write_case_end(status, case_id=None, api_config_str=None, duration_ms=None, 
         outcome = "FAIL"
     else:
         outcome = status.upper()
+    final_result, final_dimensions = _get_final_case_result(api_config_str, result_types)
     if _case_comparisons:
         ordered_comps = [comp for pair in COMP_SUMMARY_PAIRS for comp in pair]
         known_comps = {comp for comp, _ in _case_comparisons}
@@ -698,19 +728,21 @@ def write_case_end(status, case_id=None, api_config_str=None, duration_ms=None, 
         for pair in COMP_SUMMARY_PAIRS:
             pair_summaries = [summaries.pop(comp) for comp in pair if comp in summaries]
             if pair_summaries:
-                summary_lines.append("> COMP SUMMARY | " + " | ".join(pair_summaries))
+                summary_lines.append("  " + " | ".join(pair_summaries))
         for summary in summaries.values():
-            summary_lines.append("> COMP SUMMARY | " + summary)
-        print("\n".join(summary_lines), flush=True)
-        _case_has_comp_output = True
+            summary_lines.append("  " + summary)
+        print("\n> COMP SUMMARY\n" + "\n".join(summary_lines), flush=True)
         _case_comparisons.clear()
-    if _case_has_comp_output:
-        print(flush=True)
-        _case_has_comp_output = False
+    if final_result not in (None, "pass", "skip") and final_dimensions:
+        print(
+            f"> FINAL RESULT | {final_result} | dimensions {','.join(final_dimensions)}",
+            flush=True,
+        )
+    _case_has_comp_output = False
     fields = [f"{CASE_END_TAG} {case_id}", outcome]
     if duration_ms is not None:
         fields.append(f"{duration_ms} ms")
-    print(" | ".join(fields), flush=True)
+    print(" | ".join(fields) + "\n", flush=True)
     return get_worker_log_offset()
 
 
@@ -1241,7 +1273,7 @@ def _read_log_lines(log_file):
 
 
 def _sync_comp_main_summary():
-    """将各 comp 维度分类合并到主结果摘要。"""
+    """将各 comp 维度分类收敛为互斥的主结果摘要。"""
     comp_out_dir = TEST_LOG_PATH / "comp"
     if not comp_out_dir.exists():
         return
@@ -1258,6 +1290,12 @@ def _sync_comp_main_summary():
             if log_type == "checkpoint":
                 continue
             main_lines_by_type[log_type].update(_read_log_lines(dim_dir / f"{prefix}.txt"))
+
+    selected_configs = set()
+    for log_type in FINAL_RESULT_PRIORITY:
+        lines = main_lines_by_type[log_type]
+        lines.difference_update(selected_configs)
+        selected_configs.update(lines)
 
     for log_type, lines in main_lines_by_type.items():
         log_file = TEST_LOG_PATH / f"{LOG_PREFIXES[log_type]}.txt"
@@ -1534,15 +1572,10 @@ def format_comp_line(
     framework_names = {"P": "Paddle", "T": "Torch"}
     actual_source = f"{framework_names[actual_kind]}#{actual_run}"
     expected_source = f"{framework_names[expected_kind]}#{expected_run}"
-    fields = [f"> COMP {comp}", result]
+    fields = [f"> COMP {comp}", result, phase]
     if tensor_index is not None and tensor_count is not None:
         fields.append(f"tensor {tensor_index + 1}/{tensor_count}")
-    fields.extend(
-        [
-            phase,
-            f"{actual_source} vs {expected_source}",
-        ]
-    )
+    fields.append(f"{actual_source} vs {expected_source}")
     for key, value in details.items():
         display_value = _single_line(value)
         if key == "reason":
