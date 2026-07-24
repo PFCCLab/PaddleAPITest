@@ -63,6 +63,7 @@
 | `--api_config`                   | str   | API 配置字符串（单条测试）                                                             |
 | `--api_config_file`              | str   | API 配置文件路径（如`tester/api_config/5_accuracy/accuracy_1.txt`）                    |
 | `--api_config_file_pattern`      | str   | API 配置文件 glob 模式，以逗号分隔（如 `tester/api_config/5_accuracy/accuracy_*.txt`） |
+| `--retest`                       | str   | 从当前 `--log_dir` 按分类快速复测，多个分类以逗号分隔（如 `config_input,timeout`）      |
 | `--paddle_only`                  | bool  | 运行 Paddle 测试（默认 False）                                                         |
 | `--accuracy`                     | bool  | 运行 Paddle vs Torch 精度测试（默认 False）                                            |
 | `--paddle_cinn`                  | bool  | 运行 CINN vs Dygraph 对比测试（默认 False）                                            |
@@ -72,9 +73,8 @@
 | `--accuracy_stable`              | bool  | 启用稳定性测试（默认 False）                                                           |
 | `--paddle_custom_device`         | bool  | 运行Custom Device或者XPU的API与CPU的精度对比（默认 False）                              |
 | `--num_gpus`                     | int   | 使用的 GPU 数量（默认 -1，-1 动态最大）                                                |
-| `--num_workers_per_gpu`          | int   | 每 GPU 的 worker 进程数（默认 1，-1 动态最大）                                         |
+| `--num_workers_per_gpu`          | int   | 每 GPU 的 worker 进程数（默认 1；gpu_mode 下 -1 表示每 GPU 1 个 worker）               |
 | `--gpu_ids`                      | str   | 使用的 GPU 序号，以逗号分隔或横线范围（默认 ""，"-1" 动态最大）                        |
-| `--required_memory`              | float | 每 worker 进程预估使用显存 GB（默认 10.0）                                             |
 | `--test_amp`                     | bool  | 启用自动混合精度测试（默认 False）                                                     |
 | `--test_cpu`                     | bool  | 启用 Paddle CPU 模式测试（默认 False）                                                 |
 | `--use_cached_numpy`             | bool  | 启用 Numpy 缓存（默认 False）                                                          |

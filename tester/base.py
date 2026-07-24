@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import collections
+import contextlib
+import gc
 import inspect
+import os
 
 import numpy
 import paddle
@@ -11,10 +14,14 @@ from .api_config.config_analyzer import (
     USE_CACHED_NUMPY,
     TensorConfig,
     get_cached_numpy_array,
-    is_gpu_cache_mode,
-    should_skip_gpu_cleanup,
 )
-from .api_config.log_writer import log_accuracy_tolerance, write_to_log
+from .api_config.dump_writer import DEFAULT_DUMP_DIR, DumpContext, dump_enabled
+from .api_config.log_writer import (
+    MAX_CSV_CONFIG_LENGTH,
+    log_accuracy_tolerance,
+    write_to_log,
+)
+from .runtime_config import TestRuntimeConfig
 
 with open("tester/base_config.yaml", encoding="utf-8") as f:
     config = yaml.safe_load(f)
@@ -26,7 +33,7 @@ rand_apis = frozenset(config.get("rand_apis", []))
 stochastic_behavior_apis = frozenset(config.get("stochastic_behavior_apis", []))
 single_op_no_signature_apis = frozenset(config.get("single_op_no_signature_apis", []))
 
-paddle_error_dismiss = {}  # disabled: covered by classify_runtime_error()
+paddle_error_dismiss = {}  # disabled: covered by the unified runtime error reporter
 # paddle_error_dismiss = config.get("paddle_error_dismiss", {})
 special_accuracy_atol_rtol = config.get("special_accuracy_atol_rtol", {})
 
@@ -65,8 +72,61 @@ CUDA_OOM = frozenset(
 )
 
 
+def gpu_mode_maybe_empty_cache(gpu_config, phase="", force=False, request_spill=False):
+    if not gpu_config.enabled:
+        return False
+    try:
+        if "gpu" not in paddle.device.get_device():
+            return False
+    except Exception:
+        return False
+
+    try:
+        torch_reserved = torch.cuda.memory_reserved() / (1024**3)
+    except Exception:
+        torch_reserved = 0.0
+    if request_spill:
+        torch_allocated = 0.0
+    else:
+        try:
+            torch_allocated = torch.cuda.memory_allocated() / (1024**3)
+        except Exception:
+            torch_allocated = 0.0
+
+    memory_budget = gpu_config.memory_budget
+    pressure_ratio = gpu_config.cleanup_pressure_ratio
+    used_ratio = gpu_config.cleanup_used_ratio
+    idle_reserved = max(0.0, torch_reserved - torch_allocated)
+    over_budget = memory_budget > 0 and torch_reserved >= memory_budget * used_ratio
+    should_spill = bool(request_spill and over_budget)
+
+    # A spill probe should be side-effect free while under budget. The previous
+    # idle-cache branch could empty both allocators without returning a spill
+    # request, adding synchronization/allocator overhead to hot paths.
+    should_cleanup = bool(force or should_spill)
+    if not should_cleanup and not request_spill:
+        if memory_budget <= 0:
+            should_cleanup = (
+                torch_reserved > 0 and torch_allocated / max(torch_reserved, 1e-6) < 0.5
+            )
+        else:
+            should_cleanup = over_budget or idle_reserved >= max(
+                1.0, memory_budget * pressure_ratio
+            )
+
+    if should_cleanup:
+        gc.collect()
+        torch.cuda.empty_cache()
+        paddle.device.cuda.empty_cache()
+
+    return should_spill if request_spill else should_cleanup
+
+
 def classify_runtime_error(error_msg):
+    """Classify runtime errors without printing or mutating log state."""
     error_msg_lower = error_msg.lower()
+    if error_msg.startswith("[torch_assert_OOM]"):
+        return "oom", False
     oom_markers = tuple(marker.lower() for marker in CUDA_OOM) + (
         "cannot allocate memory",
         "std::bad_alloc",
@@ -86,8 +146,24 @@ def classify_runtime_error(error_msg):
     # (Unimplemented): Paddle 已知不支持的功能，当前 case 无法有效验证
     if "(unimplemented)" in error_msg_lower:
         return "skip", False
-    # (InvalidArgument) / (PreconditionNotMet): 输入/配置不满足前提，归入配置输入问题
-    if "(invalidargument)" in error_msg_lower or "(preconditionnotmet)" in error_msg_lower:
+    # Paddle 输出数值检查失败
+    if "there are nan or inf" in error_msg_lower or "check_numerics" in error_msg_lower:
+        return "paddle_error", False
+    # (InvalidArgument) / (PreconditionNotMet) / (OutOfRange): 输入/配置不满足前提
+    if (
+        "(invalidargument)" in error_msg_lower
+        or "(preconditionnotmet)" in error_msg_lower
+        or "(outofrange)" in error_msg_lower
+    ):
+        return "config_input", False
+    # Torch-side equivalents of invalid configs (accuracy runs torch before paddle).
+    torch_invalid_config_markers = (
+        "out of bounds for dimension",
+        "is invalid for input of size",
+        "must match the size of tensor b",
+        "does not match the shape of the indexed tensor",
+    )
+    if any(marker in error_msg_lower for marker in torch_invalid_config_markers):
         return "config_input", False
     return None, False
 
@@ -217,16 +293,64 @@ no_signature_api_mappings.update(
 
 
 class APITestBase:
-    def __init__(self, api_config, use_torch=True):
+    def __init__(self, api_config, use_torch=True, runtime_config=None):
         self.api_config = api_config
+        self.api_config.use_torch = use_torch
+        self.runtime_config = runtime_config or TestRuntimeConfig()
+        self.gpu_mode_config = self.runtime_config.gpu_mode
+        self.dump_context = (
+            DumpContext(
+                os.environ.get("DUMP_DIR") or DEFAULT_DUMP_DIR, api_config=api_config.config
+            )
+            if dump_enabled()
+            else None
+        )
         self.outputs_grad_numpy = []
         self.outputs_grad_paddleonly = []
         if use_torch:
             torch.set_num_threads(8)
             torch.set_printoptions(threshold=100, linewidth=120)
 
-    def report_runtime_error(self, err, default_log_type, phase="", allow_ignore_paddle=False):
+    def run_with_dump(self):
+        """Execute the test with dump output capture and lifecycle reporting."""
+        if self.dump_context is None:
+            raise RuntimeError("run_with_dump() requires dump mode to be enabled")
+        with self.dump_context.tee_output():
+            try:
+                return self.test()
+            except Exception as err:
+                if self.dump_context._data.get("status") is None:
+                    self.dump_finalize("engine_error", error=str(err))
+                raise
+
+    def dump_event(self, name, **data):
+        if self.dump_context:
+            self.dump_context.event(name, **data)
+
+    def dump_error(self, name, err):
+        if self.dump_context:
+            self.dump_context.error_event(name, err)
+
+    def dump_save(self, stem, obj, framework=None):
+        if self.dump_context:
+            self.dump_context.save_tensors(stem, obj, framework=framework)
+
+    def dump_finalize(self, status, **data):
+        if self.dump_context:
+            self.dump_context.finalize(status, **data)
+
+    def report_runtime_error(
+        self,
+        err,
+        default_log_type,
+        phase,
+        allow_ignore_paddle=False,
+        *,
+        tensor_position=None,
+    ):
         err_msg = str(err)
+        if phase:
+            self.dump_error(f"{phase}_error", err)
         log_type, fatal = classify_runtime_error(err_msg)
         if log_type is None and allow_ignore_paddle and self.should_ignore_paddle_error(err_msg):
             print(f"[pass] {self.api_config.config}", flush=True)
@@ -234,12 +358,73 @@ class APITestBase:
             return "pass", False
         if log_type is None:
             log_type = default_log_type
-        phase_text = f" phase={phase}" if phase else ""
+        head = f"[{log_type}]"
+        if phase:
+            head += f" {phase}"
+        fields = []
+        if tensor_position:
+            fields.append(f"tensor {tensor_position}")
+        prefix = " | ".join([head, *fields])
         print(
-            f"[{log_type}]{phase_text} {self.api_config.config}\n{err_msg}",
+            (
+                f"{prefix} | {self.api_config.config}\n{err_msg}"
+                if phase or fields
+                else f"{prefix} {self.api_config.config}\n{err_msg}"
+            ),
             flush=True,
         )
         write_to_log(log_type, self.api_config.config)
+        return log_type, fatal
+
+    def reset_random_state(self, seed=42):
+        """Reset NumPy and framework RNGs for reproducible executions."""
+        numpy.random.seed(seed)
+        try:
+            paddle.seed(seed)
+            if paddle.device.is_compiled_with_cuda():
+                try:
+                    for device_id in range(paddle.device.cuda.device_count()):
+                        paddle.framework.core.default_cuda_generator(device_id).manual_seed(seed)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        try:
+            torch.manual_seed(seed)
+            if torch.cuda.is_available():
+                torch.cuda.manual_seed_all(seed)
+        except Exception:
+            pass
+
+    def clear_runtime_inputs(self, framework):
+        """Release one framework's generated inputs after an execution."""
+        attr_names = [f"{framework}_args", f"{framework}_kwargs"]
+        if framework == "paddle":
+            attr_names.append("paddle_merged_kwargs")
+        for attr_name in attr_names:
+            if hasattr(self, attr_name):
+                delattr(self, attr_name)
+        if not self.gpu_mode_config.enabled and framework == "torch":
+            torch.cuda.empty_cache()
+        elif not self.gpu_mode_config.enabled:
+            paddle.device.cuda.empty_cache()
+
+    def report_compare_error(
+        self,
+        err,
+        phase,
+        default_log_type="paddle_accuracy",
+        *,
+        tensor_position=None,
+    ):
+        log_type, fatal = self.report_runtime_error(
+            err,
+            default_log_type,
+            phase,
+            tensor_position=tensor_position,
+        )
+        if fatal:
+            raise err
         return log_type, fatal
 
     def need_skip(self, paddle_only=False):
@@ -255,51 +440,31 @@ class APITestBase:
         #     return True
         if not paddle_only and self.api_config.config in torch_error_skip:
             return True
-        # float8 types: skip only in accuracy mode (torch comparison), allow in paddle_only mode
-        if not paddle_only:
-            for i in range(len(self.api_config.args)):
-                if isinstance(self.api_config.args[i], TensorConfig):
-                    if self.api_config.args[i].dtype in ["float8_e5m2", "float8_e4m3fn"]:
-                        return True
-                elif isinstance(self.api_config.args[i], list) or isinstance(
-                    self.api_config.args[i], tuple
-                ):
-                    for j in range(len(self.api_config.args[i])):
-                        if isinstance(self.api_config.args[i][j], TensorConfig):
-                            if self.api_config.args[i][j].dtype in [
-                                "float8_e5m2",
-                                "float8_e4m3fn",
-                            ]:
-                                return True
-                elif self.api_config.args[i] in [
-                    paddle.base.core.DataType.FLOAT8_E4M3FN,
-                    paddle.base.core.DataType.FLOAT8_E5M2,
-                    "float8_e5m2",
-                    "float8_e4m3fn",
-                ]:
-                    return True
-
-            for _key, arg_config in self.api_config.kwargs.items():
-                if isinstance(arg_config, TensorConfig):
-                    if arg_config.dtype in ["float8_e5m2", "float8_e4m3fn"]:
-                        return True
-                elif isinstance(arg_config, (list, tuple)):
-                    for i in range(len(arg_config)):
-                        if isinstance(arg_config[i], TensorConfig):
-                            if arg_config[i].dtype in ["float8_e5m2", "float8_e4m3fn"]:
-                                return True
-                elif arg_config in [
-                    paddle.base.core.DataType.FLOAT8_E4M3FN,
-                    paddle.base.core.DataType.FLOAT8_E5M2,
-                    "float8_e5m2",
-                    "float8_e4m3fn",
-                ]:
-                    return True
+        # float8 dtypes are handled by TensorConfig / paddle_to_torch Rules;
+        # do not skip accuracy-mode comparison solely because of float8 inputs.
 
         return False
 
+    def _has_float8_tensor_config(self):
+        """True if any TensorConfig arg/kwarg uses float8 dtype."""
+        float8 = ("float8_e5m2", "float8_e4m3fn")
+
+        def _check(obj):
+            if isinstance(obj, TensorConfig):
+                return obj.dtype in float8
+            if isinstance(obj, (list, tuple)):
+                return any(_check(x) for x in obj)
+            return False
+
+        if any(_check(a) for a in self.api_config.args):
+            return True
+        return any(_check(v) for v in self.api_config.kwargs.values())
+
     def need_check_grad(self):
         if self.is_forward_only():
+            return False
+        # float8 autograd / numpy grad path is unsupported in current torch tooling
+        if self._has_float8_tensor_config():
             return False
 
         if self.api_config.api_name == "paddle.assign":
@@ -384,6 +549,14 @@ class APITestBase:
                 raise ValueError(f"API {api_name} has no inspectable signature")
             paddle_bound_args = paddle_sig.bind(*args, **self.api_config.kwargs)
             return finish(paddle_bound_args.arguments)
+
+        if api_name in ("paddle.Tensor.reshape", "paddle.reshape"):
+            # paddle.reshape supports variadic int args: reshape(1, 2048, -1) in addition to reshape([1, 2048, -1])
+            # Tensor.reshape signature is (x, shape, name=None), so bind() rejects multiple ints.
+            args = self.api_config.args
+            rest = args[1:]
+            if len(rest) >= 1 and all(isinstance(arg, int) for arg in rest):
+                return finish({"x": args[0], "shape": list(rest)})
 
         if api_name in no_signature_api_mappings:
             # For APIs without signatures, use the external mapping dict
@@ -823,7 +996,7 @@ class APITestBase:
         return (paddle.rand(tuple(shape), dtype=base_dtype) - 0.5).cast(dtype)
 
     def _use_gpu_output_grad(self, output):
-        if not is_gpu_cache_mode() or "gpu" not in paddle.device.get_device():
+        if not self.gpu_mode_config.enabled or "gpu" not in paddle.device.get_device():
             return False
         dtype = str(output.dtype).split(".")[-1]
         return dtype in ["float32", "float64", "float16", "bfloat16", "complex64", "complex128"]
@@ -839,12 +1012,12 @@ class APITestBase:
     def _get_gpu_output_grad_pair(self, output, index):
         if len(self.outputs_grad_numpy) <= index:
             dtype = str(output.dtype).split(".")[-1]
-            torch_grad = self._make_torch_output_grad(output.shape, dtype)
+            torch_grad = self._make_torch_output_grad(output.shape, dtype).detach()
             paddle_grad = paddle.utils.dlpack.from_dlpack(
-                torch.utils.dlpack.to_dlpack(torch_grad.detach().clone())
+                torch.utils.dlpack.to_dlpack(torch_grad.clone())
             )
             paddle_grad.stop_gradient = False
-            self.outputs_grad_numpy.append((paddle_grad, torch_grad.detach().clone()))
+            self.outputs_grad_numpy.append((paddle_grad, torch_grad))
         return self.outputs_grad_numpy[index]
 
     def gen_paddle_output_and_output_grad(self, outputs):
@@ -1230,7 +1403,7 @@ class APITestBase:
         ) or self.api_config.api_name == "paddle.Tensor.__setitem__":
             self.torch_args, self.torch_kwargs = self.copy_torch_input()
 
-        if not should_skip_gpu_cleanup():
+        if not self.gpu_mode_config.enabled:
             torch.cuda.empty_cache()
         return True
 
@@ -1296,165 +1469,377 @@ class APITestBase:
         except Exception as e:
             error_str = str(e)
             if error_str.startswith("Comparing"):
-                print("torch_assert failed, try np_assert", flush=True)
-                self.np_assert_accuracy(
-                    actual_paddle_tensor.numpy(),
-                    expected_paddle_tensor.numpy(),
-                    atol,
-                    rtol,
-                )
-            else:
-                raise
-
-    def _prepare_torch_compare_tensors(self, paddle_tensor, torch_tensor):
-        if not paddle_tensor.is_contiguous():
-            paddle_tensor = paddle_tensor.contiguous()
-        paddle_tensor = paddle_tensor.detach()
-
-        if not torch_tensor.is_contiguous():
-            torch_tensor = torch_tensor.contiguous()
-        torch_tensor = torch_tensor.detach()
-
-        paddle_dlpack = paddle.utils.dlpack.to_dlpack(paddle_tensor)  # type: ignore[reportGeneralTypeIssues]
-        converted_paddle_tensor = torch.utils.dlpack.from_dlpack(paddle_dlpack)  # type: ignore[reportGeneralTypeIssues]
-        if torch_tensor.device != converted_paddle_tensor.device:
-            torch_tensor = torch_tensor.to(device=converted_paddle_tensor.device)
-        return converted_paddle_tensor, torch_tensor
-
-    def _torch_compare_error_msg(self, actual, expected, atol, rtol, suffix=""):
-        def error_msg(msg):
-            suffix_text = f"\n{suffix}" if suffix else ""
-            return (
-                f"Not equal to tolerance rtol={rtol}, atol={atol}{suffix_text}\n"
-                f"{msg}\n"
-                f"ACTUAL: (shape={actual.shape}, dtype={actual.dtype})\n"
-                f"{actual}\n"
-                f"DESIRED: (shape={expected.shape}, dtype={expected.dtype})\n"
-                f"{expected}"
-            )
-
-        return error_msg
-
-    def _assert_torch_close(self, actual, expected, atol, rtol, is_check_dtype, suffix=""):
-        torch.testing.assert_close(
-            actual,
-            expected,
-            rtol=rtol,
-            atol=atol,
-            equal_nan=True,
-            check_dtype=is_check_dtype,
-            msg=self._torch_compare_error_msg(actual, expected, atol, rtol, suffix),
-        )
-
-    def _torch_assert_accuracy_cpu(
-        self, paddle_tensor, torch_tensor, atol, rtol, is_check_dtype, test_tol, is_backward
-    ):
-        if not paddle_tensor.is_contiguous():
-            paddle_tensor = paddle_tensor.contiguous()
-        paddle_tensor = paddle_tensor.cpu().detach()
-
-        if not torch_tensor.is_contiguous():
-            torch_tensor = torch_tensor.contiguous()
-        torch_tensor = torch_tensor.cpu().detach()
-
-        paddle_dlpack = paddle.utils.dlpack.to_dlpack(paddle_tensor)  # type: ignore[reportGeneralTypeIssues]
-        converted_paddle_tensor = torch.utils.dlpack.from_dlpack(paddle_dlpack)  # type: ignore[reportGeneralTypeIssues]
-
-        try:
-            self._assert_torch_close(
-                converted_paddle_tensor,
-                torch_tensor,
-                atol,
-                rtol,
-                is_check_dtype,
-            )
-            if test_tol:
-                api_name = self.api_config.api_name
-                config = self.api_config.config[:120000]
-                log_accuracy_tolerance(
-                    "Identical",
-                    api_name,
-                    config,
-                    str(paddle_tensor.dtype),
-                    is_backward,
-                )
-        except Exception as e:
-            error_str = str(e)
-            if error_str.startswith("Comparing"):
-                print("torch_assert failed, try np_assert", flush=True)
-                self.np_assert_accuracy(
-                    paddle_tensor.numpy(),
-                    torch_tensor.numpy(),
-                    atol,
-                    rtol,
-                )
-            elif test_tol:
-                error_info = error_str.split("\n", maxsplit=2)[1] if "\n" in error_str else None
-                if error_info and (
-                    error_info.startswith("Tensor-likes") or error_info.startswith("Scalars")
-                ):
-                    api_name = self.api_config.api_name
-                    config = self.api_config.config[:120000]
-                    log_accuracy_tolerance(
-                        error_str,
-                        api_name,
-                        config,
-                        str(paddle_tensor.dtype),
-                        is_backward,
+                if os.environ.get("PADDLEAPITEST_NP_FALLBACK", "0") == "1":
+                    # torch_assert OOM or internal error, fallback to np_assert
+                    print(
+                        "[torch_assert_OOM] torch.testing.assert_close OOM, fallback to np_assert",
+                        flush=True,
+                    )
+                    # numpy does not support bfloat16/float8, cast to float32 for comparison
+                    actual_np = actual_paddle_tensor
+                    expected_np = expected_paddle_tensor
+                    if hasattr(actual_np, "dtype"):
+                        dtype_str = str(actual_np.dtype)
+                        if "bfloat16" in dtype_str or "float8" in dtype_str:
+                            actual_np = (
+                                actual_np.astype("float32")
+                                if hasattr(actual_np, "astype")
+                                else actual_np.float()
+                            )
+                    if hasattr(expected_np, "dtype"):
+                        dtype_str = str(expected_np.dtype)
+                        if "bfloat16" in dtype_str or "float8" in dtype_str:
+                            expected_np = (
+                                expected_np.astype("float32")
+                                if hasattr(expected_np, "astype")
+                                else expected_np.float()
+                            )
+                    self.np_assert_accuracy(
+                        actual_np.numpy() if hasattr(actual_np, "numpy") else actual_np,
+                        expected_np.numpy() if hasattr(expected_np, "numpy") else expected_np,
+                        atol,
+                        rtol,
+                    )
+                else:
+                    raise RuntimeError(
+                        "[torch_assert_OOM] torch.testing.assert_close OOM on large tensor comparison"
                     )
             else:
                 raise
 
-    def _torch_assert_accuracy_gpu(self, paddle_tensor, torch_tensor, atol, rtol, is_check_dtype):
-        converted_paddle_tensor, torch_tensor = self._prepare_torch_compare_tensors(
-            paddle_tensor, torch_tensor
+    def _torch_assert_accuracy_in_chunks(
+        self, actual, expected, atol, rtol, error_msg, working_bytes
+    ):
+        temp_bytes_per_element = max(
+            32, 4 * max(actual.element_size(), expected.element_size()) + 16
         )
-        if converted_paddle_tensor.shape != torch_tensor.shape:
-            raise AssertionError(
-                f"shape mismatch: paddle {converted_paddle_tensor.shape}, torch {torch_tensor.shape}"
-            )
-        if is_check_dtype and converted_paddle_tensor.dtype != torch_tensor.dtype:
-            raise AssertionError(
-                f"dtype mismatch: paddle {converted_paddle_tensor.dtype}, torch {torch_tensor.dtype}"
-            )
+        chunk_numel = max(1, working_bytes // temp_bytes_per_element)
+        actual_flat = actual.reshape(-1)
+        expected_flat = expected.reshape(-1)
+        actual_numel = actual_flat.numel()
+        actual_dtype = actual.dtype
+        expected_dtype = expected.dtype
+        actual_is_complex = actual_dtype.is_complex
+        expected_is_complex = expected_dtype.is_complex
+        actual_is_float64 = actual_dtype == torch.float64
+        expected_is_float64 = expected_dtype == torch.float64
+        actual_is_float8 = "float8" in str(actual_dtype)
+        expected_is_float8 = "float8" in str(expected_dtype)
+        actual_is_integer = not actual_dtype.is_floating_point and not actual_is_complex
+        actual_supports_nan = actual_dtype.is_floating_point or actual_is_complex
+        mismatch_count = 0
+        max_abs_diff = -1.0
+        max_abs_index = 0
+        max_rel_diff = -1.0
+        max_rel_index = 0
+        exact_compare = atol == 0.0 and rtol == 0.0
+        for start in range(0, actual_numel, chunk_numel):
+            end = min(actual_numel, start + chunk_numel)
+            actual_chunk = actual_flat[start:end]
+            expected_chunk = expected_flat[start:end]
+            if exact_compare:
+                equal = actual_chunk == expected_chunk
+                if actual_supports_nan:
+                    equal |= torch.isnan(actual_chunk) & torch.isnan(expected_chunk)
+                mismatch = equal.logical_not_()
+            else:
+                if actual_is_float8:
+                    actual_chunk = actual_chunk.float()
+                if expected_is_float8:
+                    expected_chunk = expected_chunk.float()
+                mismatch = torch.isclose(
+                    actual_chunk,
+                    expected_chunk,
+                    rtol=rtol,
+                    atol=atol,
+                    equal_nan=True,
+                ).logical_not_()
 
-        self._assert_torch_close(
-            converted_paddle_tensor,
-            torch_tensor,
-            atol,
-            rtol,
-            is_check_dtype,
+            chunk_mismatch_count = int(mismatch.sum().item())
+            mismatch_count += chunk_mismatch_count
+            if chunk_mismatch_count == 0:
+                continue
+
+            if actual_is_complex or expected_is_complex:
+                actual_for_diff = actual_chunk
+                expected_for_diff = expected_chunk
+            elif actual_is_float64 or expected_is_float64:
+                actual_for_diff = actual_chunk.to(torch.float64)
+                expected_for_diff = expected_chunk.to(torch.float64)
+            elif actual_is_float8 or expected_is_float8:
+                actual_for_diff = actual_chunk.float()
+                expected_for_diff = expected_chunk.float()
+            elif actual_is_integer:
+                actual_for_diff = actual_chunk.to(torch.int64)
+                expected_for_diff = expected_chunk.to(torch.int64)
+            else:
+                actual_for_diff = actual_chunk
+                expected_for_diff = expected_chunk
+            abs_diff = torch.abs(actual_for_diff - expected_for_diff)
+            matched = ~mismatch
+            abs_diff.masked_fill_(matched, -1.0)
+            chunk_max_abs, chunk_abs_index = torch.max(abs_diff, dim=0)
+            rel_diff = abs_diff / torch.abs(expected_for_diff)
+            rel_diff.masked_fill_(matched, -1.0)
+            chunk_max_rel, chunk_rel_index = torch.max(rel_diff, dim=0)
+
+            # Transfer all reduction results in one synchronization.  Calling
+            # .item() for every value dominates scans with hundreds of chunks.
+            (
+                chunk_max_abs_value,
+                chunk_abs_index_value,
+                chunk_max_rel_value,
+                chunk_rel_index_value,
+            ) = (
+                torch.stack(
+                    (
+                        chunk_max_abs.to(torch.float64),
+                        chunk_abs_index.to(torch.float64),
+                        chunk_max_rel.to(torch.float64),
+                        chunk_rel_index.to(torch.float64),
+                    )
+                )
+                .cpu()
+                .tolist()
+            )
+            if chunk_max_abs_value > max_abs_diff:
+                max_abs_diff = chunk_max_abs_value
+                max_abs_index = start + int(chunk_abs_index_value)
+            if chunk_max_rel_value > max_rel_diff:
+                max_rel_diff = chunk_max_rel_value
+                max_rel_index = start + int(chunk_rel_index_value)
+
+        if mismatch_count == 0:
+            return
+
+        abs_index = tuple(int(value) for value in numpy.unravel_index(max_abs_index, actual.shape))
+        rel_index = tuple(int(value) for value in numpy.unravel_index(max_rel_index, actual.shape))
+        mismatch_percent = 100.0 * mismatch_count / actual.numel()
+        raise AssertionError(
+            error_msg(
+                "Tensor-likes are not equal!\n\n"
+                f"Mismatched elements: {mismatch_count} / {actual.numel()} "
+                f"({mismatch_percent:.1f}%)\n"
+                f"Greatest absolute difference: {max_abs_diff} at index {abs_index}\n"
+                f"Greatest relative difference: {max_rel_diff} at index {rel_index}"
+            )
         )
 
-    def torch_assert_accuracy(self, paddle_tensor, torch_tensor, atol=1e-2, rtol=1e-2):
-        is_check_dtype = self.api_config.api_name not in not_check_dtype
+    def torch_assert_accuracy(
+        self,
+        actual,
+        expected,
+        atol=1e-2,
+        rtol=1e-2,
+        check_dtype=None,
+        actual_name="ACTUAL",
+        expected_name="DESIRED",
+        apply_special_tolerance=True,
+        tensor_index=0,
+        tensor_count=1,
+    ):
+        is_check_dtype = self.should_check_dtype() if check_dtype is None else check_dtype
         bitwise_alignment = getattr(self, "bitwise_alignment", False)
 
-        if not bitwise_alignment and self.api_config.api_name in special_accuracy_atol_rtol:
+        if (
+            apply_special_tolerance
+            and not bitwise_alignment
+            and self.api_config.api_name in special_accuracy_atol_rtol
+        ):
             atol, rtol = special_accuracy_atol_rtol[self.api_config.api_name]
         test_tol = getattr(self, "test_tol", False)
         is_backward = getattr(self, "is_backward", False)
         if test_tol:
             atol, rtol = 0.0, 0.0
 
-        if test_tol or not is_gpu_cache_mode():
-            self._torch_assert_accuracy_cpu(
-                paddle_tensor,
-                torch_tensor,
-                atol,
-                rtol,
-                is_check_dtype,
-                test_tol,
-                is_backward,
-            )
-            return
-        self._torch_assert_accuracy_gpu(
-            paddle_tensor,
-            torch_tensor,
-            atol,
-            rtol,
-            is_check_dtype,
+        def is_cpu_tensor(value):
+            if isinstance(value, torch.Tensor):
+                return value.device.type == "cpu"
+            if isinstance(value, paddle.Tensor):
+                return value.place.is_cpu_place()
+            return False
+
+        compare_on_cpu = (
+            test_tol
+            or not self.gpu_mode_config.enabled
+            or is_cpu_tensor(actual)
+            or is_cpu_tensor(expected)
         )
+        if isinstance(actual, paddle.Tensor):
+            if not actual.is_contiguous():
+                actual = actual.contiguous()
+            actual = actual.detach()
+            if compare_on_cpu:
+                actual = actual.cpu()
+            actual_tensor = torch.utils.dlpack.from_dlpack(
+                paddle.utils.dlpack.to_dlpack(actual)  # type: ignore[reportGeneralTypeIssues]
+            )
+        elif isinstance(actual, torch.Tensor):
+            if not actual.is_contiguous():
+                actual = actual.contiguous()
+            actual_tensor = actual.detach()
+            if compare_on_cpu:
+                actual_tensor = actual_tensor.cpu()
+        else:
+            raise TypeError(f"Expected Paddle or Torch tensor, but got {type(actual)}")
+
+        if isinstance(expected, paddle.Tensor):
+            if not expected.is_contiguous():
+                expected = expected.contiguous()
+            expected = expected.detach()
+            if compare_on_cpu:
+                expected = expected.cpu()
+            expected_tensor = torch.utils.dlpack.from_dlpack(
+                paddle.utils.dlpack.to_dlpack(expected)  # type: ignore[reportGeneralTypeIssues]
+            )
+        elif isinstance(expected, torch.Tensor):
+            if not expected.is_contiguous():
+                expected = expected.contiguous()
+            expected_tensor = expected.detach()
+            if compare_on_cpu:
+                expected_tensor = expected_tensor.cpu()
+        else:
+            raise TypeError(f"Expected Paddle or Torch tensor, but got {type(expected)}")
+
+        if actual_tensor.device != expected_tensor.device:
+            expected_tensor = expected_tensor.to(device=actual_tensor.device)
+
+        if actual_tensor.shape != expected_tensor.shape:
+            raise AssertionError(
+                f"shape mismatch: {actual_name} {actual_tensor.shape}, "
+                f"{expected_name} {expected_tensor.shape}"
+            )
+        if is_check_dtype and actual_tensor.dtype != expected_tensor.dtype:
+            raise AssertionError(
+                f"dtype mismatch: {actual_name} {actual_tensor.dtype}, "
+                f"{expected_name} {expected_tensor.dtype}"
+            )
+
+        def error_msg(msg):
+            return (
+                f"Not equal to tolerance rtol={rtol}, atol={atol}\n"
+                f"{msg}\n"
+                f"{actual_name}: (shape={actual_tensor.shape}, dtype={actual_tensor.dtype})\n"
+                f"{actual_tensor}\n"
+                f"{expected_name}: (shape={expected_tensor.shape}, dtype={expected_tensor.dtype})\n"
+                f"{expected_tensor}"
+            )
+
+        try:
+            working_bytes = 1024**3
+            estimated_temp_bytes = actual_tensor.numel() * max(
+                32,
+                4 * max(actual_tensor.element_size(), expected_tensor.element_size()) + 16,
+            )
+            # Small tensors always use torch.testing.assert_close directly. Avoid
+            # querying the CUDA driver for a working budget on that hot path.
+            needs_chunk_budget = estimated_temp_bytes > working_bytes
+            if actual_tensor.is_cuda and needs_chunk_budget:
+                try:
+                    free_bytes, _ = torch.cuda.mem_get_info(actual_tensor.device)
+                    max_working_bytes = 32 * 1024**3
+                    min_working_bytes = 256 * 1024**2
+                    working_bytes = min(max_working_bytes, max(min_working_bytes, free_bytes // 5))
+
+                    memory_budget = float(
+                        getattr(self.gpu_mode_config, "memory_budget", 0.0) or 0.0
+                    )
+                    if memory_budget > 0:
+                        reserved_bytes = torch.cuda.memory_reserved(actual_tensor.device)
+                        budget_headroom = max(
+                            0,
+                            int(memory_budget * (1024**3)) - reserved_bytes,
+                        )
+                        working_bytes = min(
+                            working_bytes,
+                            max(min_working_bytes, budget_headroom // 5),
+                        )
+                except Exception:
+                    pass
+            if estimated_temp_bytes > working_bytes:
+                self._torch_assert_accuracy_in_chunks(
+                    actual_tensor,
+                    expected_tensor,
+                    atol,
+                    rtol,
+                    error_msg,
+                    working_bytes,
+                )
+                if test_tol:
+                    log_accuracy_tolerance(
+                        "Identical",
+                        self.api_config.api_name,
+                        self.api_config.config[:MAX_CSV_CONFIG_LENGTH],
+                        str(actual.dtype),
+                        is_backward,
+                        tensor_index=tensor_index,
+                        tensor_count=tensor_count,
+                    )
+                return
+
+            # Keep FP8 diagnostics consistent with the chunked path by comparing
+            # promoted float32 values even for exact comparisons.
+            if "float8" in str(actual_tensor.dtype):
+                actual_tensor = actual_tensor.float()
+            if "float8" in str(expected_tensor.dtype):
+                expected_tensor = expected_tensor.float()
+            torch.testing.assert_close(
+                actual_tensor,
+                expected_tensor,
+                rtol=rtol,
+                atol=atol,
+                equal_nan=True,
+                check_device=False,
+                check_dtype=is_check_dtype,
+                msg=error_msg,
+            )
+            if test_tol:
+                log_accuracy_tolerance(
+                    "Identical",
+                    self.api_config.api_name,
+                    self.api_config.config[:MAX_CSV_CONFIG_LENGTH],
+                    str(actual.dtype),
+                    is_backward,
+                    tensor_index=tensor_index,
+                    tensor_count=tensor_count,
+                )
+        except Exception as err:
+            error_str = str(err)
+            if error_str.startswith("Comparing"):
+                if os.environ.get("PADDLEAPITEST_NP_FALLBACK", "0") != "1":
+                    raise RuntimeError(
+                        "[torch_assert_OOM] torch.testing.assert_close OOM on large tensor comparison"
+                    ) from err
+                print(
+                    "[torch_assert_OOM] torch.testing.assert_close OOM, fallback to np_assert",
+                    flush=True,
+                )
+                actual_cpu = actual_tensor.cpu()
+                expected_cpu = expected_tensor.cpu()
+                if actual_cpu.dtype == torch.bfloat16 or "float8" in str(actual_cpu.dtype):
+                    actual_cpu = actual_cpu.float()
+                if expected_cpu.dtype == torch.bfloat16 or "float8" in str(expected_cpu.dtype):
+                    expected_cpu = expected_cpu.float()
+                self.np_assert_accuracy(
+                    actual_cpu.numpy(), expected_cpu.numpy(), atol=atol, rtol=rtol
+                )
+                return
+            if test_tol:
+                error_info = error_str.split("\n", maxsplit=2)[1] if "\n" in error_str else None
+                if error_info and (
+                    error_info.startswith("Tensor-likes") or error_info.startswith("Scalars")
+                ):
+                    log_accuracy_tolerance(
+                        error_str,
+                        self.api_config.api_name,
+                        self.api_config.config[:MAX_CSV_CONFIG_LENGTH],
+                        str(actual.dtype),
+                        is_backward,
+                        tensor_index=tensor_index,
+                        tensor_count=tensor_count,
+                    )
+                    return
+            raise
 
     def test(self):
         pass
@@ -1469,9 +1854,66 @@ class APITestBase:
                 for i in range(len(arg_config)):
                     if isinstance(arg_config[i], TensorConfig):
                         arg_config[i].clear_tensor()
-        if not should_skip_gpu_cleanup():
+        if self.gpu_mode_config.enabled:
+            gpu_mode_maybe_empty_cache(self.gpu_mode_config, "clear_tensor")
+        else:
             torch.cuda.empty_cache()
             paddle.device.cuda.empty_cache()
+
+    def _for_each_tensor_config(self, callback):
+        """Apply callback to every TensorConfig in the parsed argument tree."""
+        seen = set()
+
+        def visit(value):
+            if isinstance(value, TensorConfig):
+                if id(value) not in seen:
+                    seen.add(id(value))
+                    callback(value)
+            elif isinstance(value, (list, tuple)):
+                for item in value:
+                    visit(item)
+            elif isinstance(value, dict):
+                for item in value.values():
+                    visit(item)
+
+        for value in getattr(self, "paddle_args_config", ()):
+            visit(value)
+        visit(getattr(self, "paddle_kwargs_config", {}))
+
+    def move_tensor_tree_to_cpu(self, value):
+        """Recursively move framework tensors to CPU without changing containers."""
+        if isinstance(value, (torch.Tensor, paddle.Tensor)):
+            return value.cpu()
+        if isinstance(value, list):
+            return [self.move_tensor_tree_to_cpu(item) for item in value]
+        if isinstance(value, tuple):
+            return tuple(self.move_tensor_tree_to_cpu(item) for item in value)
+        if isinstance(value, dict):
+            return type(value)(
+                (key, self.move_tensor_tree_to_cpu(item)) for key, item in value.items()
+            )
+        return value
+
+    def detach_tensor_tree(self, value):
+        """Detach every framework tensor while preserving the argument tree."""
+        if isinstance(value, (torch.Tensor, paddle.Tensor)):
+            return value.detach()
+        if isinstance(value, list):
+            return [self.detach_tensor_tree(item) for item in value]
+        if isinstance(value, tuple):
+            return tuple(self.detach_tensor_tree(item) for item in value)
+        if isinstance(value, dict):
+            return type(value)((key, self.detach_tensor_tree(item)) for key, item in value.items())
+        return value
+
+    def save_original_inputs_to_cpu(self):
+        """Save config inputs on CPU before either framework can mutate them."""
+        self._for_each_tensor_config(
+            lambda config: config.save_original_tensor_to_cpu(self.api_config)
+        )
+
+    def clear_original_cpu_inputs(self):
+        self._for_each_tensor_config(lambda config: config.clear_original_cpu_tensor())
 
     def clear_paddle_tensor(self):
         if not hasattr(self, "torch_kwargs_config"):
@@ -1483,7 +1925,9 @@ class APITestBase:
                 for i in range(len(arg_config)):
                     if isinstance(arg_config[i], TensorConfig):
                         arg_config[i].clear_paddle_tensor()
-        if not should_skip_gpu_cleanup():
+        if self.gpu_mode_config.enabled:
+            gpu_mode_maybe_empty_cache(self.gpu_mode_config, "clear_paddle_tensor")
+        else:
             paddle.device.cuda.empty_cache()
 
     def clear_torch_tensor(self):
@@ -1496,7 +1940,9 @@ class APITestBase:
                 for i in range(len(arg_config)):
                     if isinstance(arg_config[i], TensorConfig):
                         arg_config[i].clear_torch_tensor()
-        if not should_skip_gpu_cleanup():
+        if self.gpu_mode_config.enabled:
+            gpu_mode_maybe_empty_cache(self.gpu_mode_config, "clear_torch_tensor")
+        else:
             torch.cuda.empty_cache()
 
     def clear_numpy_tensor(self):

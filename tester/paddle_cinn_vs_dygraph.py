@@ -27,8 +27,9 @@ class APITestCINNVSDygraph(APITestBase):
                 print("gen_numpy_input failed", flush=True)
                 return
         except Exception as err:
-            print(f"[numpy error] {self.api_config.config}\n{err!s}", flush=True)
-            write_to_log("config_input", self.api_config.config)
+            log_type, fatal = self.report_runtime_error(err, "config_input", "input")
+            if fatal:
+                raise
             return
 
         if not self.gen_paddle_input():
@@ -297,11 +298,7 @@ class APITestCINNVSDygraph(APITestBase):
             try:
                 self.paddle_assert_accuracy(dygraph_output, static_output)
             except Exception as err:
-                print(
-                    f"[accuracy error] {backward_str}{self.api_config.config}\n{err!s}",
-                    flush=True,
-                )
-                write_to_log("paddle_accuracy", self.api_config.config)
+                self.report_compare_error(err, backward_str.strip())
                 return False
         elif isinstance(dygraph_output, (list, tuple)):
             if not isinstance(static_output, (list, tuple)):
@@ -340,11 +337,9 @@ class APITestCINNVSDygraph(APITestBase):
                 try:
                     self.paddle_assert_accuracy(dygraph_item, static_item)
                 except Exception as err:
-                    print(
-                        f"[accuracy error] {backward_str}{self.api_config.config}\n{err!s}",
-                        flush=True,
-                    )
-                    write_to_log("paddle_accuracy", self.api_config.config)
+                    position = f"tensor {i + 1}/{len(dygraph_output)}"
+                    phase = f"{backward_str.strip()} | {position}" if backward_str else position
+                    self.report_compare_error(err, phase)
                     return False
         elif dygraph_output is None and static_output is None:
             pass

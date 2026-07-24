@@ -6,6 +6,7 @@ runner:
   engine: engineV4
   foreground: true
 env:
+  PADDLEAPITEST_GPU_MEMORY_POLICY: aggressive
   FLAGS_use_system_allocator: "true"
   FLAGS_check_cuda_error: "true"
 input:
@@ -15,6 +16,6 @@ output:
 engine_args:
   paddle_only: true
   num_gpus: -1
-  num_workers_per_gpu: 16
+  num_workers_per_gpu: 8
   timeout: 600
   use_compute_sanitizer: true

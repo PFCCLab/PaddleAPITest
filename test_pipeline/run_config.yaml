@@ -20,6 +20,9 @@
 # - output.log_dir 必填。
 # - engine_args 中未配置或注释掉的字段使用 engine 默认值。
 # - 布尔值会被 run.py 转为 --key=True/False 传给 engine。
+# - Dump 配置逐字段按显式 CLI > 环境变量 > 默认值解析：USE_DUMP 默认 false，DUMP_DIR 默认
+#   tester/api_config/test_log/dump_case。仅配置 dump_dir / DUMP_DIR 不会开启 dump。
+# - --dump_dir=（显式空路径）使用默认路径，不会回退 DUMP_DIR。
 # - 标注 engineV4 only 的字段只应在 runner.engine=engineV4 时启用。
 
 name: run_config
@@ -103,12 +106,16 @@ engine_args:
   # test_amp: true
   # test_cpu: true
   # use_cached_numpy: true
-  # use_gpu_cache_mode: true
+  # use_gpu_mode: true
   # test_tol: true
   # test_backward: true
   # bitwise_alignment: true
   # generate_failed_tests: true
   # exit_on_error: true
+  # use_dump: true  # 单条 api_config 调试；当前仅支持 accuracy / paddle_only
+  # dump_dir: "tester/api_config/test_log/dump_case"
+  # 也可使用环境变量 USE_DUMP=True 和 DUMP_DIR=<dir>；USE_DUMP 大小写不敏感，
+  # 接受 true/1/yes/y 和 false/0/no/n。
 
   # ========== 精度阈值 ==========
   # atol: 0.01
@@ -119,7 +126,6 @@ engine_args:
   num_gpus: -1
   num_workers_per_gpu: -1
   gpu_ids: "4-7"
-  # required_memory: 10.0
 
   # ========== 运行控制 ==========
   timeout: 600

@@ -37,7 +37,19 @@ if TYPE_CHECKING:
         APITestTorchGPUPerformance,
     )
 
+from tester.api_config.dump_writer import (
+    dump_enabled,
+    parse_strict_bool,
+    record_dump_terminal_status,
+    resolve_dump_options,
+)
 from tester.api_config.log_writer import *
+from tester.runtime_config import (
+    GPU_MEMORY_POLICY_ENV,
+    TestRuntimeConfig,
+    resolve_gpu_memory_policy,
+    runtime_config_for_gpu,
+)
 
 os.environ["FLAGS_use_system_allocator"] = "1"
 os.environ["NVIDIA_TF32_OVERRIDE"] = "0"
@@ -57,7 +69,8 @@ VALID_TEST_ARGS = {
     "generate_failed_tests",
     "bitwise_alignment",
     "exit_on_error",
-    "use_gpu_cache_mode",
+    "use_gpu_mode",
+    "runtime_config",
 }
 
 DEVICE_TYPE = None
@@ -71,6 +84,10 @@ FATAL_OOM_EXIT_CODE = 98
 FATAL_TORCH_EXIT_CODE = 97
 MEMORY_WAIT_SECONDS = 10
 MEMORY_WAIT_LOG_INTERVAL = 60
+
+
+class GpuMemoryDeferred(Exception):
+    """Raised when a GPU-mode case should wait for more free memory."""
 
 
 def cleanup(pool):
@@ -436,12 +453,18 @@ def validate_gpu_options(options) -> tuple:
             f"invalid --num_workers_per_gpu={options.num_workers_per_gpu}: "
             "expected -1 or a positive integer"
         )
-    if options.required_memory <= 0:
-        raise ValueError(
-            f"invalid --required_memory={options.required_memory:g}: "
-            "expected a positive number of GiB"
-        )
     return tuple(gpu_ids)
+
+
+def _resolve_dump_options(parser, options):
+    try:
+        options.use_dump, options.dump_dir = resolve_dump_options(
+            options.use_dump, options.dump_dir
+        )
+    except ValueError as err:
+        parser.error(str(err))
+    os.environ["USE_DUMP"] = str(options.use_dump)
+    os.environ["DUMP_DIR"] = options.dump_dir
 
 
 def parse_bool(value):
@@ -455,47 +478,55 @@ def parse_bool(value):
         raise ValueError(f"Invalid boolean value: {value} parsed from command line")
 
 
+def _apply_single_config_gpu_defaults(options):
+    if not options.gpu_ids and options.num_gpus == -1:
+        options.gpu_ids = "0"
+        options.num_gpus = 1
+
+
 def _prepare_single_config_gpu(options):
     if options.test_cpu:
+        options.gpu_workers_per_gpu_map = {}
+        options.gpu_total_memory_map = {}
+        options.runtime_config = TestRuntimeConfig.from_options(options)
         return None
 
+    _apply_single_config_gpu_defaults(options)
     gpu_ids = validate_gpu_options(options)
     if len(gpu_ids) != 1:
         raise ValueError(
             f"single --api_config run supports exactly one GPU; got {len(gpu_ids)} GPUs: {gpu_ids}"
         )
     os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_ids[0])
+    try:
+        options.gpu_total_memory_map = {gpu_ids[0]: get_memory_info(gpu_ids[0])[0]}
+    except Exception:
+        options.gpu_total_memory_map = {}
+    options.gpu_workers_per_gpu_map = {gpu_ids[0]: 1}
+    options.runtime_config = TestRuntimeConfig.from_options(options)
+    options.runtime_config = runtime_config_for_gpu(options, gpu_ids[0])
     return gpu_ids[0]
 
 
-def check_gpu_memory(gpu_ids, num_workers_per_gpu, required_memory):  # required_memory in GB
+def check_gpu_memory(gpu_ids, num_workers_per_gpu):
     assert isinstance(gpu_ids, tuple) and len(gpu_ids) > 0
     available_gpus = []
     max_workers_per_gpu = {}
 
     for gpu_id in gpu_ids:
         try:
-            total_memory, used_memory = get_memory_info(gpu_id)
-            free_memory = total_memory - used_memory
-            max_workers = int(free_memory // required_memory)
-            if max_workers >= 1:
-                available_gpus.append(gpu_id)
-                max_workers_per_gpu[gpu_id] = (
-                    max_workers
-                    if num_workers_per_gpu == -1
-                    else min(max_workers, num_workers_per_gpu)
-                )
+            get_memory_info(gpu_id)
         except pynvml.NVMLError as e:
             print(f"[warn] Failed to check GPU {gpu_id}: {e!s}", flush=True)
             continue
+        available_gpus.append(gpu_id)
+        max_workers_per_gpu[gpu_id] = 1 if num_workers_per_gpu == -1 else num_workers_per_gpu
 
     return available_gpus, max_workers_per_gpu
 
 
 def init_worker_gpu(gpu_worker_list, lock, available_gpus, max_workers_per_gpu, options):
-    if options.log_dir:
-        set_test_log_path(options.log_dir)
-    set_engineV2()
+    init_log(options.log_dir, worker_tmp_logs=True)
     my_pid = os.getpid()
 
     def pid_exists(pid):
@@ -523,175 +554,178 @@ def init_worker_gpu(gpu_worker_list, lock, available_gpus, max_workers_per_gpu, 
             gpu_worker_list[assigned_gpu].append(my_pid)
 
         os.environ["CUDA_VISIBLE_DEVICES"] = str(assigned_gpu)
+        with suppress_startup_output():
+            import paddle
 
-        import paddle
+            globals()["paddle"] = paddle
+            if options.test_cpu:
+                paddle.device.set_device("cpu")
+            elif not getattr(options, "paddle_custom_device", False):
+                # CUDA_VISIBLE_DEVICES assigns the worker slot; Paddle still needs an explicit device.
+                paddle.set_device("gpu")
+            try:
+                import paddlefleet_ops
+            except ImportError:
+                pass
+            try:
+                import FusedQuantOps
+            except ImportError:
+                pass
+            globals().update(_load_test_classes(options))
 
-        # Load custom ops from paddlefleet to register _run_custom_op operators
-        try:
-            import paddlefleet_ops
-        except ImportError:
-            pass
-        try:
-            import FusedQuantOps
-        except ImportError:
-            pass
+            def signal_handler(*args):
+                _clear_device_cache(options)
+                restore_stdio()
+                close_process_files()
+                sys.exit(0)
 
-        globals()["paddle"] = paddle
-        globals().update(_load_test_classes(options))
+            signal.signal(signal.SIGINT, signal_handler)
+            signal.signal(signal.SIGTERM, signal_handler)
 
-        def signal_handler(*args):
-            _clear_device_cache(options)
-            restore_stdio()
-            close_process_files()
-            sys.exit(0)
+            redirect_stdio()
 
-        signal.signal(signal.SIGINT, signal_handler)
-        signal.signal(signal.SIGTERM, signal_handler)
-
-        if options.test_cpu:
-            paddle.device.set_device("cpu")
-
-        redirect_stdio()
-
-        print(
-            f"{datetime.now()} Worker PID: {my_pid}, Assigned GPU ID: {assigned_gpu}",
-            flush=True,
-        )
     except Exception as e:
-        print(f"{datetime.now()} Worker {my_pid} initialization failed: {e}", flush=True)
+        print(f"[worker] INIT_FAILED | PID {my_pid} | {e}", flush=True)
         raise
 
 
 def run_test_case(api_config_str, options):
     """Run a single test case for the given API configuration."""
-    cuda_visible = os.environ.get("CUDA_VISIBLE_DEVICES", "0")
-    gpu_id = int(cuda_visible.split(",")[0])
-
-    print(
-        f"{datetime.now()} GPU {gpu_id} {os.getpid()} [paddle {options.paddle_version}] test begin: {api_config_str}",
-        flush=True,
+    completion = [os.getpid(), None]
+    started_at = time.monotonic()
+    gpu_id = int(os.environ.get("CUDA_VISIBLE_DEVICES", "0").split(",")[0])
+    case_id = write_case_begin(
+        api_config_str,
+        worker_pid=os.getpid(),
+        gpu=gpu_id,
+        paddle_version=options.paddle_version,
     )
-
-    last_memory_log_time = 0
-    while True:
-        total_memory, used_memory = get_memory_info(gpu_id)
-        free_memory = total_memory - used_memory
-
-        if free_memory >= options.required_memory:
-            break
-
-        now = time.time()
-        if now - last_memory_log_time >= MEMORY_WAIT_LOG_INTERVAL:
+    runtime_config = runtime_config_for_gpu(options, gpu_id)
+    case_status = "done"
+    try:
+        if options.show_runtime_status:
+            total_memory, used_memory_before = get_memory_info(gpu_id)
             print(
-                f"{datetime.now()} device {gpu_id} Free: {free_memory:.1f} GB, "
-                f"Required: {options.required_memory:.1f} GB. ",
-                "Waiting for available memory...",
+                f"{datetime.now()} GPU {gpu_id} memory before: used={used_memory_before:.1f} GB, "
+                f"free={total_memory - used_memory_before:.1f} GB",
                 flush=True,
             )
-            last_memory_log_time = now
-        time.sleep(MEMORY_WAIT_SECONDS)
 
-    if options.show_runtime_status:
-        total_memory, used_memory_before = get_memory_info(gpu_id)
-        print(
-            f"{datetime.now()} GPU {gpu_id} memory before: used={used_memory_before:.1f} GB, "
-            f"free={total_memory - used_memory_before:.1f} GB",
-            flush=True,
-        )
+        api_config = None
+        case = None
+        try:
+            api_config = APIConfig(api_config_str)
+        except Exception as err:
+            print(f"[config_parse] {api_config_str} {err!s}", flush=True)
+            write_terminal_log("config_parse", api_config_str)
+            case_status = "error"
+            return completion
 
-    api_config = None
-    case = None
-    try:
-        api_config = APIConfig(api_config_str)
-    except Exception as err:
-        print(f"[config_parse] {api_config_str} {err!s}", flush=True)
-        write_terminal_log("config_parse", api_config_str)
-        return
-
-    test_class = _select_test_class(options)
-    kwargs = {k: v for k, v in vars(options).items() if k in VALID_TEST_ARGS}
-    case = test_class(api_config, **kwargs)
-    try:
-        case.test()
-        if has_terminal_log(api_config_str):
-            write_checkpoint(api_config_str)
-    except Exception as err:
-        err_msg = str(err).lower()
-        terminal_log_type = get_terminal_log_type(api_config_str)
-        oom_markers = (
-            "cuda out of memory",
-            "out of memory error",
-            "resourceexhaustederror",
-            "out of memory",
-            "outofmemoryerror",
-            "cannot allocate memory",
-            "std::bad_alloc",
-            "bad allocation",
-            "memoryerror",
-            "cublas_status_alloc_failed",
-        )
-        cuda_markers = (
-            "cuda error",
-            "memory corruption",
-            "illegal memory access",
-            "invalid configuration argument",
-            "invalid resource handle",
-        )
-        exit_code = None
-        if any(marker in err_msg for marker in oom_markers):
-            exit_code = FATAL_OOM_EXIT_CODE
-        elif terminal_log_type == "torch_error" and any(
-            marker in err_msg for marker in cuda_markers
-        ):
-            exit_code = FATAL_TORCH_EXIT_CODE
-        elif any(marker in err_msg for marker in cuda_markers):
-            exit_code = FATAL_CUDA_EXIT_CODE
-        if exit_code is not None:
+        test_class = _select_test_class(options)
+        kwargs = {k: v for k, v in vars(options).items() if k in VALID_TEST_ARGS}
+        kwargs["runtime_config"] = runtime_config
+        case = test_class(api_config, **kwargs)
+        try:
+            if dump_enabled():
+                case.run_with_dump()
+            else:
+                case.test()
             if has_terminal_log(api_config_str):
                 write_checkpoint(api_config_str)
-            try:
-                close_process_files()
-            finally:
+        except Exception as err:
+            err_msg = str(err).lower()
+            terminal_log_type = get_terminal_log_type(api_config_str)
+            oom_markers = (
+                "cuda out of memory",
+                "out of memory error",
+                "resourceexhaustederror",
+                "out of memory",
+                "outofmemoryerror",
+                "cannot allocate memory",
+                "std::bad_alloc",
+                "bad allocation",
+                "memoryerror",
+                "cublas_status_alloc_failed",
+            )
+            cuda_markers = (
+                "cuda error",
+                "memory corruption",
+                "illegal memory access",
+                "invalid configuration argument",
+                "invalid resource handle",
+            )
+            exit_code = None
+            if any(marker in err_msg for marker in oom_markers):
+                exit_code = FATAL_OOM_EXIT_CODE
+            elif terminal_log_type == "torch_error" and any(
+                marker in err_msg for marker in cuda_markers
+            ):
+                exit_code = FATAL_TORCH_EXIT_CODE
+            elif any(marker in err_msg for marker in cuda_markers):
+                exit_code = FATAL_CUDA_EXIT_CODE
+            if exit_code is not None:
+                if dump_enabled():
+                    record_dump_terminal_status("engine_fatal", exit_code=exit_code, error=str(err))
+                if has_terminal_log(api_config_str):
+                    write_checkpoint(api_config_str)
                 try:
-                    restore_stdio()
+                    close_process_files()
                 finally:
-                    os._exit(exit_code)
-        if has_terminal_log(api_config_str):
-            write_checkpoint(api_config_str)
-            return
-        # if not fatal error, subprocess will be alive and report error
-        print(f"[error] {api_config_str}: {err}", flush=True)
+                    try:
+                        restore_stdio()
+                    finally:
+                        os._exit(exit_code)
+            if has_terminal_log(api_config_str):
+                write_checkpoint(api_config_str)
+                return completion
+            # if not fatal error, subprocess will be alive and report error
+            print(f"[error] {api_config_str}: {err}", flush=True)
+            raise
+        finally:
+            del test_class, api_config, case
+            if not getattr(options, "use_gpu_mode", False):
+                gc.collect()
+            if not any(
+                getattr(options, opt)
+                for opt in (
+                    "paddle_gpu_performance",
+                    "torch_gpu_performance",
+                    "paddle_torch_gpu_performance",
+                )
+            ) and not getattr(options, "use_gpu_mode", False):
+                _clear_device_cache(options)
+            if options.show_runtime_status:
+                try:
+                    total_memory, used_memory_after = get_memory_info(gpu_id)
+                    print(
+                        f"{datetime.now()} GPU {gpu_id} memory after cleanup: used={used_memory_after:.1f} GB, "
+                        f"free={total_memory - used_memory_after:.1f} GB",
+                        flush=True,
+                    )
+                except Exception as err:
+                    print(
+                        f"{datetime.now()} Failed to read GPU {gpu_id} memory after cleanup: {err}",
+                        flush=True,
+                    )
+
+        return completion
+    except GpuMemoryDeferred:
+        case_status = "deferred"
+        raise
+    except BaseException:
+        case_status = "error"
         raise
     finally:
-        del test_class, api_config, case
-        gc.collect()
-        if not any(
-            getattr(options, opt)
-            for opt in (
-                "paddle_gpu_performance",
-                "torch_gpu_performance",
-                "paddle_torch_gpu_performance",
-            )
-        ) and not getattr(options, "use_gpu_cache_mode", False):
-            _clear_device_cache(options)
-        if options.show_runtime_status:
-            try:
-                total_memory, used_memory_after = get_memory_info(gpu_id)
-                print(
-                    f"{datetime.now()} GPU {gpu_id} memory after cleanup: used={used_memory_after:.1f} GB, "
-                    f"free={total_memory - used_memory_after:.1f} GB",
-                    flush=True,
-                )
-            except Exception as err:
-                print(
-                    f"{datetime.now()} Failed to read GPU {gpu_id} memory after cleanup: {err}",
-                    flush=True,
-                )
+        completion[1] = write_case_end(
+            case_status,
+            case_id=case_id,
+            api_config_str=api_config_str,
+            duration_ms=round((time.monotonic() - started_at) * 1000),
+        )
 
 
 def main():
     start_time = time.time()
-    print(f"Main process id: {os.getpid()}")
     set_start_method("spawn")
 
     try:
@@ -702,13 +736,13 @@ def main():
     except Exception:
         paddle_version = "unknown"
 
-    parser = argparse.ArgumentParser(description="Run Paddle API test cases")
+    parser = argparse.ArgumentParser(description="Run Paddle API test cases", allow_abbrev=False)
     parser.add_argument(
         "--api_config_file",
         default="",
         help=(
             "Path to a config file. Mutually exclusive with "
-            "--api_config_file_pattern and --api_config."
+            "--api_config_file_pattern, --api_config, and --retest."
         ),
     )
     parser.add_argument(
@@ -720,6 +754,14 @@ def main():
         "--api_config",
         default="",
         help="Run one API config string directly. Single-case mode supports at most one GPU.",
+    )
+    parser.add_argument(
+        "--retest",
+        default="",
+        help=(
+            "Retest classifications from --log_dir, e.g. config_input or "
+            "config_input,timeout. Mutually exclusive with other config inputs."
+        ),
     )
     parser.add_argument(
         "--paddle_only",
@@ -785,19 +827,13 @@ def main():
         "--num_workers_per_gpu",
         type=int,
         default=1,
-        help="Workers per GPU. Use -1 to maximize workers based on free memory.",
+        help="Workers per GPU. In gpu_mode, -1 uses one worker per GPU.",
     )
     parser.add_argument(
         "--gpu_ids",
         type=str,
         default="",
         help="GPU IDs to use, e.g. '0', '0,2', '0-3'. Use '-1' for all GPUs.",
-    )
-    parser.add_argument(
-        "--required_memory",
-        type=float,
-        default=10.0,
-        help="Minimum free memory required per worker, in GiB.",
     )
     parser.add_argument(
         "--test_cpu",
@@ -812,10 +848,10 @@ def main():
         help="Reuse cached NumPy inputs when available.",
     )
     parser.add_argument(
-        "--use_gpu_cache_mode",
+        "--use_gpu_mode",
         type=parse_bool,
         default=False,
-        help="Enable GPU-first tensor cache, GPU compare, and CUDA allocator reuse for speed.",
+        help="Enable GPU tensor generation, GPU compare, and CUDA allocator reuse for speed.",
     )
     parser.add_argument(
         "--log_dir",
@@ -902,13 +938,48 @@ def main():
         default=False,
         help="Exit the process when a paddle_error occurs.",
     )
+    parser.add_argument(
+        "--use_dump",
+        type=parse_strict_bool,
+        default=None,
+        help="Enable dump tracing (True or False). Overrides USE_DUMP.",
+    )
+    parser.add_argument(
+        "--dump_dir",
+        default=None,
+        help="Dump output directory. Overrides DUMP_DIR; empty uses the default directory.",
+    )
 
     options = parser.parse_args()
     options.paddle_version = paddle_version
-    print(f"Options: {vars(options)}", flush=True)
-    print(f"PaddlePaddle version: {paddle_version}", flush=True)
+    _resolve_dump_options(parser, options)
+    try:
+        options.gpu_memory_policy = resolve_gpu_memory_policy()
+    except ValueError as err:
+        parser.error(str(err))
     if options.random_seed != parser.get_default("random_seed"):
         np.random.seed(options.random_seed)
+    try:
+        options.retest_types = parse_retest_types(options.retest)
+    except ValueError as err:
+        _print_argument(ARGUMENT_ERROR_PREFIX, str(err))
+        return
+
+    input_sources = (
+        bool(options.api_config),
+        bool(options.api_config_file),
+        bool(options.api_config_file_pattern),
+        bool(options.retest),
+    )
+    if sum(input_sources) != 1:
+        _print_argument(
+            ARGUMENT_ERROR_PREFIX,
+            "exactly one of --api_config, --api_config_file, "
+            "--api_config_file_pattern, or --retest is required",
+        )
+        return
+    if options.api_config and not options.test_cpu:
+        _apply_single_config_gpu_defaults(options)
 
     mode = [
         options.accuracy,
@@ -924,6 +995,16 @@ def main():
     if len([m for m in mode if m is True]) != 1:
         _print_argument(ARGUMENT_ERROR_PREFIX, TEST_MODE_ERROR)
         return
+    print_run_header(options, paddle_version)
+    if options.use_dump:
+        if not options.api_config or options.api_config_file or options.api_config_file_pattern:
+            _print_argument(ARGUMENT_ERROR_PREFIX, "dump only supports single --api_config runs")
+            return
+        if not (options.accuracy or options.paddle_only):
+            _print_argument(
+                ARGUMENT_ERROR_PREFIX, "dump currently supports only --accuracy or --paddle_only"
+            )
+            return
 
     # 处理 custom_device_vs_gpu 模式的配置
     bos_config_data = None
@@ -967,26 +1048,19 @@ def main():
         _print_argument(
             ARGUMENT_WARNING_PREFIX, "--test_backward takes effect only when --paddle_cinn=True"
         )
-    if options.use_gpu_cache_mode and options.use_cached_numpy:
-        print(
-            "[gpu_cache_mode] --use_cached_numpy=True is ignored because "
-            "--use_gpu_cache_mode=True uses GPU tensor cache.",
-            flush=True,
+    if options.use_gpu_mode and options.use_cached_numpy:
+        _print_argument(
+            ARGUMENT_WARNING_PREFIX,
+            "--use_cached_numpy=True is ignored because --use_gpu_mode=True uses GPU "
+            "tensor generation",
         )
         options.use_cached_numpy = False
     os.environ["USE_CACHED_NUMPY"] = str(options.use_cached_numpy)
-    os.environ["USE_GPU_CACHE_MODE"] = str(options.use_gpu_cache_mode)
-    os.environ["SKIP_GPU_CLEANUP"] = str(options.use_gpu_cache_mode)
-    if options.use_gpu_cache_mode:
-        print(
-            "[gpu_cache_mode] enabled: GPU tensor cache, GPU compare, and allocator reuse are active.",
-            flush=True,
-        )
+    os.environ["USE_GPU_MODE"] = str(options.use_gpu_mode)
+    os.environ[GPU_MEMORY_POLICY_ENV] = options.gpu_memory_policy
     if options.bitwise_alignment:
         options.atol = 0.0
         options.rtol = 0.0
-    if options.log_dir:
-        set_test_log_path(options.log_dir)
 
     if options.api_config:
         try:
@@ -996,6 +1070,15 @@ def main():
             return
 
         # Single config execution
+        import paddle
+
+        globals()["paddle"] = paddle
+        if options.test_cpu:
+            paddle.device.set_device("cpu")
+        elif not getattr(options, "paddle_custom_device", False):
+            # CUDA_VISIBLE_DEVICES assigns the worker slot; Paddle still needs an explicit device.
+            paddle.set_device("gpu")
+
         # Load custom ops from paddlefleet to register _run_custom_op operators
         try:
             import paddlefleet_ops
@@ -1008,8 +1091,7 @@ def main():
 
         globals().update(_load_test_classes(options))
 
-        # set log_writer
-        set_engineV2()
+        init_log(options.log_dir, worker_tmp_logs=True)
 
         options.api_config = options.api_config.strip()
         print(
@@ -1020,14 +1102,12 @@ def main():
             api_config = APIConfig(options.api_config)
         except Exception as err:
             print(f"[config_parse] {options.api_config} {err!s}", flush=True)
+            if dump_enabled():
+                record_dump_terminal_status("config_parse", error=str(err))
             return
 
         test_class = _select_test_class(options)
 
-        if options.test_cpu:
-            import paddle
-
-            paddle.device.set_device("cpu")
         if options.custom_device_vs_gpu:
             # custom_device_vs_gpu 模式需要传递额外参数
             case = test_class(
@@ -1050,12 +1130,16 @@ def main():
                 test_tol=options.test_tol,
                 bitwise_alignment=options.bitwise_alignment,
                 exit_on_error=options.exit_on_error,
-                use_gpu_cache_mode=options.use_gpu_cache_mode,
+                use_gpu_mode=options.use_gpu_mode,
+                runtime_config=options.runtime_config,
             )
         else:
             case = test_class(api_config, test_amp=options.test_amp)
         try:
-            case.test()
+            if dump_enabled():
+                case.run_with_dump()
+            else:
+                case.test()
         except Exception as err:
             if (
                 "Tensor-likes are not equal" in str(err)
@@ -1068,12 +1152,11 @@ def main():
         finally:
             case.clear_tensor()
             del case
-    elif options.api_config_file or options.api_config_file_pattern:
-        # validate GPU options
-        gpu_ids = validate_gpu_options(options)
-
+    elif options.api_config_file or options.api_config_file_pattern or options.retest:
         # get config files
-        if options.api_config_file_pattern:
+        if options.retest:
+            config_files = []
+        elif options.api_config_file_pattern:
             import glob
 
             config_files = []
@@ -1097,77 +1180,103 @@ def main():
                 return
             config_files = [options.api_config_file]
 
-        # set log_writer before resume/checkpoint handling
-        if options.log_dir:
-            set_test_log_path(options.log_dir)
-        set_engineV2()
+        init_log(options.log_dir, worker_tmp_logs=True)
 
         # when engineV2 was interrupted, resume from .tmp dir
         aggregate_logs(cleanup=True)
-        removed_stale_logs = cleanup_uncheckpointed_result_logs()
-        if removed_stale_logs:
-            print(
-                f"{removed_stale_logs} stale result log entries without checkpoint were removed.",
-                flush=True,
-            )
+        removed_stale_logs = 0 if options.retest else cleanup_uncheckpointed_result_logs()
 
-        # read checkpoint
-        finish_configs = read_log("checkpoint")
-        print(len(finish_configs), "cases in checkpoint.", flush=True)
-
-        api_config_count = 0
-        skipped_non_config = 0
-        api_configs = set()
-        for config_file in config_files:
+        if options.retest:
             try:
-                with open(config_file) as f:
-                    for line in f:
-                        line = line.strip()
-                        if not line:
-                            continue
-                        if not line.startswith("paddle."):
-                            skipped_non_config += 1
-                            continue
-                        api_config_count += 1
-                        api_configs.add(line)
-            except Exception as e:
-                print(f"Failed to read config file {config_file}: {e}", flush=True)
+                api_configs = prepare_retest(options.retest_types)
+            except (OSError, ValueError) as err:
+                _print_argument(ARGUMENT_ERROR_PREFIX, str(err))
                 return
-        if skipped_non_config:
-            print(f"{skipped_non_config} non-config lines skipped.", flush=True)
-        print(api_config_count, "cases in total.", flush=True)
+            removed_stale_logs = cleanup_uncheckpointed_result_logs()
+            api_config_count = len(api_configs)
+            skipped_non_config = 0
+            finish_configs = read_log("checkpoint")
+        else:
+            finish_configs = read_log("checkpoint")
+            api_config_count = 0
+            skipped_non_config = 0
+            api_configs = set()
+            for config_file in config_files:
+                try:
+                    with open(config_file) as f:
+                        for line in f:
+                            line = line.strip()
+                            if not line:
+                                continue
+                            if not line.startswith("paddle."):
+                                skipped_non_config += 1
+                                continue
+                            api_config_count += 1
+                            api_configs.add(line)
+                except Exception as e:
+                    print(f"Failed to read config file {config_file}: {e}", flush=True)
+                    return
         dup_case = api_config_count - len(api_configs)
-        if dup_case > 0:
-            print(dup_case, "cases are duplicates and removed.", flush=True)
-
+        read_count = api_config_count + skipped_non_config
         api_config_count = len(api_configs)
         api_configs = sorted(api_configs - finish_configs)
         all_case = len(api_configs)
         finish_case = api_config_count - all_case
-        if finish_case:
-            print(finish_case, "cases already tested.", flush=True)
-        print(all_case, "cases will be tested.", flush=True)
-        del api_config_count, dup_case, finish_case
-
-        # validate GPU memory
-        available_gpus, max_workers_per_gpu = check_gpu_memory(
-            gpu_ids, options.num_workers_per_gpu, options.required_memory
+        print_preparing_summary(
+            read_count,
+            skipped_non_config,
+            dup_case,
+            api_config_count,
+            finish_case,
+            all_case,
+            removed_stale_logs=removed_stale_logs,
+            retest_types=options.retest_types,
         )
-        if not available_gpus:
-            print(
-                f"No GPUs with sufficient memory available. Current memory constraint is {options.required_memory} GB.",
-                flush=True,
+        del api_config_count, dup_case, finish_case, read_count
+
+        if not api_configs:
+            if options.retest:
+                finish_retest()
+            print_running_header()
+            print("Workers: skipped | 0 pending", flush=True)
+            log_counts = aggregate_logs(end=True)
+            print_log_info(0, log_counts)
+            print_run_footer(
+                0,
+                0,
+                0,
+                log_counts,
+                time.time() - start_time,
+                options.log_dir,
             )
             return
 
-        total_workers = sum(max_workers_per_gpu.values())
-        print(
-            f"Using {len(available_gpus)} GPU(s) with max workers per GPU: {max_workers_per_gpu}. Total workers: {total_workers}.",
-            flush=True,
+        # validate GPU visibility and derive per-GPU worker counts
+        gpu_ids = validate_gpu_options(options)
+        available_gpus, max_workers_per_gpu = check_gpu_memory(gpu_ids, options.num_workers_per_gpu)
+        if not available_gpus:
+            print("No usable GPUs available.", flush=True)
+            return
+        available_gpus, max_workers_per_gpu = limit_worker_layout(
+            available_gpus, max_workers_per_gpu, all_case
         )
 
+        total_workers = sum(max_workers_per_gpu.values())
+        gpu_total_memory_map = {}
+        for gpu_id in available_gpus:
+            try:
+                gpu_total_memory_map[gpu_id] = get_memory_info(gpu_id)[0]
+            except Exception:
+                pass
+        options.gpu_workers_per_gpu_map = dict(max_workers_per_gpu)
+        options.gpu_total_memory_map = gpu_total_memory_map
+        options.runtime_config = TestRuntimeConfig.from_options(options)
+        print_compute_summary(available_gpus, max_workers_per_gpu)
+
         if options.test_cpu:
-            print(f"Using {cpu_count()} CPU(s) for paddle in CPU mode.", flush=True)
+            print(f"CPU: {cpu_count()} available | Paddle CPU mode", flush=True)
+
+        print_running_header()
 
         # initialize process pool
         manager = Manager()
@@ -1200,7 +1309,8 @@ def main():
             for batch_start in range(0, len(api_configs), BATCH_SIZE):
                 batch = api_configs[batch_start : batch_start + BATCH_SIZE]
                 futures = {}
-                for config in batch:
+
+                def schedule_config(config):
                     # timeout = estimate_timeout(config)
                     timeout = options.timeout
                     future = pool.schedule(
@@ -1210,83 +1320,97 @@ def main():
                     )
                     futures[future] = config
 
-                for future in as_completed(futures):
-                    config = futures[future]
-                    checkpoint_ready = True
-                    try:
-                        future.result()
-                        if options.show_runtime_status or tested_case % 10000 == 0:
-                            print(f"[info] Test case succeeded for {config}", flush=True)
-                    except TimeoutError as err:
-                        write_terminal_log("timeout", config)
-                        print(
-                            f"[timeout] {config}: {err}",
-                            flush=True,
-                        )
-                    except ProcessExpired as err:
-                        # CUDA, OOM, and Torch fatal errors may also expire the subprocess;
-                        # classify them by dedicated terminal log types instead of falling through to crash.
-                        if err.exitcode == FATAL_CUDA_EXIT_CODE:
-                            write_terminal_log("paddle_cuda", config)
-                            print(
-                                f"[paddle_cuda] {config}: {err}",
-                                flush=True,
-                            )
-                        elif err.exitcode == FATAL_OOM_EXIT_CODE:
-                            write_terminal_log("oom", config)
-                            print(
-                                f"[oom] {config}: {err}",
-                                flush=True,
-                            )
-                        elif err.exitcode == FATAL_TORCH_EXIT_CODE:
-                            write_terminal_log("torch_error", config)
-                            print(
-                                f"[torch_error] {config}: {err}",
-                                flush=True,
-                            )
-                        elif err.exitcode in (-signal.SIGKILL, -signal.SIGTERM):
+                for config in batch:
+                    schedule_config(config)
+
+                while futures:
+                    for future in list(as_completed(futures)):
+                        config = futures.pop(future)
+                        checkpoint_ready = True
+                        worker_pid = None
+                        progress_status = "DONE"
+                        progress_detail = None
+                        try:
+                            worker_pid, completed_offset = future.result()
+                            mark_inorder_case_complete(worker_pid, completed_offset)
+                        except TimeoutError as err:
+                            write_terminal_log("timeout", config)
+                            progress_status = "TIMEOUT"
+                            worker_pid = getattr(err, "pid", None)
+                            if worker_pid is not None:
+                                completed_offset = append_case_end_to_worker_log(
+                                    worker_pid, "timeout", api_config_str=config
+                                )
+                                mark_inorder_case_complete(worker_pid, completed_offset)
+                        except ProcessExpired as err:
+                            worker_pid = getattr(err, "pid", None)
+                            if err.exitcode in (-signal.SIGKILL, -signal.SIGTERM):
+                                expired_status = "timeout"
+                                checkpoint_ready = False
+                                progress_status = "RETRY"
+                                progress_detail = f"exit {err.exitcode}"
+                            else:
+                                expired_status, progress_status = classify_worker_exit(
+                                    err.exitcode,
+                                    FATAL_CUDA_EXIT_CODE,
+                                    FATAL_OOM_EXIT_CODE,
+                                    FATAL_TORCH_EXIT_CODE,
+                                )
+                                write_terminal_log(expired_status, config)
+                                if progress_status == "PADDLE_CRASH":
+                                    progress_detail = f"exit {err.exitcode}"
+                            if worker_pid is not None:
+                                completed_offset = append_case_end_to_worker_log(
+                                    worker_pid, expired_status, api_config_str=config
+                                )
+                                mark_inorder_case_complete(worker_pid, completed_offset)
+                        except GpuMemoryDeferred as err:
                             checkpoint_ready = False
-                            print(
-                                f"[warn] Worker was externally killed for {config} "
-                                f"(exit={err.exitcode}); case will be retried on next run.",
-                                flush=True,
-                            )
-                        else:
-                            write_terminal_log("paddle_crash", config)
-                            print(
-                                f"[paddle_crash] {config}: {err}",
-                                flush=True,
-                            )
-                    except Exception as err:
-                        write_terminal_log("config_parse", config)
-                        print(
-                            f"[config_parse] {config}: {err}",
-                            flush=True,
-                        )
-                        checkpoint_ready = False  # checkpoint already written by write_terminal_log
-                    if checkpoint_ready:
-                        tested_case += 1
-                        if options.show_runtime_status or tested_case % 10000 == 0:
-                            print(
-                                f"[{tested_case}/{all_case}] Testing {config}",
-                                flush=True,
-                            )
+                            progress_status = "DEFERRED"
+                            progress_detail = str(err)
+                            schedule_config(config)
+                        except Exception as err:
+                            write_terminal_log("config_parse", config)
+                            checkpoint_ready = False
+                            progress_status = "CONFIG_PARSE"
+                            progress_detail = str(err)
+                        if checkpoint_ready:
+                            tested_case += 1
+                            if (
+                                options.show_runtime_status
+                                or tested_case % 10000 == 0
+                                or progress_status != "DONE"
+                            ):
+                                print_case_progress(
+                                    tested_case,
+                                    all_case,
+                                    progress_status,
+                                    config,
+                                    progress_detail,
+                                )
+                        elif progress_status in ("RETRY", "DEFERRED", "CONFIG_PARSE"):
+                            print_case_notice(progress_status, config, progress_detail)
                 aggregate_logs()
             pool.close()
             pool.join()
         except Exception as e:
             print(f"Unexpected error: {e}", flush=True)
             cleanup(pool)
-            total_time = time.time() - start_time
-            print(f"Test time: {round(total_time / 60, 3)} minutes.", flush=True)
         finally:
-            print(f"{tested_case} cases have been tested.", flush=True)
             log_counts = aggregate_logs(end=True)
-            print_log_info(all_case, log_counts)
+            if options.retest and tested_case == all_case:
+                finish_retest()
+            print_log_info(max(all_case - tested_case, 0), log_counts)
             end_time = time.time()
             total_time = end_time - start_time
-            print(f"Test time: {round(total_time / 60, 3)} minutes.", flush=True)
-    print("Done.")
+            print_run_footer(
+                all_case,
+                tested_case,
+                max(all_case - tested_case, 0),
+                log_counts,
+                total_time,
+                options.log_dir,
+            )
 
 
 if __name__ == "__main__":

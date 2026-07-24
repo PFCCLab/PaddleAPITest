@@ -185,11 +185,9 @@ class APITestPaddleDeviceVSGPU(APITestCustomDeviceVSCPU):
             return paddle_output, paddle_grads
 
         except Exception as e:
-            print(
-                f"[paddle {paddle_device_type} error] {self.api_config.config}: {e}",
-                flush=True,
-            )
-            write_to_log("paddle_error", self.api_config.config)
+            _, fatal = self.report_runtime_error(e, "paddle_error", f"paddle {paddle_device_type}")
+            if fatal:
+                raise
             return None, None
 
     def _compare_with_downloaded(self, local_output, local_grads, downloaded_tensor):
@@ -258,11 +256,7 @@ class APITestPaddleDeviceVSGPU(APITestCustomDeviceVSCPU):
                     flush=True,
                 )
             except Exception as e:
-                print(
-                    f"[compare] Forward accuracy check failed for {self.api_config.config}, error: {e}",
-                    flush=True,
-                )
-                write_to_log("paddle_accuracy", self.api_config.config)
+                self.report_compare_error(e, "download forward")
                 return False
 
             # 对比Backward梯度（如果存在且Forward通过）
@@ -306,10 +300,7 @@ class APITestPaddleDeviceVSGPU(APITestCustomDeviceVSCPU):
                         flush=True,
                     )
                 except Exception as e:
-                    print(
-                        f"[compare] Backward gradient check failed for {self.api_config.config}, error: {e}",
-                        flush=True,
-                    )
+                    self.report_compare_error(e, "download backward")
                     return False
 
             print(
@@ -320,11 +311,7 @@ class APITestPaddleDeviceVSGPU(APITestCustomDeviceVSCPU):
             return True
 
         except Exception as e:
-            print(
-                f"[compare] Comparison failed for {self.api_config.config}, error: {e}",
-                flush=True,
-            )
-            write_to_log("paddle_accuracy", self.api_config.config)
+            self.report_compare_error(e, "download compare")
             return False
 
     def test(self):

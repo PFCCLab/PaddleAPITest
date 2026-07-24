@@ -3,7 +3,7 @@ from __future__ import annotations
 import paddle
 import torch
 
-from .api_config.log_writer import write_to_log
+from .api_config.log_writer import has_terminal_log, write_to_log
 from .base import APITestBase
 
 
@@ -125,11 +125,8 @@ class APITestCustomDeviceVSCPU(APITestBase):
             return True
 
         except Exception as err:
-            error_msg = "[accuracy error]"
-            if tensor_name:
-                error_msg += f" {tensor_name}"
-            error_msg += f"\n{self.api_config.config}\n{err!s}"
-            print(error_msg, flush=True)
+            phase = f"compare {tensor_name}" if tensor_name else "compare"
+            self.report_compare_error(err, phase)
             return False
 
     def compare_outputs(self, cpu_output, custom_output):
@@ -252,8 +249,9 @@ class APITestCustomDeviceVSCPU(APITestBase):
                 print("gen_numpy_input failed")
                 return
         except Exception as err:
-            print("[numpy error]", self.api_config.config, "\n", str(err))
-            write_to_log("config_input", self.api_config.config)
+            log_type, fatal = self.report_runtime_error(err, "config_input", "input")
+            if fatal:
+                raise
             return
 
         # 5. Run API on CPU (including forward and backward)
@@ -354,7 +352,8 @@ class APITestCustomDeviceVSCPU(APITestBase):
             write_to_log("pass", self.api_config.config)
         else:
             print("[Fail]", self.api_config.config, flush=True)
-            write_to_log("paddle_accuracy", self.api_config.config)
+            if not has_terminal_log(self.api_config.config):
+                write_to_log("paddle_accuracy", self.api_config.config)
             # 生成可复现的单测文件
             if self.generate_failed_tests:
                 try:

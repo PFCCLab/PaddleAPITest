@@ -4,6 +4,7 @@ import argparse
 import copy
 import os
 import shlex
+import shutil
 import signal
 import subprocess
 import sys
@@ -17,16 +18,17 @@ import yaml
 PROJECT_ROOT = Path(__file__).resolve().parent
 DEFAULT_CONFIG = Path("test_pipeline/run_config.yaml")
 DEFAULT_RETEST_ERROR_CONFIGS = [
-    "api_config_accuracy_error.txt",
     "api_config_paddle_error.txt",
-    "api_config_timeout.txt",
-    "api_config_crash.txt",
+    "api_config_paddle_accuracy.txt",
+    "api_config_paddle_bitwise.txt",
+    "api_config_paddle_cuda.txt",
+    "api_config_paddle_crash.txt",
     "api_config_oom.txt",
-    "api_config_cuda_error.txt",
-    "api_config_match_error.txt",
-    "api_config_numpy_error.txt",
+    "api_config_timeout.txt",
     "api_config_torch_error.txt",
-    "api_config_paddle_to_torch_failed.txt",
+    "api_config_config_input.txt",
+    "api_config_config_parse.txt",
+    "api_config_config_convert.txt",
 ]
 
 TOP_LEVEL_KEYS = {"name", "runner", "env", "input", "output", "retest", "engine_args"}
@@ -56,10 +58,9 @@ ENGINE_ARG_TYPES = {
     "num_gpus": int,
     "num_workers_per_gpu": int,
     "gpu_ids": str,
-    "required_memory": (int, float),
     "test_cpu": bool,
     "use_cached_numpy": bool,
-    "use_gpu_cache_mode": bool,
+    "use_gpu_mode": bool,
     "atol": (int, float),
     "rtol": (int, float),
     "manual_threshold_config_file": str,
@@ -73,6 +74,8 @@ ENGINE_ARG_TYPES = {
     "bitwise_alignment": bool,
     "generate_failed_tests": bool,
     "exit_on_error": bool,
+    "use_dump": bool,
+    "dump_dir": str,
     "use_compute_sanitizer": bool,
     "sanitizer_command": str,
     "sanitizer_error_exitcode": int,
@@ -290,7 +293,6 @@ def apply_overrides(config: dict[str, Any], args: argparse.Namespace) -> None:
         "num_gpus": args.num_gpus,
         "num_workers_per_gpu": args.num_workers_per_gpu,
         "gpu_ids": args.gpu_ids,
-        "required_memory": args.required_memory,
     }
     for key, value in simple_engine_overrides.items():
         if value is not None:
@@ -371,7 +373,8 @@ def build_engine_command(engine: str, config: dict[str, Any], passthrough: list[
 
 
 def command_to_display(command: list[str]) -> str:
-    return shlex.join(command)
+    display_command = [Path(command[0]).name, *command[1:]] if command else []
+    return shlex.join(display_command)
 
 
 def input_value_from_config(config: dict[str, Any]) -> str | None:
@@ -441,12 +444,12 @@ def retest_error_configs(config: dict[str, Any]) -> list[str]:
 def should_skip_retest_input(path: Path, *, skip_unavailable: bool) -> bool:
     if not path.exists():
         if skip_unavailable:
-            print(f"[RETEST] 跳过不存在的失败配置: {display_path(path)}")
+            print(f"[复测] 跳过 | 输入不存在 | 输入 {display_path(path)}")
             return True
         raise FileNotFoundError(f"失败配置文件不存在: {path}")
     if path.stat().st_size == 0:
         if skip_unavailable:
-            print(f"[RETEST] 跳过空失败配置: {display_path(path)}")
+            print(f"[复测] 跳过 | 输入为空 | 输入 {display_path(path)}")
             return True
         raise ValueError(f"失败配置文件为空: {path}")
     return False
@@ -472,7 +475,7 @@ def process_running(pid: int) -> bool:
 def stop_process(pid_file: Path) -> int:
     pid = read_pid(pid_file)
     if pid is None:
-        print("未找到 PID 文件，没有正在运行的任务")
+        print(">>> 终止任务 | 无记录")
         return 0
     if process_running(pid):
         try:
@@ -484,9 +487,9 @@ def stop_process(pid_file: Path) -> int:
                 os.kill(pid, signal.SIGTERM)
             except ProcessLookupError:
                 pass
-        print(f"已终止进程组 PGID={pid}")
+        print(f">>> 终止任务 | 已终止 | PGID {pid}")
     else:
-        print(f"进程 PID={pid} 已不存在")
+        print(f">>> 终止任务 | 已结束 | PID {pid}")
     pid_file.unlink(missing_ok=True)
     return 0
 
@@ -506,30 +509,29 @@ def latest_log(log_dir: Path) -> Path | None:
 def show_status(pid_file: Path, engine: str, log_dir: Path) -> int:
     pid = read_pid(pid_file)
     if pid is None:
-        print("无运行记录（PID 文件不存在）")
+        print(">>> 运行状态 | 无记录")
+        print(f"PID文件  {display_path(pid_file)}")
         return 0
     if not process_running(pid):
-        print(f"\033[31m已结束\033[0m  PID={pid} (进程不存在)")
+        print(">>> 运行状态 | 已结束")
+        print(f"进程    PID {pid}")
         pid_file.unlink(missing_ok=True)
         return 0
 
-    print(f"\033[32m运行中\033[0m  PID={pid}  引擎={engine}")
     try:
         children_output = subprocess.check_output(["pgrep", "-P", str(pid)], text=True)
         children = sum(1 for line in children_output.splitlines() if line.strip())
     except subprocess.CalledProcessError:
         children = 0
-    print(f"  Worker 进程数: {children}")
-
     try:
         elapsed = subprocess.check_output(["ps", "-o", "etime=", "-p", str(pid)], text=True).strip()
     except subprocess.CalledProcessError:
-        elapsed = "unknown"
-    print(f"  已运行: {elapsed}")
-
+        elapsed = "未知"
     log = latest_log(log_dir)
+    print(">>> 运行状态 | 运行中")
+    print(f"进程    PID {pid} | {engine}.py | Worker {children} | 已运行 {elapsed}")
     if log:
-        print(f"  最新日志: {display_path(log)}")
+        print(f"日志    {display_path(log)}")
     return 0
 
 
@@ -548,9 +550,7 @@ def cleanup_pid_when_done(pid: int, pid_file: Path) -> None:
 
 
 def run_foreground(command: list[str], env: dict[str, str], log_file: Path) -> int:
-    print("\n\033[36m[前台模式] Ctrl+C 终止\033[0m")
-    print(f"日志同时写入: {display_path(log_file)}")
-    print("")
+    print(f"开始    日志 {display_path(log_file)} | Ctrl+C 终止")
     process = subprocess.Popen(
         command,
         cwd=PROJECT_ROOT,
@@ -559,6 +559,7 @@ def run_foreground(command: list[str], env: dict[str, str], log_file: Path) -> i
         stderr=subprocess.STDOUT,
         text=True,
         bufsize=1,
+        start_new_session=True,
     )
     with log_file.open("a", encoding="utf-8") as log_handle:
         assert process.stdout is not None
@@ -567,20 +568,47 @@ def run_foreground(command: list[str], env: dict[str, str], log_file: Path) -> i
                 print(line, end="")
                 log_handle.write(line)
         except KeyboardInterrupt:
-            for line in process.stdout:
-                print(line, end="")
-                log_handle.write(line)
+            print("\n[中断] 正在停止测试进程", flush=True)
+            try:
+                try:
+                    os.killpg(process.pid, signal.SIGINT)
+                except ProcessLookupError:
+                    pass
+                remaining_output, _ = process.communicate(timeout=30)
+            except subprocess.TimeoutExpired:
+                try:
+                    os.killpg(process.pid, signal.SIGTERM)
+                except ProcessLookupError:
+                    pass
+                try:
+                    remaining_output, _ = process.communicate(timeout=10)
+                except subprocess.TimeoutExpired:
+                    try:
+                        os.killpg(process.pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+                    remaining_output, _ = process.communicate()
+            if remaining_output:
+                print(remaining_output, end="")
+                log_handle.write(remaining_output)
+            shutil.rmtree(log_file.parent / ".tmp", ignore_errors=True)
+            return_code = process.returncode
+            return 130 if return_code is None or return_code < 0 else return_code
     return process.wait()
 
 
 def run_background(
-    command: list[str], env: dict[str, str], log_file: Path, pid_file: Path, engine: str
+    command: list[str],
+    env: dict[str, str],
+    log_file: Path,
+    pid_file: Path,
+    engine: str,
+    manage_command: str,
 ) -> int:
     if pid_file.exists():
         old_pid = read_pid(pid_file)
         if old_pid and process_running(old_pid):
-            print(f"\033[33m警告: 已有运行中的任务 PID={old_pid}\033[0m")
-            print(f"使用 --stop 终止后再启动，或删除 {display_path(pid_file)} 强制启动")
+            print(f"[警告] 任务已在运行 | PID {old_pid} | 终止 {manage_command} --stop")
             return 1
         pid_file.unlink(missing_ok=True)
 
@@ -617,31 +645,22 @@ def run_background(
         "    except FileNotFoundError:\n"
         "        pass\n"
     )
-    cleaner = subprocess.Popen(
+    subprocess.Popen(
         [sys.executable, "-c", cleaner_code, str(process.pid), str(pid_file)],
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
         start_new_session=True,
     )
-    cleaner.wait()
 
     time.sleep(1)
     if not process_running(process.pid):
-        print(f"\033[31m错误: {engine} 启动失败\033[0m")
-        print(f"查看日志: tail -50 {display_path(log_file)}")
+        print(f"[错误] 启动失败 | {engine}.py | 日志 {display_path(log_file)}")
         pid_file.unlink(missing_ok=True)
         return 1
 
-    print("")
-    print(f"\033[32m启动成功! PID={process.pid}\033[0m")
-    print("")
-    print("常用操作:")
-    print("  查看状态:  python run.py -c <config> --status")
-    print("  终止任务:  python run.py -c <config> --stop")
-    print(f"  跟踪日志:  tail -f {display_path(log_file)}")
-    print("  GPU监控:   watch -n 1 nvidia-smi")
-    print("")
-    print("进程已在后台运行，关闭终端不影响执行")
+    print(f"已启动  PID {process.pid} | 日志 {display_path(log_file)}")
+    print(f"管理    状态: {manage_command} --status | 终止: {manage_command} --stop")
+    print(f"跟踪    tail -f {display_path(log_file)}")
     return 0
 
 
@@ -676,7 +695,6 @@ def parse_args() -> argparse.Namespace:
         "--num-workers-per-gpu", type=int, help="覆盖 engine_args.num_workers_per_gpu"
     )
     parser.add_argument("--gpu-ids", help="覆盖 engine_args.gpu_ids")
-    parser.add_argument("--required-memory", type=float, help="覆盖 engine_args.required_memory")
     parser.add_argument(
         "--set-env", action="append", default=[], help="追加或覆盖环境变量 KEY=VALUE"
     )
@@ -710,40 +728,50 @@ def run_once(
         if value is not None:
             env[str(key)] = str(value)
 
-    print("── PaddleAPITest ──────────────────────────")
-    if label:
-        print(f"  轮次:    {label}")
-    print(f"  配置:    {display_path(config_path)}")
-    print(f"  引擎:    {engine}.py")
-    print(f"  输入:    {input_value_from_config(config)}")
-    print(f"  日志:    {output['log_dir']}")
     engine_args = ensure_mapping(config, "engine_args")
-    print(
-        "  GPU:     "
-        f"ids={engine_args.get('gpu_ids', '')}  "
-        f"workers/gpu={engine_args.get('num_workers_per_gpu', '')}"
-    )
-    if engine_args.get("timeout") is not None:
-        print(f"  超时:    {engine_args['timeout']}s")
-    print(f"  命令:    {command_to_display(command)}")
-    print("────────────────────────────────────────────")
-
     dry_run = bool(runner.get("dry_run"))
     if dry_run:
-        print("")
-        print("[DRY-RUN] 最终命令:")
-        print(f"  {command_to_display(command)}")
-        if env_config:
-            print("[DRY-RUN] 环境变量:")
-            for key in sorted(env_config):
-                print(f"  {key}={env_config[key]}")
+        print(f">>> 模拟运行 | {engine}.py | 配置 {display_path(config_path)}")
+        print(f"命令    {command_to_display(command)}")
+        environment = [
+            f"{key}={shlex.quote(str(env_config[key]))}"
+            for key in sorted(env_config)
+            if env_config[key] is not None
+        ]
+        if environment:
+            print(f"环境    {' | '.join(environment)}")
         return 0
 
     log_file = prepare_log_file(log_dir)
     foreground = force_foreground or bool(runner.get("foreground"))
+    mode = "前台" if foreground else "后台"
+    label_field = f" | 轮次 {label}" if label else ""
+    print(f">>> 启动测试 | {engine}.py | {mode} | 配置 {display_path(config_path)}{label_field}")
+    print(f"输入    {input_value_from_config(config)}")
+    print(f"日志    {output['log_dir']}")
+    hidden_options = {
+        "--api_config",
+        "--api_config_file",
+        "--api_config_file_pattern",
+        "--log_dir",
+        "--_sanitizer_child",
+    }
+    if engine_args.get("num_gpus") == -1:
+        hidden_options.add("--num_gpus")
+    if not engine_args.get("use_compute_sanitizer"):
+        hidden_options.update(
+            {"--use_compute_sanitizer", "--sanitizer_command", "--sanitizer_error_exitcode"}
+        )
+    display_args = [
+        shlex.quote(arg.replace("=True", "=true").replace("=False", "=false"))
+        for arg in command[2:]
+        if arg != "--" and arg.partition("=")[0] not in hidden_options
+    ]
+    print(f"参数    {' | '.join(display_args)}")
     if foreground:
         return run_foreground(command, env, log_file)
-    return run_background(command, env, log_file, pid_file, engine)
+    manage_command = f"python run.py -c {shlex.quote(display_path(config_path))}"
+    return run_background(command, env, log_file, pid_file, engine, manage_command)
 
 
 def run_retest_plan(config_path: Path, config: dict[str, Any], passthrough: list[str]) -> int:
