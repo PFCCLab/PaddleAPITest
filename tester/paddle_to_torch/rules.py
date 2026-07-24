@@ -7199,12 +7199,154 @@ class CopsFusedLinearParamGradAddRule(BaseRule):
     """paddle._C_ops.fused_linear_param_grad_add(x, dout, dweight, dbias, multi_prec, has_bias)
 
     Computes dweight += x.T @ dout  (and optionally dbias += dout.sum(0)).
-    Prefer Torch's linear backward op for the raw param gradients, then apply the
-    Paddle fused-add and dtype semantics.
+
+    Reference implementation is selected via PADDLEAPITEST_FLPGA_IMPL env var:
+      - "te"    (default): Transformer Engine general_gemm (BF16 + FP32 accum)
+      - "apex":            Apex/Megatron wgrad_gemm_accum_fp32
+      - "torch":           aten.linear_backward + matmul fallback
     """
 
     def apply(self, paddle_api: str) -> ConvertResult:
-        core = """
+        import os
+
+        impl = os.environ.get("PADDLEAPITEST_FLPGA_IMPL", "te")
+        if impl == "apex":
+            core = self._wgrad_gemm_accum_fp32_code()
+        elif impl == "torch":
+            core = self._torch_code()
+        else:
+            core = self._te_general_gemm_code()
+        code = Code(core=core.splitlines())
+        return ConvertResult.success(paddle_api, code, is_torch_corresponding=False)
+
+    @staticmethod
+    def _te_general_gemm_code() -> str:
+        return """
+import os as _os
+import ctypes as _ctypes
+import pathlib as _pathlib
+
+x               = locals().get("x")
+dout            = locals().get("dout")
+dweight         = locals().get("dweight")
+dbias           = locals().get("dbias")
+multi_precision = locals().get("multi_precision", False)
+has_bias        = locals().get("has_bias", False)
+
+# TE general_gemm only supports BF16 input + FP32 accumulation
+if x.dtype != torch.bfloat16:
+    raise RuntimeError(
+        f"PADDLEAPITEST_FLPGA_IMPL=te requires bfloat16 input, got {x.dtype}"
+    )
+
+# Preload libcublasLt for Transformer Engine
+_ld_preload = _os.environ.get("LD_PRELOAD", "")
+if "libcublasLt.so" not in _ld_preload:
+    _candidates = [
+        _os.environ.get("TE_CUBLASLT_PRELOAD"),
+        "/usr/local/cuda/lib64/libcublasLt.so.13",
+        "/usr/local/cuda-13.2/targets/x86_64-linux/lib/libcublasLt.so.13.3.0.5",
+        "/usr/local/cuda-13.2/targets/x86_64-linux/lib/libcublasLt.so.13",
+    ]
+    for _cand in _candidates:
+        if _cand and _pathlib.Path(_cand).exists():
+            try:
+                _ctypes.CDLL(_cand, mode=_ctypes.RTLD_GLOBAL)
+                break
+            except Exception:
+                pass
+
+try:
+    from transformer_engine.pytorch.cpp_extensions.gemm import general_gemm as _te_gemm
+except Exception as _err:
+    raise RuntimeError(
+        "PADDLEAPITEST_FLPGA_IMPL=te: cannot import "
+        "transformer_engine.pytorch.cpp_extensions.gemm.general_gemm; "
+        f"error={type(_err).__name__}: {_err}"
+    ) from _err
+
+_raw = _te_gemm(x, dout, out_dtype=torch.float32, layout="NT")
+_gemm_out = _raw[0] if isinstance(_raw, tuple) else _raw
+new_dweight = _gemm_out.t()
+
+if dweight is not None:
+    new_dweight = new_dweight + dweight.float()
+    dweight_out = new_dweight.to(dweight.dtype).detach()
+else:
+    dweight_out = new_dweight.detach()
+
+if has_bias:
+    dout_f = dout.float() if multi_precision else dout
+    new_dbias = dout_f.reshape(-1, dout_f.shape[-1]).sum(0)
+    if dbias is not None:
+        dbias_sum = new_dbias + dbias.float() if multi_precision else new_dbias + dbias
+        dbias_out = dbias_sum.to(dbias.dtype).detach()
+    else:
+        dbias_out = new_dbias.detach()
+else:
+    dout_f = dout.float() if multi_precision else dout
+    dbias_out = torch.zeros(dout_f.shape[-1], dtype=dout_f.dtype, device=dout_f.device)
+
+torch.cuda.synchronize()
+result = [dweight_out, dbias_out]
+"""
+
+    @staticmethod
+    def _wgrad_gemm_accum_fp32_code() -> str:
+        return """
+x               = locals().get("x")
+dout            = locals().get("dout")
+dweight         = locals().get("dweight")
+dbias           = locals().get("dbias")
+multi_precision = locals().get("multi_precision", False)
+has_bias        = locals().get("has_bias", False)
+
+# wgrad_gemm_accum_fp32 only supports BF16 input + FP32 dweight
+if x.dtype != torch.bfloat16:
+    raise RuntimeError(
+        f"PADDLEAPITEST_FLPGA_IMPL=apex requires bfloat16 input, got {x.dtype}"
+    )
+
+try:
+    import fused_weight_gradient_mlp_cuda as _wgrad_ext
+except Exception as _err:
+    raise RuntimeError(
+        "PADDLEAPITEST_FLPGA_IMPL=apex: cannot import fused_weight_gradient_mlp_cuda; "
+        f"error={type(_err).__name__}: {_err}"
+    ) from _err
+
+# wgrad extension uses PyTorch Linear weight layout [N, K] and computes dout.T @ x.
+# Our target dweight layout is [K, N], so we pass dweight.t() as main_grad,
+# then transpose back after the in-place accumulation.
+if dweight is not None:
+    _main_grad = dweight.float().t().contiguous()
+else:
+    _main_grad = torch.zeros(
+        (dout.shape[-1], x.shape[-1]), dtype=torch.float32, device=x.device
+    )
+
+_wgrad_ext.wgrad_gemm_accum_fp32(x, dout, _main_grad)
+torch.cuda.synchronize()
+dweight_out = _main_grad.t().contiguous().to(dweight.dtype if dweight is not None else torch.float32).detach()
+
+if has_bias:
+    dout_f = dout.float() if multi_precision else dout
+    new_dbias = dout_f.reshape(-1, dout_f.shape[-1]).sum(0)
+    if dbias is not None:
+        dbias_sum = new_dbias + dbias.float() if multi_precision else new_dbias + dbias
+        dbias_out = dbias_sum.to(dbias.dtype).detach()
+    else:
+        dbias_out = new_dbias.detach()
+else:
+    dout_f = dout.float() if multi_precision else dout
+    dbias_out = torch.zeros(dout_f.shape[-1], dtype=dout_f.dtype, device=dout_f.device)
+
+result = [dweight_out, dbias_out]
+"""
+
+    @staticmethod
+    def _torch_code() -> str:
+        return """
 x               = locals().get("x")
 dout            = locals().get("dout")
 dweight         = locals().get("dweight")
@@ -7260,8 +7402,6 @@ else:
 
 result = [dweight_out, dbias_out]
 """
-        code = Code(core=core.splitlines())
-        return ConvertResult.success(paddle_api, code, is_torch_corresponding=False)
 
 
 class CopsGaussianRule(BaseRule):
