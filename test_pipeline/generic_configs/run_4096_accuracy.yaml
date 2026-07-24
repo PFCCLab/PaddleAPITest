@@ -5,13 +5,15 @@ name: run_4096_accuracy
 runner:
   engine: engineV4
   foreground: true
+env:
+  PADDLEAPITEST_GPU_MEMORY_POLICY: aggressive
 input:
   api_config_file: "${APITEST_MODEL}/accuracy/4096.txt"
 output:
   log_dir: "test_${APITEST_MODEL}_log_4096_accuracy"
 engine_args:
   accuracy_stable: true
-  use_cached_numpy: true
+  use_gpu_mode: true
   num_gpus: -1
-  num_workers_per_gpu: 8
+  num_workers_per_gpu: 4
   timeout: 1200

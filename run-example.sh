@@ -3,11 +3,8 @@
 # Script to run engineV2.py
 # Usage: ./<当前脚本名>
 
-SCRIPT_FILE="${BASH_SOURCE[0]##*/}"
-RUN_COMMAND="./${SCRIPT_FILE}"
-
 if [[ ! -f "engineV2.py" || ! -d "tester" ]]; then
-    echo "错误: 请在 PaddleAPITest 项目根目录执行此脚本"
+    echo "[错误] 请在 PaddleAPITest 项目根目录执行 | 缺少 engineV2.py 或 tester/"
     exit 1
 fi
 
@@ -22,6 +19,12 @@ export FLAGS_check_cuda_error=true
 export FLAGS_alloc_fill_value=255
 export FLAGS_check_nan_inf=true
 # export FLAGS_use_accuracy_compatible_kernel=true
+
+# ── PaddleAPITest 运行策略 ────────────────────────────────────
+# PADDLEAPITEST_IMPL: FP8 blockwise 参考实现，torch（默认）| te。
+# PADDLEAPITEST_GPU_MEMORY_POLICY: GPU mode 显存策略，conservative（默认）| aggressive。
+# export PADDLEAPITEST_IMPL=torch
+# export PADDLEAPITEST_GPU_MEMORY_POLICY=conservative
 
 # ── 输入输出 ──────────────────────────────────────────────────
 # input 三选一：--api_config / --api_config_file / --api_config_file_pattern
@@ -112,9 +115,35 @@ TIME_OUT_ARGS=(
 # - --_sanitizer_child=True: engineV4 内部子进程参数，普通运行不要配置。
 
 mkdir -p "$LOG_DIR" || {
-    echo "错误：无法创建日志目录 '$LOG_DIR'"
+    echo "[错误] 无法创建日志目录 | 日志 $LOG_DIR"
     exit 1
 }
+
+format_option() {
+    local option="$1"
+    case "$option" in
+        *=True) option="${option%=True}=true" ;;
+        *=False) option="${option%=False}=false" ;;
+    esac
+    printf '%s' "$option"
+}
+
+COMPACT_OPTIONS=()
+for option in "${TEST_MODE_ARGS[@]}" "${TEST_PARAM_ARGS[@]}"; do
+    COMPACT_OPTIONS+=("$(format_option "$option")")
+done
+COMPACT_OPTIONS+=(
+    "--gpu_ids=$GPU_IDS"
+    "--num_workers_per_gpu=$NUM_WORKERS_PER_GPU"
+    "--timeout=$TIME_OUT"
+)
+printf -v OPTIONS_TEXT ' | %s' "${COMPACT_OPTIONS[@]}"
+OPTIONS_TEXT="${OPTIONS_TEXT:3}"
+
+echo ">>> 启动测试 | engineV2.py | 后台"
+echo "输入    $FILE_INPUT"
+echo "日志    $LOG_DIR"
+echo "参数    $OPTIONS_TEXT"
 
 # 执行程序
 LOG_FILE="$LOG_DIR/log_$(date +%Y%m%d_%H%M%S).log"
@@ -130,16 +159,13 @@ PYTHON_PID=$!
 
 sleep 1
 if ! ps -p "$PYTHON_PID" > /dev/null; then
-    echo "错误：engineV2 启动失败，请检查 $LOG_FILE"
+    echo "[错误] 启动失败 | engineV2.py | 日志 $LOG_FILE"
     exit 1
 fi
 
-echo -e "\n\033[32m执行中... 另开终端运行监控:\033[0m"
-echo -e "1. GPU使用:   watch -n 1 nvidia-smi"
-echo -e "2. 日志目录:  ls -lh $LOG_DIR"
-echo -e "3. 详细日志:  tail -f $LOG_FILE"
-echo -e "4. 终止任务:  kill $PYTHON_PID  # ${RUN_COMMAND} 没有 --stop 管理逻辑"
-echo -e "\n进程已在后台运行，关闭终端不会影响进程执行"
+echo "已启动  PID $PYTHON_PID | 日志 $LOG_FILE"
+echo "管理    终止: kill $PYTHON_PID"
+echo "跟踪    tail -f $LOG_FILE"
 
 exit 0
 

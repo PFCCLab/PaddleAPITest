@@ -1,0 +1,15 @@
+paddlepaddle-gpu
+torch==2.12.0
+torchvision
+torchaudio
+numpy
+pandas
+func_timeout
+pebble
+nvidia-ml-py
+pyyaml
+typer
+tqdm
+
+# Optional for Transformer Engine test cases:
+# uv pip install --no-build-isolation "transformer_engine[pytorch]"

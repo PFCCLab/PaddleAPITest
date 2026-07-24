@@ -27,7 +27,7 @@ class APITestCINNVSDygraph(APITestBase):
                 print("gen_numpy_input failed", flush=True)
                 return
         except Exception as err:
-            log_type, fatal = self.report_runtime_error(err, "config_input", "gen_numpy_input")
+            log_type, fatal = self.report_runtime_error(err, "config_input", "input")
             if fatal:
                 raise
             return
@@ -337,7 +337,8 @@ class APITestCINNVSDygraph(APITestBase):
                 try:
                     self.paddle_assert_accuracy(dygraph_item, static_item)
                 except Exception as err:
-                    phase = f"{backward_str.strip()} idx={i}" if backward_str else f"idx={i}"
+                    position = f"tensor {i + 1}/{len(dygraph_output)}"
+                    phase = f"{backward_str.strip()} | {position}" if backward_str else position
                     self.report_compare_error(err, phase)
                     return False
         elif dygraph_output is None and static_output is None:

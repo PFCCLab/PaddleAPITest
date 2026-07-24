@@ -2,7 +2,7 @@
 
 # paddle errors which will be ignored and considered as pass
 # paddle_error_dismiss: disabled — (InvalidArgument)/(PreconditionNotMet) → config_input,
-#   (Unimplemented) → skip are now handled in classify_runtime_error() in base.py.
+#   (Unimplemented) → skip are now handled by classify_runtime_error() and APITestBase.report_runtime_error().
 #   Rules kept here for reference.
 # paddle_error_dismiss:
 #   # API: "error_message"
