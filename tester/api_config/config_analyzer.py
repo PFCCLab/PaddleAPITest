@@ -509,7 +509,16 @@ class TensorConfig:
             self.dtype = "float32"
 
         if self.numpy_tensor is None:
-            if api_config.api_name in {"paddle.Tensor.view", "paddle.view"}:
+            if (
+                original_dtype == "int32"
+                and api_config.api_name == "paddle.incubate.nn.functional.fused_act_dequant"
+                and self.check_arg(api_config, 1, "x_scale")
+            ):
+                # Each int32 packs four UE8M0 biased exponents. Keep the decoded
+                # scales in [2^-7, 1] so finite E4M3 inputs remain finite in BF16.
+                exponent = numpy.random.randint(120, 128, size=self.shape, dtype=numpy.int32)
+                self.numpy_tensor = exponent * numpy.int32(0x01010101)
+            elif api_config.api_name in {"paddle.Tensor.view", "paddle.view"}:
                 # Reinterpret-cast view from uint8: pack finite float bits so check_numerics
                 # does not trip on random NaN/Inf bit patterns.
                 if self.check_arg(api_config, 0, "x") and original_dtype == "uint8":

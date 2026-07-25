@@ -10,7 +10,11 @@ from .base import APITestBase
 
 class APITestPaddleOnly(APITestBase):
     def __init__(self, api_config, **kwargs):
-        super().__init__(api_config, use_torch=False)
+        super().__init__(
+            api_config,
+            use_torch=False,
+            runtime_config=kwargs.get("runtime_config"),
+        )
         self.test_amp = kwargs.get("test_amp", False)
 
     # @func_set_timeout(600)

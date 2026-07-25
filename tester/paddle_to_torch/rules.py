@@ -590,6 +590,8 @@ def convert_seq2tensor_wrap_scalar(tlist):
         py2torch_type_mapping = {float: torch.float64, int: torch.int64, bool: torch.bool}
         dtype = py2torch_type_mapping[type(tlist)]
         return torch.tensor([tlist], dtype=dtype)
+    elif isinstance(tlist, torch.Tensor):
+        return tlist
     else:
         return torch.tensor(tlist)
 

@@ -763,9 +763,9 @@ def append_case_end_to_worker_log(pid, status, case_id=None, api_config_str=None
     try:
         log_file = TMP_LOG_PATH / f"log_{pid}.log"
         log_file.parent.mkdir(parents=True, exist_ok=True)
-        with log_file.open("a", encoding="utf-8") as f:
-            f.write(f"{end_line}\n")
-        return log_file.stat().st_size
+        with log_file.open("ab") as f:
+            f.write(f"\n{end_line}\n\n".encode())
+            return f.tell()
     except Exception as err:
         print(f"Error writing case end to worker log {pid}: {err}", flush=True)
         return None

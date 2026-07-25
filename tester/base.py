@@ -1095,6 +1095,21 @@ class APITestBase:
                 else:
                     raise ValueError("outputs format not support")
 
+        paddle_autograd_dtypes = {
+            "float16",
+            "float32",
+            "float64",
+            "bfloat16",
+            "complex64",
+            "complex128",
+        }
+        result_outputs = [
+            output
+            for output in result_outputs
+            if not output.stop_gradient
+            and str(output.dtype).split(".")[-1] in paddle_autograd_dtypes
+        ]
+
         result_outputs_grads = []
         if len(self.outputs_grad_numpy) == 0 and len(self.outputs_grad_paddleonly) == 0:
             for i, output in enumerate(result_outputs):
@@ -1158,6 +1173,8 @@ class APITestBase:
                     result_outputs.append(output)
                 else:
                     raise ValueError("outputs format not support")
+
+        result_outputs = [output for output in result_outputs if output.requires_grad]
 
         result_outputs_grads = []
         if len(self.outputs_grad_numpy) == 0:

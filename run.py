@@ -659,7 +659,8 @@ def run_background(
         return 1
 
     print(f"已启动  PID {process.pid} | 日志 {display_path(log_file)}")
-    print(f"管理    状态: {manage_command} --status | 终止: {manage_command} --stop")
+    print(f"状态    {manage_command} --status")
+    print(f"终止    {manage_command} --stop")
     print(f"跟踪    tail -f {display_path(log_file)}")
     return 0
 
