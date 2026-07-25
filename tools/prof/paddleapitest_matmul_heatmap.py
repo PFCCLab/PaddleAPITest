@@ -157,20 +157,20 @@ def restore_patches() -> None:
         setattr(cls, name, value)
 
 
-def init_log_writer(output_dir: Path) -> None:
+def init_logging(output_dir: Path) -> None:
     try:
-        from tester.api_config import log_writer
+        from tester.api_config.logging import init_log
     except Exception as err:
-        print(f"[warn] failed to import log_writer: {err}")
+        print(f"[warn] failed to import logging: {err}")
         return
 
     log_dir = output_dir / "paddleapitest_logs"
     log_dir.mkdir(parents=True, exist_ok=True)
 
     try:
-        log_writer.init_log(str(log_dir), worker_tmp_logs=True)
+        init_log(str(log_dir))
     except Exception as err:
-        print(f"[warn] failed to initialize log_writer: {err}")
+        print(f"[warn] failed to initialize logging: {err}")
 
 
 def install_stage_hooks(recorder: StageRecorder, mode: str) -> None:
@@ -568,7 +568,7 @@ def main() -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
 
     set_device(args.device)
-    init_log_writer(output_dir)
+    init_logging(output_dir)
 
     recorder = StageRecorder()
     install_stage_hooks(recorder, args.mode)

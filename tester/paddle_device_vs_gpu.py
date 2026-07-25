@@ -9,7 +9,7 @@ from pathlib import Path
 import numpy as np
 import paddle
 
-from .api_config.log_writer import write_to_log
+from .api_config.logging.log_worker import write_to_log
 from .paddle_device_vs_cpu import APITestCustomDeviceVSCPU
 
 

@@ -6,8 +6,6 @@ __all__ = [
     "TensorConfig",
     "analyse_configs",
     "cached_numpy",
-    "get_cfg",
-    "set_cfg",
 ]
 
 if TYPE_CHECKING:
@@ -18,7 +16,6 @@ if TYPE_CHECKING:
         analyse_configs,
         cached_numpy,
     )
-    from .log_writer import get_cfg, set_cfg
 
 
 def __getattr__(name: str) -> Any:
@@ -45,13 +42,4 @@ def __getattr__(name: str) -> Any:
         from .config_analyzer import cached_numpy
 
         return cached_numpy
-    elif name == "get_cfg":
-        from .log_writer import get_cfg
-
-        return get_cfg
-    elif name == "set_cfg":
-        from .log_writer import set_cfg
-
-        return set_cfg
-
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

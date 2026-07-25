@@ -10,7 +10,7 @@ import re
 import shutil
 from pathlib import Path
 
-from tester.api_config.log_writer import (
+from tester.api_config.logging.log_schema import (
     CASE_BEGIN_TAG,
     CASE_END_TAG,
     LOG_PREFIXES,

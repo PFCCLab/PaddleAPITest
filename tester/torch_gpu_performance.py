@@ -5,7 +5,7 @@ import time
 import torch
 
 from .api_config.config_analyzer import TensorConfig
-from .api_config.log_writer import write_to_log
+from .api_config.logging.log_worker import write_to_log
 from .base import APITestBase
 from .paddle_to_torch import adaptive_workspace_bytes, get_converter
 

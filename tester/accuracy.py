@@ -8,7 +8,7 @@ import paddle
 import torch
 import yaml
 
-from .api_config.log_writer import write_to_log
+from .api_config.logging.log_worker import write_to_log
 from .base import APITestBase, gpu_mode_maybe_empty_cache
 from .paddle_to_torch import adaptive_workspace_bytes, get_converter
 

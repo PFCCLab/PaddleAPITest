@@ -80,3 +80,25 @@ def runtime_config_for_gpu(options, gpu_id):
         getattr(options, "gpu_workers_per_gpu_map", {}) or {},
         getattr(options, "gpu_total_memory_map", {}) or {},
     )
+
+
+def limit_worker_layout(available_gpus, max_workers_per_gpu, pending_cases):
+    """按待运行 case 数 breadth-first 裁剪每张 GPU 的 worker 数。"""
+    if pending_cases <= 0:
+        return [], {}
+    limited = dict.fromkeys(available_gpus, 0)
+    remaining = pending_cases
+    while remaining > 0:
+        allocated = False
+        for gpu_id in available_gpus:
+            if limited[gpu_id] >= max_workers_per_gpu[gpu_id]:
+                continue
+            limited[gpu_id] += 1
+            remaining -= 1
+            allocated = True
+            if remaining == 0:
+                break
+        if not allocated:
+            break
+    limited = {gpu_id: workers for gpu_id, workers in limited.items() if workers}
+    return list(limited), limited

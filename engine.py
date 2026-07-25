@@ -31,9 +31,13 @@ from tester import (
     APITestPaddleOnly,
     APITestPaddleTorchGPUPerformance,
     APITestTorchGPUPerformance,
-    set_cfg,
 )
-from tester.api_config.log_writer import close_process_files, read_log, write_to_log
+from tester.api_config.logging.log_runtime import (
+    close_process_files,
+    configure_direct_results,
+    read_log,
+)
+from tester.api_config.logging.log_worker import write_to_log
 
 
 def parse_bool(value):
@@ -129,7 +133,7 @@ def main():
         help="Whether to exit the process when a paddle_error occurs.",
     )
     options = parser.parse_args()
-    set_cfg(options)  # Set the command line arguments in the config module
+    configure_direct_results(options.id)
 
     if options.test_cpu:
         paddle.device.set_device("cpu")

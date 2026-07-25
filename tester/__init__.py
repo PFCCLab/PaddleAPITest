@@ -18,9 +18,7 @@ __all__ = [
     "TensorConfig",
     "analyse_configs",
     "cached_numpy",
-    "get_cfg",
     "paddle_to_torch",
-    "set_cfg",
 ]
 
 if TYPE_CHECKING:
@@ -33,8 +31,6 @@ if TYPE_CHECKING:
         TensorConfig,
         analyse_configs,
         cached_numpy,
-        get_cfg,
-        set_cfg,
     )
     from .base import APITestBase
     from .paddle_cinn_vs_dygraph import APITestCINNVSDygraph
@@ -114,13 +110,5 @@ def __getattr__(name: str) -> Any:
         from .api_config import cached_numpy
 
         return cached_numpy
-    elif name == "get_cfg":
-        from .api_config import get_cfg
-
-        return get_cfg
-    elif name == "set_cfg":
-        from .api_config import set_cfg
-
-        return set_cfg
 
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

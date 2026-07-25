@@ -3,7 +3,7 @@ from __future__ import annotations
 import paddle
 from paddle.jit import to_static
 
-from .api_config.log_writer import write_to_log
+from .api_config.logging.log_worker import write_to_log
 from .base import CUDA_ERROR, CUDA_OOM, APITestBase
 
 

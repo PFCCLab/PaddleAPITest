@@ -16,11 +16,9 @@ from .api_config.config_analyzer import (
     get_cached_numpy_array,
 )
 from .api_config.dump_writer import DEFAULT_DUMP_DIR, DumpContext, dump_enabled
-from .api_config.log_writer import (
-    MAX_CSV_CONFIG_LENGTH,
-    log_accuracy_tolerance,
-    write_to_log,
-)
+from .api_config.logging.log_comparison import log_accuracy_tolerance
+from .api_config.logging.log_schema import MAX_CSV_CONFIG_LENGTH
+from .api_config.logging.log_worker import write_to_log
 from .runtime_config import TestRuntimeConfig
 
 with open("tester/base_config.yaml", encoding="utf-8") as f:

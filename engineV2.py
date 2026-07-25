@@ -43,10 +43,18 @@ from tester.api_config.dump_writer import (
     record_dump_terminal_status,
     resolve_dump_options,
 )
-from tester.api_config.log_writer import *
+from tester.api_config.logging import (
+    init_log,
+    log_aggregation,
+    log_report,
+    log_retest,
+    log_runtime,
+    log_worker,
+)
 from tester.runtime_config import (
     GPU_MEMORY_POLICY_ENV,
     TestRuntimeConfig,
+    limit_worker_layout,
     resolve_gpu_memory_policy,
     runtime_config_for_gpu,
 )
@@ -79,9 +87,6 @@ DEVICE_COUNT = None  # total number of devices
 _MEM_SNAPSHOT = None  # dict: gpu_id -> (total_gb, used_gb)
 _MEM_SNAPSHOT_TS = 0.0
 _MEM_SNAPSHOT_TTL = 2.0  # seconds — snapshot cache ttl
-FATAL_CUDA_EXIT_CODE = 99
-FATAL_OOM_EXIT_CODE = 98
-FATAL_TORCH_EXIT_CODE = 97
 MEMORY_WAIT_SECONDS = 10
 MEMORY_WAIT_LOG_INTERVAL = 60
 
@@ -526,7 +531,7 @@ def check_gpu_memory(gpu_ids, num_workers_per_gpu):
 
 
 def init_worker_gpu(gpu_worker_list, lock, available_gpus, max_workers_per_gpu, options):
-    init_log(options.log_dir, worker_tmp_logs=True)
+    init_log(options.log_dir)
     my_pid = os.getpid()
 
     def pid_exists(pid):
@@ -554,7 +559,7 @@ def init_worker_gpu(gpu_worker_list, lock, available_gpus, max_workers_per_gpu, 
             gpu_worker_list[assigned_gpu].append(my_pid)
 
         os.environ["CUDA_VISIBLE_DEVICES"] = str(assigned_gpu)
-        with suppress_startup_output():
+        with log_worker.suppress_startup_output():
             import paddle
 
             globals()["paddle"] = paddle
@@ -575,14 +580,14 @@ def init_worker_gpu(gpu_worker_list, lock, available_gpus, max_workers_per_gpu, 
 
             def signal_handler(*args):
                 _clear_device_cache(options)
-                restore_stdio()
-                close_process_files()
+                log_worker.restore_stdio()
+                log_runtime.close_process_files()
                 sys.exit(0)
 
             signal.signal(signal.SIGINT, signal_handler)
             signal.signal(signal.SIGTERM, signal_handler)
 
-            redirect_stdio()
+            log_worker.redirect_stdio()
 
     except Exception as e:
         print(f"[worker] INIT_FAILED | PID {my_pid} | {e}", flush=True)
@@ -594,7 +599,7 @@ def run_test_case(api_config_str, options):
     completion = [os.getpid(), None]
     started_at = time.monotonic()
     gpu_id = int(os.environ.get("CUDA_VISIBLE_DEVICES", "0").split(",")[0])
-    case_id = write_case_begin(
+    log_worker.write_case_begin(
         api_config_str,
         worker_pid=os.getpid(),
         gpu=gpu_id,
@@ -617,7 +622,7 @@ def run_test_case(api_config_str, options):
             api_config = APIConfig(api_config_str)
         except Exception as err:
             print(f"[config_parse] {api_config_str} {err!s}", flush=True)
-            write_terminal_log("config_parse", api_config_str)
+            log_worker.write_to_log("config_parse", api_config_str)
             case_status = "error"
             return completion
 
@@ -630,11 +635,9 @@ def run_test_case(api_config_str, options):
                 case.run_with_dump()
             else:
                 case.test()
-            if has_terminal_log(api_config_str):
-                write_checkpoint(api_config_str)
         except Exception as err:
             err_msg = str(err).lower()
-            terminal_log_type = get_terminal_log_type(api_config_str)
+            terminal_log_type = log_worker.get_terminal_log_type(api_config_str)
             oom_markers = (
                 "cuda out of memory",
                 "out of memory error",
@@ -654,29 +657,29 @@ def run_test_case(api_config_str, options):
                 "invalid configuration argument",
                 "invalid resource handle",
             )
-            exit_code = None
+            fatal_log_type = None
             if any(marker in err_msg for marker in oom_markers):
-                exit_code = FATAL_OOM_EXIT_CODE
+                fatal_log_type = "oom"
             elif terminal_log_type == "torch_error" and any(
                 marker in err_msg for marker in cuda_markers
             ):
-                exit_code = FATAL_TORCH_EXIT_CODE
+                fatal_log_type = "torch_error"
             elif any(marker in err_msg for marker in cuda_markers):
-                exit_code = FATAL_CUDA_EXIT_CODE
-            if exit_code is not None:
+                fatal_log_type = "paddle_cuda"
+            if fatal_log_type is not None:
+                exit_code = log_worker.fatal_exit_code(
+                    fatal_log_type, terminal_log_type == fatal_log_type
+                )
                 if dump_enabled():
                     record_dump_terminal_status("engine_fatal", exit_code=exit_code, error=str(err))
-                if has_terminal_log(api_config_str):
-                    write_checkpoint(api_config_str)
                 try:
-                    close_process_files()
+                    log_runtime.close_process_files()
                 finally:
                     try:
-                        restore_stdio()
+                        log_worker.restore_stdio()
                     finally:
                         os._exit(exit_code)
-            if has_terminal_log(api_config_str):
-                write_checkpoint(api_config_str)
+            if terminal_log_type is not None:
                 return completion
             # if not fatal error, subprocess will be alive and report error
             print(f"[error] {api_config_str}: {err}", flush=True)
@@ -716,9 +719,8 @@ def run_test_case(api_config_str, options):
         case_status = "error"
         raise
     finally:
-        completion[1] = write_case_end(
+        completion[1] = log_worker.write_case_end(
             case_status,
-            case_id=case_id,
             api_config_str=api_config_str,
             duration_ms=round((time.monotonic() - started_at) * 1000),
         )
@@ -960,7 +962,7 @@ def main():
     if options.random_seed != parser.get_default("random_seed"):
         np.random.seed(options.random_seed)
     try:
-        options.retest_types = parse_retest_types(options.retest)
+        options.retest_types = log_retest.parse_retest_types(options.retest)
     except ValueError as err:
         _print_argument(ARGUMENT_ERROR_PREFIX, str(err))
         return
@@ -995,7 +997,7 @@ def main():
     if len([m for m in mode if m is True]) != 1:
         _print_argument(ARGUMENT_ERROR_PREFIX, TEST_MODE_ERROR)
         return
-    print_run_header(options, paddle_version)
+    log_report.print_run_header(options, paddle_version)
     if options.use_dump:
         if not options.api_config or options.api_config_file or options.api_config_file_pattern:
             _print_argument(ARGUMENT_ERROR_PREFIX, "dump only supports single --api_config runs")
@@ -1091,22 +1093,22 @@ def main():
 
         globals().update(_load_test_classes(options))
 
-        init_log(options.log_dir, worker_tmp_logs=True)
+        init_log(options.log_dir)
 
         options.api_config = options.api_config.strip()
         single_case_error = None
         try:
             run_test_case(options.api_config, options)
+            log_worker.write_to_log("checkpoint", options.api_config)
         except Exception as err:
             single_case_error = err
             print(f"[error] {options.api_config}: {err}", flush=True)
         finally:
-            close_process_files()
-            log_counts = aggregate_logs(end=True)
-            completed_case = (log_counts or {}).get("checkpoint", 0)
+            log_runtime.close_process_files()
+            log_counts = log_aggregation.finalize_logs()
+            completed_case = log_counts.get("checkpoint", 0)
             remaining_case = max(1 - completed_case, 0)
-            print_log_info(remaining_case, log_counts)
-            print_run_footer(
+            log_report.print_run_footer(
                 1,
                 completed_case,
                 remaining_case,
@@ -1144,24 +1146,31 @@ def main():
                 return
             config_files = [options.api_config_file]
 
-        init_log(options.log_dir, worker_tmp_logs=True)
+        init_log(options.log_dir)
 
         # when engineV2 was interrupted, resume from .tmp dir
-        aggregate_logs(cleanup=True)
-        removed_stale_logs = 0 if options.retest else cleanup_uncheckpointed_result_logs()
+        if not log_aggregation.recover_logs():
+            _print_argument(
+                ARGUMENT_ERROR_PREFIX,
+                "failed to recover worker logs; fix the reported log error before retrying",
+            )
+            return
+        removed_stale_logs = (
+            0 if options.retest else log_retest.cleanup_uncheckpointed_result_logs()
+        )
 
         if options.retest:
             try:
-                api_configs = prepare_retest(options.retest_types)
+                api_configs = log_retest.prepare_retest(options.retest_types)
             except (OSError, ValueError) as err:
                 _print_argument(ARGUMENT_ERROR_PREFIX, str(err))
                 return
-            removed_stale_logs = cleanup_uncheckpointed_result_logs()
+            removed_stale_logs = log_retest.cleanup_uncheckpointed_result_logs()
             api_config_count = len(api_configs)
             skipped_non_config = 0
-            finish_configs = read_log("checkpoint")
+            finish_configs = log_runtime.read_log("checkpoint")
         else:
-            finish_configs = read_log("checkpoint")
+            finish_configs = log_runtime.read_log("checkpoint")
             api_config_count = 0
             skipped_non_config = 0
             api_configs = set()
@@ -1186,7 +1195,7 @@ def main():
         api_configs = sorted(api_configs - finish_configs)
         all_case = len(api_configs)
         finish_case = api_config_count - all_case
-        print_preparing_summary(
+        log_report.print_preparing_summary(
             read_count,
             skipped_non_config,
             dup_case,
@@ -1200,12 +1209,11 @@ def main():
 
         if not api_configs:
             if options.retest:
-                finish_retest()
-            print_running_header()
+                log_retest.finish_retest()
+            print("\n--- RUNNING")
             print("Workers: skipped | 0 pending", flush=True)
-            log_counts = aggregate_logs(end=True)
-            print_log_info(0, log_counts)
-            print_run_footer(
+            log_counts = log_aggregation.finalize_logs()
+            log_report.print_run_footer(
                 0,
                 0,
                 0,
@@ -1235,12 +1243,12 @@ def main():
         options.gpu_workers_per_gpu_map = dict(max_workers_per_gpu)
         options.gpu_total_memory_map = gpu_total_memory_map
         options.runtime_config = TestRuntimeConfig.from_options(options)
-        print_compute_summary(available_gpus, max_workers_per_gpu)
+        log_report.print_compute_summary(available_gpus, max_workers_per_gpu)
 
         if options.test_cpu:
             print(f"CPU: {cpu_count()} available | Paddle CPU mode", flush=True)
 
-        print_running_header()
+        print("\n--- RUNNING")
 
         # initialize process pool
         manager = Manager()
@@ -1296,16 +1304,18 @@ def main():
                         progress_detail = None
                         try:
                             worker_pid, completed_offset = future.result()
-                            mark_inorder_case_complete(worker_pid, completed_offset)
+                            log_aggregation.mark_inorder_case_complete(worker_pid, completed_offset)
                         except TimeoutError as err:
-                            write_terminal_log("timeout", config)
+                            log_worker.write_to_log("timeout", config)
                             progress_status = "TIMEOUT"
                             worker_pid = getattr(err, "pid", None)
                             if worker_pid is not None:
-                                completed_offset = append_case_end_to_worker_log(
+                                completed_offset = log_worker.append_case_end_to_worker_log(
                                     worker_pid, "timeout", api_config_str=config
                                 )
-                                mark_inorder_case_complete(worker_pid, completed_offset)
+                                log_aggregation.mark_inorder_case_complete(
+                                    worker_pid, completed_offset
+                                )
                         except ProcessExpired as err:
                             worker_pid = getattr(err, "pid", None)
                             if err.exitcode in (-signal.SIGKILL, -signal.SIGTERM):
@@ -1314,38 +1324,40 @@ def main():
                                 progress_status = "RETRY"
                                 progress_detail = f"exit {err.exitcode}"
                             else:
-                                expired_status, progress_status = classify_worker_exit(
-                                    err.exitcode,
-                                    FATAL_CUDA_EXIT_CODE,
-                                    FATAL_OOM_EXIT_CODE,
-                                    FATAL_TORCH_EXIT_CODE,
-                                )
-                                write_terminal_log(expired_status, config)
+                                (
+                                    expired_status,
+                                    progress_status,
+                                    terminal_recorded,
+                                ) = log_worker.classify_exit(err.exitcode)
+                                if not terminal_recorded:
+                                    log_worker.write_to_log(expired_status, config)
                                 if progress_status == "PADDLE_CRASH":
                                     progress_detail = f"exit {err.exitcode}"
                             if worker_pid is not None:
-                                completed_offset = append_case_end_to_worker_log(
+                                completed_offset = log_worker.append_case_end_to_worker_log(
                                     worker_pid, expired_status, api_config_str=config
                                 )
-                                mark_inorder_case_complete(worker_pid, completed_offset)
+                                log_aggregation.mark_inorder_case_complete(
+                                    worker_pid, completed_offset
+                                )
                         except GpuMemoryDeferred as err:
                             checkpoint_ready = False
                             progress_status = "DEFERRED"
                             progress_detail = str(err)
                             schedule_config(config)
                         except Exception as err:
-                            write_terminal_log("config_parse", config)
-                            checkpoint_ready = False
+                            log_worker.write_to_log("config_parse", config)
                             progress_status = "CONFIG_PARSE"
                             progress_detail = str(err)
                         if checkpoint_ready:
+                            log_worker.write_to_log("checkpoint", config)
                             tested_case += 1
                             if (
                                 options.show_runtime_status
                                 or tested_case % 10000 == 0
                                 or progress_status != "DONE"
                             ):
-                                print_case_progress(
+                                log_report.print_case_progress(
                                     tested_case,
                                     all_case,
                                     progress_status,
@@ -1353,21 +1365,20 @@ def main():
                                     progress_detail,
                                 )
                         elif progress_status in ("RETRY", "DEFERRED", "CONFIG_PARSE"):
-                            print_case_notice(progress_status, config, progress_detail)
-                aggregate_logs()
+                            log_report.print_case_notice(progress_status, config, progress_detail)
+                log_aggregation.aggregate_logs()
             pool.close()
             pool.join()
         except Exception as e:
             print(f"Unexpected error: {e}", flush=True)
             cleanup(pool)
         finally:
-            log_counts = aggregate_logs(end=True)
+            log_counts = log_aggregation.finalize_logs()
             if options.retest and tested_case == all_case:
-                finish_retest()
-            print_log_info(max(all_case - tested_case, 0), log_counts)
+                log_retest.finish_retest()
             end_time = time.time()
             total_time = end_time - start_time
-            print_run_footer(
+            log_report.print_run_footer(
                 all_case,
                 tested_case,
                 max(all_case - tested_case, 0),
