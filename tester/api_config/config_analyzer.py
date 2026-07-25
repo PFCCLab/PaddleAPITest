@@ -26,6 +26,7 @@ USE_CACHED_NUMPY = os.getenv("USE_CACHED_NUMPY", "False").lower() == "true"
 TEST_NON_CONTIGUOUS = os.getenv("TEST_NON_CONTIGUOUS", "0").lower() in ("true", "1")
 USE_GPU_MODE = os.getenv("USE_GPU_MODE", "False").lower() == "true"
 cached_numpy = {}
+NUMPY_GENERATION_CHUNK_BYTES = 64 << 20
 AUTOGRAD_DTYPES = frozenset(
     ["float32", "float64", "float16", "complex64", "complex128", "bfloat16"]
 )
@@ -90,6 +91,58 @@ def get_cached_numpy_array(
         tensor = ((numpy.random.random(shape) - 0.5) * scale).astype(dtype)
     cached_numpy[key] = tensor
     return tensor
+
+
+def generate_uncached_numpy_array(
+    dtype,
+    shape,
+    scale=1.2,
+    int_low=-65535,
+    int_high=65535,
+    random_int_dtype=None,
+    chunk_bytes=None,
+):
+    """Generate the generic uncached input while bounding random temporaries."""
+    dtype = str(dtype)
+    shape = _shape_tuple(shape)
+    chunk_bytes = max(1, int(chunk_bytes or NUMPY_GENERATION_CHUNK_BYTES))
+    result = numpy.empty(shape, dtype=dtype)
+    result_flat = result.reshape(-1)
+    numel = result_flat.size
+    if numel == 0:
+        return result
+
+    chunk_numel = max(1, chunk_bytes // numpy.dtype("float64").itemsize)
+
+    def chunks():
+        for start in range(0, numel, chunk_numel):
+            yield start, min(start + chunk_numel, numel)
+
+    if "int" in dtype:
+        for start, end in chunks():
+            kwargs = {"size": end - start}
+            if random_int_dtype is not None:
+                kwargs["dtype"] = random_int_dtype
+            result_flat[start:end] = numpy.random.randint(int_low, int_high, **kwargs)
+        return result
+
+    def random_float(count):
+        values = numpy.random.random(count)
+        values -= 0.5
+        values *= scale
+        return values
+
+    if dtype.startswith("complex"):
+        for start, end in chunks():
+            result_flat.real[start:end] = random_float(end - start)
+        # Preserve the old RNG order: draw the entire real stream before imag.
+        for start, end in chunks():
+            result_flat.imag[start:end] = random_float(end - start)
+        return result
+
+    for start, end in chunks():
+        result_flat[start:end] = random_float(end - start)
+    return result
 
 
 # Optimizer APIs that need special tensor initialization to avoid NaN
@@ -516,8 +569,18 @@ class TensorConfig:
             ):
                 # Each int32 packs four UE8M0 biased exponents. Keep the decoded
                 # scales in [2^-7, 1] so finite E4M3 inputs remain finite in BF16.
-                exponent = numpy.random.randint(120, 128, size=self.shape, dtype=numpy.int32)
-                self.numpy_tensor = exponent * numpy.int32(0x01010101)
+                self.numpy_tensor = generate_uncached_numpy_array(
+                    "int32",
+                    self.shape,
+                    int_low=120,
+                    int_high=128,
+                    random_int_dtype=numpy.int32,
+                )
+                numpy.multiply(
+                    self.numpy_tensor,
+                    numpy.int32(0x01010101),
+                    out=self.numpy_tensor,
+                )
             elif api_config.api_name in {"paddle.Tensor.view", "paddle.view"}:
                 # Reinterpret-cast view from uint8: pack finite float bits so check_numerics
                 # does not trip on random NaN/Inf bit patterns.
@@ -3324,24 +3387,11 @@ class TensorConfig:
                 elif USE_CACHED_NUMPY and self.dtype not in ["int64", "float64"]:
                     self.numpy_tensor = self.get_cached_numpy(self.dtype, self.shape, scale=1.2)
                 else:
-                    if "int" in self.dtype:
-                        self.numpy_tensor = (
-                            numpy.random.randint(-65535, 65535, size=self.shape)
-                        ).astype(self.dtype)
-                    else:
-                        if self.dtype.startswith("complex"):
-                            real_dtype = "float32" if self.dtype == "complex64" else "float64"
-                            real_part = ((numpy.random.random(self.shape) - 0.5) * 1.2).astype(
-                                real_dtype
-                            )
-                            imag_part = ((numpy.random.random(self.shape) - 0.5) * 1.2).astype(
-                                real_dtype
-                            )
-                            self.numpy_tensor = (real_part + 1j * imag_part).astype(self.dtype)
-                        else:
-                            self.numpy_tensor = (
-                                (numpy.random.random(self.shape) - 0.5) * 1.2
-                            ).astype(self.dtype)
+                    self.numpy_tensor = generate_uncached_numpy_array(
+                        self.dtype,
+                        self.shape,
+                        scale=1.2,
+                    )
 
         self.dtype = original_dtype
         return self.numpy_tensor

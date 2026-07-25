@@ -5,8 +5,6 @@ name: run_4096_accuracy
 runner:
   engine: engineV4
   foreground: true
-env:
-  PADDLEAPITEST_GPU_MEMORY_POLICY: aggressive
 input:
   api_config_file: "${APITEST_MODEL}/accuracy/4096.txt"
 output:

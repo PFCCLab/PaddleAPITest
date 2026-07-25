@@ -77,12 +77,7 @@ def print_run_header(options, paddle_version):
             gpu_ids_display = options.gpu_ids
         compute = [("--gpu_ids", gpu_ids_display)]
         if options.use_gpu_mode:
-            compute.extend(
-                [
-                    ("--use_gpu_mode", True),
-                    ("--gpu_memory_policy", options.gpu_memory_policy),
-                ]
-            )
+            compute.append(("--use_gpu_mode", True))
         elif options.use_cached_numpy:
             compute.append(("--use_cached_numpy", True))
         compute.append(("--num_workers_per_gpu", options.num_workers_per_gpu))

@@ -5,8 +5,6 @@ name: run_0size_accuracy
 runner:
   engine: engineV4
   foreground: true
-env:
-  PADDLEAPITEST_GPU_MEMORY_POLICY: aggressive
 input:
   api_config_file: "${APITEST_MODEL}/accuracy_0size/0size.txt"
 output:

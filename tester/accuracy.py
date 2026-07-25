@@ -267,10 +267,13 @@ class APITestAccuracy(APITestBase):
 
         spill_torch_outputs = False
         if self.use_gpu_mode:
+            retained_tree_bytes = self.tensor_tree_nbytes((torch_output, torch_out_grads))
             spill_torch_outputs = gpu_mode_maybe_empty_cache(
                 self.gpu_mode_config,
                 request_spill=True,
                 probe_bytes=probe_bytes,
+                retained_tree_bytes=retained_tree_bytes,
+                required_headroom_bytes=probe_bytes + retained_tree_bytes,
             )
         keep_torch_outputs_on_device = self.use_gpu_mode and not spill_torch_outputs
 
