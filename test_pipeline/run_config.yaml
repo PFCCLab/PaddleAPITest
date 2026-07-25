@@ -99,6 +99,7 @@ engine_args:
   # torch_gpu_performance: true
   # paddle_torch_gpu_performance: true
   # accuracy_stable: true
+  # accuracy_stable_dual_gpu: true  # 隐式启用 accuracy_stable 和 use_gpu_mode
   # paddle_custom_device: true
   # custom_device_vs_gpu: true
 
@@ -123,6 +124,7 @@ engine_args:
   # manual_threshold_config_file: "tester/api_config/manual_threshold.yaml"
 
   # ========== GPU / worker 调度 ==========
+  # dual GPU 模式要求 num_workers_per_gpu=1，选中 GPU 数量至少为 2 且为偶数；GPU ID 可不连续。
   num_gpus: -1
   num_workers_per_gpu: -1
   gpu_ids: "4-7"

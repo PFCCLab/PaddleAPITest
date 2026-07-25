@@ -53,7 +53,7 @@ python engineV4.py \
   --num_gpus=1
 ```
 
-配置包含双引号时用单引号包裹 `--api_config`；单配置模式最多使用一块 GPU。未指定 `--gpu_ids` 和 `--num_gpus` 时默认使用 GPU 0。
+配置包含双引号时用单引号包裹 `--api_config`。普通单配置模式最多使用一块 GPU；`accuracy_stable_dual_gpu` 单配置使用一对 GPU。未指定 `--gpu_ids` 和 `--num_gpus` 时，两种模式分别默认使用 GPU 0 和 GPU 0/1。
 
 ### 批量运行
 
@@ -104,6 +104,7 @@ python engineV4.py \
 | `--paddle_only=True` | 执行 Paddle API，检查配置解析和 Paddle 支持情况 |
 | `--accuracy=True` | 比较 Paddle 与等价 Torch API 的前向输出和梯度 |
 | `--accuracy_stable=True` | Paddle/Torch 分别执行两轮，同时检查跨框架精度与框架内稳定性 |
+| `--accuracy_stable_dual_gpu=True` | 与 accuracy-stable 等价，每个 worker 使用一张计算卡和一张全量比较卡 |
 | `--paddle_cinn=True` | 比较 Paddle 动态图与 CINN；可配合 `--test_backward=True` |
 | `--paddle_gpu_performance=True` | 测量 Paddle GPU 性能 |
 | `--torch_gpu_performance=True` | 测量 Torch GPU 性能 |
@@ -121,7 +122,7 @@ python engineV4.py \
 
 ### engineV2
 
-`engineV2.py` 使用 Pebble `ProcessPool`。除调度方式和 engineV4 专属 compute-sanitizer 外，其测试模式、GPU mode、显存策略、dump 和主要参数与 engineV4 对齐。详见 [engineV2 文档](engineV2-README.md)。
+`engineV2.py` 使用 Pebble `ProcessPool`。除调度方式和 engineV4 专属 compute-sanitizer 外，其测试模式、双卡 accuracy-stable、GPU mode、显存策略、dump 和主要参数与 engineV4 对齐。详见 [engineV2 文档](engineV2-README.md)。
 
 ### 其他入口
 
@@ -173,6 +174,27 @@ python engineV4.py \
 ```
 
 两种策略都保留 CPU 输入快照和大结果分块比较。
+
+### Accuracy Stable 双卡模式
+
+`--accuracy_stable_dual_gpu=True` 为每个 worker 原子分配一对 GPU。单个进程同时看到两张卡：逻辑 `gpu:0` 负责输入生成、T1/P1/T2/P2 前向与反向，逻辑 `gpu:1` 保存每轮完整输出和输入梯度并执行原有全量比较。
+
+```bash
+python engineV4.py \
+  --accuracy_stable_dual_gpu=True \
+  --use_gpu_mode=True \
+  --api_config_file=tester/api_config/8_big_tensor/big_tensor_merged.txt \
+  --gpu_ids=0-7 \
+  --num_gpus=8 \
+  --num_workers_per_gpu=1 \
+  --log_dir=tester/api_config/test_log_big_tensor_dual_gpu
+```
+
+`--accuracy_stable_dual_gpu=True` 本身就是一种 accuracy-stable 测试模式，并隐式启用 `--use_gpu_mode=True`。如果没有显式传入 GPU mode，引擎会打印参数 warning 后继续执行。GPU 按规范化后的 `--gpu_ids` 顺序两两配对，例如 `--gpu_ids=0,2,5,7` 产生 `(0,2)`、`(5,7)` 两个 worker。该模式要求至少两张且 GPU 总数为偶数，并要求 `--num_workers_per_gpu=1`；单条 `--api_config` 默认使用 GPU 0/1，也可以显式指定任意两张卡。
+
+每次 Torch/Paddle backward 都在计算卡完成，随后将 detach 后的完整 output 和 input grad 搬到比较卡。无论 Tensor 大小，dual 模式都不进行 CPU spill、NumPy CPU fallback、chunk compare、采样、shape 裁剪、分布式 shard 或跨卡 autograd；所有比较均直接对比较卡上的完整 Tensor 执行。
+
+双卡模式只能释放跨阶段驻留结果造成的计算卡压力；如果任意一次完整 forward/backward 自身已经超过单张计算卡显存，该模式无法将单个算子的 workspace 透明拆到两张卡。
 
 ## 并行、日志与恢复
 

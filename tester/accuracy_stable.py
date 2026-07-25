@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import gc
 import traceback
+from concurrent.futures import ThreadPoolExecutor
 
 import numpy
 import paddle
@@ -28,6 +29,8 @@ class APITestAccuracyStable(APITestBase):
         super().__init__(api_config, runtime_config=kwargs.get("runtime_config"))
         self.test_amp = kwargs.get("test_amp", False)
         self.use_gpu_mode = self.gpu_mode_config.enabled
+        self.use_dual_gpu = self.use_gpu_mode and self.gpu_mode_config.dual_gpu
+        self.comparison_device_id = self.gpu_mode_config.comparison_device_id
         self.use_aggressive_gpu_memory = (
             self.use_gpu_mode and self.gpu_mode_config.memory_policy == "aggressive"
         )
@@ -36,7 +39,37 @@ class APITestAccuracyStable(APITestBase):
         torch.set_default_device("cuda")
 
     def should_spill_first_results(self):
-        return self.use_gpu_mode and not self.use_aggressive_gpu_memory
+        return self.use_gpu_mode and not self.use_dual_gpu and not self.use_aggressive_gpu_memory
+
+    def move_tensor_tree_to_comparison_gpu(self, value):
+        if self.comparison_device_id is None:
+            raise RuntimeError("dual-GPU comparison device is not configured")
+        return self.move_tensor_tree_to_gpu(value, self.comparison_device_id)
+
+    def release_compute_gpu_cache(self, framework=None, *, collect_cycles=False):
+        if collect_cycles:
+            gc.collect()
+        if framework in (None, "torch"):
+            with torch.cuda.device(0):
+                torch.cuda.empty_cache()
+        if framework in (None, "paddle"):
+            paddle.device.cuda.empty_cache()
+
+    def compare_first_pair(self, paddle_output, torch_output, paddle_grad, torch_grad):
+        with torch.cuda.device(self.comparison_device_id):
+            self.compare(paddle_output, torch_output, "P1T1")
+            self.compare(paddle_grad, torch_grad, "P1T1B")
+
+    def release_comparison_gpu_cache(self):
+        with torch.cuda.device(self.comparison_device_id):
+            torch.cuda.empty_cache()
+
+        compute_device = paddle.device.get_device()
+        try:
+            paddle.device.set_device(f"gpu:{self.comparison_device_id}")
+            paddle.device.cuda.empty_cache()
+        finally:
+            paddle.device.set_device(compute_device)
 
     def _broadcast_to_comp_dimensions(self, log_type, affected_comps):
         """将执行阶段错误广播到所有受影响的 comp 维度"""
@@ -103,6 +136,25 @@ class APITestAccuracyStable(APITestBase):
         torch_grad_pair = []
         paddle_output_pair = []
         paddle_grad_pair = []
+        first_pair_comparison = None
+        first_pair_comparison_finished = False
+        comparison_executor = (
+            ThreadPoolExecutor(max_workers=1, thread_name_prefix="accuracy-stable-compare")
+            if self.use_dual_gpu
+            else None
+        )
+
+        def finish_first_pair_comparison():
+            nonlocal first_pair_comparison_finished
+            if first_pair_comparison_finished:
+                return
+            try:
+                if first_pair_comparison is not None:
+                    first_pair_comparison.result()
+            finally:
+                if comparison_executor is not None:
+                    comparison_executor.shutdown(wait=True)
+                first_pair_comparison_finished = True
 
         # Every execution recreates its input from the same immutable CPU copy.
         for _i in range(2):
@@ -112,11 +164,16 @@ class APITestAccuracyStable(APITestBase):
                 convert_result, _i
             )
             if torch_output is None:
+                finish_first_pair_comparison()
                 return
             torch_output = self.detach_tensor_tree(torch_output)
             torch_out_grads = self.detach_tensor_tree(torch_out_grads)
             self.clear_runtime_inputs("torch")
-            if self.use_gpu_mode:
+            if self.use_dual_gpu:
+                torch_output = self.move_tensor_tree_to_comparison_gpu(torch_output)
+                torch_out_grads = self.move_tensor_tree_to_comparison_gpu(torch_out_grads)
+                self.release_compute_gpu_cache("torch")
+            elif self.use_gpu_mode:
                 # Release idle Torch blocks before the next Paddle execution;
                 # the two frameworks do not share caching allocators.
                 gpu_mode_maybe_empty_cache(
@@ -124,15 +181,21 @@ class APITestAccuracyStable(APITestBase):
                     probe_bytes=probe_bytes,
                 )
 
+            if self.use_dual_gpu and _i == 1:
+                # Bound compare-card peak: overlap P1T1 with T2 Torch, then
+                # retire its scratch before P2 Paddle results arrive.
+                finish_first_pair_comparison()
+
             # ======== paddle ========
             self.reset_random_state()
             paddle_output, paddle_out_grads = self.get_paddle_output(torch_grad_success, _i)
             if paddle_output is None:
+                finish_first_pair_comparison()
                 return
             paddle_output = self.detach_tensor_tree(paddle_output)
             paddle_out_grads = self.detach_tensor_tree(paddle_out_grads)
             self.clear_runtime_inputs("paddle")
-            if self.use_gpu_mode:
+            if self.use_gpu_mode and not self.use_dual_gpu:
                 gpu_mode_maybe_empty_cache(
                     self.gpu_mode_config,
                     probe_bytes=probe_bytes,
@@ -146,6 +209,15 @@ class APITestAccuracyStable(APITestBase):
                 self.api_config, paddle_out_grads, torch_out_grads
             )
 
+            if self.use_dual_gpu:
+                # Formatting may create replacement tensors, so normalize all
+                # four complete result trees onto the comparison GPU here.
+                torch_output = self.move_tensor_tree_to_comparison_gpu(torch_output)
+                torch_out_grads = self.move_tensor_tree_to_comparison_gpu(torch_out_grads)
+                paddle_output = self.move_tensor_tree_to_comparison_gpu(paddle_output)
+                paddle_out_grads = self.move_tensor_tree_to_comparison_gpu(paddle_out_grads)
+                self.release_compute_gpu_cache("paddle")
+
             # ======== add to pair ========
             # if torch_grad_success = False, out_grads = [] and compare return
             torch_output_pair.append(torch_output)
@@ -154,9 +226,18 @@ class APITestAccuracyStable(APITestBase):
             paddle_grad_pair.append(paddle_out_grads)
 
             if _i == 0:
-                self.compare(paddle_output_pair[0], torch_output_pair[0], "P1T1")
-                self.compare(paddle_grad_pair[0], torch_grad_pair[0], "P1T1B")
-                if self.use_gpu_mode:
+                if comparison_executor is not None:
+                    first_pair_comparison = comparison_executor.submit(
+                        self.compare_first_pair,
+                        paddle_output_pair[0],
+                        torch_output_pair[0],
+                        paddle_grad_pair[0],
+                        torch_grad_pair[0],
+                    )
+                else:
+                    self.compare(paddle_output_pair[0], torch_output_pair[0], "P1T1")
+                    self.compare(paddle_grad_pair[0], torch_grad_pair[0], "P1T1B")
+                if self.use_gpu_mode and not self.use_dual_gpu:
                     # Keep the first pair on GPU while the configured budget has
                     # headroom. Spill only when the existing GPU-mode policy says
                     # the next execution needs relief; this avoids forcing later
@@ -182,6 +263,14 @@ class APITestAccuracyStable(APITestBase):
                         )
 
         self.clear_original_cpu_inputs()
+        if self.use_dual_gpu:
+            # Output-gradient seeds are reused by all four backward executions,
+            # but are no longer needed once P2 has been offloaded.
+            self.outputs_grad_numpy.clear()
+            self.outputs_grad_paddleonly.clear()
+            self.release_compute_gpu_cache()
+
+        finish_first_pair_comparison()
 
         # ======== summary ========
         self.compare(paddle_output_pair[1], torch_output_pair[1], "P2T2")
@@ -198,6 +287,13 @@ class APITestAccuracyStable(APITestBase):
         paddle_output_pair.clear()
         self.compare(paddle_grad_pair[0], paddle_grad_pair[1], "P1P2B")
         paddle_grad_pair.clear()
+
+        if self.use_dual_gpu:
+            torch_output = None
+            paddle_output = None
+            torch_out_grads = None
+            paddle_out_grads = None
+            self.release_comparison_gpu_cache()
 
         log_worker.write_stable_passes(self.api_config.config)
 

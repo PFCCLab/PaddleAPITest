@@ -83,6 +83,8 @@ def print_run_header(options, paddle_version):
                     ("--gpu_memory_policy", options.gpu_memory_policy),
                 ]
             )
+            if getattr(options, "accuracy_stable_dual_gpu", False):
+                compute.append(("--accuracy_stable_dual_gpu", True))
         elif options.use_cached_numpy:
             compute.append(("--use_cached_numpy", True))
         compute.append(("--num_workers_per_gpu", options.num_workers_per_gpu))
@@ -117,13 +119,19 @@ def print_preparing_summary(
     print(f"Cases: {total_case} total | {checkpointed_case} checkpointed | {pending_case} pending")
 
 
-def print_compute_summary(available_gpus, max_workers_per_gpu):
+def print_compute_summary(available_gpus, max_workers_per_gpu, gpu_pairs=None):
     """打印实际选中的 GPU 和 worker 布局。"""
-    total_workers = sum(max_workers_per_gpu.values())
+    total_workers = len(gpu_pairs) if gpu_pairs is not None else sum(max_workers_per_gpu.values())
     print(f"Compute: {len(available_gpus)} GPUs | {total_workers} workers")
-    layout = " | ".join(
-        f"GPU {gpu_id}: {workers}" for gpu_id, workers in sorted(max_workers_per_gpu.items())
-    )
+    if gpu_pairs is not None:
+        layout = " | ".join(
+            f"Pair {index}: GPU {compute_gpu} compute + GPU {comparison_gpu} compare"
+            for index, (compute_gpu, comparison_gpu) in enumerate(gpu_pairs)
+        )
+    else:
+        layout = " | ".join(
+            f"GPU {gpu_id}: {workers}" for gpu_id, workers in sorted(max_workers_per_gpu.items())
+        )
     print(f"Layout: {layout}")
 
 

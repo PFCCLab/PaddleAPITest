@@ -1704,7 +1704,8 @@ class APITestBase:
                 return value.place.is_cpu_place()
             return False
 
-        compare_on_cpu = (
+        dual_gpu = bool(getattr(self.gpu_mode_config, "dual_gpu", False))
+        compare_on_cpu = not dual_gpu and (
             test_tol
             or not self.gpu_mode_config.enabled
             or is_cpu_tensor(actual)
@@ -1778,7 +1779,7 @@ class APITestBase:
             )
             # Small tensors always use torch.testing.assert_close directly. Avoid
             # querying the CUDA driver for a working budget on that hot path.
-            needs_chunk_budget = estimated_temp_bytes > working_bytes
+            needs_chunk_budget = estimated_temp_bytes > working_bytes and not dual_gpu
             if actual_tensor.is_cuda and needs_chunk_budget:
                 try:
                     free_bytes, _ = torch.cuda.mem_get_info(actual_tensor.device)
@@ -1789,6 +1790,18 @@ class APITestBase:
                     memory_budget = float(
                         getattr(self.gpu_mode_config, "memory_budget", 0.0) or 0.0
                     )
+                    comparison_device_id = getattr(
+                        self.gpu_mode_config, "comparison_device_id", None
+                    )
+                    if actual_tensor.device.index == comparison_device_id:
+                        memory_budget = float(
+                            getattr(
+                                self.gpu_mode_config,
+                                "comparison_memory_budget",
+                                memory_budget,
+                            )
+                            or memory_budget
+                        )
                     if memory_budget > 0:
                         reserved_bytes = torch.cuda.memory_reserved(actual_tensor.device)
                         budget_headroom = max(
@@ -1801,7 +1814,7 @@ class APITestBase:
                         )
                 except Exception:
                     pass
-            if estimated_temp_bytes > working_bytes:
+            if self._should_chunk_accuracy_compare(estimated_temp_bytes, working_bytes):
                 self._torch_assert_accuracy_in_chunks(
                     actual_tensor,
                     expected_tensor,
@@ -1851,7 +1864,7 @@ class APITestBase:
         except Exception as err:
             error_str = str(err)
             if error_str.startswith("Comparing"):
-                if os.environ.get("PADDLEAPITEST_NP_FALLBACK", "0") != "1":
+                if dual_gpu or os.environ.get("PADDLEAPITEST_NP_FALLBACK", "0") != "1":
                     raise RuntimeError(
                         "[torch_assert_OOM] torch.testing.assert_close OOM on large tensor comparison"
                     ) from err
@@ -1885,6 +1898,13 @@ class APITestBase:
                     )
                     return
             raise
+
+    def _should_chunk_accuracy_compare(self, estimated_temp_bytes, working_bytes):
+        """Dual-GPU accuracy compares stay on the comparison card as one full tensor."""
+        return bool(
+            estimated_temp_bytes > working_bytes
+            and not getattr(self.gpu_mode_config, "dual_gpu", False)
+        )
 
     def test(self):
         pass
@@ -1936,6 +1956,25 @@ class APITestBase:
         if isinstance(value, dict):
             return type(value)(
                 (key, self.move_tensor_tree_to_cpu(item)) for key, item in value.items()
+            )
+        return value
+
+    def move_tensor_tree_to_gpu(self, value, device_id):
+        """Recursively move framework tensors to one logical GPU."""
+        if isinstance(value, torch.Tensor):
+            return value.to(
+                device=torch.device("cuda", device_id),
+                non_blocking=False,
+            )
+        if isinstance(value, paddle.Tensor):
+            return value.cuda(device_id=device_id, blocking=True)
+        if isinstance(value, list):
+            return [self.move_tensor_tree_to_gpu(item, device_id) for item in value]
+        if isinstance(value, tuple):
+            return tuple(self.move_tensor_tree_to_gpu(item, device_id) for item in value)
+        if isinstance(value, dict):
+            return type(value)(
+                (key, self.move_tensor_tree_to_gpu(item, device_id)) for key, item in value.items()
             )
         return value
 

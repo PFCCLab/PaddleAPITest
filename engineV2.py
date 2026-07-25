@@ -300,8 +300,8 @@ ARGUMENT_WARNING_PREFIX = "[argument warning]"
 TEST_MODE_ERROR = (
     "specify exactly one test mode: --accuracy, --paddle_only, --paddle_cinn, "
     "--paddle_gpu_performance, --torch_gpu_performance, "
-    "--paddle_torch_gpu_performance, --accuracy_stable, --paddle_custom_device, "
-    "--custom_device_vs_gpu"
+    "--paddle_torch_gpu_performance, --accuracy_stable, "
+    "--accuracy_stable_dual_gpu, --paddle_custom_device, --custom_device_vs_gpu"
 )
 
 
@@ -319,6 +319,7 @@ def _mode_uses_torch(options):
             "torch_gpu_performance",
             "paddle_torch_gpu_performance",
             "accuracy_stable",
+            "accuracy_stable_dual_gpu",
             "paddle_custom_device",
             "custom_device_vs_gpu",
         )
@@ -326,41 +327,16 @@ def _mode_uses_torch(options):
 
 
 def _load_test_classes(options):
-    from tester import APIConfig, APITestPaddleOnly
+    import tester
 
-    test_classes = {
-        "APIConfig": APIConfig,
-        "APITestPaddleOnly": APITestPaddleOnly,
+    class_name = _selected_test_class_name(options)
+    return {
+        "APIConfig": tester.APIConfig,
+        class_name: getattr(tester, class_name),
     }
-    if _mode_uses_torch(options):
-        from tester import (
-            APITestAccuracy,
-            APITestAccuracyStable,
-            APITestCINNVSDygraph,
-            APITestCustomDeviceVSCPU,
-            APITestPaddleDeviceVSGPU,
-            APITestPaddleGPUPerformance,
-            APITestPaddleTorchGPUPerformance,
-            APITestTorchGPUPerformance,
-        )
-
-        test_classes.update(
-            {
-                "APITestAccuracy": APITestAccuracy,
-                "APITestCINNVSDygraph": APITestCINNVSDygraph,
-                "APITestPaddleGPUPerformance": APITestPaddleGPUPerformance,
-                "APITestTorchGPUPerformance": APITestTorchGPUPerformance,
-                "APITestPaddleTorchGPUPerformance": APITestPaddleTorchGPUPerformance,
-                "APITestAccuracyStable": APITestAccuracyStable,
-                "APITestCustomDeviceVSCPU": APITestCustomDeviceVSCPU,
-                "APITestPaddleDeviceVSGPU": APITestPaddleDeviceVSGPU,
-            }
-        )
-    return test_classes
 
 
-def _select_test_class(options):
-    test_classes = _load_test_classes(options)
+def _selected_test_class_name(options):
     option_to_class_name = {
         "paddle_only": "APITestPaddleOnly",
         "paddle_cinn": "APITestCINNVSDygraph",
@@ -368,14 +344,20 @@ def _select_test_class(options):
         "paddle_gpu_performance": "APITestPaddleGPUPerformance",
         "torch_gpu_performance": "APITestTorchGPUPerformance",
         "paddle_torch_gpu_performance": "APITestPaddleTorchGPUPerformance",
+        "accuracy_stable_dual_gpu": "APITestAccuracyStable",
         "accuracy_stable": "APITestAccuracyStable",
         "paddle_custom_device": "APITestCustomDeviceVSCPU",
         "custom_device_vs_gpu": "APITestPaddleDeviceVSGPU",
     }
-    for opt, class_name in option_to_class_name.items():
-        if getattr(options, opt, False):
-            return test_classes[class_name]
-    return test_classes["APITestAccuracy"]
+    for option, class_name in option_to_class_name.items():
+        if getattr(options, option, False):
+            return class_name
+    return "APITestAccuracy"
+
+
+def _select_test_class(options):
+    test_classes = _load_test_classes(options)
+    return test_classes[_selected_test_class_name(options)]
 
 
 def _clear_device_cache(options):
@@ -435,6 +417,7 @@ def _parse_gpu_ids(gpu_ids_arg, device_count):
 
 def validate_gpu_options(options) -> tuple:
     """Validate and normalize GPU-related options."""
+    normalize_accuracy_stable_dual_gpu_options(options)
     device_count = get_device_count()
     if device_count == 0:
         raise ValueError("no accelerator devices were found")
@@ -458,7 +441,27 @@ def validate_gpu_options(options) -> tuple:
             f"invalid --num_workers_per_gpu={options.num_workers_per_gpu}: "
             "expected -1 or a positive integer"
         )
+    if getattr(options, "accuracy_stable_dual_gpu", False):
+        if getattr(options, "test_cpu", False):
+            raise ValueError("--accuracy_stable_dual_gpu=True does not support --test_cpu=True")
+        if options.num_gpus < 2 or options.num_gpus % 2:
+            raise ValueError("--accuracy_stable_dual_gpu=True requires an even --num_gpus")
+        if options.num_workers_per_gpu != 1:
+            raise ValueError("--accuracy_stable_dual_gpu=True requires --num_workers_per_gpu=1")
     return tuple(gpu_ids)
+
+
+def normalize_accuracy_stable_dual_gpu_options(options):
+    """Make the dual-GPU flag a self-contained accuracy-stable GPU mode."""
+    if not getattr(options, "accuracy_stable_dual_gpu", False):
+        return
+    if not getattr(options, "use_gpu_mode", False):
+        _print_argument(
+            ARGUMENT_WARNING_PREFIX,
+            "--accuracy_stable_dual_gpu=True implies --use_gpu_mode=True; enabling GPU mode",
+        )
+        options.use_gpu_mode = True
+    options.accuracy_stable = True
 
 
 def _resolve_dump_options(parser, options):
@@ -485,11 +488,18 @@ def parse_bool(value):
 
 def _apply_single_config_gpu_defaults(options):
     if not options.gpu_ids and options.num_gpus == -1:
-        options.gpu_ids = "0"
-        options.num_gpus = 1
+        if getattr(options, "accuracy_stable_dual_gpu", False):
+            options.gpu_ids = "0,1"
+            options.num_gpus = 2
+        else:
+            options.gpu_ids = "0"
+            options.num_gpus = 1
 
 
 def _prepare_single_config_gpu(options):
+    normalize_accuracy_stable_dual_gpu_options(options)
+    if getattr(options, "accuracy_stable_dual_gpu", False) and getattr(options, "test_cpu", False):
+        raise ValueError("--accuracy_stable_dual_gpu=True does not support --test_cpu=True")
     if options.test_cpu:
         options.gpu_workers_per_gpu_map = {}
         options.gpu_total_memory_map = {}
@@ -498,19 +508,28 @@ def _prepare_single_config_gpu(options):
 
     _apply_single_config_gpu_defaults(options)
     gpu_ids = validate_gpu_options(options)
-    if len(gpu_ids) != 1:
+    expected_gpu_count = 2 if getattr(options, "accuracy_stable_dual_gpu", False) else 1
+    if len(gpu_ids) != expected_gpu_count:
         raise ValueError(
-            f"single --api_config run supports exactly one GPU; got {len(gpu_ids)} GPUs: {gpu_ids}"
+            f"single --api_config run requires exactly {expected_gpu_count} GPU(s); "
+            f"got {len(gpu_ids)} GPUs: {gpu_ids}"
         )
-    os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_ids[0])
-    try:
-        options.gpu_total_memory_map = {gpu_ids[0]: get_memory_info(gpu_ids[0])[0]}
-    except Exception:
-        options.gpu_total_memory_map = {}
-    options.gpu_workers_per_gpu_map = {gpu_ids[0]: 1}
+    os.environ["CUDA_VISIBLE_DEVICES"] = ",".join(str(gpu_id) for gpu_id in gpu_ids)
+    options.gpu_total_memory_map = {}
+    for gpu_id in gpu_ids:
+        try:
+            options.gpu_total_memory_map[gpu_id] = get_memory_info(gpu_id)[0]
+        except Exception:
+            pass
+    options.gpu_workers_per_gpu_map = dict.fromkeys(gpu_ids, 1)
     options.runtime_config = TestRuntimeConfig.from_options(options)
-    options.runtime_config = runtime_config_for_gpu(options, gpu_ids[0])
-    return gpu_ids[0]
+    comparison_gpu_id = gpu_ids[1] if len(gpu_ids) == 2 else None
+    options.runtime_config = runtime_config_for_gpu(
+        options,
+        gpu_ids[0],
+        comparison_gpu_id=comparison_gpu_id,
+    )
+    return gpu_ids if comparison_gpu_id is not None else gpu_ids[0]
 
 
 def check_gpu_memory(gpu_ids, num_workers_per_gpu):
@@ -530,6 +549,68 @@ def check_gpu_memory(gpu_ids, num_workers_per_gpu):
     return available_gpus, max_workers_per_gpu
 
 
+def limit_dual_gpu_worker_layout(available_gpus, pending_cases):
+    """Limit an ordered list of complete GPU pairs to the pending case count."""
+    if len(available_gpus) % 2:
+        raise ValueError("dual-GPU worker layout requires complete GPU pairs")
+    pair_count = min(len(available_gpus) // 2, max(0, pending_cases))
+    selected_gpus = list(available_gpus[: pair_count * 2])
+    return selected_gpus, dict.fromkeys(selected_gpus, 1)
+
+
+def _visible_gpu_ids(gpu_id, comparison_gpu_id=None):
+    if comparison_gpu_id is None:
+        return str(gpu_id)
+    return f"{gpu_id},{comparison_gpu_id}"
+
+
+def _assign_worker_gpus(
+    gpu_worker_list,
+    available_gpus,
+    max_workers_per_gpu,
+    options,
+    my_pid,
+    pid_exists,
+):
+    assigned_gpu = -1
+    assigned_comparison_gpu = None
+    max_available_slots = -1
+    dual_gpu = getattr(options, "accuracy_stable_dual_gpu", False)
+
+    if dual_gpu:
+        for pair_index in range(0, len(available_gpus), 2):
+            compute_gpu = available_gpus[pair_index]
+            comparison_gpu = available_gpus[pair_index + 1]
+            compute_workers = gpu_worker_list[compute_gpu]
+            comparison_workers = gpu_worker_list[comparison_gpu]
+            compute_workers[:] = [pid for pid in compute_workers if pid_exists(pid)]
+            comparison_workers[:] = [pid for pid in comparison_workers if pid_exists(pid)]
+            available_slots = 1 - max(
+                len(compute_workers),
+                len(comparison_workers),
+            )
+            if available_slots > max_available_slots:
+                max_available_slots = available_slots
+                assigned_gpu = compute_gpu
+                assigned_comparison_gpu = comparison_gpu
+    else:
+        for gpu_id in available_gpus:
+            workers = gpu_worker_list[gpu_id]
+            workers[:] = [pid for pid in workers if pid_exists(pid)]
+            available_slots = max_workers_per_gpu[gpu_id] - len(workers)
+            if available_slots > max_available_slots:
+                max_available_slots = available_slots
+                assigned_gpu = gpu_id
+
+    if assigned_gpu == -1 or (dual_gpu and max_available_slots <= 0):
+        raise RuntimeError(f"Worker {my_pid} could not be assigned a GPU.")
+
+    gpu_worker_list[assigned_gpu].append(my_pid)
+    if assigned_comparison_gpu is not None:
+        gpu_worker_list[assigned_comparison_gpu].append(my_pid)
+    return assigned_gpu, assigned_comparison_gpu
+
+
 def init_worker_gpu(gpu_worker_list, lock, available_gpus, max_workers_per_gpu, options):
     init_log(options.log_dir)
     my_pid = os.getpid()
@@ -543,22 +624,19 @@ def init_worker_gpu(gpu_worker_list, lock, available_gpus, max_workers_per_gpu, 
 
     try:
         with lock:
-            assigned_gpu = -1
-            max_available_slots = -1
-            for gpu_id in available_gpus:
-                workers = gpu_worker_list[gpu_id]
-                workers[:] = [pid for pid in workers if pid_exists(pid)]
-                available_slots = max_workers_per_gpu[gpu_id] - len(workers)
-                if available_slots > max_available_slots:
-                    max_available_slots = available_slots
-                    assigned_gpu = gpu_id
+            assigned_gpu, assigned_comparison_gpu = _assign_worker_gpus(
+                gpu_worker_list,
+                available_gpus,
+                max_workers_per_gpu,
+                options,
+                my_pid,
+                pid_exists,
+            )
 
-            if assigned_gpu == -1:
-                raise RuntimeError(f"Worker {my_pid} could not be assigned a GPU.")
-
-            gpu_worker_list[assigned_gpu].append(my_pid)
-
-        os.environ["CUDA_VISIBLE_DEVICES"] = str(assigned_gpu)
+        os.environ["CUDA_VISIBLE_DEVICES"] = _visible_gpu_ids(
+            assigned_gpu,
+            assigned_comparison_gpu,
+        )
         with log_worker.suppress_startup_output():
             import paddle
 
@@ -598,14 +676,26 @@ def run_test_case(api_config_str, options):
     """Run a single test case for the given API configuration."""
     completion = [os.getpid(), None]
     started_at = time.monotonic()
-    gpu_id = int(os.environ.get("CUDA_VISIBLE_DEVICES", "0").split(",")[0])
+    visible_gpu_ids = tuple(
+        int(value) for value in os.environ.get("CUDA_VISIBLE_DEVICES", "0").split(",")
+    )
+    gpu_id = visible_gpu_ids[0]
+    comparison_gpu_id = (
+        visible_gpu_ids[1]
+        if getattr(options, "accuracy_stable_dual_gpu", False) and len(visible_gpu_ids) > 1
+        else None
+    )
     log_worker.write_case_begin(
         api_config_str,
         worker_pid=os.getpid(),
         gpu=gpu_id,
         paddle_version=options.paddle_version,
     )
-    runtime_config = runtime_config_for_gpu(options, gpu_id)
+    runtime_config = runtime_config_for_gpu(
+        options,
+        gpu_id,
+        comparison_gpu_id=comparison_gpu_id,
+    )
     case_status = "done"
     try:
         if options.show_runtime_status:
@@ -755,7 +845,10 @@ def main():
     parser.add_argument(
         "--api_config",
         default="",
-        help="Run one API config string directly. Single-case mode supports at most one GPU.",
+        help=(
+            "Run one API config string directly. Single-case mode uses one GPU, or one "
+            "GPU pair with --accuracy_stable_dual_gpu=True."
+        ),
     )
     parser.add_argument(
         "--retest",
@@ -806,6 +899,12 @@ def main():
         type=parse_bool,
         default=False,
         help="Run stable Paddle vs corresponding Torch accuracy checks.",
+    )
+    parser.add_argument(
+        "--accuracy_stable_dual_gpu",
+        type=parse_bool,
+        default=False,
+        help=("Use one compute GPU and one full-result comparison GPU per accuracy-stable worker."),
     )
     parser.add_argument(
         "--paddle_custom_device",
@@ -980,6 +1079,7 @@ def main():
             "--api_config_file_pattern, or --retest is required",
         )
         return
+    normalize_accuracy_stable_dual_gpu_options(options)
     if options.api_config and not options.test_cpu:
         _apply_single_config_gpu_defaults(options)
 
@@ -1229,11 +1329,24 @@ def main():
         if not available_gpus:
             print("No usable GPUs available.", flush=True)
             return
-        available_gpus, max_workers_per_gpu = limit_worker_layout(
-            available_gpus, max_workers_per_gpu, all_case
-        )
+        gpu_pairs = None
+        if options.accuracy_stable_dual_gpu:
+            if len(available_gpus) != len(gpu_ids):
+                print("Not all selected GPUs are usable; no complete dual-GPU layout.", flush=True)
+                return
+            available_gpus, max_workers_per_gpu = limit_dual_gpu_worker_layout(
+                available_gpus,
+                all_case,
+            )
+            gpu_pairs = list(zip(available_gpus[::2], available_gpus[1::2], strict=True))
+        else:
+            available_gpus, max_workers_per_gpu = limit_worker_layout(
+                available_gpus, max_workers_per_gpu, all_case
+            )
 
-        total_workers = sum(max_workers_per_gpu.values())
+        total_workers = (
+            len(gpu_pairs) if gpu_pairs is not None else sum(max_workers_per_gpu.values())
+        )
         gpu_total_memory_map = {}
         for gpu_id in available_gpus:
             try:
@@ -1243,7 +1356,11 @@ def main():
         options.gpu_workers_per_gpu_map = dict(max_workers_per_gpu)
         options.gpu_total_memory_map = gpu_total_memory_map
         options.runtime_config = TestRuntimeConfig.from_options(options)
-        log_report.print_compute_summary(available_gpus, max_workers_per_gpu)
+        log_report.print_compute_summary(
+            available_gpus,
+            max_workers_per_gpu,
+            gpu_pairs=gpu_pairs,
+        )
 
         if options.test_cpu:
             print(f"CPU: {cpu_count()} available | Paddle CPU mode", flush=True)

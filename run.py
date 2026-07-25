@@ -53,6 +53,7 @@ ENGINE_ARG_TYPES = {
     "torch_gpu_performance": bool,
     "paddle_torch_gpu_performance": bool,
     "accuracy_stable": bool,
+    "accuracy_stable_dual_gpu": bool,
     "paddle_custom_device": bool,
     "test_amp": bool,
     "num_gpus": int,

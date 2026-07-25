@@ -23,10 +23,14 @@ def resolve_gpu_memory_policy(value=None):
 @dataclass(frozen=True)
 class GpuModeConfig:
     enabled: bool = False
+    dual_gpu: bool = False
+    comparison_device_id: int | None = None
     memory_policy: str = DEFAULT_GPU_MEMORY_POLICY
     workers_on_gpu: int = 1
     total_memory: float = 0.0
     memory_budget: float = 0.0
+    comparison_total_memory: float = 0.0
+    comparison_memory_budget: float = 0.0
     memory_fraction: float = 0.85
     cleanup_pressure_ratio: float = 0.25
     cleanup_used_ratio: float = 0.90
@@ -41,8 +45,11 @@ class TestRuntimeConfig:
 
     @classmethod
     def from_options(cls, options):
+        dual_gpu = bool(getattr(options, "accuracy_stable_dual_gpu", False))
         gpu_mode = GpuModeConfig(
-            enabled=bool(options.use_gpu_mode),
+            enabled=bool(options.use_gpu_mode) or dual_gpu,
+            dual_gpu=dual_gpu,
+            comparison_device_id=1 if dual_gpu else None,
             memory_policy=resolve_gpu_memory_policy(
                 getattr(options, "gpu_memory_policy", DEFAULT_GPU_MEMORY_POLICY)
             ),
@@ -54,7 +61,13 @@ class TestRuntimeConfig:
             gpu_mode=gpu_mode,
         )
 
-    def for_gpu(self, gpu_id, workers_per_gpu, total_memory_per_gpu):
+    def for_gpu(
+        self,
+        gpu_id,
+        workers_per_gpu,
+        total_memory_per_gpu,
+        comparison_gpu_id=None,
+    ):
         workers_on_gpu = max(1, int(workers_per_gpu.get(gpu_id, self.gpu_mode.workers_on_gpu) or 1))
         total_memory = float(total_memory_per_gpu.get(gpu_id, self.gpu_mode.total_memory) or 0.0)
         memory_budget = (
@@ -62,16 +75,28 @@ class TestRuntimeConfig:
             if total_memory > 0
             else 0.0
         )
+        comparison_total_memory = (
+            float(total_memory_per_gpu.get(comparison_gpu_id, 0.0) or 0.0)
+            if comparison_gpu_id is not None
+            else 0.0
+        )
+        comparison_memory_budget = (
+            comparison_total_memory * self.gpu_mode.memory_fraction
+            if comparison_total_memory > 0
+            else 0.0
+        )
         gpu_mode = replace(
             self.gpu_mode,
             workers_on_gpu=workers_on_gpu,
             total_memory=total_memory,
             memory_budget=memory_budget,
+            comparison_total_memory=comparison_total_memory,
+            comparison_memory_budget=comparison_memory_budget,
         )
         return replace(self, gpu_mode=gpu_mode)
 
 
-def runtime_config_for_gpu(options, gpu_id):
+def runtime_config_for_gpu(options, gpu_id, comparison_gpu_id=None):
     runtime_config = getattr(options, "runtime_config", None)
     if runtime_config is None:
         runtime_config = TestRuntimeConfig.from_options(options)
@@ -79,6 +104,7 @@ def runtime_config_for_gpu(options, gpu_id):
         gpu_id,
         getattr(options, "gpu_workers_per_gpu_map", {}) or {},
         getattr(options, "gpu_total_memory_map", {}) or {},
+        comparison_gpu_id=comparison_gpu_id,
     )
 
 
