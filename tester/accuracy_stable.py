@@ -141,11 +141,6 @@ class APITestAccuracyStable(APITestBase):
         paddle_grad_pair = []
         first_pair_comparison = None
         first_pair_comparison_finished = False
-        comparison_executor = (
-            ThreadPoolExecutor(max_workers=1, thread_name_prefix="accuracy-stable-compare")
-            if self.use_dual_gpu
-            else None
-        )
 
         def finish_first_pair_comparison():
             nonlocal first_pair_comparison_finished
@@ -155,8 +150,6 @@ class APITestAccuracyStable(APITestBase):
                 if first_pair_comparison is not None:
                     first_pair_comparison.result()
             finally:
-                if comparison_executor is not None:
-                    comparison_executor.shutdown(wait=True)
                 first_pair_comparison_finished = True
 
         # Every execution recreates its input from the same immutable CPU copy.
@@ -209,12 +202,16 @@ class APITestAccuracyStable(APITestBase):
                 )
 
             # ======== format ========
-            paddle_output, torch_output = process_output(
-                self.api_config, paddle_output, torch_output
-            )
-            paddle_out_grads, torch_out_grads = process_grad_output(
-                self.api_config, paddle_out_grads, torch_out_grads
-            )
+            try:
+                paddle_output, torch_output = process_output(
+                    self.api_config, paddle_output, torch_output
+                )
+                paddle_out_grads, torch_out_grads = process_grad_output(
+                    self.api_config, paddle_out_grads, torch_out_grads
+                )
+            except Exception:
+                finish_first_pair_comparison()
+                raise
 
             if self.use_dual_gpu:
                 # Formatting may create replacement tensors, so normalize all
@@ -241,14 +238,24 @@ class APITestAccuracyStable(APITestBase):
             if _i != 0:
                 continue
 
-            if comparison_executor is not None:
-                first_pair_comparison = comparison_executor.submit(
-                    self.compare_first_pair,
-                    paddle_output_pair[0],
-                    torch_output_pair[0],
-                    paddle_grad_pair[0],
-                    torch_grad_pair[0],
+            if self.use_dual_gpu:
+                comparison_executor = ThreadPoolExecutor(
+                    max_workers=1,
+                    thread_name_prefix="accuracy-stable-compare",
                 )
+                try:
+                    first_pair_comparison = comparison_executor.submit(
+                        self.compare_first_pair,
+                        paddle_output_pair[0],
+                        torch_output_pair[0],
+                        paddle_grad_pair[0],
+                        torch_grad_pair[0],
+                    )
+                finally:
+                    # Only one task is ever submitted. Closing submission immediately
+                    # lets the worker thread retire by itself when the future completes,
+                    # including paths that leave this method before the explicit join.
+                    comparison_executor.shutdown(wait=False)
             else:
                 self.compare(paddle_output_pair[0], torch_output_pair[0], "P1T1")
                 self.compare(paddle_grad_pair[0], torch_grad_pair[0], "P1T1B")

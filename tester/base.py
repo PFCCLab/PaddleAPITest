@@ -1844,6 +1844,7 @@ class APITestBase:
         error_msg,
         working_bytes,
         compare_on_cpu,
+        check_dtype,
     ):
         actual_dtype = self._framework_tensor_torch_dtype(actual)
         expected_dtype = self._framework_tensor_torch_dtype(expected)
@@ -1854,6 +1855,28 @@ class APITestBase:
         max_numel = max(1, working_bytes // temp_bytes_per_element)
         shape = tuple(actual.shape)
         actual_numel = int(actual.numel())
+
+        if not check_dtype and actual_dtype != expected_dtype:
+            for index in self._logical_slab_indices(shape, max_numel):
+                actual_chunk = self._logical_slab_to_torch(actual, index, compare_on_cpu)
+                expected_chunk = self._logical_slab_to_torch(expected, index, compare_on_cpu)
+                if actual_chunk.device != expected_chunk.device:
+                    expected_chunk = expected_chunk.to(device=actual_chunk.device)
+
+                def slab_error_msg(msg, *, slab_index=index):
+                    return error_msg(f"logical slab {slab_index}: {msg}")
+
+                torch.testing.assert_close(
+                    actual_chunk,
+                    expected_chunk,
+                    rtol=rtol,
+                    atol=atol,
+                    equal_nan=True,
+                    check_device=False,
+                    check_dtype=False,
+                    msg=slab_error_msg,
+                )
+            return
 
         def chunks():
             offset = 0
@@ -1963,6 +1986,7 @@ class APITestBase:
                     slab_error_msg,
                     working_bytes,
                     compare_on_cpu,
+                    is_check_dtype,
                 )
                 if test_tol:
                     log_accuracy_tolerance(
