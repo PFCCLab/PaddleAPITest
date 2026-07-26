@@ -1688,12 +1688,14 @@ class APITestBase:
     ):
         actual_is_complex = actual_dtype.is_complex
         expected_is_complex = expected_dtype.is_complex
-        actual_is_float64 = actual_dtype == torch.float64
-        expected_is_float64 = expected_dtype == torch.float64
         actual_is_float8 = "float8" in str(actual_dtype)
         expected_is_float8 = "float8" in str(expected_dtype)
-        actual_is_integer = not actual_dtype.is_floating_point and not actual_is_complex
-        actual_supports_nan = actual_dtype.is_floating_point or actual_is_complex
+        actual_supports_nan = (
+            actual_dtype.is_floating_point
+            or actual_is_complex
+            or expected_dtype.is_floating_point
+            or expected_is_complex
+        )
         mismatch_count = 0
         max_abs_diff = -1.0
         max_abs_index = 0
@@ -1701,6 +1703,26 @@ class APITestBase:
         max_rel_index = 0
         exact_compare = atol == 0.0 and rtol == 0.0
         for start, actual_chunk, expected_chunk in chunks:
+            if actual_chunk.dtype != expected_chunk.dtype:
+                # Match TensorLikePair._equalize_attributes without promoting
+                # either complete tensor. PyTorch does not define mixed FP8
+                # promotion, while the existing small-tensor path promotes FP8
+                # to float32 before assert_close.
+                if "float8" in str(actual_chunk.dtype):
+                    actual_chunk = actual_chunk.float()
+                if "float8" in str(expected_chunk.dtype):
+                    expected_chunk = expected_chunk.float()
+                actual_promote_dtype = actual_chunk.dtype
+                expected_promote_dtype = expected_chunk.dtype
+                unsigned_dtypes = (torch.uint16, torch.uint32, torch.uint64)
+                if actual_promote_dtype in unsigned_dtypes:
+                    actual_promote_dtype = torch.int64
+                if expected_promote_dtype in unsigned_dtypes:
+                    expected_promote_dtype = torch.int64
+                compare_dtype = torch.promote_types(actual_promote_dtype, expected_promote_dtype)
+                actual_chunk = actual_chunk.to(compare_dtype)
+                expected_chunk = expected_chunk.to(compare_dtype)
+
             if exact_compare:
                 equal = actual_chunk == expected_chunk
                 if actual_supports_nan:
@@ -1724,16 +1746,23 @@ class APITestBase:
             if chunk_mismatch_count == 0:
                 continue
 
-            if actual_is_complex or expected_is_complex:
+            chunk_actual_is_complex = actual_chunk.dtype.is_complex
+            chunk_expected_is_complex = expected_chunk.dtype.is_complex
+            if chunk_actual_is_complex or chunk_expected_is_complex:
                 actual_for_diff = actual_chunk
                 expected_for_diff = expected_chunk
-            elif actual_is_float64 or expected_is_float64:
+            elif actual_chunk.dtype == torch.float64 or expected_chunk.dtype == torch.float64:
                 actual_for_diff = actual_chunk.to(torch.float64)
                 expected_for_diff = expected_chunk.to(torch.float64)
-            elif actual_is_float8 or expected_is_float8:
+            elif "float8" in str(actual_chunk.dtype) or "float8" in str(expected_chunk.dtype):
                 actual_for_diff = actual_chunk.float()
                 expected_for_diff = expected_chunk.float()
-            elif actual_is_integer:
+            elif (
+                not actual_chunk.dtype.is_floating_point
+                and not chunk_actual_is_complex
+                and not expected_chunk.dtype.is_floating_point
+                and not chunk_expected_is_complex
+            ):
                 actual_for_diff = actual_chunk.to(torch.int64)
                 expected_for_diff = expected_chunk.to(torch.int64)
             else:
@@ -2086,13 +2115,15 @@ class APITestBase:
             )
             # Small tensors always use torch.testing.assert_close directly. Avoid
             # querying the CUDA driver for a working budget on that hot path.
-            needs_chunk_budget = estimated_temp_bytes > working_bytes and not dual_gpu
+            needs_chunk_budget = estimated_temp_bytes > working_bytes
             if actual_tensor.is_cuda and needs_chunk_budget:
                 try:
                     free_bytes, _ = torch.cuda.mem_get_info(actual_tensor.device)
                     max_working_bytes = 32 * 1024**3
                     min_working_bytes = 256 * 1024**2
-                    working_bytes = min(max_working_bytes, max(min_working_bytes, free_bytes // 5))
+                    # Physical headroom is a hard limit. The configured minimum
+                    # below is only a performance target when free memory permits.
+                    working_bytes = max(1, min(max_working_bytes, free_bytes // 5))
 
                     memory_budget = float(
                         getattr(self.gpu_mode_config, "memory_budget", 0.0) or 0.0
@@ -2207,11 +2238,8 @@ class APITestBase:
             raise
 
     def _should_chunk_accuracy_compare(self, estimated_temp_bytes, working_bytes):
-        """Dual-GPU accuracy compares stay on the comparison card as one full tensor."""
-        return bool(
-            estimated_temp_bytes > working_bytes
-            and not getattr(self.gpu_mode_config, "dual_gpu", False)
-        )
+        """Use bounded GPU workspaces when a full comparison would exceed the budget."""
+        return bool(estimated_temp_bytes > working_bytes)
 
     def test(self):
         pass

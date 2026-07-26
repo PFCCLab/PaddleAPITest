@@ -176,7 +176,7 @@ python engineV4.py \
 
 `--accuracy_stable_dual_gpu=True` 本身就是一种 accuracy-stable 测试模式，并隐式启用 `--use_gpu_mode=True`。如果没有显式传入 GPU mode，引擎会打印参数 warning 后继续执行。GPU 按规范化后的 `--gpu_ids` 顺序两两配对，例如 `--gpu_ids=0,2,5,7` 产生 `(0,2)`、`(5,7)` 两个 worker。该模式要求至少两张且 GPU 总数为偶数，并要求 `--num_workers_per_gpu=1`；单条 `--api_config` 默认使用 GPU 0/1，也可以显式指定任意两张卡。
 
-每次 Torch/Paddle backward 都在计算卡完成，随后将 detach 后的完整 output 和 input grad 搬到比较卡。无论 Tensor 大小，dual 模式都不进行 CPU spill、NumPy CPU fallback、chunk compare、采样、shape 裁剪、分布式 shard 或跨卡 autograd；所有比较均直接对比较卡上的完整 Tensor 执行。
+每次 Torch/Paddle backward 都在计算卡完成，随后将 detach 后的完整 output 和 input grad 搬到比较卡。dual 模式不进行 CPU spill、NumPy CPU fallback、采样、shape 裁剪、分布式 shard 或跨卡 autograd；所有元素仍在比较卡上参与比较。小 Tensor 直接调用 `torch.testing.assert_close`，大 Tensor 在比较卡上使用有界分块工作区完成等价的全量比较。
 
 双卡模式只能释放跨阶段驻留结果造成的计算卡压力；如果任意一次完整 forward/backward 自身已经超过单张计算卡显存，该模式无法将单个算子的 workspace 透明拆到两张卡。
 
