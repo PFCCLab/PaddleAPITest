@@ -60,10 +60,8 @@ from tester.api_config.logging import (
 )
 from tester.api_config.sanitizer_output import analyze_sanitizer_output
 from tester.runtime_config import (
-    GPU_MEMORY_POLICY_ENV,
     TestRuntimeConfig,
     limit_worker_layout,
-    resolve_gpu_memory_policy,
     runtime_config_for_gpu,
 )
 
@@ -1725,10 +1723,6 @@ def main():
     options = parser.parse_args()
     options.paddle_version = paddle_version
     _resolve_dump_options(parser, options)
-    try:
-        options.gpu_memory_policy = resolve_gpu_memory_policy()
-    except ValueError as err:
-        parser.error(str(err))
     if options.random_seed != parser.get_default("random_seed"):
         np.random.seed(options.random_seed)
     try:
@@ -1831,7 +1825,6 @@ def main():
         options.use_cached_numpy = False
     os.environ["USE_CACHED_NUMPY"] = str(options.use_cached_numpy)
     os.environ["USE_GPU_MODE"] = str(options.use_gpu_mode)
-    os.environ[GPU_MEMORY_POLICY_ENV] = options.gpu_memory_policy
     if options.bitwise_alignment:
         options.atol = 0.0
         options.rtol = 0.0

@@ -10,7 +10,7 @@ import torch
 
 from .accuracy import process_grad_output, process_output
 from .api_config.logging import log_comparison, log_worker
-from .base import CUDA_ERROR, CUDA_OOM, APITestBase, gpu_mode_maybe_empty_cache
+from .base import CUDA_ERROR, CUDA_OOM, APITestBase, gpu_mode_memory_decision
 from .paddle_to_torch import adaptive_workspace_bytes, get_converter
 
 
@@ -31,15 +31,9 @@ class APITestAccuracyStable(APITestBase):
         self.use_gpu_mode = self.gpu_mode_config.enabled
         self.use_dual_gpu = self.use_gpu_mode and self.gpu_mode_config.dual_gpu
         self.comparison_device_id = self.gpu_mode_config.comparison_device_id
-        self.use_aggressive_gpu_memory = (
-            self.use_gpu_mode and self.gpu_mode_config.memory_policy == "aggressive"
-        )
         self.converter = get_converter()
         torch.set_printoptions(profile="short", edgeitems=2, threshold=100, linewidth=120)
         torch.set_default_device("cuda")
-
-    def should_spill_first_results(self):
-        return self.use_gpu_mode and not self.use_dual_gpu and not self.use_aggressive_gpu_memory
 
     def move_tensor_tree_to_comparison_gpu(self, value):
         if self.comparison_device_id is None:
@@ -70,6 +64,15 @@ class APITestAccuracyStable(APITestBase):
             paddle.device.cuda.empty_cache()
         finally:
             paddle.device.set_device(compute_device)
+
+    def _reference_workspace_bytes(self, convert_result):
+        if not self.gpu_mode_config.enabled:
+            return 0
+        code = convert_result.code
+        source_lines = (*code.preprocess, *code.core, *code.postprocess)
+        if not any("_workspace_bytes =" in str(line) for line in source_lines):
+            return 0
+        return adaptive_workspace_bytes(torch)
 
     def _broadcast_to_comp_dimensions(self, log_type, affected_comps):
         """将执行阶段错误广播到所有受影响的 comp 维度"""
@@ -174,11 +177,14 @@ class APITestAccuracyStable(APITestBase):
                 torch_out_grads = self.move_tensor_tree_to_comparison_gpu(torch_out_grads)
                 self.release_compute_gpu_cache("torch")
             elif self.use_gpu_mode:
+                torch_live_bytes = self.tensor_tree_nbytes((torch_output, torch_out_grads))
                 # Release idle Torch blocks before the next Paddle execution;
                 # the two frameworks do not share caching allocators.
-                gpu_mode_maybe_empty_cache(
+                gpu_mode_memory_decision(
                     self.gpu_mode_config,
                     probe_bytes=probe_bytes,
+                    retained_tree_bytes=torch_live_bytes,
+                    required_headroom_bytes=probe_bytes + torch_live_bytes,
                 )
 
             if self.use_dual_gpu and _i == 1:
@@ -196,9 +202,10 @@ class APITestAccuracyStable(APITestBase):
             paddle_out_grads = self.detach_tensor_tree(paddle_out_grads)
             self.clear_runtime_inputs("paddle")
             if self.use_gpu_mode and not self.use_dual_gpu:
-                gpu_mode_maybe_empty_cache(
+                gpu_mode_memory_decision(
                     self.gpu_mode_config,
                     probe_bytes=probe_bytes,
+                    required_headroom_bytes=probe_bytes,
                 )
 
             # ======== format ========
@@ -225,42 +232,54 @@ class APITestAccuracyStable(APITestBase):
             paddle_output_pair.append(paddle_output)
             paddle_grad_pair.append(paddle_out_grads)
 
-            if _i == 0:
-                if comparison_executor is not None:
-                    first_pair_comparison = comparison_executor.submit(
-                        self.compare_first_pair,
-                        paddle_output_pair[0],
-                        torch_output_pair[0],
-                        paddle_grad_pair[0],
-                        torch_grad_pair[0],
-                    )
-                else:
-                    self.compare(paddle_output_pair[0], torch_output_pair[0], "P1T1")
-                    self.compare(paddle_grad_pair[0], torch_grad_pair[0], "P1T1B")
-                if self.use_gpu_mode and not self.use_dual_gpu:
-                    # Keep the first pair on GPU while the configured budget has
-                    # headroom. Spill only when the existing GPU-mode policy says
-                    # the next execution needs relief; this avoids forcing later
-                    # summary comparisons through CPU for very large outputs.
-                    should_spill = gpu_mode_maybe_empty_cache(
-                        self.gpu_mode_config,
-                        request_spill=True,
-                        probe_bytes=probe_bytes,
-                    )
-                    if should_spill:
-                        torch_output_pair[0] = self.move_tensor_tree_to_cpu(torch_output_pair[0])
-                        paddle_output_pair[0] = self.move_tensor_tree_to_cpu(paddle_output_pair[0])
-                        torch_grad_pair[0] = self.move_tensor_tree_to_cpu(torch_grad_pair[0])
-                        paddle_grad_pair[0] = self.move_tensor_tree_to_cpu(paddle_grad_pair[0])
-                        torch_output = None
-                        paddle_output = None
-                        torch_out_grads = None
-                        paddle_out_grads = None
-                        gc.collect()
-                        gpu_mode_maybe_empty_cache(
-                            self.gpu_mode_config,
-                            force=True,
-                        )
+            # Pair lists own the results from here onward. Drop loop-local aliases
+            # before comparison or D2H spill so source trees can be released serially.
+            torch_output = None
+            paddle_output = None
+            torch_out_grads = None
+            paddle_out_grads = None
+            if _i != 0:
+                continue
+
+            if comparison_executor is not None:
+                first_pair_comparison = comparison_executor.submit(
+                    self.compare_first_pair,
+                    paddle_output_pair[0],
+                    torch_output_pair[0],
+                    paddle_grad_pair[0],
+                    torch_grad_pair[0],
+                )
+            else:
+                self.compare(paddle_output_pair[0], torch_output_pair[0], "P1T1")
+                self.compare(paddle_grad_pair[0], torch_grad_pair[0], "P1T1B")
+
+            if self.use_dual_gpu:
+                continue
+            if not self.use_gpu_mode:
+                continue
+
+            torch_phase_bytes = self.tensor_tree_nbytes((torch_output_pair[0], torch_grad_pair[0]))
+            paddle_phase_bytes = self.tensor_tree_nbytes(
+                (paddle_output_pair[0], paddle_grad_pair[0])
+            )
+            retained_tree_bytes = torch_phase_bytes + paddle_phase_bytes
+            required_headroom_bytes = (
+                probe_bytes
+                + max(torch_phase_bytes, paddle_phase_bytes)
+                + self._reference_workspace_bytes(convert_result)
+            )
+            decision = gpu_mode_memory_decision(
+                self.gpu_mode_config,
+                request_spill=True,
+                probe_bytes=probe_bytes,
+                retained_tree_bytes=retained_tree_bytes,
+                required_headroom_bytes=required_headroom_bytes,
+            )
+            if decision.should_spill:
+                self.spill_tensor_tree_slot_to_cpu(torch_output_pair)
+                self.spill_tensor_tree_slot_to_cpu(paddle_output_pair)
+                self.spill_tensor_tree_slot_to_cpu(torch_grad_pair)
+                self.spill_tensor_tree_slot_to_cpu(paddle_grad_pair)
 
         self.clear_original_cpu_inputs()
         if self.use_dual_gpu:

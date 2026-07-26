@@ -122,7 +122,7 @@ python engineV4.py \
 
 ### engineV2
 
-`engineV2.py` 使用 Pebble `ProcessPool`。除调度方式和 engineV4 专属 compute-sanitizer 外，其测试模式、双卡 accuracy-stable、GPU mode、显存策略、dump 和主要参数与 engineV4 对齐。详见 [engineV2 文档](engineV2-README.md)。
+`engineV2.py` 使用 Pebble `ProcessPool`。除调度方式和 engineV4 专属 compute-sanitizer 外，其测试模式、双卡 accuracy-stable、GPU mode、动态显存管理、dump 和主要参数与 engineV4 对齐。详见 [engineV2 文档](engineV2-README.md)。
 
 ### 其他入口
 
@@ -138,21 +138,16 @@ python run.py -c test_pipeline/run_config.yaml
 
 模型配置集可以使用 `${APITEST_MODEL}` 占位，示例见 [generic configs 文档](test_pipeline/generic_configs/README.md)。
 
-## GPU Mode 与显存策略
+## GPU Mode 与动态显存管理
 
 `--use_gpu_mode=True` 在 GPU 上生成 Tensor 并进行比较，复用 CUDA allocator，适用于大规模 `accuracy_stable` 测试。此模式会忽略 `--use_cached_numpy=True`。
 
-进程级环境变量 `PADDLEAPITEST_GPU_MEMORY_POLICY` 控制显存使用的激进程度：
-
-| 值 | 行为 | 建议场景 |
-| --- | --- | --- |
-| `conservative` | 默认值；首轮输出和梯度转移到 CPU，并在显存压力下释放缓存 | 大 Tensor、未知 shape、优先避免 OOM |
-| `aggressive` | 首轮输出和梯度继续驻留 GPU，减少同步和 D2H 开销 | 已知的小 shape 配置集、优先吞吐 |
-
-策略在启动时固定，不按 case 切换或 OOM 自动重试。大 Tensor 使用 `conservative`：
+GPU mode 不需要选择固定显存策略。框架会在 Torch/Paddle 阶段边界查询整卡空闲显存，
+按下一阶段输入、已观测输出/梯度和 reference workspace 估算 headroom；有压力时先释放两个
+框架的 allocator cache 并重新查询，只有 headroom 仍不足时才将第一轮结果逐棵转移到 CPU。
+小 shape 在显存充足时不会执行不必要的 D2H。
 
 ```bash
-PADDLEAPITEST_GPU_MEMORY_POLICY=conservative \
 python engineV4.py \
   --accuracy_stable=True \
   --use_gpu_mode=True \
@@ -162,18 +157,7 @@ python engineV4.py \
   --log_dir=tester/api_config/test_log_big_tensor
 ```
 
-小 shape 配置可用 `aggressive`：
-
-```bash
-PADDLEAPITEST_GPU_MEMORY_POLICY=aggressive \
-python engineV4.py \
-  --accuracy_stable=True \
-  --use_gpu_mode=True \
-  --api_config_file=tester/api_config/7_0_size/0_size_tensor_1_8_1.txt \
-  --log_dir=tester/api_config/test_log_0size
-```
-
-两种策略都保留 CPU 输入快照和大结果分块比较。
+该流程始终保留不可变 CPU 输入快照、四次真实执行、全部稳定性比较和大结果分块比较。
 
 ### Accuracy Stable 双卡模式
 
@@ -279,7 +263,7 @@ PaddleAPITest/
 │   ├── accuracy.py             # Paddle/Torch 精度测试
 │   ├── accuracy_stable.py      # 跨框架精度和重复执行稳定性
 │   ├── base.py                 # 测试基类、输入生成与比较
-│   ├── runtime_config.py       # worker 运行配置和 GPU 显存策略
+│   ├── runtime_config.py       # worker 运行配置和 GPU 显存预算
 │   └── *_performance.py        # 性能测试实现
 └── tools/                      # 配置集、日志和错误分析工具
 ```

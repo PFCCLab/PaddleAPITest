@@ -6,7 +6,6 @@ runner:
   engine: engineV4
   foreground: true
 env:
-  PADDLEAPITEST_GPU_MEMORY_POLICY: aggressive
   FLAGS_use_system_allocator: "true"
   FLAGS_check_cuda_error: "true"
   FLAGS_alloc_fill_value: "255"

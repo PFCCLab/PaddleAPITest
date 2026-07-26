@@ -77,12 +77,7 @@ def print_run_header(options, paddle_version):
             gpu_ids_display = options.gpu_ids
         compute = [("--gpu_ids", gpu_ids_display)]
         if options.use_gpu_mode:
-            compute.extend(
-                [
-                    ("--use_gpu_mode", True),
-                    ("--gpu_memory_policy", options.gpu_memory_policy),
-                ]
-            )
+            compute.append(("--use_gpu_mode", True))
             if getattr(options, "accuracy_stable_dual_gpu", False):
                 compute.append(("--accuracy_stable_dual_gpu", True))
         elif options.use_cached_numpy:
