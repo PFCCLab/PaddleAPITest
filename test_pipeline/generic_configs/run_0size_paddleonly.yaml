@@ -8,13 +8,16 @@ runner:
 env:
   FLAGS_use_system_allocator: "true"
   FLAGS_check_cuda_error: "true"
+  FLAGS_alloc_fill_value: "255"
+  FLAGS_check_nan_inf: "true"
 input:
   api_config_file: "${APITEST_MODEL}/paddleonly_0size/0size.txt"
 output:
   log_dir: "test_${APITEST_MODEL}_log_0size_paddleonly"
 engine_args:
   paddle_only: true
+  use_gpu_mode: true
   num_gpus: -1
-  num_workers_per_gpu: 8
+  num_workers_per_gpu: 4
   timeout: 600
   use_compute_sanitizer: true

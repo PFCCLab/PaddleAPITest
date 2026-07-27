@@ -13,5 +13,5 @@ engine_args:
   accuracy_stable: true
   use_gpu_mode: true
   num_gpus: -1
-  num_workers_per_gpu: 8
+  num_workers_per_gpu: 4
   timeout: 600

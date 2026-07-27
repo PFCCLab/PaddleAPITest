@@ -47,8 +47,8 @@ python run.py -c test_pipeline/generic_configs/run_1M_accuracy.yaml \
 
 | 配置 | num_workers_per_gpu |
 | --- | --- |
-| 0size accuracy | 8 |
-| 0size paddleonly | 8 |
+| 0size accuracy | 4 |
+| 0size paddleonly | 4 |
 | 4096 accuracy | 4 |
 | 4096 paddleonly | 4 |
 | 1M accuracy/paddleonly | 1 |
