@@ -1009,7 +1009,6 @@ apis:
  - paddle.incubate.nn.functional.moe_gate_dispatch_partial_nosoftmaxtopk
  - paddle.incubate.nn.functional.moe_gate_dispatch_permute
  - paddle.narrow
- - paddle.nn.clip
  - paddle.nn.clip._squared_l2_norm
  - paddle.nn.clip.get_tensor_from_selected_rows
  - paddle.nn.clip.merge_selected_rows
