@@ -402,18 +402,9 @@ class APITestAccuracyStable(APITestBase):
             if paddle_output is None:
                 abort_case_resources()
                 return
-            paddle_output = self.detach_tensor_tree(paddle_output)
-            paddle_out_grads = self.detach_tensor_tree(paddle_out_grads)
-            self.clear_runtime_inputs("paddle")
-            if self.use_gpu_mode and not self.use_dual_gpu:
-                gpu_mode_memory_decision(
-                    self.gpu_mode_config,
-                    probe_bytes=probe_bytes,
-                    required_headroom_bytes=probe_bytes,
-                )
-
-            # ======== format ========
             try:
+                # Normalize API-specific output quirks before detach/move/byte
+                # accounting touches uninitialized Paddle placeholders.
                 paddle_output, torch_output = process_output(
                     self.api_config, paddle_output, torch_output
                 )
@@ -423,6 +414,15 @@ class APITestAccuracyStable(APITestBase):
             except Exception:
                 abort_case_resources()
                 raise
+            paddle_output = self.detach_tensor_tree(paddle_output)
+            paddle_out_grads = self.detach_tensor_tree(paddle_out_grads)
+            self.clear_runtime_inputs("paddle")
+            if self.use_gpu_mode and not self.use_dual_gpu:
+                gpu_mode_memory_decision(
+                    self.gpu_mode_config,
+                    probe_bytes=probe_bytes,
+                    required_headroom_bytes=probe_bytes,
+                )
 
             if self.use_dual_gpu:
                 # Formatting may create replacement tensors. Normalize the first
@@ -844,7 +844,32 @@ class APITestAccuracyStable(APITestBase):
         return paddle_output, paddle_out_grads
 
     def compare(self, input1, input2, comp):
-        if isinstance(input1, (paddle.Tensor, torch.Tensor)):
+        input1_missing = input1 is None or (
+            isinstance(input1, paddle.Tensor)
+            and not input1._is_initialized()
+            and int(input1.numel()) != 0
+        )
+        input2_missing = input2 is None or (
+            isinstance(input2, paddle.Tensor)
+            and not input2._is_initialized()
+            and int(input2.numel()) != 0
+        )
+        if input1_missing and input2_missing:
+            dtype = "None"
+            if isinstance(input1, (paddle.Tensor, torch.Tensor)):
+                dtype = str(input1.dtype)
+            elif isinstance(input2, (paddle.Tensor, torch.Tensor)):
+                dtype = str(input2.dtype)
+            log_comparison.log_accuracy_stable(
+                "Identical",
+                self.api_config.api_name,
+                self.api_config.config,
+                dtype,
+                comp,
+                tensor_index=0,
+                tensor_count=1,
+            )
+        elif isinstance(input1, (paddle.Tensor, torch.Tensor)):
             if isinstance(input2, (paddle.Tensor, torch.Tensor)):
                 try:
                     self.assert_accuracy(
@@ -900,7 +925,32 @@ class APITestAccuracyStable(APITestBase):
                 return
             tensor_count = len(input1)
             for idx, (item1, item2) in enumerate(zip(input1, input2, strict=False)):
-                if isinstance(item1, (paddle.Tensor, torch.Tensor)) and isinstance(
+                item1_missing = item1 is None or (
+                    isinstance(item1, paddle.Tensor)
+                    and not item1._is_initialized()
+                    and int(item1.numel()) != 0
+                )
+                item2_missing = item2 is None or (
+                    isinstance(item2, paddle.Tensor)
+                    and not item2._is_initialized()
+                    and int(item2.numel()) != 0
+                )
+                if item1_missing and item2_missing:
+                    dtype = "None"
+                    if isinstance(item1, (paddle.Tensor, torch.Tensor)):
+                        dtype = str(item1.dtype)
+                    elif isinstance(item2, (paddle.Tensor, torch.Tensor)):
+                        dtype = str(item2.dtype)
+                    log_comparison.log_accuracy_stable(
+                        "Identical",
+                        self.api_config.api_name,
+                        self.api_config.config,
+                        dtype,
+                        comp,
+                        tensor_index=idx,
+                        tensor_count=tensor_count,
+                    )
+                elif isinstance(item1, (paddle.Tensor, torch.Tensor)) and isinstance(
                     item2, (paddle.Tensor, torch.Tensor)
                 ):
                     try:

@@ -476,6 +476,13 @@ class TensorConfig:
     def get_gpu_paddle_tensor(self, api_config, dtype=None):
         dtype = dtype or self.dtype
         if self.paddle_tensor is None:
+            if (
+                getattr(api_config, "api_name", "") == "paddle.assign"
+                and self.numel() == 0
+                and self.check_arg(api_config, 1, "output")
+            ):
+                self.paddle_tensor = self._make_gpu_paddle_tensor(api_config, dtype)
+                return self.paddle_tensor
             if getattr(api_config, "use_torch", True):
                 self.paddle_tensor, self.torch_tensor = self._make_gpu_tensor_pair(
                     api_config, dtype
@@ -3398,6 +3405,14 @@ class TensorConfig:
 
     def get_paddle_tensor(self, api_config):
         if self.paddle_tensor is None:
+            if (
+                getattr(api_config, "api_name", "") == "paddle.assign"
+                and self.numel() == 0
+                and self.check_arg(api_config, 1, "output")
+                and self._use_gpu(api_config)
+            ):
+                self.paddle_tensor = self._make_gpu_paddle_tensor(api_config)
+                return self.paddle_tensor
             if self.cpu_tensor is not None:
                 torch_tensor = self.cpu_tensor.to(
                     device=torch.device("cuda:0") if self._use_gpu(api_config) else "cpu",

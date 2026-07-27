@@ -8257,24 +8257,32 @@ elif op_name == "fused_swiglu_scale_clamp":
     scale   = arg2   # scalar or tensor [..., 1] or [...,]
     max_val = arg3   # scalar
     _hidden = x.shape[-1] // 2
-    _outer = x.numel() // (_hidden * 2)
-    _x_2d = x.reshape(_outer, _hidden * 2)
-    _out = torch.empty((_outer, _hidden), dtype=x.dtype, device=x.device)
-    if torch.is_tensor(scale):
-        scale = scale.view(*scale.shape[:-1], 1) if scale.dim() > 1 else scale.unsqueeze(-1)
-    _workspace_bytes = 32 << 30
-    _bytes_per_row = max(1, _hidden * (4 * 4 + x.element_size()))
-    _row_chunk = max(1, min(_outer, _workspace_bytes // _bytes_per_row))
-    with torch.no_grad():
-        for _row_start in range(0, _outer, _row_chunk):
-            _row_end = min(_outer, _row_start + _row_chunk)
-            _lhs = _x_2d[_row_start:_row_end, :_hidden].to(torch.float32)
-            _rhs = _x_2d[_row_start:_row_end, _hidden:].to(torch.float32)
-            _lhs.mul_(torch.sigmoid(_lhs)).mul_(_rhs)
-            _scale_chunk = scale[_row_start:_row_end] if torch.is_tensor(scale) and scale.numel() > 1 else scale
-            _lhs.mul_(_scale_chunk).clamp_(min=-float(max_val), max=float(max_val))
-            _out[_row_start:_row_end] = _lhs.to(x.dtype)
-    result = [_out.reshape(*x.shape[:-1], _hidden)]
+    if x.shape[-1] == 0:
+        result = [torch.empty((*x.shape[:-1], 0), dtype=x.dtype, device=x.device)]
+    elif x.shape[-1] % 2 != 0:
+        raise ValueError(
+            f"input shape is invalid for input of size {tuple(x.shape)}: "
+            "fused_swiglu_scale_clamp requires an even last dimension"
+        )
+    else:
+        _outer = x.numel() // (_hidden * 2)
+        _x_2d = x.reshape(_outer, _hidden * 2)
+        _out = torch.empty((_outer, _hidden), dtype=x.dtype, device=x.device)
+        if torch.is_tensor(scale):
+            scale = scale.view(*scale.shape[:-1], 1) if scale.dim() > 1 else scale.unsqueeze(-1)
+        _workspace_bytes = 32 << 30
+        _bytes_per_row = max(1, _hidden * (4 * 4 + x.element_size()))
+        _row_chunk = max(1, min(_outer, _workspace_bytes // _bytes_per_row))
+        with torch.no_grad():
+            for _row_start in range(0, _outer, _row_chunk):
+                _row_end = min(_outer, _row_start + _row_chunk)
+                _lhs = _x_2d[_row_start:_row_end, :_hidden].to(torch.float32)
+                _rhs = _x_2d[_row_start:_row_end, _hidden:].to(torch.float32)
+                _lhs.mul_(torch.sigmoid(_lhs)).mul_(_rhs)
+                _scale_chunk = scale[_row_start:_row_end] if torch.is_tensor(scale) and scale.numel() > 1 else scale
+                _lhs.mul_(_scale_chunk).clamp_(min=-float(max_val), max=float(max_val))
+                _out[_row_start:_row_end] = _lhs.to(x.dtype)
+        result = [_out.reshape(*x.shape[:-1], _hidden)]
 
 
 elif op_name == "fused_swiglu_scale_clamp_bwd":
