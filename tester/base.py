@@ -1686,16 +1686,8 @@ class APITestBase:
         rtol,
         error_msg,
     ):
-        actual_is_complex = actual_dtype.is_complex
-        expected_is_complex = expected_dtype.is_complex
         actual_is_float8 = "float8" in str(actual_dtype)
         expected_is_float8 = "float8" in str(expected_dtype)
-        actual_supports_nan = (
-            actual_dtype.is_floating_point
-            or actual_is_complex
-            or expected_dtype.is_floating_point
-            or expected_is_complex
-        )
         mismatch_count = 0
         max_abs_diff = -1.0
         max_abs_index = 0
@@ -1725,7 +1717,7 @@ class APITestBase:
 
             if exact_compare:
                 equal = actual_chunk == expected_chunk
-                if actual_supports_nan:
+                if actual_chunk.dtype.is_floating_point or actual_chunk.dtype.is_complex:
                     equal |= torch.isnan(actual_chunk) & torch.isnan(expected_chunk)
                 mismatch = equal.logical_not_()
             else:
@@ -2117,14 +2109,10 @@ class APITestBase:
             # querying the CUDA driver for a working budget on that hot path.
             needs_chunk_budget = estimated_temp_bytes > working_bytes
             if actual_tensor.is_cuda and needs_chunk_budget:
+                insufficient_dual_headroom = False
                 try:
-                    free_bytes, _ = torch.cuda.mem_get_info(actual_tensor.device)
-                    max_working_bytes = 32 * 1024**3
+                    free_bytes, total_bytes = torch.cuda.mem_get_info(actual_tensor.device)
                     min_working_bytes = 256 * 1024**2
-                    # Physical headroom is a hard limit. The configured minimum
-                    # below is only a performance target when free memory permits.
-                    working_bytes = max(1, min(max_working_bytes, free_bytes // 5))
-
                     memory_budget = float(
                         getattr(self.gpu_mode_config, "memory_budget", 0.0) or 0.0
                     )
@@ -2140,8 +2128,24 @@ class APITestBase:
                             )
                             or memory_budget
                         )
-                    if memory_budget > 0:
+
+                    if dual_gpu:
+                        budget_bytes = int(memory_budget * (1024**3)) if memory_budget > 0 else 0
+                        reserve_bytes = self._dual_comparison_safety_reserve_bytes(
+                            total_bytes, budget_bytes
+                        )
+                        working_bytes = self._dual_comparison_workspace_bytes(
+                            free_bytes, reserve_bytes
+                        )
+                        insufficient_dual_headroom = working_bytes == 0
+                    else:
                         reserved_bytes = torch.cuda.memory_reserved(actual_tensor.device)
+                        max_working_bytes = 32 * 1024**3
+                        # Physical headroom is a hard limit. The configured minimum
+                        # below is only a performance target when free memory permits.
+                        working_bytes = max(1, min(max_working_bytes, free_bytes // 5))
+
+                    if memory_budget > 0 and not dual_gpu:
                         budget_headroom = max(
                             0,
                             int(memory_budget * (1024**3)) - reserved_bytes,
@@ -2152,6 +2156,11 @@ class APITestBase:
                         )
                 except Exception:
                     pass
+                if insufficient_dual_headroom:
+                    raise RuntimeError(
+                        "[torch_assert_OOM] comparison card lacks the reserved headroom "
+                        "for a bounded GPU comparison"
+                    )
             if self._should_chunk_accuracy_compare(estimated_temp_bytes, working_bytes):
                 self._torch_assert_accuracy_in_chunks(
                     actual_tensor,
@@ -2240,6 +2249,29 @@ class APITestBase:
     def _should_chunk_accuracy_compare(self, estimated_temp_bytes, working_bytes):
         """Use bounded GPU workspaces when a full comparison would exceed the budget."""
         return bool(estimated_temp_bytes > working_bytes)
+
+    @staticmethod
+    def _dual_comparison_workspace_bytes(free_bytes, reserve_bytes):
+        """Choose a bounded comparison workspace from physical card headroom."""
+        max_workspace = 64 * 1024**3
+        min_workspace = 256 * 1024**2
+        available_bytes = max(0, int(free_bytes) - int(reserve_bytes))
+        half_available = available_bytes // 2
+        if half_available <= 0:
+            return 0
+        if half_available < min_workspace:
+            return half_available
+        return min(max_workspace, max(min_workspace, half_available))
+
+    @staticmethod
+    def _dual_comparison_safety_reserve_bytes(total_bytes, budget_bytes):
+        """Keep a small physical reserve without double-counting allocator state."""
+        minimum_reserve = 1 * 1024**3
+        total_bytes = max(0, int(total_bytes))
+        budget_bytes = max(0, int(budget_bytes))
+        if budget_bytes > 0 and budget_bytes < total_bytes:
+            return max(minimum_reserve, total_bytes - budget_bytes)
+        return max(minimum_reserve, total_bytes // 20)
 
     def test(self):
         pass
