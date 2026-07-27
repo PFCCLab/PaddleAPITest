@@ -642,6 +642,7 @@ class APITestAccuracyStable(APITestBase):
                         outputs=result_outputs,
                         inputs=inputs_list,
                         grad_outputs=result_outputs_grads,
+                        allow_unused=True,
                     )
                     torch_grad_success = True
             except Exception as err:

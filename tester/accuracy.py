@@ -242,6 +242,7 @@ class APITestAccuracy(APITestBase):
                         outputs=result_outputs,
                         inputs=inputs_list,
                         grad_outputs=result_outputs_grads,
+                        allow_unused=True,
                     )
                     torch_grad_success = True
                     self.dump_save("torch_input_grads", torch_out_grads, framework="torch")

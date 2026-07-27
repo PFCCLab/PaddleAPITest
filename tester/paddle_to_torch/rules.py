@@ -5232,7 +5232,9 @@ if broadcast == True:
 index = index.to(dtype=torch.int64)
 """
         core = """
-if reduce == 'assign':
+if index.numel() == 0:
+    result = input.clone()
+elif reduce == 'assign':
     result = torch.scatter(input, dim, index, src)
 else:
     result = torch.scatter_reduce(input, dim, index, src, reduce, include_self=include_self)
