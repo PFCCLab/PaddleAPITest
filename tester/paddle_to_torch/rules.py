@@ -8340,86 +8340,62 @@ elif op_name == "fused_swiglu_scale_clamp_bwd":
 
 elif op_name in ("fused_swiglu_probs_bwd", "paddlefleet_fused_swiglu_probs_bwd"):
     # _run_custom_op("fused_swiglu_probs_bwd", o1, do2_s, unzipped_probs, inplace)
-    # 输出 [do1, probs_grad, o2_s]，语义参考 paddlefleet 的 SwigluProbsGradKernel:
-    #   lhs, rhs = chunk(o1, 2, -1); sig = sigmoid(lhs); silu = sig*lhs
-    #   do1[..., :H] = (do2_s*probs) * rhs * sig * (1 + lhs - silu)
-    #   do1[..., H:] = (do2_s*probs) * silu
-    #   o2_s         = silu * rhs * probs
-    #   probs_grad   = sum_last_dim(do2_s * silu * rhs),shape [outer_dim],float32
-    # 注意：
-    #   1) 空输入 (numel==0) 时 Paddle 直接返回占位 tensor,不做 shape 一致性检查；
-    #   2) 大 shape + bf16 输入若整体 upcast 到 fp32 会爆显存，分块处理。
-    o1     = arg1
-    do2_s  = arg2
-    probs  = arg3
+    # 对照 paddlefleet_ops/_extensions/fused_swiglu_probs_bwd.cu 中
+    # SwigluProbsGradKernel 的公式逐句实现，全程 fp32、只在写出时舍入一次；
+    # 乘法结合顺序与 kernel 保持一致（不做代数重排）:
+    #   lhs = o1[..., :H];  rhs = o1[..., H:]
+    #   sig = 1/(1+exp(-lhs));  tmp = sig*lhs;  o2_val = tmp*rhs
+    #   do2_val = do2_s*prob
+    #   do1[..., :H] = do2_val*rhs*sig*(1+lhs-tmp)
+    #   do1[..., H:] = do2_val*tmp
+    #   o2_s         = o2_val*prob
+    #   probs_grad   = sum(do2_s*o2_val)，fp32，shape [outer]
+    o1 = arg1
+    do2_s = arg2
+    probs = arg3
     inplace_flag = bool(arg4) if arg4 is not None else False
-    H2 = o1.shape[-1]
-    H = H2 // 2
+    H = o1.shape[-1] // 2
     outer = 1
     for _s in o1.shape[:-1]:
         outer *= _s
 
-    # Paddle 的 SwigluProbsGradCUDABackward:
-    #   do1      = inplace ? o1    : empty_like(o1)
-    #   o2_s     = inplace ? do2_s : empty_like(do2_s)
-    #   probs_grad = empty({outer}, fp32)   # 始终新分配
-    # 当任一输入 numel==0 时，kernel 不执行，直接返回上述（已分配但未写入的）buffer。
-    # 因此 inplace=True 时 do1/o2_s 保留 o1/do2_s 的原值；非 inplace 时为未初始化值。
+    # SwigluProbsGradCUDABackward 在任一输入 numel==0 时不启动 kernel，直接返回
+    # do1 = inplace ? o1 : empty_like(o1)、o2_s = inplace ? do2_s : empty_like(do2_s)
+    # 以及始终新分配的 probs_grad = empty({outer}, fp32)（未初始化）。
     if o1.numel() == 0 or do2_s.numel() == 0 or probs.numel() == 0:
         if inplace_flag:
-            do1_e  = o1.clone()
-            o2_s_e = do2_s.clone()
+            do1 = o1.clone()
+            o2_s = do2_s.clone()
         else:
-            do1_e  = torch.zeros_like(o1)
-            o2_s_e = torch.zeros_like(do2_s)
-        # probs_grad 始终是新分配的未初始化 buffer；用 0 占位
-        pg_e = torch.zeros([outer], dtype=torch.float32, device=o1.device)
-        result = [do1_e, pg_e, o2_s_e]
+            do1 = torch.zeros_like(o1)
+            o2_s = torch.zeros_like(do2_s)
+        probs_grad = torch.zeros([outer], dtype=torch.float32, device=o1.device)
+        result = [do1, probs_grad, o2_s]
     else:
-        o1_dtype  = o1.dtype
-        do2_dtype = do2_s.dtype
-        o1_2d  = o1.reshape(outer, H2)
-        do2_2d = do2_s.reshape(outer, H)
-        probs_flat = probs.reshape(-1)
-        # Accuracy tests create Paddle/Torch input pairs through DLPack, so the
-        # two framework tensors can share storage. Even when the custom op asks
-        # Paddle to reuse its inputs, the reference must preserve its inputs for
-        # the subsequent Paddle run. Chunked temporaries still bound the peak.
-        do1_out = torch.empty_like(o1_2d)
-        o2_s_out = torch.empty_like(do2_2d)
-        pg_out = torch.empty([outer], dtype=torch.float32, device=o1.device)
-        # At most nine FP32 [chunk, H] buffers overlap below. Include BF16
-        # casts so the temporary working set remains within 32 GiB.
-        _workspace_bytes = 32 << 30
-        bytes_per_row = max(1, H * (4 * 9 + o1.element_size() * 3))
-        row_chunk = max(1, min(outer, _workspace_bytes // bytes_per_row))
-        # 切片原地写入会触发 autograd 对叶子张量的报错（尤其 fp32 叶子节点），
-        # 这里整体走 no_grad：本算子是 bwd kernel 的数值复刻，不需要再次求导。
+        o1_2d = o1.reshape(outer, H * 2)
+        # 本算子是 bwd kernel 的数值复刻，不需要再次求导；同时 inplace=True 时
+        # paddle 会写坏共享存储的输入，参考实现一律输出新 buffer。
         with torch.no_grad():
-            for row_start in range(0, outer, row_chunk):
-                row_end = min(outer, row_start + row_chunk)
-                # inplace 时 o1_2d 即将被写入，需先把 lhs/rhs 拷到 fp32 中间变量
-                lhs_c = o1_2d[row_start:row_end, :H].float()
-                rhs_c = o1_2d[row_start:row_end, H:].float()
-                do2_c = do2_2d[row_start:row_end].float()
-                prob_c = probs_flat[row_start:row_end].to(torch.float32).unsqueeze(-1)
-                sig_c = torch.sigmoid(lhs_c)
-                silu_c = lhs_c * sig_c
-                o2_c = silu_c * rhs_c
+            lhs = o1_2d[:, :H].float()
+            rhs = o1_2d[:, H:].float()
+            do2 = do2_s.reshape(outer, H).float()
+            prob = probs.reshape(outer, 1).to(torch.float32)
 
-                pg_out[row_start:row_end] = (do2_c * o2_c).sum(dim=-1)
-                o2_s_out[row_start:row_end] = (o2_c * prob_c).to(do2_dtype)
+            sig = torch.sigmoid(lhs)
+            tmp = sig * lhs
+            o2_val = tmp * rhs
+            do2_val = do2 * prob
 
-                # Reuse do2_c for the probability-weighted upstream gradient.
-                do2_c.mul_(prob_c)
-                x1g_c = do2_c * silu_c
-                lhs_c.sub_(silu_c).add_(1.0).mul_(sig_c).mul_(rhs_c).mul_(do2_c)
-                do1_out[row_start:row_end, :H] = lhs_c.to(o1_dtype)
-                do1_out[row_start:row_end, H:] = x1g_c.to(o1_dtype)
+            x0_grad = do2_val * rhs * sig * (1.0 + lhs - tmp)
+            x1_grad = do2_val * tmp
+
+            do1 = torch.cat([x0_grad, x1_grad], dim=-1).to(o1.dtype)
+            o2_s = (o2_val * prob).to(do2_s.dtype)
+            probs_grad = (do2 * o2_val).sum(dim=-1)
         result = [
-            do1_out.reshape(o1.shape),
-            pg_out,
-            o2_s_out.reshape(do2_s.shape),
+            do1.reshape(o1.shape),
+            probs_grad,
+            o2_s.reshape(do2_s.shape),
         ]
 
 elif op_name == "fuse_weighted_swiglu_fp8_quant":
