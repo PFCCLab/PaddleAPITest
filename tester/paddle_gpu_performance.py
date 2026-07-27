@@ -4,7 +4,7 @@ import time
 
 import paddle
 
-from .api_config.config_analyzer import TensorConfig
+from .api_config.input_generation.tensor_config import TensorConfig
 from .api_config.logging.log_worker import write_to_log
 from .base import APITestBase
 

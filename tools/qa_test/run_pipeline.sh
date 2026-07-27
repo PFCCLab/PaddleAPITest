@@ -55,15 +55,8 @@ echo "  输入: $INPUT_DIR"
 echo "  输出: $OUTPUT_DIR"
 echo "======================================================================"
 
-# ─── 同步 config_analyzer.py 和 api.yaml ───
 REPO_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
-SOURCE_DIR="$REPO_DIR/tester/api_config"
-
-echo ""
-echo "[准备] 同步 config_analyzer.py 和 api.yaml..."
-cp "$SOURCE_DIR/config_analyzer.py" "$SCRIPT_DIR/config_analyzer.py"
-cp "$SOURCE_DIR/api.yaml" "$SCRIPT_DIR/api.yaml"
-echo "  已从 $SOURCE_DIR 复制到 $SCRIPT_DIR"
+export PYTHONPATH="$REPO_DIR${PYTHONPATH:+:$PYTHONPATH}"
 
 # ─── 检查输入 ───
 if [ ! -f "$INPUT_DIR/api_config_1024.txt" ] || [ ! -f "$INPUT_DIR/api_config_2048.txt" ]; then

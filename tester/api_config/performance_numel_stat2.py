@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from config_analyzer import TensorConfig, analyse_configs
+from tester.api_config.input_generation.tensor_config import TensorConfig
+from tester.api_config.parser import analyse_configs
 from tqdm import tqdm
 
 

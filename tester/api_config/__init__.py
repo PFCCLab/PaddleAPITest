@@ -9,13 +9,12 @@ __all__ = [
 ]
 
 if TYPE_CHECKING:
-    from .config_analyzer import (
+    from .input_generation.tensor_config import (
         USE_CACHED_NUMPY,
-        APIConfig,
         TensorConfig,
-        analyse_configs,
         cached_numpy,
     )
+    from .parser import APIConfig, analyse_configs
 
 
 def __getattr__(name: str) -> Any:
@@ -23,23 +22,23 @@ def __getattr__(name: str) -> Any:
         raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
     if name == "TensorConfig":
-        from .config_analyzer import TensorConfig
+        from .input_generation.tensor_config import TensorConfig
 
         return TensorConfig
     elif name == "APIConfig":
-        from .config_analyzer import APIConfig
+        from .parser import APIConfig
 
         return APIConfig
     elif name == "analyse_configs":
-        from .config_analyzer import analyse_configs
+        from .parser import analyse_configs
 
         return analyse_configs
     elif name == "USE_CACHED_NUMPY":
-        from .config_analyzer import USE_CACHED_NUMPY
+        from .input_generation.tensor_config import USE_CACHED_NUMPY
 
         return USE_CACHED_NUMPY
     elif name == "cached_numpy":
-        from .config_analyzer import cached_numpy
+        from .input_generation.tensor_config import cached_numpy
 
         return cached_numpy
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

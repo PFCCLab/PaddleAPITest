@@ -10,12 +10,12 @@ import numpy
 import paddle
 import yaml
 
-from .api_config.config_analyzer import (
+from .api_config.dump_writer import DEFAULT_DUMP_DIR, DumpContext, dump_enabled
+from .api_config.input_generation.tensor_config import (
     USE_CACHED_NUMPY,
     TensorConfig,
     get_cached_numpy_array,
 )
-from .api_config.dump_writer import DEFAULT_DUMP_DIR, DumpContext, dump_enabled
 from .api_config.logging.log_comparison import log_accuracy_tolerance
 from .api_config.logging.log_schema import MAX_CSV_CONFIG_LENGTH
 from .api_config.logging.log_worker import write_to_log
@@ -828,7 +828,7 @@ class APITestBase:
 
         return tuple(processed_indices) if is_tuple else processed_indices
 
-    def gen_numpy_input(self):
+    def _gen_numpy_input_legacy(self):
         for i, arg_config in enumerate(self.paddle_args_config):
             if isinstance(arg_config, (list, tuple)):
                 is_tuple = isinstance(arg_config, tuple)
@@ -842,6 +842,11 @@ class APITestBase:
             elif isinstance(kwarg_config, TensorConfig):
                 kwarg_config.get_numpy_tensor(self.api_config, key=key)
         return True
+
+    def gen_numpy_input(self):
+        from .api_config.input_generation.dispatcher import dispatch_input_generation
+
+        return dispatch_input_generation(self, self._gen_numpy_input_legacy)
 
     def _handle_list_or_tuple_paddle(self, config_items, is_tuple=False):
         """处理 list 或 tuple"""
