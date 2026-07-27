@@ -8251,72 +8251,89 @@ if op_name == "fused_swiglu_bwd":
 
 elif op_name == "fused_swiglu_scale_clamp":
     # _run_custom_op("fused_swiglu_scale_clamp", x, scale, max_val)
-    # fwd: split x -> (x1, x2); out = clamp(silu(x1) * x2 * scale, -max_val, max_val)
-    # Paddle custom op returns a list; we return [out] to match.
+    # clamp 语义对齐 PaddleFleet fusions/fused_swiglu_scale.py::
+    # fused_swiglu_scale_forward (gate 只截上限, value 对称截断),
+    # 精度顺序对齐 CUDA kernel VectorizedFusedSwiGLUFwd 以做到 bit 级一致:
+    #   g = min(gate, cv); v = clamp(value, -cv, cv)
+    #   out = (T)((g * sigmoid(g)) * v * s)   # 全程 fp32, 只在最后舍入一次
+    # 注意: fleet 的 CPU/XPU fallback 写成
+    #   (silu(g)*v).cast(x.dtype) * scale.cast(x.dtype)
+    # 比 kernel 多两次 bf16 舍入, 与 CUDA 算子本身不 bit 一致, 故这里按 kernel 写。
     x       = arg1   # shape [..., 2D]
     scale   = arg2   # scalar or tensor [..., 1] or [...,]
     max_val = arg3   # scalar
+    _cv = float(max_val)
     _hidden = x.shape[-1] // 2
-    _outer = x.numel() // (_hidden * 2)
-    _x_2d = x.reshape(_outer, _hidden * 2)
-    _out = torch.empty((_outer, _hidden), dtype=x.dtype, device=x.device)
+    _x_fp32 = x.to(torch.float32)
+    _gate = torch.clamp(_x_fp32[..., :_hidden], max=_cv)
+    _val = torch.clamp(_x_fp32[..., _hidden:], min=-_cv, max=_cv)
     if torch.is_tensor(scale):
-        scale = scale.view(*scale.shape[:-1], 1) if scale.dim() > 1 else scale.unsqueeze(-1)
-    _workspace_bytes = 32 << 30
-    _bytes_per_row = max(1, _hidden * (4 * 4 + x.element_size()))
-    _row_chunk = max(1, min(_outer, _workspace_bytes // _bytes_per_row))
-    with torch.no_grad():
-        for _row_start in range(0, _outer, _row_chunk):
-            _row_end = min(_outer, _row_start + _row_chunk)
-            _lhs = _x_2d[_row_start:_row_end, :_hidden].to(torch.float32)
-            _rhs = _x_2d[_row_start:_row_end, _hidden:].to(torch.float32)
-            _lhs.mul_(torch.sigmoid(_lhs)).mul_(_rhs)
-            _scale_chunk = scale[_row_start:_row_end] if torch.is_tensor(scale) and scale.numel() > 1 else scale
-            _lhs.mul_(_scale_chunk).clamp_(min=-float(max_val), max=float(max_val))
-            _out[_row_start:_row_end] = _lhs.to(x.dtype)
-    result = [_out.reshape(*x.shape[:-1], _hidden)]
+        _scale_exp = scale.to(torch.float32)
+    else:
+        _scale_exp = torch.tensor(float(scale), dtype=torch.float32, device=x.device)
+    while _scale_exp.dim() < _gate.dim():
+        _scale_exp = _scale_exp.unsqueeze(-1)
+    _swiglu = (_gate * torch.sigmoid(_gate)) * _val
+    result = [(_swiglu * _scale_exp).to(x.dtype)]
 
 
 elif op_name == "fused_swiglu_scale_clamp_bwd":
     # _run_custom_op("fused_swiglu_scale_clamp_bwd", x, scale, dy, max_val)
-    # arg1=x (original fwd input [..., 2D]), arg2=scale, arg3=dy (grad of output [..., D]),
-    # arg4=max_val.  Returns [dx, d_scale] to match Paddle output.
+    # clamp 语义对齐 PaddleFleet fusions/fused_swiglu_scale.py::
+    # fused_swiglu_scale_backward, 精度/舍入点对齐 CUDA kernel
+    # VectorizedFusedSwiGLUBwd (kHasClamp=true):
+    #   g_eff = min(g, cv); v_eff = clamp(v, -cv, cv)
+    #   g_mask = (g <= cv); v_mask = (-cv <= v <= cv)   # fp32 掩码, 边界处梯度通过
+    #   d_u    = dout * s                                # 全程 fp32
+    #   d_v    = (T)(d_u * silu_g * v_mask)
+    #   d_g    = (T)(d_u * sig * (1 + g_eff*(1-sig)) * v_eff * g_mask)
+    #   d_scale = (ScaleT)sum_fp32( (T)swiglu * (ScaleT)dout )
+    #             kernel 特意把 fp32 swiglu 先压回 x.dtype 再与 dout 相乘, 用 fp32 累加
     x       = arg1   # shape [..., 2D] (original forward input)
     scale   = arg2   # scalar or tensor [..., 1]
     dy      = arg3   # shape [..., D] (gradient of forward output)
     max_val = arg4   # scalar
-    _hidden = dy.shape[-1]
-    _outer = dy.numel() // _hidden
-    _x_2d = x.reshape(_outer, _hidden * 2)
-    _dy_2d = dy.reshape(_outer, _hidden)
-    _dx = torch.empty_like(_x_2d)
-    _d_scale = torch.empty((_outer, 1), dtype=torch.float32, device=x.device)
+    _cv = float(max_val)
+    _hidden = x.shape[-1] // 2
+    _x_fp32 = x.to(torch.float32)
+    _gate_raw = _x_fp32[..., :_hidden]
+    _val_raw = _x_fp32[..., _hidden:]
+    _gate = torch.clamp(_gate_raw, max=_cv)
+    _val = torch.clamp(_val_raw, min=-_cv, max=_cv)
+    # kernel 中掩码是 float, 保持 fp32 避免额外的 dtype 提升
+    _g_mask = (_gate_raw <= _cv).to(torch.float32)
+    _v_mask = ((_val_raw <= _cv) & (_val_raw >= -_cv)).to(torch.float32)
+    _sig = torch.sigmoid(_gate)
+    _silu = _gate * _sig
+    _swiglu_val = _silu * _val
     if torch.is_tensor(scale):
-        scale_v = scale.view(*scale.shape[:-1], 1) if scale.dim() > 1 else scale.unsqueeze(-1)
+        _scale_dtype = scale.dtype
+        _scale_exp = scale.to(torch.float32)
     else:
-        scale_v = float(scale)
-    _workspace_bytes = 32 << 30
-    _bytes_per_row = max(1, _hidden * (4 * 10 + x.element_size() * 2))
-    _row_chunk = max(1, min(_outer, _workspace_bytes // _bytes_per_row))
-    with torch.no_grad():
-        for _row_start in range(0, _outer, _row_chunk):
-            _row_end = min(_outer, _row_start + _row_chunk)
-            _lhs = _x_2d[_row_start:_row_end, :_hidden].to(torch.float32)
-            _rhs = _x_2d[_row_start:_row_end, _hidden:].to(torch.float32)
-            _dy = _dy_2d[_row_start:_row_end].to(torch.float32)
-            _scale_chunk = scale_v[_row_start:_row_end] if torch.is_tensor(scale_v) and scale_v.numel() > 1 else scale_v
-            _sigmoid = torch.sigmoid(_lhs)
-            _silu = _lhs * _sigmoid
-            _pre_clamp = _silu * _rhs * _scale_chunk
-            _dy.mul_((_pre_clamp.abs() < float(max_val)).to(torch.float32))
-            _d_scale[_row_start:_row_end] = (_dy * _silu * _rhs).sum(dim=-1, keepdim=True)
-            _dx[_row_start:_row_end, _hidden:] = (_dy * _silu * _scale_chunk).to(x.dtype)
-            _lhs.sub_(_silu).add_(1.0).mul_(_sigmoid).mul_(_rhs).mul_(_dy).mul_(_scale_chunk)
-            _dx[_row_start:_row_end, :_hidden] = _lhs.to(x.dtype)
-    dx = _dx.reshape(x.shape)
-    d_scale = _d_scale.reshape(*x.shape[:-1], 1)
-    if torch.is_tensor(scale):
-        d_scale = d_scale.to(scale.dtype)
+        _scale_dtype = torch.float32
+        _scale_exp = torch.tensor(float(scale), dtype=torch.float32, device=x.device)
+    while _scale_exp.dim() < dy.dim():
+        _scale_exp = _scale_exp.unsqueeze(-1)
+    _d_u = dy * _scale_exp
+    _d_val = _d_u * _silu * _v_mask
+    # kernel 里 1.0f + g_eff*(1.0f-sig) 会被 nvcc 收缩成单条 FMA(只舍入一次),
+    # 用 addcmul 走同一条 fused 路径, 而不是 mul+add 两次舍入。
+    _d_gate = (
+        _d_u
+        * _sig
+        * torch.addcmul(torch.ones((), dtype=torch.float32, device=x.device), _gate, 1.0 - _sig)
+        * _val
+        * _g_mask
+    )
+    dx = torch.cat([_d_gate, _d_val], dim=-1).to(x.dtype)
+    # d_scale: fp32 swiglu 先压回 x.dtype, dout 转 scale dtype, 乘积用 fp32 累加,
+    # 最后一次性 cast 回 scale dtype(与 kernel 的 shared float 归约一致)
+    d_scale = (
+        (_swiglu_val.to(x.dtype) * dy.to(_scale_dtype))
+        .to(torch.float32)
+        .sum(dim=-1, keepdim=True)
+        .to(_scale_dtype)
+    )
     result = [dx, d_scale]
 
 elif op_name in ("fused_swiglu_probs_bwd", "paddlefleet_fused_swiglu_probs_bwd"):
