@@ -598,7 +598,8 @@ class APITestBase:
             has_second_arg = (
                 len(self.paddle_args_config) > 1 and self.paddle_args_config[1] is not None
             )
-            if has_list_arg or has_second_arg:
+            has_output_kwarg = self.paddle_kwargs_config.get("output") is not None
+            if has_list_arg or has_second_arg or has_output_kwarg:
                 return False
 
         return True

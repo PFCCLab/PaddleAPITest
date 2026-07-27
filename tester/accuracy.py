@@ -242,6 +242,7 @@ class APITestAccuracy(APITestBase):
                         outputs=result_outputs,
                         inputs=inputs_list,
                         grad_outputs=result_outputs_grads,
+                        allow_unused=True,
                     )
                     torch_grad_success = True
                     self.dump_save("torch_input_grads", torch_out_grads, framework="torch")
@@ -525,11 +526,11 @@ class APITestAccuracy(APITestBase):
                 elif (
                     paddle_item is None
                     or (
-                        isinstance(paddle_item, paddle.Tensor) and not paddle_item._is_initialized()
+                        isinstance(paddle_item, paddle.Tensor)
+                        and not paddle_item._is_initialized()
+                        and int(paddle_item.numel()) != 0
                     )
                 ) and torch_item is None:
-                    # paddle is None and torch is None
-                    # paddle is Tensor but uninitialized and torch is None
                     tensor_index += 1
                 elif not isinstance(paddle_item, paddle.Tensor) or not isinstance(
                     torch_item, torch.Tensor
@@ -648,10 +649,9 @@ class APITestAccuracy(APITestBase):
                         or (
                             isinstance(paddle_item, paddle.Tensor)
                             and not paddle_item._is_initialized()
+                            and int(paddle_item.numel()) != 0
                         )
-                    ) and torch_item is None:
-                        # paddle is None and torch is None
-                        # paddle is Tensor but uninitialized and torch is None
+                    ) and (torch_item is None):
                         pass
                     elif not isinstance(paddle_item, paddle.Tensor) or not isinstance(
                         torch_item, torch.Tensor

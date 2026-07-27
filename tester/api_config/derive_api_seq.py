@@ -352,15 +352,27 @@ def derive_line(line, vmap):
         if not is_int(text):
             continue
         value = int(text)
+        if value == SEQ_LARGE:
+            replacements.append((start, end, str(SEQ_TARGET)))
+            continue
         mapping = vmap.get((sig, pos))
         if mapping and value in mapping and mapping[value] != value:
-            replacements.append((start, end, str(mapping[value])))
+            new_value = mapping[value]
+            if new_value < 0 and _looks_like_shape_context(line, start):
+                continue
+            replacements.append((start, end, str(new_value)))
     if not replacements:
         return line
     result = line
     for start, end, new_text in reversed(replacements):
         result = result[:start] + new_text + result[end:]
     return result
+
+
+def _looks_like_shape_context(line, start):
+    """形状/长度类 token 避免被映射成负数。"""
+    prefix = line[max(0, start - 80) : start]
+    return "Size([" in prefix or "list[" in prefix or line.startswith("paddle.arange(")
 
 
 # ──────────────────────────── MoE 结构重建 ────────────────────────────
