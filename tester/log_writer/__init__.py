@@ -1,5 +1,7 @@
 """Paddle API 测试日志包。"""
 
+from __future__ import annotations
+
 from . import log_aggregation as _aggregation
 from . import log_runtime as _runtime
 from . import log_worker as _worker

@@ -2,8 +2,8 @@ from __future__ import annotations
 
 import paddle
 
-from .api_config.logging.log_worker import write_to_log
 from .base import APITestBase
+from .log_writer.log_worker import write_to_log
 
 # from func_timeout import func_set_timeout
 

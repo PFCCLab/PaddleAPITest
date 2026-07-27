@@ -5,8 +5,8 @@ import time
 import paddle
 
 from .api_config.config_analyzer import TensorConfig
-from .api_config.logging.log_worker import write_to_log
 from .base import APITestBase
+from .log_writer.log_worker import write_to_log
 
 
 def tensor_numel(tensor_config):

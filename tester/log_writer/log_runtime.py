@@ -8,7 +8,7 @@ from pathlib import Path
 
 from .log_schema import LOG_PREFIXES, LogType
 
-PROJECT_ROOT = Path(__file__).resolve().parents[3]
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
 TEST_LOG_PATH = PROJECT_ROOT / "tester/api_config/test_log"
 TEST_LOG_PATH.mkdir(parents=True, exist_ok=True)
 TMP_LOG_PATH = TEST_LOG_PATH / ".tmp"

@@ -50,7 +50,8 @@ from tester.api_config.dump_writer import (
     record_dump_terminal_status,
     resolve_dump_options,
 )
-from tester.api_config.logging import (
+from tester.api_config.sanitizer_output import analyze_sanitizer_output
+from tester.log_writer import (
     init_log,
     log_aggregation,
     log_report,
@@ -58,7 +59,6 @@ from tester.api_config.logging import (
     log_runtime,
     log_worker,
 )
-from tester.api_config.sanitizer_output import analyze_sanitizer_output
 from tester.runtime_config import (
     TestRuntimeConfig,
     limit_worker_layout,

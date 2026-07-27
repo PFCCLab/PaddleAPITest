@@ -12,6 +12,27 @@ import paddle
 import yaml
 
 
+def _is_paddle_place(value):
+    value_type = type(value)
+    return value_type.__module__.startswith("paddle.") and value_type.__name__.endswith("Place")
+
+
+def _deepcopy_config_value(value, memo):
+    if _is_paddle_place(value):
+        return value
+    if isinstance(value, list):
+        return [_deepcopy_config_value(item, memo) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_deepcopy_config_value(item, memo) for item in value)
+    if isinstance(value, collections.OrderedDict):
+        return collections.OrderedDict(
+            (key, _deepcopy_config_value(item, memo)) for key, item in value.items()
+        )
+    if isinstance(value, dict):
+        return {key: _deepcopy_config_value(item, memo) for key, item in value.items()}
+    return copy.deepcopy(value, memo)
+
+
 class _LazyTorch:
     def __getattr__(self, name):
         import torch
@@ -237,7 +258,7 @@ class TensorConfig:
         memo[id(self)] = result
         result.shape = copy.deepcopy(self.shape)
         result.dtype = copy.deepcopy(self.dtype)
-        result.place = copy.deepcopy(self.place)
+        result.place = _deepcopy_config_value(self.place, memo)
         result.is_contiguous = self.is_contiguous
         result.strides = copy.deepcopy(self.strides)
         result.numpy_tensor = None
@@ -3726,8 +3747,8 @@ class APIConfig:
         cls = self.__class__
         result = cls.__new__(cls)
         memo[id(self)] = result
-        result.args = copy.deepcopy(self.args)
-        result.kwargs = copy.deepcopy(self.kwargs)
+        result.args = _deepcopy_config_value(self.args, memo)
+        result.kwargs = _deepcopy_config_value(self.kwargs, memo)
         result.api_name = self.api_name
         return result
 

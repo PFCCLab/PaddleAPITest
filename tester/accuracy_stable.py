@@ -9,8 +9,8 @@ import paddle
 import torch
 
 from .accuracy import process_grad_output, process_output
-from .api_config.logging import log_comparison, log_worker
 from .base import CUDA_ERROR, CUDA_OOM, APITestBase, gpu_mode_memory_decision
+from .log_writer import log_comparison, log_worker
 from .paddle_to_torch import adaptive_workspace_bytes, get_converter
 
 

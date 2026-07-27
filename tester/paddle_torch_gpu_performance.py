@@ -7,8 +7,8 @@ import torch
 from func_timeout import func_set_timeout
 
 from .api_config.config_analyzer import TensorConfig
-from .api_config.logging.log_worker import write_to_log
 from .base import APITestBase
+from .log_writer.log_worker import write_to_log
 from .paddle_to_torch import adaptive_workspace_bytes, get_converter
 
 

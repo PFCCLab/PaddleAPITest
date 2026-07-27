@@ -159,9 +159,9 @@ def restore_patches() -> None:
 
 def init_logging(output_dir: Path) -> None:
     try:
-        from tester.api_config.logging import init_log
+        from tester.log_writer import init_log
     except Exception as err:
-        print(f"[warn] failed to import logging: {err}")
+        print(f"[warn] failed to import log_writer: {err}")
         return
 
     log_dir = output_dir / "paddleapitest_logs"

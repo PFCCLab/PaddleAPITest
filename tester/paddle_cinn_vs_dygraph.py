@@ -3,8 +3,8 @@ from __future__ import annotations
 import paddle
 from paddle.jit import to_static
 
-from .api_config.logging.log_worker import write_to_log
 from .base import CUDA_ERROR, CUDA_OOM, APITestBase
+from .log_writer.log_worker import write_to_log
 
 
 class APITestCINNVSDygraph(APITestBase):

@@ -43,7 +43,7 @@ from tester.api_config.dump_writer import (
     record_dump_terminal_status,
     resolve_dump_options,
 )
-from tester.api_config.logging import (
+from tester.log_writer import (
     init_log,
     log_aggregation,
     log_report,

@@ -3,8 +3,8 @@ from __future__ import annotations
 import paddle
 import torch
 
-from .api_config.logging.log_worker import get_terminal_log_type, write_to_log
 from .base import APITestBase
+from .log_writer.log_worker import get_terminal_log_type, write_to_log
 
 
 class APITestCustomDeviceVSCPU(APITestBase):

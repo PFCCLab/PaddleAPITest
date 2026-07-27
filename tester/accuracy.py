@@ -8,8 +8,8 @@ import paddle
 import torch
 import yaml
 
-from .api_config.logging.log_worker import write_to_log
 from .base import APITestBase, gpu_mode_maybe_empty_cache
+from .log_writer.log_worker import write_to_log
 from .paddle_to_torch import adaptive_workspace_bytes, get_converter
 
 # from func_timeout import func_set_timeout
