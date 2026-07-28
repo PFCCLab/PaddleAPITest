@@ -87,7 +87,11 @@ def runtime_config_for_gpu(options, gpu_id, comparison_gpu_id=None):
     )
 
 
-def limit_worker_layout(available_gpus, max_workers_per_gpu, pending_cases):
+def limit_worker_layout(
+    available_gpus,
+    max_workers_per_gpu,
+    pending_cases,
+):
     """按待运行 case 数 breadth-first 裁剪每张 GPU 的 worker 数。"""
     if pending_cases <= 0:
         return [], {}

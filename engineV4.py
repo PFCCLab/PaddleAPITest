@@ -17,7 +17,7 @@ import threading
 import time
 import warnings
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from multiprocessing import cpu_count, set_start_method
 from pathlib import Path
@@ -129,6 +129,16 @@ _MEM_SNAPSHOT = None  # dict: gpu_id -> (total_gb, used_gb)
 _MEM_SNAPSHOT_TS = 0.0
 _NVML_INITIALIZED = False  # persistent NVML session for repeated memory queries
 _MEM_SNAPSHOT_TTL = 2.0  # seconds — snapshot cache ttl
+MAX_TOTAL_WORKERS = 64
+MAX_EXTERNAL_KILL_RETRIES_PER_CASE = 1
+MAX_TOTAL_EXTERNAL_KILL_EVENTS = 3
+
+
+@dataclass
+class BatchRetryState:
+    per_case_external_kill_retries: dict[str, int] = field(default_factory=dict)
+    total_external_kills: int = 0
+    unsafe_environment: bool = False
 
 
 def cleanup(pool):
@@ -536,6 +546,7 @@ class WorkerPool:
         self._shutdown_event = threading.Event()
         self._watchdog_thread = None
         self._lock = threading.Lock()  # protects slot state modifications
+        self._spawn_lock = threading.Lock()
         self._closed = False
 
         # Build worker slots: deterministic GPU or GPU-pair assignment.
@@ -590,62 +601,53 @@ class WorkerPool:
 
     def _spawn_worker(self, slot):
         """Spawn a new worker process for the given slot."""
-        if self._closed or self._shutdown_event.is_set():
-            return False
-        if slot.process is not None and not slot.process.is_alive():
-            self._join_process(slot.process, timeout=1)
-        self._close_queue(slot.input_queue, cancel_join=True)
-        slot.input_queue = mp.Queue()
-        worker_target = (
-            _sanitizer_worker_loop
-            if getattr(self.options, "use_compute_sanitizer", False)
-            else _worker_loop
-        )
-        p = mp.Process(
-            target=worker_target,
-            args=(
-                slot.index,
-                slot.gpu_id,
-                slot.comparison_gpu_id,
-                slot.input_queue,
-                self.result_queue,
-                self.options,
-            ),
-            daemon=True,
-        )
-        p.start()
-        slot.process = p
-        slot.state = "starting"
-        slot.current_task = None
-        slot.task_start_time = None
-        slot.child_pid = None
-        return True
+        with self._spawn_lock:
+            if self._closed or self._shutdown_event.is_set():
+                return False
+            if slot.process is not None and slot.process.is_alive():
+                return False
+            if slot.process is not None:
+                self._join_process(slot.process, timeout=1)
+            self._close_queue(slot.input_queue, cancel_join=True)
+            slot.input_queue = mp.Queue()
+            worker_target = (
+                _sanitizer_worker_loop
+                if getattr(self.options, "use_compute_sanitizer", False)
+                else _worker_loop
+            )
+            p = mp.Process(
+                target=worker_target,
+                args=(
+                    slot.index,
+                    slot.gpu_id,
+                    slot.comparison_gpu_id,
+                    slot.input_queue,
+                    self.result_queue,
+                    self.options,
+                ),
+                daemon=True,
+            )
+            p.start()
+            slot.process = p
+            slot.state = "starting"
+            slot.current_task = None
+            slot.task_start_time = None
+            slot.child_pid = None
+            return True
 
     def warmup(self, timeout=180):
-        """Wait for all workers to report ready."""
+        """Wait until at least one worker is ready or startup times out."""
         ready_slots = set()
         deadline = time.time() + timeout
 
-        while len(ready_slots) < self.total_workers and time.time() < deadline:
+        while not ready_slots and time.time() < deadline:
             try:
                 remaining = max(0.1, deadline - time.time())
                 msg = self.result_queue.get(timeout=min(5.0, remaining))
-                msg_type = msg[0]
-                if msg_type == "ready":
-                    slot_idx = msg[1]
-                    with self._lock:
-                        self.slots[slot_idx].state = "idle"
-                    ready_slots.add(slot_idx)
-                elif msg_type == "init_failed":
-                    slot_idx = msg[1]
-                    error_msg = msg[2]
-                    print(
-                        f"[worker] INIT_FAILED | slot {slot_idx} | {error_msg}",
-                        flush=True,
-                    )
-                    slot = self.slots[slot_idx]
-                    self._join_process(slot.process, timeout=1)
-                    self._spawn_worker(slot)
+                if self._handle_worker_control_message(msg):
+                    if msg[0] == "ready":
+                        ready_slots.add(msg[1])
+                    continue
             except queue.Empty:
                 # Check for dead processes
                 for slot in self.slots:
@@ -658,13 +660,40 @@ class WorkerPool:
                         self._spawn_worker(slot)
 
         ready_count = len(ready_slots)
-        if ready_count < self.total_workers:
+        if ready_count == 0:
             print(
                 f"[workers] READY_TIMEOUT | {ready_count}/{self.total_workers} ready | "
                 f"timeout {timeout} s",
                 flush=True,
             )
         return ready_count
+
+    def _handle_worker_control_message(self, msg):
+        """Handle ready/init-failed/child bookkeeping messages from workers."""
+        msg_type = msg[0]
+        if msg_type == "ready":
+            slot_idx = msg[1]
+            with self._lock:
+                self.slots[slot_idx].state = "idle"
+            return True
+        if msg_type == "init_failed":
+            slot_idx = msg[1]
+            error_msg = msg[2]
+            print(
+                f"[worker] INIT_FAILED | slot {slot_idx} | {error_msg}",
+                flush=True,
+            )
+            slot = self.slots[slot_idx]
+            self._join_process(slot.process, timeout=1)
+            self._spawn_worker(slot)
+            return True
+        if msg_type == "child":
+            slot_idx = msg[1]
+            child_pid = msg[2]
+            with self._lock:
+                self.slots[slot_idx].child_pid = child_pid
+            return True
+        return False
 
     def dispatch(self, slot_index, config):
         """Send a task to a specific worker slot."""
@@ -1342,7 +1371,8 @@ def limit_dual_gpu_worker_layout(available_gpus, pending_cases):
     """Limit an ordered list of complete GPU pairs to the pending case count."""
     if len(available_gpus) % 2:
         raise ValueError("dual-GPU worker layout requires complete GPU pairs")
-    pair_count = min(len(available_gpus) // 2, max(0, pending_cases))
+    pair_budget = max(0, pending_cases)
+    pair_count = min(len(available_gpus) // 2, pair_budget)
     selected_gpus = list(available_gpus[: pair_count * 2])
     return selected_gpus, dict.fromkeys(selected_gpus, 1)
 
@@ -1350,6 +1380,72 @@ def limit_dual_gpu_worker_layout(available_gpus, pending_cases):
 def _requeue_retry_case(pending_dispatch, api_config_str):
     """Put a retry case back at the front of the pending queue."""
     pending_dispatch.insert(0, api_config_str)
+
+
+def validate_configured_worker_count(
+    configured_worker_count, *, max_total_workers=MAX_TOTAL_WORKERS
+):
+    """Reject worker layouts that would create too many processes."""
+    if configured_worker_count > max_total_workers:
+        raise ValueError(
+            f"configured worker count {configured_worker_count} exceeds the engine limit "
+            f"{max_total_workers}"
+        )
+
+
+def _handle_external_kill_retry(
+    retry_state,
+    pending_dispatch,
+    api_config_str,
+    *,
+    max_case_retries=MAX_EXTERNAL_KILL_RETRIES_PER_CASE,
+    max_total_external_kills=None,
+):
+    """Retry once per case, then mark the run unsafe if kills keep happening."""
+    retry_state.total_external_kills += 1
+    if (
+        max_total_external_kills is not None
+        and retry_state.total_external_kills > max_total_external_kills
+    ):
+        retry_state.unsafe_environment = True
+        return False
+
+    retry_count = retry_state.per_case_external_kill_retries.get(api_config_str, 0)
+    if retry_count < max_case_retries:
+        retry_state.per_case_external_kill_retries[api_config_str] = retry_count + 1
+        _requeue_retry_case(pending_dispatch, api_config_str)
+        return True
+
+    retry_state.unsafe_environment = True
+    return False
+
+
+def resolve_batch_worker_layout(
+    available_gpus,
+    max_workers_per_gpu,
+    pending_cases,
+    *,
+    dual_gpu=False,
+):
+    """Validate and trim the worker layout for the current batch."""
+    if dual_gpu:
+        configured_worker_count = len(available_gpus) // 2
+        validate_configured_worker_count(configured_worker_count)
+        available_gpus, max_workers_per_gpu = limit_dual_gpu_worker_layout(
+            available_gpus,
+            pending_cases,
+        )
+        gpu_pairs = list(zip(available_gpus[::2], available_gpus[1::2], strict=True))
+    else:
+        configured_worker_count = sum(max_workers_per_gpu.values())
+        validate_configured_worker_count(configured_worker_count)
+        available_gpus, max_workers_per_gpu = limit_worker_layout(
+            available_gpus,
+            max_workers_per_gpu,
+            pending_cases,
+        )
+        gpu_pairs = None
+    return available_gpus, max_workers_per_gpu, gpu_pairs
 
 
 def run_test_case(api_config_str, options):
@@ -1478,7 +1574,10 @@ def run_test_case(api_config_str, options):
 
 def main():
     start_time = time.time()
-    set_start_method("spawn")
+    try:
+        set_start_method("spawn")
+    except RuntimeError:
+        pass
 
     try:
         from importlib.metadata import version as _pkg_version
@@ -2003,20 +2102,20 @@ def main():
         if not available_gpus:
             print("No usable GPUs available.", flush=True)
             return 2
-        gpu_pairs = None
         if options.accuracy_stable_dual_gpu:
             if len(available_gpus) != len(gpu_ids):
                 print("Not all selected GPUs are usable; no complete dual-GPU layout.", flush=True)
                 return 2
-            available_gpus, max_workers_per_gpu = limit_dual_gpu_worker_layout(
+
+        try:
+            available_gpus, max_workers_per_gpu, gpu_pairs = resolve_batch_worker_layout(
                 available_gpus,
+                max_workers_per_gpu,
                 all_case,
+                dual_gpu=options.accuracy_stable_dual_gpu,
             )
-            gpu_pairs = list(zip(available_gpus[::2], available_gpus[1::2], strict=True))
-        else:
-            available_gpus, max_workers_per_gpu = limit_worker_layout(
-                available_gpus, max_workers_per_gpu, all_case
-            )
+        except ValueError as err:
+            return _argument_error(str(err))
 
         if (
             options.use_compute_sanitizer
@@ -2061,21 +2160,31 @@ def main():
 
         # dispatch tasks using per-worker queue round-robin
         tested_case = 0
+        batch_exit_code = 0
+        shutdown_force = False
+        retry_state = BatchRetryState()
+        max_total_external_kills = MAX_TOTAL_EXTERNAL_KILL_EVENTS
+        if ready_workers == 0:
+            print("Workers: failed | no worker became ready", flush=True)
+            batch_exit_code = 1
+            shutdown_force = True
         try:
             config_iter = iter(api_configs)
             active_tasks = 0
             pending_dispatch = []  # configs waiting for a free worker
+            abort_run = ready_workers == 0
 
             # Initial dispatch: one task per idle worker
-            for slot in pool.idle_slots():
-                config = next(config_iter, None)
-                if config is None:
-                    break
-                pool.dispatch(slot.index, config)
-                active_tasks += 1
+            if not abort_run:
+                for slot in pool.idle_slots():
+                    config = next(config_iter, None)
+                    if config is None:
+                        break
+                    pool.dispatch(slot.index, config)
+                    active_tasks += 1
 
             # Main loop: collect results and dispatch next
-            while active_tasks > 0 or pending_dispatch:
+            while (active_tasks > 0 or pending_dispatch) and not abort_run:
                 msg = pool.collect_one(timeout=5.0)
                 if msg is None:
                     if pending_dispatch:
@@ -2087,6 +2196,13 @@ def main():
                             active_tasks += 1
                     continue  # watchdog handles timeouts/crashes
 
+                if pool._handle_worker_control_message(msg):
+                    if msg[0] == "ready" and pending_dispatch:
+                        config = pending_dispatch.pop(0)
+                        pool.dispatch(msg[1], config)
+                        active_tasks += 1
+                    continue
+
                 msg_type = msg[0]
 
                 if msg_type == "ack":
@@ -2094,24 +2210,6 @@ def main():
                     slot_idx = msg[1]
                     with pool._lock:
                         pool.slots[slot_idx].task_start_time = time.time()
-                    continue
-
-                if msg_type == "ready":
-                    # A respawned worker is ready — dispatch pending task if any
-                    slot_idx = msg[1]
-                    with pool._lock:
-                        pool.slots[slot_idx].state = "idle"
-                    if pending_dispatch:
-                        config = pending_dispatch.pop(0)
-                        pool.dispatch(slot_idx, config)
-                        active_tasks += 1
-                    continue
-
-                if msg_type == "child":
-                    slot_idx = msg[1]
-                    child_pid = msg[2]
-                    with pool._lock:
-                        pool.slots[slot_idx].child_pid = child_pid
                     continue
 
                 # Task completed (done/error/timeout/crashed)
@@ -2153,17 +2251,33 @@ def main():
                 active_tasks -= 1
 
                 if external_kill:
-                    log_report.print_case_notice("RETRY", config, f"exit {exitcode}")
-                    if worker_reusable:
-                        pool.mark_idle(slot_idx)
-                    _requeue_retry_case(pending_dispatch, config)
-                    next_config = next(config_iter, None)
-                    if next_config is not None:
-                        if not worker_reusable:
-                            pending_dispatch.append(next_config)
-                        else:
-                            pool.dispatch(slot_idx, next_config)
-                            active_tasks += 1
+                    if _handle_external_kill_retry(
+                        retry_state,
+                        pending_dispatch,
+                        config,
+                        max_case_retries=MAX_EXTERNAL_KILL_RETRIES_PER_CASE,
+                        max_total_external_kills=max_total_external_kills,
+                    ):
+                        log_report.print_case_notice("RETRY", config, f"exit {exitcode}")
+                        if worker_reusable:
+                            pool.mark_idle(slot_idx)
+                        next_config = next(config_iter, None)
+                        if next_config is not None:
+                            if not worker_reusable:
+                                pending_dispatch.append(next_config)
+                            else:
+                                pool.dispatch(slot_idx, next_config)
+                                active_tasks += 1
+                    else:
+                        log_report.print_case_notice(
+                            "ABORT",
+                            config,
+                            f"exit {exitcode} | unsafe environment",
+                        )
+                        batch_exit_code = 1
+                        shutdown_force = True
+                        pending_dispatch.clear()
+                        abort_run = True
                     continue
 
                 if worker_reusable:
@@ -2237,16 +2351,16 @@ def main():
                 if tested_case % 1000 == 0:
                     log_aggregation.aggregate_logs()
 
-            pool.shutdown()
         except Exception as e:
             print(f"Unexpected error: {e}", flush=True)
-            cleanup(pool)
+            batch_exit_code = 1
+            shutdown_force = True
         finally:
-            pool.shutdown()
+            pool.shutdown(force=shutdown_force)
             if options.use_compute_sanitizer:
                 log_worker.clean_sanitizer_case_logs()
             log_counts = log_aggregation.finalize_logs()
-            if options.retest and tested_case == all_case:
+            if options.retest and batch_exit_code == 0 and tested_case == all_case:
                 log_retest.finish_retest()
             end_time = time.time()
             total_time = end_time - start_time
@@ -2258,6 +2372,7 @@ def main():
                 total_time,
                 options.log_dir,
             )
+        return batch_exit_code
 
 
 if __name__ == "__main__":
