@@ -70,7 +70,7 @@ os.environ["NVIDIA_TF32_OVERRIDE"] = "0"
 
 
 class GpuMemoryDeferred(Exception):
-    """Raised when a GPU-mode case should wait for more free memory."""
+    """当 GPU 模式下的 case 需要等待更多可用显存时抛出。"""
 
 
 VALID_TEST_ARGS = {
@@ -124,14 +124,16 @@ SANITIZER_FORWARD_ARGS_SORTED = tuple(sorted(SANITIZER_FORWARD_ARGS))
 
 DEVICE_TYPE = None
 DEVICE_TYPE_DETECTED = False
-DEVICE_COUNT = None  # total number of devices
-_MEM_SNAPSHOT = None  # dict: gpu_id -> (total_gb, used_gb)
+DEVICE_COUNT = None  # 设备总数
+_MEM_SNAPSHOT = None  # 字典：gpu_id -> (total_gb, used_gb)
 _MEM_SNAPSHOT_TS = 0.0
-_NVML_INITIALIZED = False  # persistent NVML session for repeated memory queries
-_MEM_SNAPSHOT_TTL = 2.0  # seconds — snapshot cache ttl
+_NVML_INITIALIZED = False  # 为重复显存查询保留的 NVML 会话
+_MEM_SNAPSHOT_TTL = 2.0  # 秒，快照缓存有效期
 MAX_TOTAL_WORKERS = 64
 MAX_EXTERNAL_KILL_RETRIES_PER_CASE = 1
 MAX_TOTAL_EXTERNAL_KILL_EVENTS = 3
+# 初始 warmup 与单个 slot 复活共用的启动超时预算。
+WORKER_STARTUP_TIMEOUT = 180
 
 
 @dataclass
@@ -139,6 +141,15 @@ class BatchRetryState:
     per_case_external_kill_retries: dict[str, int] = field(default_factory=dict)
     total_external_kills: int = 0
     unsafe_environment: bool = False
+
+
+@dataclass
+class BatchRunState:
+    tested_case: int = 0
+    batch_exit_code: int = 0
+    shutdown_force: bool = False
+    abort_run: bool = False
+    active_tasks: int = 0
 
 
 def cleanup(pool):
@@ -151,12 +162,12 @@ def cleanup(pool):
     print(f"{datetime.now()} Cleanup completed", flush=True)
 
 
-# ─── WorkerPool: per-worker queue architecture ───────────────────────────────
+# ─── WorkerPool：每个 worker 独立队列的架构 ───────────────────────────────
 
 
 @dataclass
 class WorkerSlot:
-    """Represents one worker process slot with its own input queue."""
+    """表示一个拥有独立输入队列的 worker 进程槽位。"""
 
     index: int
     gpu_id: int
@@ -166,7 +177,8 @@ class WorkerSlot:
     current_task: str | None = None
     task_start_time: float | None = None
     child_pid: int | None = None
-    state: str = "dead"  # dead, starting, idle, busy
+    started_at: float | None = None
+    state: str = "dead"  # dead、starting、idle、busy
 
 
 def _import_optional_runtime_module(module_name):
@@ -184,7 +196,7 @@ def _init_runtime_modules(options):
         if options.test_cpu:
             paddle.device.set_device("cpu")
         elif not getattr(options, "paddle_custom_device", False):
-            # CUDA_VISIBLE_DEVICES assigns the worker slot; Paddle still needs an explicit device.
+            # CUDA_VISIBLE_DEVICES 只负责限定 slot，Paddle 仍需要显式设置 device。
             paddle.set_device("gpu")
         _import_optional_runtime_module("paddlefleet_ops")
         _import_optional_runtime_module("FusedQuantOps")
@@ -231,7 +243,7 @@ def _worker_loop(
     result_queue,
     options,
 ):
-    """Long-running worker process. Receives tasks from input_queue, sends results to result_queue.
+    """常驻 worker 进程，从 input_queue 取任务并把结果写入 result_queue。
 
     Exit behavior:
         - Normal exit: receives None, releases device resources, and returns gracefully.
@@ -245,7 +257,7 @@ def _worker_loop(
     timeout, the next task goes to `pending_dispatch` and is sent after the new worker reports
     "ready".
     """
-    # ── GPU initialization (equivalent to init_worker_gpu) ──
+    # ── GPU 初始化（等价于 init_worker_gpu） ──
     try:
         _init_worker_runtime(
             slot_index,
@@ -258,16 +270,16 @@ def _worker_loop(
         result_queue.put(("init_failed", slot_index, str(e)))
         return
 
-    # ── Notify main: ready ──
+    # ── 通知主进程：ready ──
     result_queue.put(("ready", slot_index))
 
-    # ── Task loop ──
+    # ── 任务循环 ──
     while True:
         try:
             task = input_queue.get()
         except (EOFError, OSError):
             break
-        if task is None:  # poison pill
+        if task is None:  # 毒丸
             break
 
         api_config_str = task
@@ -296,8 +308,8 @@ def _worker_loop(
                 )
             )
         except SystemExit:
-            # run_test_case calls os._exit for CUDA errors, this shouldn't reach here
-            # but if it does via sys.exit, let it propagate
+            # run_test_case 遇到 CUDA 错误时会走 os._exit，这里理论上不应到达；
+            # 如果是通过 sys.exit 进入这里，则继续向上抛出。
             raise
         except Exception as e:
             result_queue.put(
@@ -311,8 +323,8 @@ def _worker_loop(
                 )
             )
 
-    # Graceful exit. GPU mode skips per-case collection, so collect its cyclic
-    # tensor graphs before framework atexit handlers tear down the device manager.
+    # 优雅退出。GPU 模式会跳过逐 case 的收集，因此要在框架 atexit
+    # 释放设备管理器之前先清理循环张量图。
     try:
         gc.collect()
         log_runtime.close_process_files()
@@ -524,10 +536,10 @@ def _sanitizer_worker_loop(
 
 
 class WorkerPool:
-    """Custom process pool with per-worker queues for fair GPU scheduling."""
+    """用于公平 GPU 调度的自定义进程池，每个 worker 对应一个队列。"""
 
     def __init__(self, available_gpus, max_workers_per_gpu, options):
-        # Convert argparse.Namespace to SimpleNamespace(dict) for cleaner pickling to workers
+        # 将 argparse.Namespace 转成 SimpleNamespace，便于 worker 进程更干净地 pickle。
         if isinstance(options, argparse.Namespace):
             self.options = SimpleNamespace(**vars(options))
         else:
@@ -545,11 +557,11 @@ class WorkerPool:
         self.slots: list[WorkerSlot] = []
         self._shutdown_event = threading.Event()
         self._watchdog_thread = None
-        self._lock = threading.Lock()  # protects slot state modifications
+        self._lock = threading.Lock()  # 保护 slot 状态修改
         self._spawn_lock = threading.Lock()
         self._closed = False
 
-        # Build worker slots: deterministic GPU or GPU-pair assignment.
+        # 构建 worker 槽位：按 GPU 或 GPU 对确定性分配。
         idx = 0
         if getattr(self.options, "accuracy_stable_dual_gpu", False):
             for pair_index in range(0, len(available_gpus), 2):
@@ -572,7 +584,7 @@ class WorkerPool:
         return len(self.slots)
 
     def start(self):
-        """Spawn all worker processes and start watchdog thread."""
+        """启动所有 worker 进程并启动 watchdog 线程。"""
         for slot in self.slots:
             self._spawn_worker(slot)
         self._watchdog_thread = threading.Thread(
@@ -581,7 +593,7 @@ class WorkerPool:
         self._watchdog_thread.start()
 
     def _close_queue(self, q, *, cancel_join=False):
-        """Close a multiprocessing queue without letting cleanup errors mask test results."""
+        """关闭 multiprocessing 队列，避免清理错误掩盖测试结果。"""
         if q is None:
             return
         try:
@@ -600,7 +612,7 @@ class WorkerPool:
                 pass
 
     def _spawn_worker(self, slot):
-        """Spawn a new worker process for the given slot."""
+        """为指定 slot 拉起一个新的 worker 进程。"""
         with self._spawn_lock:
             if self._closed or self._shutdown_event.is_set():
                 return False
@@ -633,31 +645,53 @@ class WorkerPool:
             slot.current_task = None
             slot.task_start_time = None
             slot.child_pid = None
+            slot.started_at = time.monotonic()
             return True
 
-    def warmup(self, timeout=180):
-        """Wait until at least one worker is ready or startup times out."""
-        ready_slots = set()
-        deadline = time.time() + timeout
+    def _startup_timeout(self):
+        return getattr(self.options, "worker_startup_timeout", WORKER_STARTUP_TIMEOUT)
 
-        while not ready_slots and time.time() < deadline:
+    def _check_starting_worker(self, slot, *, now=None):
+        """重启一个在启动阶段失败或卡住的 worker。"""
+        if slot.state != "starting" or slot.process is None or slot.started_at is None:
+            return False
+        now = time.monotonic() if now is None else now
+        if now - slot.started_at < self._startup_timeout():
+            return False
+        if slot.process.is_alive():
+            print(
+                f"[worker] INIT_TIMEOUT | slot {slot.index} | timeout {self._startup_timeout()} s",
+                flush=True,
+            )
+            self._kill_process(slot.process)
+        else:
+            print(
+                f"[worker] INIT_CRASH | slot {slot.index} | exit {slot.process.exitcode}",
+                flush=True,
+            )
+            self._join_process(slot.process, timeout=1)
+        self._spawn_worker(slot)
+        return True
+
+    def warmup(self, timeout=None):
+        """等待至少一个 worker 就绪，或直到启动超时。"""
+        if timeout is None:
+            timeout = self._startup_timeout()
+        ready_slots = set()
+        deadline = time.monotonic() + timeout
+
+        while not ready_slots and time.monotonic() < deadline:
             try:
-                remaining = max(0.1, deadline - time.time())
+                remaining = max(0.1, deadline - time.monotonic())
                 msg = self.result_queue.get(timeout=min(5.0, remaining))
                 if self._handle_worker_control_message(msg):
                     if msg[0] == "ready":
                         ready_slots.add(msg[1])
                     continue
             except queue.Empty:
-                # Check for dead processes
+                now = time.monotonic()
                 for slot in self.slots:
-                    if slot.state == "starting" and slot.process and not slot.process.is_alive():
-                        print(
-                            f"[worker] INIT_CRASH | slot {slot.index} | "
-                            f"exit {slot.process.exitcode}",
-                            flush=True,
-                        )
-                        self._spawn_worker(slot)
+                    self._check_starting_worker(slot, now=now)
 
         ready_count = len(ready_slots)
         if ready_count == 0:
@@ -669,12 +703,14 @@ class WorkerPool:
         return ready_count
 
     def _handle_worker_control_message(self, msg):
-        """Handle ready/init-failed/child bookkeeping messages from workers."""
+        """处理来自 worker 的 ready、init_failed 和 child 账务消息。"""
         msg_type = msg[0]
         if msg_type == "ready":
             slot_idx = msg[1]
             with self._lock:
-                self.slots[slot_idx].state = "idle"
+                slot = self.slots[slot_idx]
+                slot.state = "idle"
+                slot.started_at = None
             return True
         if msg_type == "init_failed":
             slot_idx = msg[1]
@@ -696,38 +732,39 @@ class WorkerPool:
         return False
 
     def dispatch(self, slot_index, config):
-        """Send a task to a specific worker slot."""
+        """向指定 worker slot 派发任务。"""
         slot = self.slots[slot_index]
         with self._lock:
             slot.current_task = config
-            slot.task_start_time = None  # set when ack received
+            slot.task_start_time = None  # 在 ack 到来时再记录
             slot.state = "busy"
         slot.input_queue.put(config)
 
     def collect_one(self, timeout=5.0):
-        """Get one message from result_queue. Returns None on timeout."""
+        """从 result_queue 取一条消息，超时则返回 None。"""
         try:
             return self.result_queue.get(timeout=timeout)
         except queue.Empty:
             return None
 
     def idle_slots(self):
-        """Yield slots that are currently idle."""
+        """遍历当前处于空闲状态的 slot。"""
         for slot in self.slots:
             if slot.state == "idle":
                 yield slot
 
     def mark_idle(self, slot_index):
-        """Mark a worker slot as idle after task completion."""
+        """在任务完成后将 worker slot 标记为空闲。"""
         with self._lock:
             slot = self.slots[slot_index]
             slot.state = "idle"
             slot.current_task = None
             slot.task_start_time = None
             slot.child_pid = None
+            slot.started_at = None
 
     def _watchdog_loop(self):
-        """Periodically check for timeouts and unexpectedly dead workers."""
+        """周期性检查超时和非预期死亡的 worker。"""
         while not self._shutdown_event.is_set():
             if self._shutdown_event.wait(1.0):
                 break
@@ -736,31 +773,33 @@ class WorkerPool:
             for slot in self.slots:
                 if self._shutdown_event.is_set():
                     break
-                with self._lock:
-                    if self._shutdown_event.is_set():
-                        break
-                    # Check timeout
-                    if (
-                        slot.state == "busy"
-                        and slot.task_start_time is not None
-                        and now - slot.task_start_time > self.options.timeout
-                    ):
-                        self._handle_timeout(slot)
-                        continue
+                self._watchdog_tick_slot(slot, now=now)
 
-                    if self._shutdown_event.is_set():
-                        break
-
-                    # Check unexpected death
-                    if (
-                        slot.state in ("busy", "idle")
-                        and slot.process is not None
-                        and not slot.process.is_alive()
-                    ):
-                        self._handle_crash(slot)
+    def _watchdog_tick_slot(self, slot, *, now):
+        """在持有 slot 锁时评估单个 slot 并执行恢复。"""
+        with self._lock:
+            if self._shutdown_event.is_set():
+                return
+            # 在 slot 快照仍然一致时直接执行恢复动作。
+            if slot.state == "starting":
+                self._check_starting_worker(slot, now=time.monotonic())
+                return
+            if (
+                slot.state == "busy"
+                and slot.task_start_time is not None
+                and now - slot.task_start_time > self.options.timeout
+            ):
+                self._handle_timeout(slot)
+                return
+            if (
+                slot.state in ("busy", "idle")
+                and slot.process is not None
+                and not slot.process.is_alive()
+            ):
+                self._handle_crash(slot)
 
     def _handle_timeout(self, slot):
-        """Kill timed-out worker and enqueue timeout result."""
+        """终止超时 worker，并写入 timeout 结果。"""
         if self._closed or self._shutdown_event.is_set():
             return
         config = slot.current_task
@@ -778,7 +817,7 @@ class WorkerPool:
         self._spawn_worker(slot)
 
     def _handle_crash(self, slot):
-        """Handle unexpectedly dead worker."""
+        """处理非预期死亡的 worker。"""
         if self._closed or self._shutdown_event.is_set():
             return
         exitcode = slot.process.exitcode if slot.process else None
@@ -813,7 +852,7 @@ class WorkerPool:
             slot.child_pid = None
 
     def _sigkill_process(self, process):
-        """Send SIGKILL to a process without waiting for it to exit."""
+        """向进程发送 SIGKILL，但不等待其退出。"""
         try:
             if process.is_alive():
                 os.kill(process.pid, signal.SIGKILL)
@@ -821,19 +860,19 @@ class WorkerPool:
             pass
 
     def _join_process(self, process, timeout=5):
-        """Wait for a process to exit, ignoring cleanup-time failures."""
+        """等待进程退出，并忽略清理阶段的失败。"""
         try:
             process.join(timeout=timeout)
         except Exception:
             pass
 
     def _kill_process(self, process):
-        """SIGKILL a process (CUDA-deadlocked processes don't respond to SIGTERM)."""
+        """SIGKILL 一个进程（CUDA 死锁进程通常不会响应 SIGTERM）。"""
         self._sigkill_process(process)
         self._join_process(process, timeout=5)
 
     def shutdown(self, force=False):
-        """Stop all workers and release multiprocessing queues."""
+        """停止所有 worker 并释放 multiprocessing 队列。"""
         if self._closed:
             return
         self._closed = True
@@ -844,7 +883,7 @@ class WorkerPool:
 
         try:
             if not force:
-                # Graceful: send poison pills
+                # 优雅退出：发送毒丸
                 for slot in self.slots:
                     if slot.input_queue is not None:
                         try:
@@ -857,8 +896,8 @@ class WorkerPool:
                         if slot.process.is_alive():
                             self._kill_process(slot.process)
             else:
-                # Force: send SIGKILL to all workers first, then join all.
-                # This avoids serial join latency when many CUDA-deadlocked workers exist.
+                # 强制退出：先对所有 worker 发 SIGKILL，再统一 join。
+                # 这样在存在大量 CUDA 死锁 worker 时不会串行等待太久。
                 for slot in self.slots:
                     self._kill_slot_child(slot)
                     if slot.process is not None:
@@ -890,7 +929,7 @@ def detect_device_type() -> str:
             DEVICE_TYPE_DETECTED = True
             return DEVICE_TYPE
     except Exception:
-        # 没有 NVML 或不是 NVIDIA，忽略错误，继续往下探测
+        # 如果没有 NVML 或不是 NVIDIA，就忽略错误并继续探测。
         pass
 
     # 再尝试 XPU
@@ -915,14 +954,14 @@ def detect_device_type() -> str:
         except Exception:
             pass
 
-    # 都没有就是 CPU
+    # 都没有则视为 CPU
     DEVICE_TYPE = "cpu"
     DEVICE_TYPE_DETECTED = True
     return DEVICE_TYPE
 
 
 def get_device_count() -> int:
-    """Get the number of available devices (accelerators)."""
+    """获取可用设备（加速器）数量。"""
     global DEVICE_COUNT, _NVML_INITIALIZED
     if DEVICE_COUNT is not None:
         return DEVICE_COUNT
@@ -959,7 +998,7 @@ def get_device_count() -> int:
         DEVICE_COUNT = len(ids)
         return DEVICE_COUNT
 
-    # CPU case／no accelerator
+    # CPU 场景 / 无加速器场景
     DEVICE_COUNT = 0
     return 0
 
@@ -1003,7 +1042,7 @@ def _refresh_snapshot(device_type):
                         break
 
     else:
-        # GPU (NVIDIA) case does not use snapshot (use NVML directly)
+        # NVIDIA GPU 场景不使用快照，直接调用 NVML。
         _MEM_SNAPSHOT = None
         _MEM_SNAPSHOT_TS = now
         return
@@ -1013,7 +1052,7 @@ def _refresh_snapshot(device_type):
 
 
 def get_memory_info(gpu_id):
-    """Return (total_memory, used_memory) in GB for accelerator device."""
+    """返回加速器设备的 (total_memory, used_memory)，单位 GB。"""
     global _NVML_INITIALIZED
     device_type = detect_device_type()
 
@@ -1160,7 +1199,7 @@ def _parse_gpu_ids(gpu_ids_arg, device_count):
 
 
 def normalize_accuracy_stable_dual_gpu_options(options):
-    """Make the dual-GPU flag a self-contained accuracy-stable GPU mode."""
+    """让双 GPU 标志自洽地进入 accuracy-stable GPU 模式。"""
     if not getattr(options, "accuracy_stable_dual_gpu", False):
         return
     if not getattr(options, "use_gpu_mode", False):
@@ -1173,7 +1212,7 @@ def normalize_accuracy_stable_dual_gpu_options(options):
 
 
 def validate_gpu_options(options) -> tuple:
-    """Validate and normalize GPU-related options."""
+    """校验并规范化 GPU 相关参数。"""
     normalize_accuracy_stable_dual_gpu_options(options)
     device_count = get_device_count()
     if device_count == 0:
@@ -1368,7 +1407,7 @@ def check_gpu_memory(gpu_ids, num_workers_per_gpu):
 
 
 def limit_dual_gpu_worker_layout(available_gpus, pending_cases):
-    """Limit an ordered list of complete GPU pairs to the pending case count."""
+    """根据待处理 case 数限制完整 GPU 对的数量。"""
     if len(available_gpus) % 2:
         raise ValueError("dual-GPU worker layout requires complete GPU pairs")
     pair_budget = max(0, pending_cases)
@@ -1378,14 +1417,14 @@ def limit_dual_gpu_worker_layout(available_gpus, pending_cases):
 
 
 def _requeue_retry_case(pending_dispatch, api_config_str):
-    """Put a retry case back at the front of the pending queue."""
+    """把需要重试的 case 放回 pending 队首。"""
     pending_dispatch.insert(0, api_config_str)
 
 
 def validate_configured_worker_count(
     configured_worker_count, *, max_total_workers=MAX_TOTAL_WORKERS
 ):
-    """Reject worker layouts that would create too many processes."""
+    """拒绝会创建过多进程的 worker 布局。"""
     if configured_worker_count > max_total_workers:
         raise ValueError(
             f"configured worker count {configured_worker_count} exceeds the engine limit "
@@ -1401,7 +1440,7 @@ def _handle_external_kill_retry(
     max_case_retries=MAX_EXTERNAL_KILL_RETRIES_PER_CASE,
     max_total_external_kills=None,
 ):
-    """Retry once per case, then mark the run unsafe if kills keep happening."""
+    """每个 case 只重试一次；若外部 kill 持续发生，则标记运行环境不安全。"""
     retry_state.total_external_kills += 1
     if (
         max_total_external_kills is not None
@@ -1427,7 +1466,7 @@ def resolve_batch_worker_layout(
     *,
     dual_gpu=False,
 ):
-    """Validate and trim the worker layout for the current batch."""
+    """校验并裁剪当前 batch 的 worker 布局。"""
     if dual_gpu:
         configured_worker_count = len(available_gpus) // 2
         validate_configured_worker_count(configured_worker_count)
@@ -1448,8 +1487,315 @@ def resolve_batch_worker_layout(
     return available_gpus, max_workers_per_gpu, gpu_pairs
 
 
+def _fill_idle_workers(pool, pending_dispatch, config_iter):
+    """优先用 pending 队列补满空闲 worker，再消费新的 case。"""
+    dispatched_count = 0
+    while True:
+        slot = next(pool.idle_slots(), None)
+        if slot is None:
+            break
+        if pending_dispatch:
+            config = pending_dispatch.pop(0)
+        else:
+            config = next(config_iter, None)
+        if config is None:
+            break
+        pool.dispatch(slot.index, config)
+        dispatched_count += 1
+    return dispatched_count
+
+
+def _handle_batch_result(
+    *,
+    pool,
+    options,
+    all_case,
+    batch_state,
+    retry_state,
+    pending_dispatch,
+    msg,
+    max_total_external_kills,
+):
+    """处理单条 case 终态消息，并维护批处理状态。"""
+    msg_type = msg[0]
+    slot_idx = msg[1]
+    config = msg[2]
+    exitcode = msg[3] if msg_type == "crashed" and len(msg) > 3 else None
+    crash_source = "worker"
+    worker_pid = None
+    completed_offset = None
+    reason = None
+
+    if msg_type == "done":
+        worker_pid = msg[3] if len(msg) > 3 else None
+        completed_offset = msg[4] if len(msg) > 4 else None
+    elif msg_type == "error":
+        reason = msg[3] if len(msg) > 3 else ""
+        worker_pid = msg[4] if len(msg) > 4 else None
+        completed_offset = msg[5] if len(msg) > 5 else None
+    elif msg_type == "timeout":
+        worker_pid = msg[3] if len(msg) > 3 else None
+    elif msg_type == "deferred":
+        reason = msg[3] if len(msg) > 3 else "insufficient GPU memory"
+        worker_pid = msg[4] if len(msg) > 4 else None
+        completed_offset = msg[5] if len(msg) > 5 else None
+    elif msg_type == "crashed":
+        if len(msg) > 5 and msg[5] == "child":
+            crash_source = "child"
+            worker_pid = msg[6] if len(msg) > 6 else None
+            completed_offset = msg[7] if len(msg) > 7 else None
+        else:
+            worker_pid = msg[4] if len(msg) > 4 else None
+
+    if worker_pid is not None:
+        log_aggregation.mark_inorder_case_complete(worker_pid, completed_offset)
+
+    worker_reusable = msg_type in ("done", "error", "deferred") or (
+        msg_type == "crashed" and options.use_compute_sanitizer and crash_source == "child"
+    )
+    external_kill = msg_type == "crashed" and exitcode in (
+        -signal.SIGKILL,
+        -signal.SIGTERM,
+    )
+    batch_state.active_tasks -= 1
+
+    if external_kill:
+        if _handle_external_kill_retry(
+            retry_state,
+            pending_dispatch,
+            config,
+            max_case_retries=MAX_EXTERNAL_KILL_RETRIES_PER_CASE,
+            max_total_external_kills=max_total_external_kills,
+        ):
+            log_report.print_case_notice("RETRY", config, f"exit {exitcode}")
+            if worker_reusable:
+                pool.mark_idle(slot_idx)
+        else:
+            log_report.print_case_notice(
+                "ABORT",
+                config,
+                f"exit {exitcode} | unsafe environment",
+            )
+            batch_state.batch_exit_code = 1
+            batch_state.shutdown_force = True
+            batch_state.abort_run = True
+            pending_dispatch.clear()
+        return
+
+    if worker_reusable:
+        pool.mark_idle(slot_idx)
+
+    if msg_type == "deferred":
+        pending_dispatch.append(config)
+        log_report.print_case_notice("DEFERRED", config, reason)
+        return
+
+    batch_state.tested_case += 1
+    progress_status = "DONE"
+    progress_detail = None
+
+    if msg_type == "timeout":
+        log_worker.write_to_log("timeout", config)
+        progress_status = "TIMEOUT"
+    elif msg_type == "crashed":
+        log_type, progress_status, terminal_recorded = log_worker.classify_exit(exitcode)
+        if crash_source == "child":
+            terminal_recorded = False
+        if (
+            progress_status == "PADDLE_CRASH"
+            and options.use_compute_sanitizer
+            and exitcode == options.sanitizer_error_exitcode
+        ):
+            log_type = "paddle_cuda"
+            progress_status = "PADDLE_CUDA"
+            terminal_recorded = False
+            progress_detail = f"sanitizer exit {exitcode}"
+        elif progress_status == "PADDLE_CRASH":
+            progress_detail = f"exit {exitcode}"
+        if not terminal_recorded:
+            log_worker.write_to_log(log_type, config)
+    elif msg_type == "error":
+        log_worker.write_to_log("config_parse", config)
+        progress_status = "CONFIG_PARSE"
+        progress_detail = reason
+
+    if (
+        options.show_runtime_status
+        or batch_state.tested_case % 10000 == 0
+        or progress_status != "DONE"
+    ):
+        log_report.print_case_progress(
+            batch_state.tested_case,
+            all_case,
+            progress_status,
+            config,
+            progress_detail,
+        )
+
+    log_worker.write_to_log("checkpoint", config)
+
+    if batch_state.tested_case % 1000 == 0:
+        log_aggregation.aggregate_logs()
+
+
+def _install_batch_signal_handlers(cleanup_handler):
+    previous_handlers = {}
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        previous_handlers[sig] = signal.signal(sig, cleanup_handler)
+    return previous_handlers
+
+
+def _restore_batch_signal_handlers(previous_handlers):
+    for sig, handler in previous_handlers.items():
+        signal.signal(sig, handler)
+
+
+def _run_batch_mode(
+    *,
+    options,
+    api_configs,
+    all_case,
+    available_gpus,
+    max_workers_per_gpu,
+    start_time,
+):
+    batch_state = BatchRunState()
+    retry_state = BatchRetryState()
+    max_total_external_kills = MAX_TOTAL_EXTERNAL_KILL_EVENTS
+    pool = None
+    previous_signal_handlers = {}
+
+    try:
+        # batch 执行分为三段：
+        # 启动 worker、处理结果、收尾日志和信号处理器。
+        print("\n--- RUNNING")
+        pool = WorkerPool(available_gpus, max_workers_per_gpu, options)
+
+        def cleanup_handler(*args):
+            cleanup(pool)
+            sys.exit(1)
+
+        previous_signal_handlers = _install_batch_signal_handlers(cleanup_handler)
+
+        worker_start_time = time.monotonic()
+        print(f"Workers: starting | {len(pool.slots)} requested", flush=True)
+        pool.start()
+        ready_workers = pool.warmup()
+        requested_field = (
+            f" | {len(pool.slots)} requested" if ready_workers != len(pool.slots) else ""
+        )
+        print(
+            f"Workers: ready | {ready_workers} online{requested_field} | "
+            f"{log_report.format_duration(time.monotonic() - worker_start_time)}",
+            flush=True,
+        )
+
+        if ready_workers == 0:
+            print("Workers: failed | no worker became ready", flush=True)
+            batch_state.batch_exit_code = 1
+            batch_state.shutdown_force = True
+
+        config_iter = iter(api_configs)
+        pending_dispatch = []
+        batch_state.abort_run = ready_workers == 0
+
+        # 先把当前已经空闲的 worker 填满，让首轮尽快开始。
+        if not batch_state.abort_run:
+            batch_state.active_tasks += _fill_idle_workers(pool, pending_dispatch, config_iter)
+
+        # 主循环只负责收消息、补空闲 worker、以及把结果交给专门的处理逻辑。
+        while (batch_state.active_tasks > 0 or pending_dispatch) and not batch_state.abort_run:
+            msg = pool.collect_one(timeout=5.0)
+            if msg is None:
+                if not batch_state.abort_run:
+                    batch_state.active_tasks += _fill_idle_workers(
+                        pool,
+                        pending_dispatch,
+                        config_iter,
+                    )
+                continue
+
+            if pool._handle_worker_control_message(msg):
+                if not batch_state.abort_run:
+                    batch_state.active_tasks += _fill_idle_workers(
+                        pool,
+                        pending_dispatch,
+                        config_iter,
+                    )
+                continue
+
+            msg_type = msg[0]
+
+            if msg_type == "ack":
+                slot_idx = msg[1]
+                with pool._lock:
+                    pool.slots[slot_idx].task_start_time = time.time()
+                if not batch_state.abort_run:
+                    batch_state.active_tasks += _fill_idle_workers(
+                        pool,
+                        pending_dispatch,
+                        config_iter,
+                    )
+                continue
+
+            if msg_type not in ("done", "error", "timeout", "deferred", "crashed"):
+                if not batch_state.abort_run:
+                    batch_state.active_tasks += _fill_idle_workers(
+                        pool,
+                        pending_dispatch,
+                        config_iter,
+                    )
+                continue
+
+            _handle_batch_result(
+                pool=pool,
+                options=options,
+                all_case=all_case,
+                batch_state=batch_state,
+                retry_state=retry_state,
+                pending_dispatch=pending_dispatch,
+                msg=msg,
+                max_total_external_kills=max_total_external_kills,
+            )
+
+            if not batch_state.abort_run:
+                batch_state.active_tasks += _fill_idle_workers(
+                    pool,
+                    pending_dispatch,
+                    config_iter,
+                )
+
+    except Exception as e:
+        print(f"Unexpected error: {e}", flush=True)
+        batch_state.batch_exit_code = 1
+        batch_state.shutdown_force = True
+    finally:
+        # 在进入 pool 清理前恢复进程级信号处理器。
+        _restore_batch_signal_handlers(previous_signal_handlers)
+        if pool is not None:
+            pool.shutdown(force=batch_state.shutdown_force)
+        if options.use_compute_sanitizer:
+            log_worker.clean_sanitizer_case_logs()
+        log_counts = log_aggregation.finalize_logs()
+        if (
+            options.retest
+            and batch_state.batch_exit_code == 0
+            and batch_state.tested_case == all_case
+        ):
+            log_retest.finish_retest()
+        log_report.print_run_footer(
+            all_case,
+            batch_state.tested_case,
+            max(all_case - batch_state.tested_case, 0),
+            log_counts,
+            time.time() - start_time,
+            options.log_dir,
+        )
+    return batch_state.batch_exit_code
+
+
 def run_test_case(api_config_str, options):
-    """Run a single test case for the given API configuration."""
+    """运行指定 API 配置的单个测试 case。"""
     started_at = time.monotonic()
     visible_gpu_ids = tuple(
         int(value) for value in os.environ.get("CUDA_VISIBLE_DEVICES", "0").split(",")
@@ -1540,7 +1886,7 @@ def run_test_case(api_config_str, options):
                         os._exit(exit_code)
             if terminal_log_type is not None:
                 return
-            # if not fatal error, subprocess will be alive and report error
+            # 如果不是致命错误，子进程会继续存活并上报错误。
             print(f"[test error] {api_config_str}: {err}", flush=True)
             raise
         finally:
@@ -1884,7 +2230,7 @@ def main():
         if not (options.accuracy or options.paddle_only):
             return _argument_error("dump currently supports only --accuracy or --paddle_only")
 
-    # 处理 custom_device_vs_gpu 模式的配置
+        # 处理 custom_device_vs_gpu 模式的配置
     bos_config_data = None
     if options.custom_device_vs_gpu:
         # 读取 BOS 配置文件（固定路径：tester/bos_config.yaml）
@@ -1908,7 +2254,7 @@ def main():
                 print(f"Missing required keys in BOS config: {missing_keys}", flush=True)
                 return 2
 
-            # 将配置添加到 options 中，以便传递给测试类
+            # 将配置写回 options，便于继续传递给测试类。
             options.operation_mode = options.custom_device_vs_gpu_mode
             options.bos_path = bos_config_data["bos_path"]
             options.bos_conf_path = bos_config_data["bos_conf_path"]
@@ -1964,7 +2310,7 @@ def main():
         except ValueError as err:
             return _argument_error(str(err))
 
-        # Single config execution uses the same quiet Paddle/bootstrap path as workers.
+        # 单 case 执行与 worker 复用同样的静默 Paddle/bootstrap 路径。
         _init_runtime_modules(options)
 
         init_log(options.log_dir)
@@ -1993,7 +2339,7 @@ def main():
         if single_case_error is not None:
             sys.exit(1)
     elif options.api_config_file or options.api_config_file_pattern or options.retest:
-        # get config files
+        # 获取配置文件
         if options.retest:
             config_files = []
         elif options.api_config_file_pattern:
@@ -2022,7 +2368,7 @@ def main():
 
         init_log(options.log_dir)
 
-        # when engineV2 was interrupted, resume from .tmp dir
+        # 当 engineV2 被中断时，从 .tmp 目录恢复。
         if not log_aggregation.recover_logs():
             return _argument_error(
                 "failed to recover worker logs; fix the reported log error before retrying"
@@ -2096,16 +2442,15 @@ def main():
             )
             return 0
 
-        # validate GPU visibility and derive per-GPU worker counts
+        # 校验 GPU 可见性并推导每张 GPU 的 worker 数量。
         gpu_ids = validate_gpu_options(options)
         available_gpus, max_workers_per_gpu = check_gpu_memory(gpu_ids, options.num_workers_per_gpu)
         if not available_gpus:
             print("No usable GPUs available.", flush=True)
             return 2
-        if options.accuracy_stable_dual_gpu:
-            if len(available_gpus) != len(gpu_ids):
-                print("Not all selected GPUs are usable; no complete dual-GPU layout.", flush=True)
-                return 2
+        if options.accuracy_stable_dual_gpu and len(available_gpus) != len(gpu_ids):
+            print("Not all selected GPUs are usable; no complete dual-GPU layout.", flush=True)
+            return 2
 
         try:
             available_gpus, max_workers_per_gpu, gpu_pairs = resolve_batch_worker_layout(
@@ -2123,9 +2468,6 @@ def main():
         ):
             return 2
 
-        total_workers = (
-            len(gpu_pairs) if gpu_pairs is not None else sum(max_workers_per_gpu.values())
-        )
         log_report.print_compute_summary(
             available_gpus,
             max_workers_per_gpu,
@@ -2135,244 +2477,14 @@ def main():
         if options.test_cpu:
             print(f"CPU: {cpu_count()} available | Paddle CPU mode", flush=True)
 
-        print("\n--- RUNNING")
-
-        # initialize worker pool (per-worker queue architecture)
-        pool = WorkerPool(available_gpus, max_workers_per_gpu, options)
-
-        def cleanup_handler(*args):
-            cleanup(pool)
-            sys.exit(1)
-
-        signal.signal(signal.SIGINT, cleanup_handler)
-        signal.signal(signal.SIGTERM, cleanup_handler)
-
-        worker_start_time = time.monotonic()
-        print(f"Workers: starting | {total_workers} requested", flush=True)
-        pool.start()
-        ready_workers = pool.warmup(timeout=180)
-        requested_field = f" | {total_workers} requested" if ready_workers != total_workers else ""
-        print(
-            f"Workers: ready | {ready_workers} online{requested_field} | "
-            f"{log_report.format_duration(time.monotonic() - worker_start_time)}",
-            flush=True,
+        return _run_batch_mode(
+            options=options,
+            api_configs=api_configs,
+            all_case=all_case,
+            available_gpus=available_gpus,
+            max_workers_per_gpu=max_workers_per_gpu,
+            start_time=start_time,
         )
-
-        # dispatch tasks using per-worker queue round-robin
-        tested_case = 0
-        batch_exit_code = 0
-        shutdown_force = False
-        retry_state = BatchRetryState()
-        max_total_external_kills = MAX_TOTAL_EXTERNAL_KILL_EVENTS
-        if ready_workers == 0:
-            print("Workers: failed | no worker became ready", flush=True)
-            batch_exit_code = 1
-            shutdown_force = True
-        try:
-            config_iter = iter(api_configs)
-            active_tasks = 0
-            pending_dispatch = []  # configs waiting for a free worker
-            abort_run = ready_workers == 0
-
-            # Initial dispatch: one task per idle worker
-            if not abort_run:
-                for slot in pool.idle_slots():
-                    config = next(config_iter, None)
-                    if config is None:
-                        break
-                    pool.dispatch(slot.index, config)
-                    active_tasks += 1
-
-            # Main loop: collect results and dispatch next
-            while (active_tasks > 0 or pending_dispatch) and not abort_run:
-                msg = pool.collect_one(timeout=5.0)
-                if msg is None:
-                    if pending_dispatch:
-                        for slot in pool.idle_slots():
-                            if not pending_dispatch:
-                                break
-                            config = pending_dispatch.pop(0)
-                            pool.dispatch(slot.index, config)
-                            active_tasks += 1
-                    continue  # watchdog handles timeouts/crashes
-
-                if pool._handle_worker_control_message(msg):
-                    if msg[0] == "ready" and pending_dispatch:
-                        config = pending_dispatch.pop(0)
-                        pool.dispatch(msg[1], config)
-                        active_tasks += 1
-                    continue
-
-                msg_type = msg[0]
-
-                if msg_type == "ack":
-                    # Worker started processing — record start time
-                    slot_idx = msg[1]
-                    with pool._lock:
-                        pool.slots[slot_idx].task_start_time = time.time()
-                    continue
-
-                # Task completed (done/error/timeout/crashed)
-                slot_idx = msg[1]
-                config = msg[2]
-                exitcode = msg[3] if msg_type == "crashed" and len(msg) > 3 else None
-                crash_source = "worker"
-                worker_pid = None
-                completed_offset = None
-                if msg_type == "done":
-                    worker_pid = msg[3] if len(msg) > 3 else None
-                    completed_offset = msg[4] if len(msg) > 4 else None
-                elif msg_type == "error":
-                    worker_pid = msg[4] if len(msg) > 4 else None
-                    completed_offset = msg[5] if len(msg) > 5 else None
-                elif msg_type == "timeout":
-                    worker_pid = msg[3] if len(msg) > 3 else None
-                elif msg_type == "deferred":
-                    worker_pid = msg[4] if len(msg) > 4 else None
-                    completed_offset = msg[5] if len(msg) > 5 else None
-                elif msg_type == "crashed":
-                    if len(msg) > 5 and msg[5] == "child":
-                        crash_source = "child"
-                        worker_pid = msg[6] if len(msg) > 6 else None
-                        completed_offset = msg[7] if len(msg) > 7 else None
-                    else:
-                        worker_pid = msg[4] if len(msg) > 4 else None
-                if worker_pid is not None:
-                    log_aggregation.mark_inorder_case_complete(worker_pid, completed_offset)
-                worker_reusable = msg_type in ("done", "error", "deferred") or (
-                    msg_type == "crashed"
-                    and options.use_compute_sanitizer
-                    and crash_source == "child"
-                )
-                external_kill = msg_type == "crashed" and exitcode in (
-                    -signal.SIGKILL,
-                    -signal.SIGTERM,
-                )
-                active_tasks -= 1
-
-                if external_kill:
-                    if _handle_external_kill_retry(
-                        retry_state,
-                        pending_dispatch,
-                        config,
-                        max_case_retries=MAX_EXTERNAL_KILL_RETRIES_PER_CASE,
-                        max_total_external_kills=max_total_external_kills,
-                    ):
-                        log_report.print_case_notice("RETRY", config, f"exit {exitcode}")
-                        if worker_reusable:
-                            pool.mark_idle(slot_idx)
-                        next_config = next(config_iter, None)
-                        if next_config is not None:
-                            if not worker_reusable:
-                                pending_dispatch.append(next_config)
-                            else:
-                                pool.dispatch(slot_idx, next_config)
-                                active_tasks += 1
-                    else:
-                        log_report.print_case_notice(
-                            "ABORT",
-                            config,
-                            f"exit {exitcode} | unsafe environment",
-                        )
-                        batch_exit_code = 1
-                        shutdown_force = True
-                        pending_dispatch.clear()
-                        abort_run = True
-                    continue
-
-                if worker_reusable:
-                    pool.mark_idle(slot_idx)
-
-                if msg_type == "deferred":
-                    reason = msg[3] if len(msg) > 3 else "insufficient GPU memory"
-                    pending_dispatch.append(config)
-                    log_report.print_case_notice("DEFERRED", config, reason)
-                    continue
-
-                tested_case += 1
-                progress_status = "DONE"
-                progress_detail = None
-
-                if msg_type == "timeout":
-                    log_worker.write_to_log("timeout", config)
-                    progress_status = "TIMEOUT"
-                elif msg_type == "crashed":
-                    log_type, progress_status, terminal_recorded = log_worker.classify_exit(
-                        exitcode
-                    )
-                    if crash_source == "child":
-                        terminal_recorded = False
-                    if (
-                        progress_status == "PADDLE_CRASH"
-                        and options.use_compute_sanitizer
-                        and exitcode == options.sanitizer_error_exitcode
-                    ):
-                        log_type = "paddle_cuda"
-                        progress_status = "PADDLE_CUDA"
-                        terminal_recorded = False
-                        progress_detail = f"sanitizer exit {exitcode}"
-                    elif progress_status == "PADDLE_CRASH":
-                        progress_detail = f"exit {exitcode}"
-                    if not terminal_recorded:
-                        log_worker.write_to_log(log_type, config)
-                elif msg_type == "error":
-                    error_msg = msg[3] if len(msg) > 3 else ""
-                    log_worker.write_to_log("config_parse", config)
-                    progress_status = "CONFIG_PARSE"
-                    progress_detail = error_msg
-
-                if (
-                    options.show_runtime_status
-                    or tested_case % 10000 == 0
-                    or progress_status != "DONE"
-                ):
-                    log_report.print_case_progress(
-                        tested_case,
-                        all_case,
-                        progress_status,
-                        config,
-                        progress_detail,
-                    )
-
-                log_worker.write_to_log("checkpoint", config)
-
-                # 先派发下一项，再做周期日志聚合，避免空闲 worker 等待共享存储 I/O。
-                next_config = next(config_iter, None)
-                if next_config is not None:
-                    # For timeout/non-sanitizer crashed: worker is restarting, queue for later dispatch
-                    if not worker_reusable:
-                        pending_dispatch.append(next_config)
-                    else:
-                        # Worker is alive and ready for next task
-                        pool.dispatch(slot_idx, next_config)
-                        active_tasks += 1
-
-                # Periodic log aggregation
-                if tested_case % 1000 == 0:
-                    log_aggregation.aggregate_logs()
-
-        except Exception as e:
-            print(f"Unexpected error: {e}", flush=True)
-            batch_exit_code = 1
-            shutdown_force = True
-        finally:
-            pool.shutdown(force=shutdown_force)
-            if options.use_compute_sanitizer:
-                log_worker.clean_sanitizer_case_logs()
-            log_counts = log_aggregation.finalize_logs()
-            if options.retest and batch_exit_code == 0 and tested_case == all_case:
-                log_retest.finish_retest()
-            end_time = time.time()
-            total_time = end_time - start_time
-            log_report.print_run_footer(
-                all_case,
-                tested_case,
-                max(all_case - tested_case, 0),
-                log_counts,
-                total_time,
-                options.log_dir,
-            )
-        return batch_exit_code
 
 
 if __name__ == "__main__":
