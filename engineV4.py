@@ -397,7 +397,10 @@ def _sanitizer_worker_loop(
             case_log_dir.mkdir(parents=True, exist_ok=True)
             try:
                 cmd = _build_sanitizer_case_command(
-                    api_config_str, options, str(case_log_dir), sanitizer_cmd
+                    api_config_str,
+                    options,
+                    options.log_dir,
+                    sanitizer_cmd=sanitizer_cmd,
                 )
             except ValueError as err:
                 shutil.rmtree(case_log_dir, ignore_errors=True)
@@ -1016,6 +1019,11 @@ def _print_argument(prefix, message):
     print(f"{prefix} {message}", flush=True)
 
 
+def _argument_error(message):
+    _print_argument(ARGUMENT_ERROR_PREFIX, message)
+    return 2
+
+
 def _mode_uses_torch(options):
     return any(
         getattr(options, opt, False)
@@ -1183,14 +1191,15 @@ def _resolve_dump_options(parser, options):
 
 
 def parse_bool(value):
+    if isinstance(value, bool):
+        return value
     if isinstance(value, str):
-        value = value.lower()
-        if value in ["true", "1", "yes", "y"]:
+        normalized = value.lower()
+        if normalized in ("true", "1", "yes", "y"):
             return True
-        elif value in ["false", "0", "no", "n"]:
+        if normalized in ("false", "0", "no", "n"):
             return False
-    else:
-        raise ValueError(f"Invalid boolean value: {value} parsed from command line")
+    raise argparse.ArgumentTypeError(f"invalid boolean value: {value!r}")
 
 
 def _apply_single_config_gpu_defaults(options):
@@ -1272,7 +1281,12 @@ def _run_single_config_with_sanitizer(options):
         return 2
 
     api_config = options.api_config.strip()
-    cmd = _build_sanitizer_case_command(api_config, options, sanitizer_cmd)
+    cmd = _build_sanitizer_case_command(
+        api_config,
+        options,
+        options.log_dir,
+        sanitizer_cmd=sanitizer_cmd,
+    )
     env = os.environ.copy()
     if gpu_ids:
         env["CUDA_VISIBLE_DEVICES"] = ",".join(str(gpu_id) for gpu_id in gpu_ids)
@@ -1331,6 +1345,11 @@ def limit_dual_gpu_worker_layout(available_gpus, pending_cases):
     pair_count = min(len(available_gpus) // 2, max(0, pending_cases))
     selected_gpus = list(available_gpus[: pair_count * 2])
     return selected_gpus, dict.fromkeys(selected_gpus, 1)
+
+
+def _requeue_retry_case(pending_dispatch, api_config_str):
+    """Put a retry case back at the front of the pending queue."""
+    pending_dispatch.insert(0, api_config_str)
 
 
 def run_test_case(api_config_str, options):
@@ -1668,7 +1687,7 @@ def main():
     )
     parser.add_argument(
         "--bitwise_alignment",
-        type=bool,
+        type=parse_bool,
         default=False,
         help="Use bitwise alignment for accuracy checks.",
     )
@@ -1728,8 +1747,7 @@ def main():
     try:
         options.retest_types = log_retest.parse_retest_types(options.retest)
     except ValueError as err:
-        _print_argument(ARGUMENT_ERROR_PREFIX, str(err))
-        return
+        return _argument_error(str(err))
 
     input_sources = (
         bool(options.api_config),
@@ -1738,12 +1756,10 @@ def main():
         bool(options.retest),
     )
     if sum(input_sources) != 1:
-        _print_argument(
-            ARGUMENT_ERROR_PREFIX,
+        return _argument_error(
             "exactly one of --api_config, --api_config_file, "
-            "--api_config_file_pattern, or --retest is required",
+            "--api_config_file_pattern, or --retest is required"
         )
-        return
     normalize_accuracy_stable_dual_gpu_options(options)
     if options.api_config and not options.test_cpu:
         _apply_single_config_gpu_defaults(options)
@@ -1760,19 +1776,14 @@ def main():
         options.custom_device_vs_gpu,
     ]
     if len([m for m in mode if m is True]) != 1:
-        _print_argument(ARGUMENT_ERROR_PREFIX, TEST_MODE_ERROR)
-        return
+        return _argument_error(TEST_MODE_ERROR)
     if not options._sanitizer_child:
         log_report.print_run_header(options, paddle_version)
     if options.use_dump:
         if not options.api_config or options.api_config_file or options.api_config_file_pattern:
-            _print_argument(ARGUMENT_ERROR_PREFIX, "dump only supports single --api_config runs")
-            return
+            return _argument_error("dump only supports single --api_config runs")
         if not (options.accuracy or options.paddle_only):
-            _print_argument(
-                ARGUMENT_ERROR_PREFIX, "dump currently supports only --accuracy or --paddle_only"
-            )
-            return
+            return _argument_error("dump currently supports only --accuracy or --paddle_only")
 
     # 处理 custom_device_vs_gpu 模式的配置
     bos_config_data = None
@@ -1781,7 +1792,7 @@ def main():
         bos_config_path = Path("tester/bos_config.yaml")
         if not bos_config_path.exists():
             print(f"BOS config file not found: {bos_config_path}", flush=True)
-            return
+            return 2
 
         try:
             with open(bos_config_path, encoding="utf-8") as f:
@@ -1789,14 +1800,14 @@ def main():
 
             if not bos_config_data:
                 print(f"BOS config file is empty: {bos_config_path}", flush=True)
-                return
+                return 2
 
             # 验证必需的配置项
             required_keys = ["bos_path", "bos_conf_path", "bcecmd_path"]
             missing_keys = [key for key in required_keys if key not in bos_config_data]
             if missing_keys:
                 print(f"Missing required keys in BOS config: {missing_keys}", flush=True)
-                return
+                return 2
 
             # 将配置添加到 options 中，以便传递给测试类
             options.operation_mode = options.custom_device_vs_gpu_mode
@@ -1806,7 +1817,7 @@ def main():
 
         except Exception as e:
             print(f"Failed to load BOS config file {bos_config_path}: {e}", flush=True)
-            return
+            return 2
 
     if options.test_tol and not options.accuracy:
         _print_argument(
@@ -1852,8 +1863,7 @@ def main():
         try:
             _prepare_single_config_gpu(options)
         except ValueError as err:
-            _print_argument(ARGUMENT_ERROR_PREFIX, str(err))
-            return
+            return _argument_error(str(err))
 
         # Single config execution uses the same quiet Paddle/bootstrap path as workers.
         _init_runtime_modules(options)
@@ -1900,7 +1910,7 @@ def main():
                     f"No config files found: {options.api_config_file_pattern}",
                     flush=True,
                 )
-                return
+                return 2
             config_files.sort()
             print("Config files to be tested:", flush=True)
             for i, config_file in enumerate(config_files, 1):
@@ -1908,18 +1918,16 @@ def main():
         else:
             if not os.path.exists(options.api_config_file):
                 print(f"No config file found: {options.api_config_file}", flush=True)
-                return
+                return 2
             config_files = [options.api_config_file]
 
         init_log(options.log_dir)
 
         # when engineV2 was interrupted, resume from .tmp dir
         if not log_aggregation.recover_logs():
-            _print_argument(
-                ARGUMENT_ERROR_PREFIX,
-                "failed to recover worker logs; fix the reported log error before retrying",
+            return _argument_error(
+                "failed to recover worker logs; fix the reported log error before retrying"
             )
-            return
         if options.use_compute_sanitizer:
             log_worker.clean_sanitizer_case_logs()
         removed_stale_logs = (
@@ -1930,8 +1938,7 @@ def main():
             try:
                 api_configs = log_retest.prepare_retest(options.retest_types)
             except (OSError, ValueError) as err:
-                _print_argument(ARGUMENT_ERROR_PREFIX, str(err))
-                return
+                return _argument_error(str(err))
             removed_stale_logs = log_retest.cleanup_uncheckpointed_result_logs()
             api_config_count = len(api_configs)
             skipped_non_config = 0
@@ -1955,7 +1962,7 @@ def main():
                             api_configs.add(line)
                 except Exception as e:
                     print(f"Failed to read config file {config_file}: {e}", flush=True)
-                    return
+                    return 2
         dup_case = api_config_count - len(api_configs)
         read_count = api_config_count + skipped_non_config
         api_config_count = len(api_configs)
@@ -1988,19 +1995,19 @@ def main():
                 time.time() - start_time,
                 options.log_dir,
             )
-            return
+            return 0
 
         # validate GPU visibility and derive per-GPU worker counts
         gpu_ids = validate_gpu_options(options)
         available_gpus, max_workers_per_gpu = check_gpu_memory(gpu_ids, options.num_workers_per_gpu)
         if not available_gpus:
             print("No usable GPUs available.", flush=True)
-            return
+            return 2
         gpu_pairs = None
         if options.accuracy_stable_dual_gpu:
             if len(available_gpus) != len(gpu_ids):
                 print("Not all selected GPUs are usable; no complete dual-GPU layout.", flush=True)
-                return
+                return 2
             available_gpus, max_workers_per_gpu = limit_dual_gpu_worker_layout(
                 available_gpus,
                 all_case,
@@ -2015,7 +2022,7 @@ def main():
             options.use_compute_sanitizer
             and _validate_sanitizer_command(options.sanitizer_command) is None
         ):
-            return
+            return 2
 
         total_workers = (
             len(gpu_pairs) if gpu_pairs is not None else sum(max_workers_per_gpu.values())
@@ -2149,6 +2156,7 @@ def main():
                     log_report.print_case_notice("RETRY", config, f"exit {exitcode}")
                     if worker_reusable:
                         pool.mark_idle(slot_idx)
+                    _requeue_retry_case(pending_dispatch, config)
                     next_config = next(config_iter, None)
                     if next_config is not None:
                         if not worker_reusable:
@@ -2253,4 +2261,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
