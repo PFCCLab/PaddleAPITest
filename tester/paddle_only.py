@@ -63,11 +63,14 @@ class APITestPaddleOnly(APITestBase):
             self.dump_event("paddle_input_done")
 
             self.dump_event("paddle_forward_start")
-            if self.test_amp:
-                with paddle.amp.auto_cast():
+            with self.disable_paddle_nan_inf_check_if_needed():
+                if self.test_amp:
+                    with paddle.amp.auto_cast():
+                        paddle_output = self.paddle_api(
+                            *tuple(self.paddle_args), **self.paddle_kwargs
+                        )
+                else:
                     paddle_output = self.paddle_api(*tuple(self.paddle_args), **self.paddle_kwargs)
-            else:
-                paddle_output = self.paddle_api(*tuple(self.paddle_args), **self.paddle_kwargs)
             self.dump_save("paddle_forward_output", paddle_output, framework="paddle")
             self.dump_event("paddle_forward_done")
 
@@ -91,12 +94,13 @@ class APITestPaddleOnly(APITestBase):
                     and len(result_outputs) != 0
                     and len(result_outputs_grads) != 0
                 ):
-                    input_grads = paddle.grad(
-                        result_outputs,
-                        inputs_list,
-                        grad_outputs=result_outputs_grads,
-                        allow_unused=True,
-                    )
+                    with self.disable_paddle_nan_inf_check_if_needed():
+                        input_grads = paddle.grad(
+                            result_outputs,
+                            inputs_list,
+                            grad_outputs=result_outputs_grads,
+                            allow_unused=True,
+                        )
                     self.dump_save("paddle_input_grads", input_grads, framework="paddle")
                 self.dump_event("paddle_backward_done")
             else:

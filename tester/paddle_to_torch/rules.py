@@ -648,6 +648,20 @@ if x.dtype != y.dtype:
         return ConvertResult.success(paddle_api, code)
 
 
+class BaddbmmRule(BaseRule):
+    def apply(self, paddle_api: str) -> ConvertResult:
+        core = """
+input = locals().get('input', args[0] if args else None)
+x = locals().get('x', args[1] if len(args) > 1 else None)
+y = locals().get('y', args[2] if len(args) > 2 else None)
+beta = locals().get('beta', 1.0)
+alpha = locals().get('alpha', 1.0)
+result = torch.baddbmm(input, x, y, beta=beta, alpha=alpha)
+"""
+        code = Code(core=core.splitlines())
+        return ConvertResult.success(paddle_api, code)
+
+
 class BroadcastShapeRule(BaseRule):
     def apply(self, paddle_api: str) -> ConvertResult:
         pre = """
@@ -8123,11 +8137,27 @@ class CopsSquaredL2NormRule(BaseRule):
 
     def apply(self, paddle_api: str) -> ConvertResult:
         core = """
-x = locals().get("x")
+x = locals().get("x", args[0] if args else None)
 result = (x.float() * x.float()).sum().reshape([1])
 """
         code = Code(core=core.splitlines())
         return ConvertResult.success(paddle_api, code, is_torch_corresponding=False)
+
+
+class TruncNormalRule(BaseRule):
+    """paddle.nn.init.trunc_normal_ → torch.nn.init.trunc_normal_"""
+
+    def apply(self, paddle_api: str) -> ConvertResult:
+        core = """
+tensor = locals().get("tensor", args[0] if args else None)
+mean = locals().get("mean", 0.0)
+std = locals().get("std", 1.0)
+a = locals().get("a", -2.0)
+b = locals().get("b", 2.0)
+result = torch.nn.init.trunc_normal_(tensor, mean=mean, std=std, a=a, b=b)
+"""
+        code = Code(core=core.splitlines())
+        return ConvertResult.success(paddle_api, code)
 
 
 class CopsSwigluGradRule(BaseRule):

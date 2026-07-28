@@ -4,7 +4,9 @@ import collections
 import contextlib
 import gc
 import inspect
+import math
 import os
+import re
 from dataclasses import dataclass
 
 import numpy
@@ -51,6 +53,8 @@ class _LazyTorch:
 
 
 torch = _LazyTorch()
+
+_GPU_DEVICE_PATTERN = re.compile(r"^(cuda|gpu):(\d+)$", re.IGNORECASE)
 
 
 CUDA_ERROR = frozenset(
@@ -290,6 +294,75 @@ def classify_runtime_error(error_msg):
     if any(marker in error_msg_lower for marker in torch_invalid_config_markers):
         return "config_input", False
     return None, False
+
+
+def _contains_non_finite_scalar(value):
+    if isinstance(value, bool) or isinstance(value, int):
+        return False
+    if isinstance(value, float):
+        return not math.isfinite(value)
+    if isinstance(value, numpy.generic):
+        try:
+            return not numpy.isfinite(value).item()
+        except Exception:
+            return False
+    if isinstance(value, complex):
+        return not math.isfinite(value.real) or not math.isfinite(value.imag)
+    if isinstance(value, TensorConfig):
+        return False
+    if isinstance(value, (list, tuple)):
+        return any(_contains_non_finite_scalar(item) for item in value)
+    if isinstance(value, (dict, collections.OrderedDict)):
+        return any(_contains_non_finite_scalar(item) for item in value.values())
+    return False
+
+
+def _normalize_visible_gpu_device(value):
+    if not isinstance(value, str):
+        return value
+    match = _GPU_DEVICE_PATTERN.match(value)
+    if match is None:
+        return value
+    try:
+        gpu_count = paddle.device.cuda.device_count()
+    except Exception:
+        return value
+    if gpu_count <= 0:
+        return value
+    return f"cuda:{int(match.group(2)) % gpu_count}"
+
+
+def _normalize_runtime_value_tree(value):
+    if isinstance(value, TensorConfig):
+        return value
+    if isinstance(value, list):
+        return [_normalize_runtime_value_tree(item) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_normalize_runtime_value_tree(item) for item in value)
+    if isinstance(value, collections.OrderedDict):
+        return collections.OrderedDict(
+            (key, _normalize_runtime_value_tree(item)) for key, item in value.items()
+        )
+    if isinstance(value, dict):
+        return {key: _normalize_runtime_value_tree(item) for key, item in value.items()}
+    return _normalize_visible_gpu_device(value)
+
+
+def _normalize_shape_like_api_arguments(api_name, args):
+    if api_name in {"paddle.zeros", "paddle.ones", "paddle.empty"}:
+        if len(args) > 1 and not isinstance(args[0], (list, tuple, TensorConfig)):
+            return [list(args)]
+    if api_name == "paddle.full":
+        if len(args) > 1 and not isinstance(args[0], (list, tuple, TensorConfig)):
+            return [list(args[:-1]), args[-1]]
+    return list(args)
+
+
+def normalize_api_arguments(api_name, args, kwargs):
+    normalized_args = _normalize_shape_like_api_arguments(api_name, args)
+    normalized_args = _normalize_runtime_value_tree(normalized_args)
+    normalized_kwargs = _normalize_runtime_value_tree(kwargs)
+    return normalized_args, normalized_kwargs
 
 
 def get_arg(api_config, arg_pos, arg_name, default=None):
@@ -551,6 +624,36 @@ class APITestBase:
             raise err
         return log_type, fatal
 
+    @contextlib.contextmanager
+    def disable_paddle_nan_inf_check_if_needed(self):
+        if not _contains_non_finite_scalar(
+            self.api_config.args
+        ) and not _contains_non_finite_scalar(self.api_config.kwargs):
+            yield
+            return
+
+        flag_name = "FLAGS_check_nan_inf"
+        original_flags = None
+        try:
+            original_flags = paddle.get_flags([flag_name])
+        except Exception:
+            original_flags = None
+
+        if original_flags and flag_name in original_flags:
+            try:
+                paddle.set_flags({flag_name: False})
+            except Exception:
+                original_flags = None
+
+        try:
+            yield
+        finally:
+            if original_flags and flag_name in original_flags:
+                try:
+                    paddle.set_flags({flag_name: original_flags[flag_name]})
+                except Exception:
+                    pass
+
     def need_skip(self, paddle_only=False):
         # not support
         if "sparse" in self.api_config.api_name:
@@ -627,12 +730,18 @@ class APITestBase:
         return self.ana_paddle_api_info() and self.ana_torch_api_info()
 
     def ana_paddle_api_info(self):
+        self.api_config.args, self.api_config.kwargs = normalize_api_arguments(
+            self.api_config.api_name, self.api_config.args, self.api_config.kwargs
+        )
         self.paddle_api = eval(self.api_config.api_name)
         self.paddle_args_config = self.api_config.args
         self.paddle_kwargs_config = self.api_config.kwargs
         return True
 
     def ana_torch_api_info(self):
+        self.api_config.args, self.api_config.kwargs = normalize_api_arguments(
+            self.api_config.api_name, self.api_config.args, self.api_config.kwargs
+        )
         self.torch_args_config = []
         self.torch_kwargs_config = collections.OrderedDict()
         self.paddle_merged_kwargs_config = collections.OrderedDict()

@@ -53,6 +53,9 @@
             "alpha": "alpha"
         }
     },
+    "paddle.baddbmm": {
+        "Rule": "BaddbmmRule"
+    },
     "paddle.all": {
         "Rule": "AllRule",
         "torch_api": "torch.all",
@@ -424,6 +427,15 @@
     "paddle.Tensor.cast": {
         "Rule": "CastRule"
     },
+    "paddle.cat": {
+        "torch_api": "torch.cat",
+        "torch_args": [
+            "locals().get('x', args[0] if args else ())"
+        ],
+        "torch_kwargs": {
+            "dim": "locals().get('axis', args[1] if len(args) > 1 else 0)"
+        }
+    },
     "paddle.cdist": {
         "torch_api": "torch.cdist",
         "paddle_torch_args_map": {
@@ -472,6 +484,16 @@
             "x": "input",
             "min": "min",
             "max": "max"
+        }
+    },
+    "paddle.clamp": {
+        "torch_api": "torch.clamp",
+        "torch_args": [
+            "locals().get('x', args[0] if args else None)"
+        ],
+        "torch_kwargs": {
+            "min": "locals().get('min', args[1] if len(args) > 1 else None)",
+            "max": "locals().get('max', args[2] if len(args) > 2 else None)"
         }
     },
     "paddle.Tensor.clip": {
@@ -3035,6 +3057,20 @@
             "weight": "weight",
             "bias": "bias"
         }
+    },
+    "paddle.compat.nn.functional.linear": {
+        "torch_api": "torch.nn.functional.linear",
+        "torch_args": [
+            "locals().get('input', locals().get('x', args[0] if len(args) > 0 else None))",
+            "locals().get('weight', args[1] if len(args) > 1 else None)",
+            "locals().get('bias', args[2] if len(args) > 2 else None)"
+        ]
+    },
+    "paddle.nn.clip._squared_l2_norm": {
+        "Rule": "CopsSquaredL2NormRule"
+    },
+    "paddle.nn.init.trunc_normal_": {
+        "Rule": "TruncNormalRule"
     },
     "paddle.nn.functional.local_response_norm": {
         "Rule": "LocalResponseNormRule",
