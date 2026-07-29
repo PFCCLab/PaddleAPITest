@@ -2412,13 +2412,28 @@ class APITestBase:
 
         return visit(value)
 
-    def spill_tensor_tree_slot_to_cpu(self, values, index=0):
+    def tensor_tree_has_gpu_tensor(self, value):
+        """Return whether a result tree contains at least one GPU tensor leaf."""
+        if isinstance(value, torch.Tensor):
+            return value.device.type != "cpu"
+        if isinstance(value, paddle.Tensor):
+            return not value.place.is_cpu_place()
+        if isinstance(value, (list, tuple)):
+            return any(self.tensor_tree_has_gpu_tensor(item) for item in value)
+        if isinstance(value, dict):
+            return any(self.tensor_tree_has_gpu_tensor(item) for item in value.values())
+        return False
+
+    def spill_tensor_tree_slot_to_cpu(self, values, index=0, release_cache=True):
         """Replace one result-tree slot with a CPU copy, then release its GPU source."""
         source = values[index]
+        if not self.tensor_tree_has_gpu_tensor(source):
+            return False
         values[index] = self.move_tensor_tree_to_cpu(source)
         del source
-        if self.gpu_mode_config.enabled:
+        if release_cache and self.gpu_mode_config.enabled:
             gpu_mode_memory_decision(self.gpu_mode_config, force=True)
+        return True
 
     def detach_tensor_tree(self, value):
         """Detach every framework tensor while preserving the argument tree."""

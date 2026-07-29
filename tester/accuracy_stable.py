@@ -12,6 +12,10 @@ from .base import CUDA_ERROR, CUDA_OOM, APITestBase, gpu_mode_memory_decision
 from .log_writer import log_comparison, log_worker
 from .paddle_to_torch import adaptive_workspace_bytes, get_converter
 
+_GIB = 1024**3
+_RESULT_STREAM_WORKSPACE_BYTES = 256 * 1024**2
+_SUMMARY_COMPARISON_WORKSPACE_BYTES = _GIB
+
 
 @dataclass
 class _StableResultPairs:
@@ -38,11 +42,12 @@ class _StableResultPairs:
 
 
 @dataclass
-class _DualComparisonState:
+class _StableExecutionState:
     first_pair_comparison: object | None = None
     first_pair_finished: bool = False
     phased_result_residency: bool = False
     first_iteration_spilled: bool = False
+    probe_bytes: int = 0
 
 
 class APITestAccuracyStable(APITestBase):
@@ -127,20 +132,18 @@ class APITestAccuracyStable(APITestBase):
         if not self.use_dual_gpu:
             return False
         memory_state = self._comparison_gpu_memory_state()
-        allocator_margin = max(1 * 1024**3, int(projected_bytes) // 20)
-        target_workspace = 256 * 1024**2
+        allocator_margin = max(_GIB, int(projected_bytes) // 20)
         return (
-            int(projected_bytes) + allocator_margin + target_workspace
+            int(projected_bytes) + allocator_margin + _RESULT_STREAM_WORKSPACE_BYTES
             > memory_state.live_budget_bytes
         )
 
     def _prepare_second_torch_results(self, state, torch_result_bytes):
         """Reserve comparison-card space before copying the T2 result family."""
-        target_workspace = 256 * 1024**2
         memory_state = self._comparison_gpu_memory_state()
         free_bytes = memory_state.free_bytes
         reserve_bytes = memory_state.reserve_bytes
-        target_free = reserve_bytes + int(torch_result_bytes) + target_workspace
+        target_free = reserve_bytes + int(torch_result_bytes) + _RESULT_STREAM_WORKSPACE_BYTES
         if free_bytes < target_free:
             # P1T1 has completed, so its reduction blocks are no longer live.
             self._release_comparison_gpu_cache()
@@ -157,14 +160,13 @@ class APITestAccuracyStable(APITestBase):
             state.phased_result_residency = True
 
     def _place_second_iteration_results(self, pairs):
-        target_workspace = 256 * 1024**2
         output_bytes = self.tensor_tree_nbytes(pairs.paddle_outputs[1])
         grad_bytes = self.tensor_tree_nbytes(pairs.paddle_grads[1])
         memory_state = self._comparison_gpu_memory_state()
         free_bytes = memory_state.free_bytes
         reserve_bytes = memory_state.reserve_bytes
         new_bytes = output_bytes + grad_bytes
-        if free_bytes < reserve_bytes + new_bytes + target_workspace:
+        if free_bytes < reserve_bytes + new_bytes + _RESULT_STREAM_WORKSPACE_BYTES:
             # A completed first comparison may leave allocator cache behind. A
             # smaller chunk is valid when the 256 MiB performance target cannot
             # be met, but the second result copy must not consume the reserve.
@@ -196,10 +198,17 @@ class APITestAccuracyStable(APITestBase):
         )
 
     def _cleanup_comparison_stage(self, state, pairs, *, discard_results, release_cache):
-        """Join compare, drop result references, then release comparison allocators."""
+        """Join compare, drop result references, then release allocator cache when needed."""
         if not self.use_dual_gpu:
             if discard_results:
                 pairs.clear_all()
+            if release_cache and self.use_gpu_mode:
+                probe_bytes = getattr(state, "probe_bytes", 0)
+                gpu_mode_memory_decision(
+                    self.gpu_mode_config,
+                    probe_bytes=probe_bytes,
+                    required_headroom_bytes=probe_bytes,
+                )
             return
         try:
             if state.first_pair_comparison is not None:
@@ -258,9 +267,9 @@ class APITestAccuracyStable(APITestBase):
         )
         retained_tree_bytes = torch_phase_bytes + paddle_phase_bytes
         projected_summary_bytes = 2 * retained_tree_bytes
-        allocator_margin = max(1 * 1024**3, projected_summary_bytes // 20)
+        allocator_margin = max(_GIB, projected_summary_bytes // 20)
         reference_workspace = self._reference_workspace_bytes(convert_result)
-        comparison_workspace = max(1024**3, reference_workspace)
+        comparison_workspace = max(_SUMMARY_COMPARISON_WORKSPACE_BYTES, reference_workspace)
         required_headroom_bytes = (
             probe_bytes + max(torch_phase_bytes, paddle_phase_bytes) + reference_workspace
         )
@@ -276,11 +285,15 @@ class APITestAccuracyStable(APITestBase):
             required_headroom_bytes=required_headroom_bytes,
         )
         if decision.should_spill or state.first_iteration_spilled:
-            self.spill_tensor_tree_slot_to_cpu(pairs.torch_outputs)
-            self.spill_tensor_tree_slot_to_cpu(pairs.paddle_outputs)
-            self.spill_tensor_tree_slot_to_cpu(pairs.torch_grads)
-            self.spill_tensor_tree_slot_to_cpu(pairs.paddle_grads)
-            state.first_iteration_spilled = True
+            spill_results = [
+                self.spill_tensor_tree_slot_to_cpu(pairs.torch_outputs, release_cache=False),
+                self.spill_tensor_tree_slot_to_cpu(pairs.paddle_outputs, release_cache=False),
+                self.spill_tensor_tree_slot_to_cpu(pairs.torch_grads, release_cache=False),
+                self.spill_tensor_tree_slot_to_cpu(pairs.paddle_grads, release_cache=False),
+            ]
+            if any(spill_results):
+                gpu_mode_memory_decision(self.gpu_mode_config, force=True)
+                state.first_iteration_spilled = True
 
     def _compare_on_compute_gpu(self, input1, input2, comp):
         with torch.cuda.device(0):
@@ -294,11 +307,10 @@ class APITestAccuracyStable(APITestBase):
         value_bytes = self.tensor_tree_nbytes(value)
         if value_bytes <= 0:
             return
-        target_workspace = 256 * 1024**2
         memory_state = self._comparison_gpu_memory_state()
         free_bytes = memory_state.free_bytes
         reserve_bytes = memory_state.reserve_bytes
-        if free_bytes < reserve_bytes + value_bytes + target_workspace:
+        if free_bytes < reserve_bytes + value_bytes + _RESULT_STREAM_WORKSPACE_BYTES:
             self._release_comparison_gpu_cache()
             memory_state = self._comparison_gpu_memory_state()
             free_bytes = memory_state.free_bytes
@@ -312,7 +324,20 @@ class APITestAccuracyStable(APITestBase):
     def _stream_second_slot_to_comparison_gpu(self, values, index):
         source = values[index]
         self._ensure_comparison_stream_headroom(source)
-        values[index] = self._move_tensor_tree_to_comparison_gpu(source)
+        try:
+            values[index] = self._move_tensor_tree_to_comparison_gpu(source)
+        except Exception as err:
+            err_str = str(err).lower()
+            if not any(marker.lower() in err_str for marker in CUDA_OOM):
+                raise
+            try:
+                self._release_comparison_gpu_cache()
+            except Exception as cleanup_error:
+                self._log_dual_cleanup_error(cleanup_error)
+            raise RuntimeError(
+                "comparison out of memory prevention: streaming a second result "
+                "failed on the comparison card"
+            ) from err
         del source
         self._release_compute_gpu_cache()
 
@@ -356,7 +381,6 @@ class APITestAccuracyStable(APITestBase):
             return
 
         if self.use_gpu_mode and state.first_iteration_spilled:
-            target_workspace = 256 * 1024**2
 
             def restore_first_slot(values):
                 source = values[0]
@@ -367,7 +391,7 @@ class APITestAccuracyStable(APITestBase):
                         budget_gib=self.gpu_mode_config.memory_budget,
                     )
                     if memory_state.free_bytes < (
-                        memory_state.reserve_bytes + value_bytes + target_workspace
+                        memory_state.reserve_bytes + value_bytes + _RESULT_STREAM_WORKSPACE_BYTES
                     ):
                         self._release_compute_gpu_cache()
                         memory_state = self.gpu_memory_state(
@@ -434,6 +458,8 @@ class APITestAccuracyStable(APITestBase):
         pairs.paddle_grads.clear()
 
     def _run_stable_iteration(self, iter_idx, convert_result, probe_bytes, pairs, state):
+        state.probe_bytes = probe_bytes
+
         # ======== torch ========
         self.reset_random_state()
         try:
@@ -656,12 +682,12 @@ class APITestAccuracyStable(APITestBase):
         probe_bytes = self.estimate_input_bytes()
 
         pairs = _StableResultPairs()
-        dual_state = _DualComparisonState()
+        execution_state = _StableExecutionState()
 
         # Every execution recreates its input from the same immutable CPU copy.
         for iter_idx in range(2):
             if not self._run_stable_iteration(
-                iter_idx, convert_result, probe_bytes, pairs, dual_state
+                iter_idx, convert_result, probe_bytes, pairs, execution_state
             ):
                 return
 
@@ -670,13 +696,13 @@ class APITestAccuracyStable(APITestBase):
             self.clear_original_cpu_inputs()
 
             self._cleanup_comparison_stage(
-                dual_state,
+                execution_state,
                 pairs,
                 discard_results=False,
                 release_cache=False,
             )
 
-            self._run_summary_comparisons(pairs, dual_state)
+            self._run_summary_comparisons(pairs, execution_state)
             log_worker.write_stable_passes(self.api_config.config)
         except Exception:
             summary_failed = True
@@ -685,10 +711,10 @@ class APITestAccuracyStable(APITestBase):
             # Summary comparisons can fail before the success-path cleanup.
             # Clear result families first, then release both comparison allocators.
             if summary_failed:
-                self._abort_case_resources(dual_state, pairs)
+                self._abort_case_resources(execution_state, pairs)
             else:
                 self._cleanup_comparison_stage(
-                    dual_state,
+                    execution_state,
                     pairs,
                     discard_results=True,
                     release_cache=True,
