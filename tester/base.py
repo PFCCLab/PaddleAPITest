@@ -3,7 +3,6 @@ from __future__ import annotations
 import collections
 import contextlib
 import gc
-import inspect
 import os
 
 import numpy
@@ -11,6 +10,10 @@ import paddle
 import yaml
 
 from .api_config.dump_writer import DEFAULT_DUMP_DIR, DumpContext, dump_enabled
+from .api_config.input_generation.signature_mappings import (
+    bind_api_arguments,
+    get_arg,
+)
 from .api_config.input_generation.tensor_config import (
     USE_CACHED_NUMPY,
     TensorConfig,
@@ -29,7 +32,6 @@ handle_axes_api = frozenset(config.get("handle_axes_api", []))
 not_check_dtype = frozenset(config.get("not_check_dtype", []))
 rand_apis = frozenset(config.get("rand_apis", []))
 stochastic_behavior_apis = frozenset(config.get("stochastic_behavior_apis", []))
-single_op_no_signature_apis = frozenset(config.get("single_op_no_signature_apis", []))
 
 paddle_error_dismiss = {}  # disabled: covered by the unified runtime error reporter
 # paddle_error_dismiss = config.get("paddle_error_dismiss", {})
@@ -194,130 +196,6 @@ def classify_runtime_error(error_msg):
     if any(marker in error_msg_lower for marker in torch_invalid_config_markers):
         return "config_input", False
     return None, False
-
-
-def get_arg(api_config, arg_pos, arg_name, default=None):
-    if 0 <= arg_pos < len(api_config.args):
-        return api_config.args[arg_pos]
-    if arg_name in api_config.kwargs:
-        return api_config.kwargs[arg_name]
-    return default
-
-
-no_signature_api_mappings = {
-    f"paddle.Tensor.{method}": {
-        "self": lambda cfg: get_arg(cfg, 0, "self"),
-        "y": lambda cfg: get_arg(cfg, 1, "y"),
-    }
-    for method in single_op_no_signature_apis
-}
-
-# For _C_ops builtins that share the same parameter names as a public Paddle API,
-# we reuse the public API's signature for argument binding instead of a manual mapping.
-# Positional args beyond the public API's parameter count (e.g. a trailing `place`)
-# are silently dropped.
-_COPS_API_PUBLIC_ALIAS: dict[str, str] = {
-    "paddle._C_ops.add_": "paddle.add",
-    "paddle._C_ops.bitwise_not": "paddle.bitwise_not",
-    "paddle._C_ops.clip": "paddle.clip",
-    "paddle._C_ops.concat": "paddle.concat",
-    "paddle._C_ops.flatten_": "paddle.flatten",
-    "paddle._C_ops.matmul": "paddle.matmul",
-    "paddle._C_ops.multiply_": "paddle.multiply",
-    "paddle._C_ops.numel": "paddle.numel",
-    "paddle._C_ops.put_along_axis_": "paddle.put_along_axis",
-    "paddle._C_ops.reshape_": "paddle.reshape",
-    "paddle._C_ops.scale_": "paddle.scale",
-    "paddle._C_ops.subtract_": "paddle.subtract",
-    "paddle._C_ops.transpose": "paddle.transpose",
-    "paddle._C_ops.uniform": "paddle.uniform",
-}
-
-# Manual mappings for _C_ops that have no public API counterpart or whose signature
-# differs materially from any public API.
-no_signature_api_mappings.update(
-    {
-        # adamw_(param, grad, lr, moment1, moment2, moment2_max,
-        #        beta1_pow, beta2_pow, master_param, skip_update,
-        #        beta1, beta2, epsilon, lr_ratio, coeff, with_decay,
-        #        lazy_mode, min_row_size, multi_precision, use_global_beta_pow, amsgrad)
-        "paddle._C_ops.adamw_": {
-            "param": lambda cfg: get_arg(cfg, 0, "param"),
-            "grad": lambda cfg: get_arg(cfg, 1, "grad"),
-            "learning_rate": lambda cfg: get_arg(cfg, 2, "learning_rate"),
-            "moment1": lambda cfg: get_arg(cfg, 3, "moment1"),
-            "moment2": lambda cfg: get_arg(cfg, 4, "moment2"),
-            "moment2_max": lambda cfg: get_arg(cfg, 5, "moment2_max"),
-            "beta1_pow": lambda cfg: get_arg(cfg, 6, "beta1_pow"),
-            "beta2_pow": lambda cfg: get_arg(cfg, 7, "beta2_pow"),
-            "master_param": lambda cfg: get_arg(cfg, 8, "master_param"),
-            "skip_update": lambda cfg: get_arg(cfg, 9, "skip_update"),
-            "beta1": lambda cfg: get_arg(cfg, 10, "beta1"),
-            "beta2": lambda cfg: get_arg(cfg, 11, "beta2"),
-            "epsilon": lambda cfg: get_arg(cfg, 12, "epsilon"),
-            "lr_ratio": lambda cfg: get_arg(cfg, 13, "lr_ratio"),
-            "coeff": lambda cfg: get_arg(cfg, 14, "coeff"),
-            "with_decay": lambda cfg: get_arg(cfg, 15, "with_decay"),
-            "lazy_mode": lambda cfg: get_arg(cfg, 16, "lazy_mode"),
-            "min_row_size_to_use_multithread": lambda cfg: get_arg(
-                cfg, 17, "min_row_size_to_use_multithread"
-            ),
-            "multi_precision": lambda cfg: get_arg(cfg, 18, "multi_precision"),
-            "use_global_beta_pow": lambda cfg: get_arg(cfg, 19, "use_global_beta_pow"),
-            "amsgrad": lambda cfg: get_arg(cfg, 20, "amsgrad"),
-        },
-        # full_(x, shape, value, dtype, place) — fills x in-place; no public API equivalent
-        "paddle._C_ops.full_": {
-            "x": lambda cfg: get_arg(cfg, 0, "x"),
-            "shape": lambda cfg: get_arg(cfg, 1, "shape"),
-            "value": lambda cfg: get_arg(cfg, 2, "value"),
-            "dtype": lambda cfg: get_arg(cfg, 3, "dtype"),
-        },
-        # fused_linear_param_grad_add(x, dout, dweight, dbias, multi_precision, has_bias)
-        "paddle._C_ops.fused_linear_param_grad_add": {
-            "x": lambda cfg: get_arg(cfg, 0, "x"),
-            "dout": lambda cfg: get_arg(cfg, 1, "dout"),
-            "dweight": lambda cfg: get_arg(cfg, 2, "dweight"),
-            "dbias": lambda cfg: get_arg(cfg, 3, "dbias"),
-            "multi_precision": lambda cfg: get_arg(cfg, 4, "multi_precision"),
-            "has_bias": lambda cfg: get_arg(cfg, 5, "has_bias"),
-        },
-        # gaussian(shape, mean, std, seed, dtype, place) — no paddle.gaussian public API
-        "paddle._C_ops.gaussian": {
-            "shape": lambda cfg: get_arg(cfg, 0, "shape"),
-            "mean": lambda cfg: get_arg(cfg, 1, "mean"),
-            "std": lambda cfg: get_arg(cfg, 2, "std"),
-            "seed": lambda cfg: get_arg(cfg, 3, "seed"),
-            "dtype": lambda cfg: get_arg(cfg, 4, "dtype"),
-        },
-        # matmul_grad(x, y, dout, transpose_x, transpose_y) -> (dx, dy)
-        "paddle._C_ops.matmul_grad": {
-            "x": lambda cfg: get_arg(cfg, 0, "x"),
-            "y": lambda cfg: get_arg(cfg, 1, "y"),
-            "dout": lambda cfg: get_arg(cfg, 2, "dout"),
-            "transpose_x": lambda cfg: get_arg(cfg, 3, "transpose_x"),
-            "transpose_y": lambda cfg: get_arg(cfg, 4, "transpose_y"),
-        },
-        # squared_l2_norm(x)
-        "paddle._C_ops.squared_l2_norm": {
-            "x": lambda cfg: get_arg(cfg, 0, "x"),
-        },
-        # swiglu_grad(x, y, dout) -> (dx, dy); y may be None (then x is split along last dim)
-        "paddle._C_ops.swiglu_grad": {
-            "x": lambda cfg: get_arg(cfg, 0, "x"),
-            "y": lambda cfg: get_arg(cfg, 1, "y"),
-            "dout": lambda cfg: get_arg(cfg, 2, "dout"),
-        },
-        # _run_custom_op(op_name, *args) — op_name dispatches to per-op sub-rules
-        "paddle._C_ops._run_custom_op": {
-            "op_name": lambda cfg: get_arg(cfg, 0, "op_name"),
-            "arg1": lambda cfg: get_arg(cfg, 1, "arg1"),
-            "arg2": lambda cfg: get_arg(cfg, 2, "arg2"),
-            "arg3": lambda cfg: get_arg(cfg, 3, "arg3"),
-            "arg4": lambda cfg: get_arg(cfg, 4, "arg4"),
-        },
-    }
-)
 
 
 class APITestBase:
@@ -546,90 +424,20 @@ class APITestBase:
             self.torch_kwargs_config.pop("name", None)
             return True
 
-        signature_cache = getattr(APITestBase.ana_torch_api_info, "_signature_cache", None)
-        if signature_cache is None:
-            signature_cache = {}
-            APITestBase.ana_torch_api_info._signature_cache = signature_cache
-
-        def get_signature(cache_key, api):
-            if cache_key not in signature_cache:
-                try:
-                    signature_cache[cache_key] = inspect.signature(api)
-                except ValueError:
-                    signature_cache[cache_key] = None
-            return signature_cache[cache_key]
-
         api_name = self.api_config.api_name
         if api_name in ("paddle.Tensor.__getitem__", "paddle.Tensor.__setitem__"):
             self.torch_args_config = self.api_config.args
             return True
 
-        if api_name in ("paddle.Tensor.view", "paddle.view"):
-            # paddle.view supports variadic int args: view(-1, 4096) in addition to view([-1, 4096])
-            # inspect.bind incorrectly maps the second int to `name` param, so handle manually.
-            args = self.api_config.args
-            rest = args[1:]
-            if len(rest) > 1 and all(isinstance(arg, int) for arg in rest):
-                return finish({"x": args[0], "shape_or_dtype": list(rest)})
-
-            paddle_sig = get_signature(api_name, self.paddle_api)
-            if paddle_sig is None:
-                raise ValueError(f"API {api_name} has no inspectable signature")
-            paddle_bound_args = paddle_sig.bind(*args, **self.api_config.kwargs)
-            return finish(paddle_bound_args.arguments)
-
-        if api_name in ("paddle.Tensor.reshape", "paddle.reshape"):
-            # paddle.reshape supports variadic int args: reshape(1, 2048, -1) in addition to reshape([1, 2048, -1])
-            # Tensor.reshape signature is (x, shape, name=None), so bind() rejects multiple ints.
-            args = self.api_config.args
-            rest = args[1:]
-            if len(rest) >= 1 and all(isinstance(arg, int) for arg in rest):
-                return finish({"x": args[0], "shape": list(rest)})
-
-        if api_name in no_signature_api_mappings:
-            # For APIs without signatures, use the external mapping dict
-            mapping = no_signature_api_mappings[api_name]
-            return finish(
-                {key: get_value_func(self.api_config) for key, get_value_func in mapping.items()}
-            )
-
-        # For APIs with signatures, use paddle_sig.bind to get arguments.
-        paddle_sig = get_signature(api_name, self.paddle_api)
-        if paddle_sig is None:
-            # _C_ops builtins have no inspectable signature. If the op has a public
-            # API counterpart with the same params, use its signature.
-            public_api_name = _COPS_API_PUBLIC_ALIAS.get(api_name)
-            if public_api_name is None:
-                # No alias and no manual mapping — forward-only, skip torch comparison.
-                return True
-
-            paddle_sig = get_signature(public_api_name, eval(public_api_name))
-            if paddle_sig is None:
-                raise ValueError(f"API {public_api_name} has no inspectable signature")
-            positional_count = sum(
-                1
-                for param in paddle_sig.parameters.values()
-                if param.kind in (param.POSITIONAL_ONLY, param.POSITIONAL_OR_KEYWORD)
-            )
-            valid_names = set(paddle_sig.parameters)
-            filtered_kwargs = {
-                key: value for key, value in self.api_config.kwargs.items() if key in valid_names
-            }
-            paddle_bound_args = paddle_sig.bind(
-                *self.api_config.args[:positional_count], **filtered_kwargs
-            )
-            return finish(paddle_bound_args.arguments)
-
-        paddle_bound_args = paddle_sig.bind(*self.api_config.args, **self.api_config.kwargs)
-        paddle_args_dict = paddle_bound_args.arguments
-        # fix paddle.arange wrong binding
-        if api_name == "paddle.arange":
-            # if end is not provided, use the 'start' kwargs as end
-            if "end" not in paddle_args_dict:
-                paddle_args_dict["end"] = paddle_args_dict["start"]
-                paddle_args_dict["start"] = 0
-
-        return finish(paddle_args_dict)
+        resolution = bind_api_arguments(
+            api_name,
+            self.api_config.args,
+            self.api_config.kwargs,
+            api=self.paddle_api,
+        )
+        if resolution.source == "unresolved":
+            return True
+        return finish(resolution.arguments)
 
     def _handle_list_or_tuple(
         self, config_items, is_tuple=False, index=None, key=None, list_index=None

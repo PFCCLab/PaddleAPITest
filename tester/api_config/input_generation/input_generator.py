@@ -11,12 +11,12 @@ import math
 import numpy
 import paddle
 
+from .signature_mappings import OPTIMIZER_APIS
 from .telemetry import record_legacy_generation
 from .tensor_config import (
     USE_CACHED_NUMPY,
     TensorConfig,
     not_zero_apis,
-    optimizer_apis,
 )
 
 
@@ -77,8 +77,8 @@ def generate_numpy_tensor(self, api_config, index=None, key=None, **kwargs):
                         )
                         self.numpy_tensor = numpy.ascontiguousarray(finite).view("uint8")
         elif (
-            api_config.api_name in optimizer_apis
-            and self.index in optimizer_apis[api_config.api_name]
+            api_config.api_name in OPTIMIZER_APIS
+            and self.index in OPTIMIZER_APIS[api_config.api_name]
         ):
             self.numpy_tensor = numpy.zeros(self.shape).astype(self.dtype)
         elif api_config.api_name in not_zero_apis:

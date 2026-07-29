@@ -11,6 +11,8 @@ import numpy
 import paddle
 import yaml
 
+from .signature_mappings import OPTIMIZER_APIS
+
 
 class _LazyTorch:
     def __getattr__(self, name):
@@ -40,6 +42,7 @@ def _load_forward_only_apis():
 
 
 FORWARD_ONLY_APIS = _load_forward_only_apis()
+optimizer_apis = OPTIMIZER_APIS
 
 
 def is_gpu_mode():
@@ -91,16 +94,6 @@ def get_cached_numpy_array(
     cached_numpy[key] = tensor
     return tensor
 
-
-# Optimizer APIs that need special tensor initialization to avoid NaN
-# Format: {api_name: {arg_index: init_method}}
-# init_method: "zeros" = fill with 0, "small_positive" = fill with small positive value
-optimizer_apis = {
-    # moment1, moment2, moment2_max (must be non-negative for amsgrad)
-    "paddle._C_ops.adamw_": {3: "zeros", 4: "zeros", 5: "zeros"},
-    "paddle._C_ops.adam_": {3: "zeros", 4: "zeros", 5: "zeros"},
-    "paddle._C_ops.merged_adam_": {3: "zeros", 4: "zeros", 5: "zeros"},
-}
 
 not_zero_apis = frozenset(
     [
@@ -529,7 +522,7 @@ class TensorConfig:
                     else ("float16" if self.dtype in FLOAT8_DTYPES else self.dtype)
                 )
                 self.paddle_tensor = paddle.to_tensor(
-                    self.get_numpy_tensor(api_config),
+                    self._logical_numpy_tensor(api_config),
                     dtype=intermediate_dtype,
                     place=self.place,
                 )
@@ -569,7 +562,7 @@ class TensorConfig:
                 device=self.place,
             )
             tensor = paddle.as_strided(flat_tensor, self.shape, self.strides)
-            logical_tensor = self.get_numpy_tensor(api_config)
+            logical_tensor = self._logical_numpy_tensor(api_config)
             if logical_tensor.size > 0:
                 tensor[...] = paddle.to_tensor(
                     logical_tensor,
@@ -608,7 +601,7 @@ class TensorConfig:
                     intermediate_torch_dtype = self.convert_dtype_to_torch_type(self.dtype)
                 requires_grad = self._requires_autograd(api_config)
                 self.torch_tensor = torch.tensor(
-                    self.get_numpy_tensor(api_config),
+                    self._logical_numpy_tensor(api_config),
                     dtype=intermediate_torch_dtype,
                     requires_grad=requires_grad and not needs_cast,
                 )
@@ -642,7 +635,7 @@ class TensorConfig:
             device=device,
         )
         tensor = torch.as_strided(flat_tensor, self.shape, self.strides)
-        logical_tensor = self.get_numpy_tensor(api_config)
+        logical_tensor = self._logical_numpy_tensor(api_config)
         if logical_tensor.size > 0:
             tensor.copy_(
                 torch.tensor(
@@ -659,7 +652,16 @@ class TensorConfig:
             tensor = tensor.detach().requires_grad_(True)
         return tensor
 
-    def clear_tensor(self):
+    def _logical_numpy_tensor(self, api_config):
+        from .payload import logical_value
+
+        return logical_value(api_config, self)
+
+    def clear_tensor(self, api_config=None):
+        if api_config is not None:
+            from .payload import clear_logical_value
+
+            clear_logical_value(api_config, self)
         self.torch_tensor = None
         self.paddle_tensor = None
         self.numpy_tensor = None
@@ -674,7 +676,11 @@ class TensorConfig:
         if not is_gpu_mode():
             paddle.device.cuda.empty_cache()
 
-    def clear_numpy_tensor(self):
+    def clear_numpy_tensor(self, api_config=None):
+        if api_config is not None:
+            from .payload import clear_logical_value
+
+            clear_logical_value(api_config, self)
         del self.numpy_tensor
         self.numpy_tensor = None
 
@@ -743,12 +749,16 @@ class TensorConfig:
         # for uninitialized numpy_tensor, return None implicitly as numpy_tensor is None
         if arg_pos is not None and 0 <= arg_pos < len(api_config.args):
             if isinstance(api_config.args[arg_pos], TensorConfig):
-                return api_config.args[arg_pos].numpy_tensor
+                from .payload import logical_value
+
+                return logical_value(api_config, api_config.args[arg_pos])
             else:
                 return api_config.args[arg_pos]
         if arg_name and arg_name in api_config.kwargs:
             if isinstance(api_config.kwargs[arg_name], TensorConfig):
-                return api_config.kwargs[arg_name].numpy_tensor
+                from .payload import logical_value
+
+                return logical_value(api_config, api_config.kwargs[arg_name])
             else:
                 return api_config.kwargs[arg_name]
         # for args that does not appear in api_config
@@ -775,13 +785,17 @@ class TensorConfig:
             and 0 <= arg_pos < len(api_config.args)
             and isinstance(api_config.args[arg_pos], TensorConfig)
         ):
-            api_config.args[arg_pos].numpy_tensor = value
+            from .payload import write_logical_value
+
+            write_logical_value(api_config, api_config.args[arg_pos], value)
         elif (
             arg_name
             and arg_name in api_config.kwargs
             and isinstance(api_config.kwargs[arg_name], TensorConfig)
         ):
-            api_config.kwargs[arg_name].numpy_tensor = value
+            from .payload import write_logical_value
+
+            write_logical_value(api_config, api_config.kwargs[arg_name], value)
         else:
             raise ValueError(
                 f"argument at position {arg_pos} or name '{arg_name}' is not of type TensorConfig."

@@ -10,10 +10,11 @@ from dataclasses import dataclass
 
 import numpy
 
-from .model import GenerationContext
+from .model import GenerationContext, TensorSpec
+from .payload import TensorPayload, attach_payloads
 from .tensor_config import not_zero_apis
 from .value_generators import (
-    LEGACY_NUMPY_RNG,
+    create_case_rng,
     generate_abs_unit_plus_one,
     generate_binary_0_1,
     generate_default,
@@ -46,50 +47,44 @@ ValueGenerator = Callable[..., numpy.ndarray]
 CaseValueGenerator = Callable[[object], numpy.ndarray]
 RuleFunction = Callable[[GenerationContext, "RuleCase"], None]
 FallbackFunction = Callable[[GenerationContext], str | None]
+_RAW_WRITE = object()
 
 
 _VALUE_GENERATORS: dict[str, ValueGenerator] = {
-    "default": lambda spec, low, high: generate_default(spec, LEGACY_NUMPY_RNG),
-    "nonzero": lambda spec, low, high: generate_nonzero(spec, LEGACY_NUMPY_RNG),
-    "unit_interval": lambda spec, low, high: generate_unit_interval(spec, LEGACY_NUMPY_RNG),
-    "multiply": lambda spec, low, high: generate_multiply(spec, LEGACY_NUMPY_RNG),
-    "unit_interval_plus_one": lambda spec, low, high: generate_unit_interval_plus_one(
-        spec, LEGACY_NUMPY_RNG
+    "default": lambda spec, low, high, rng: generate_default(spec, rng),
+    "nonzero": lambda spec, low, high, rng: generate_nonzero(spec, rng),
+    "unit_interval": lambda spec, low, high, rng: generate_unit_interval(spec, rng),
+    "multiply": lambda spec, low, high, rng: generate_multiply(spec, rng),
+    "unit_interval_plus_one": lambda spec, low, high, rng: generate_unit_interval_plus_one(
+        spec, rng
     ),
-    "signed_half_interval": lambda spec, low, high: generate_signed_half_interval(
-        spec, LEGACY_NUMPY_RNG
+    "signed_half_interval": lambda spec, low, high, rng: generate_signed_half_interval(spec, rng),
+    "normal_std": lambda spec, low, high, rng: generate_normal_std(spec, rng),
+    "dropout_probability": lambda spec, low, high, rng: generate_dropout_probability(spec, rng),
+    "full_fill_value": lambda spec, low, high, rng: generate_full_fill_value(spec, rng),
+    "quantile_q": lambda spec, low, high, rng: generate_quantile_q(spec, rng),
+    "remainder_rhs": lambda spec, low, high, rng: generate_remainder_rhs(spec, rng),
+    "int_zero_1024": lambda spec, low, high, rng: generate_int_zero_1024(spec, rng),
+    "int_zero_64": lambda spec, low, high, rng: generate_int_zero_64(spec, rng),
+    "int_zero_2048_no_cast": lambda spec, low, high, rng: generate_int_zero_2048_no_cast(spec, rng),
+    "empty_shape": lambda spec, low, high, rng: generate_empty_shape(spec, rng),
+    "int_one_128": lambda spec, low, high, rng: generate_int_one_128(spec, rng),
+    "int_one_2048": lambda spec, low, high, rng: generate_int_one_2048(spec, rng),
+    "int_one_65535_no_cast": lambda spec, low, high, rng: generate_int_one_65535_no_cast(spec, rng),
+    "ones_shape": lambda spec, low, high, rng: generate_ones_shape(spec, rng),
+    "int_zero_65535_else_unit": lambda spec, low, high, rng: generate_int_zero_65535_else_unit(
+        spec, rng
     ),
-    "normal_std": lambda spec, low, high: generate_normal_std(spec, LEGACY_NUMPY_RNG),
-    "dropout_probability": lambda spec, low, high: generate_dropout_probability(
-        spec, LEGACY_NUMPY_RNG
-    ),
-    "full_fill_value": lambda spec, low, high: generate_full_fill_value(spec, LEGACY_NUMPY_RNG),
-    "quantile_q": lambda spec, low, high: generate_quantile_q(spec, LEGACY_NUMPY_RNG),
-    "remainder_rhs": lambda spec, low, high: generate_remainder_rhs(spec, LEGACY_NUMPY_RNG),
-    "int_zero_1024": lambda spec, low, high: generate_int_zero_1024(spec, LEGACY_NUMPY_RNG),
-    "int_zero_64": lambda spec, low, high: generate_int_zero_64(spec, LEGACY_NUMPY_RNG),
-    "int_zero_2048_no_cast": lambda spec, low, high: generate_int_zero_2048_no_cast(
-        spec, LEGACY_NUMPY_RNG
-    ),
-    "empty_shape": lambda spec, low, high: generate_empty_shape(spec, LEGACY_NUMPY_RNG),
-    "int_one_128": lambda spec, low, high: generate_int_one_128(spec, LEGACY_NUMPY_RNG),
-    "int_one_2048": lambda spec, low, high: generate_int_one_2048(spec, LEGACY_NUMPY_RNG),
-    "int_one_65535_no_cast": lambda spec, low, high: generate_int_one_65535_no_cast(
-        spec, LEGACY_NUMPY_RNG
-    ),
-    "ones_shape": lambda spec, low, high: generate_ones_shape(spec, LEGACY_NUMPY_RNG),
-    "int_zero_65535_else_unit": lambda spec, low, high: generate_int_zero_65535_else_unit(
-        spec, LEGACY_NUMPY_RNG
-    ),
-    "int_minus127_127_else_default": lambda spec, low, high: generate_int_minus127_127_else_default(
-        spec, LEGACY_NUMPY_RNG
-    ),
-    "binary_0_1": lambda spec, low, high: generate_binary_0_1(spec, LEGACY_NUMPY_RNG),
-    "hinge_labels": lambda spec, low, high: generate_hinge_labels(spec, LEGACY_NUMPY_RNG),
-    "abs_unit_plus_one": lambda spec, low, high: generate_abs_unit_plus_one(spec, LEGACY_NUMPY_RNG),
-    "uniform": lambda spec, low, high: generate_uniform(spec, low, high, LEGACY_NUMPY_RNG),
-    "legacy_random_range": lambda spec, low, high: generate_legacy_random_range(
-        spec, low, high, LEGACY_NUMPY_RNG
+    "int_minus127_127_else_default": lambda spec,
+    low,
+    high,
+    rng: generate_int_minus127_127_else_default(spec, rng),
+    "binary_0_1": lambda spec, low, high, rng: generate_binary_0_1(spec, rng),
+    "hinge_labels": lambda spec, low, high, rng: generate_hinge_labels(spec, rng),
+    "abs_unit_plus_one": lambda spec, low, high, rng: generate_abs_unit_plus_one(spec, rng),
+    "uniform": lambda spec, low, high, rng: generate_uniform(spec, low, high, rng),
+    "legacy_random_range": lambda spec, low, high, rng: generate_legacy_random_range(
+        spec, low, high, rng
     ),
 }
 
@@ -102,17 +97,20 @@ class RegisteredRule:
     function: RuleFunction
     fallback_key: str
     fallback: FallbackFunction | None = None
+    allow_gpu: bool = True
+    allow_cached: bool = True
 
     @property
     def rule_id(self) -> str:
         return self.api_names[0]
 
     def fallback_reason(self, context: GenerationContext) -> str | None:
-        if context.gpu_enabled:
-            return f"{self.fallback_key}-strategy-gpu-not-migrated"
         from .tensor_config import USE_CACHED_NUMPY
 
-        if USE_CACHED_NUMPY:
+        if context.gpu_enabled and not self.allow_gpu:
+            return f"{self.fallback_key}-strategy-gpu-not-migrated"
+
+        if USE_CACHED_NUMPY and not self.allow_cached:
             return f"{self.fallback_key}-strategy-cache-not-migrated"
         if self.fallback is not None:
             return self.fallback(context)
@@ -122,6 +120,7 @@ class RegisteredRule:
         rule_case = RuleCase(context, case)
         self.function(context, rule_case)
         rule_case.require_complete()
+        attach_payloads(case, rule_case.payload_items())
         return True
 
 
@@ -131,7 +130,9 @@ class RuleCase:
     def __init__(self, context: GenerationContext, raw_case: object):
         self.context = context
         self.raw_case = raw_case
+        self.rng = create_case_rng(context)
         self._generated_paths = set()
+        self._payload_by_path: dict[object, TensorPayload] = {}
 
     def generate_all(self, generator: str, low=None, high=None):
         for binding in self.context.call.tensors:
@@ -198,16 +199,34 @@ class RuleCase:
             raise ValueError(f"rule generated tensor twice: {binding.path}")
         if callable(generator):
             value = generator(binding)
+            if value is _RAW_WRITE:
+                return
         else:
             generate_value = _VALUE_GENERATORS[generator]
-            value = generate_value(binding.spec, low, high)
+            value = generate_value(binding.spec, low, high, self.rng)
         self.set_value(binding, value)
 
     def set_value(self, binding, value):
         if binding.path in self._generated_paths:
             raise ValueError(f"rule generated tensor twice: {binding.path}")
+        self._payload_by_path[binding.path] = TensorPayload(binding.path, value)
         _apply_value(self.raw_case, binding.path, value)
         self._generated_paths.add(binding.path)
+
+    def rewrite_value(self, binding, value):
+        self._payload_by_path[binding.path] = TensorPayload(binding.path, value)
+        _apply_value(self.raw_case, binding.path, value)
+        self._generated_paths.add(binding.path)
+
+    def set_value_raw(self, binding, value):
+        if binding.path in self._generated_paths:
+            raise ValueError(f"rule generated tensor twice: {binding.path}")
+        self._payload_by_path[binding.path] = TensorPayload(
+            binding.path, value, update_metadata=False
+        )
+        _apply_value_raw(self.raw_case, binding.path, value, update_metadata=False)
+        self._generated_paths.add(binding.path)
+        return _RAW_WRITE
 
     def find(self, parameter_name: str):
         for binding in self.context.call.tensors:
@@ -215,9 +234,21 @@ class RuleCase:
                 return binding
         return None
 
+    def binding_for_config(self, tensor_config):
+        for binding in self.context.call.tensors:
+            if _tensor_config_at(self.raw_case, binding.path) is tensor_config:
+                return binding
+        return None
+
     def value(self, binding):
         config = _tensor_config_at(self.raw_case, binding.path)
         return config.numpy_tensor
+
+    def payload(self, binding):
+        return self._payload_by_path.get(binding.path)
+
+    def payload_items(self):
+        return tuple(self._payload_by_path.values())
 
     @property
     def api_name(self):
@@ -243,24 +274,24 @@ class RuleCase:
         return _is_tensor_config(value)
 
     def value_domain(self, generator: str, binding, low=None, high=None):
-        return _VALUE_GENERATORS[generator](binding.spec, low, high)
+        return _VALUE_GENERATORS[generator](binding.spec, low, high, self.rng)
 
     def random(self, size=None, dtype=None):
-        value = LEGACY_NUMPY_RNG.random(size)
+        value = self.rng.random(size)
         return value.astype(dtype) if dtype is not None else value
 
     def uniform(self, low=0.0, high=1.0, size=None, dtype=None):
-        value = LEGACY_NUMPY_RNG.uniform(low=low, high=high, size=size)
+        value = self.rng.uniform(low=low, high=high, size=size)
         return value.astype(dtype) if dtype is not None else value
 
     def randn(self, *shape):
-        return LEGACY_NUMPY_RNG.randn(*shape)
+        return self.rng.randn(*shape)
 
     def randint(self, low, high=None, size=None, dtype=None):
         kwargs = {"size": size}
         if dtype is not None:
             kwargs["dtype"] = dtype
-        return LEGACY_NUMPY_RNG.randint(low, high, **kwargs)
+        return self.rng.randint(low, high, **kwargs)
 
     def array(self, value, dtype=None, copy=True, order="K"):
         return numpy.array(value, dtype=dtype, copy=copy, order=order)
@@ -278,7 +309,7 @@ class RuleCase:
         return numpy.full(shape, fill_value, dtype=dtype)
 
     def choice(self, values, size=None, replace=True):
-        return LEGACY_NUMPY_RNG.choice(values, size=size, replace=replace)
+        return self.rng.choice(values, size=size, replace=replace)
 
     def python_choice(self, values):
         return random.choice(values)
@@ -304,6 +335,12 @@ class RuleCase:
     def sum(self, value):
         return numpy.sum(value)
 
+    def count_nonzero(self, value):
+        return numpy.count_nonzero(value)
+
+    def nonzero(self, value):
+        return numpy.nonzero(value)
+
     def einsum(self, expression, *operands):
         return numpy.einsum(expression, *operands)
 
@@ -315,6 +352,12 @@ class RuleCase:
 
     def swapaxes(self, value, axis1, axis2):
         return numpy.swapaxes(value, axis1, axis2)
+
+    def triu(self, value, k=0):
+        return numpy.triu(value, k=k)
+
+    def tril(self, value, k=0):
+        return numpy.tril(value, k=k)
 
     def conj(self, value):
         return numpy.conj(value)
@@ -348,6 +391,8 @@ class RuleRegistry:
         aliases: tuple[str, ...] = (),
         fallback_key: str | None = None,
         fallback: FallbackFunction | None = None,
+        allow_gpu: bool = True,
+        allow_cached: bool = True,
     ):
         names = _normalize_names((*api_names, *aliases), "api_names")
         if not names:
@@ -362,6 +407,8 @@ class RuleRegistry:
                 function=function,
                 fallback_key=fallback_key or names[0],
                 fallback=fallback,
+                allow_gpu=allow_gpu,
+                allow_cached=allow_cached,
             )
             self._rules.append(rule)
             for api_name in names:
@@ -433,6 +480,71 @@ def _block_multihead_attention_fallback(context: GenerationContext) -> str | Non
     if any(binding.parameter_name == "rope_emb" for binding in context.call.tensors):
         return "block-multihead-attention-rope-emb-place-not-migrated"
     return None
+
+
+def _max_unpool_pool_input_size(
+    api_name: str,
+    x_shape,
+    unpool_output_size,
+    kernel_size,
+    stride,
+    padding,
+):
+    ndim = 1
+    if "max_unpool2d" in api_name:
+        ndim = 2
+    elif "max_unpool3d" in api_name:
+        ndim = 3
+    if isinstance(kernel_size, int):
+        kernel_size = [kernel_size] * ndim
+    if isinstance(stride, int):
+        stride = [stride] * ndim
+    if isinstance(padding, int):
+        padding = [padding] * ndim
+
+    pool_input_size = unpool_output_size
+    if pool_input_size is None:
+        if ndim == 1:
+            w_in = x_shape[-1]
+            w_out = (w_in - 1) * stride[0] - 2 * padding[0] + kernel_size[0]
+            pool_input_size = [*x_shape[:-1], w_out]
+        elif ndim == 2:
+            h_in, w_in = x_shape[-2], x_shape[-1]
+            h_out = (h_in - 1) * stride[0] - 2 * padding[0] + kernel_size[0]
+            w_out = (w_in - 1) * stride[1] - 2 * padding[1] + kernel_size[1]
+            pool_input_size = [*x_shape[:-2], h_out, w_out]
+        else:
+            d_in, h_in, w_in = (
+                x_shape[-3],
+                x_shape[-2],
+                x_shape[-1],
+            )
+            d_out = (d_in - 1) * stride[0] - 2 * padding[0] + kernel_size[0]
+            h_out = (h_in - 1) * stride[1] - 2 * padding[1] + kernel_size[1]
+            w_out = (w_in - 1) * stride[2] - 2 * padding[2] + kernel_size[2]
+            pool_input_size = [*x_shape[:-3], d_out, h_out, w_out]
+    elif len(pool_input_size) == ndim:
+        pool_input_size = [*x_shape[:-ndim], *pool_input_size[-ndim:]]
+    elif len(pool_input_size) != len(x_shape):
+        raise ValueError(
+            f"invalid output_size for {api_name}, len(output_size) should be {ndim} or "
+            f"{len(x_shape)} or output_size == None, got len(output_size)="
+            f"{len(pool_input_size)} and output_size={unpool_output_size}"
+        )
+    return kernel_size, stride, padding, pool_input_size
+
+
+def _optimizer_beta_pow_value(case: RuleCase, binding, beta, step):
+    import paddle
+
+    use_accuracy_compatible = paddle.get_flags("FLAGS_use_accuracy_compatible_kernel")[
+        "FLAGS_use_accuracy_compatible_kernel"
+    ]
+    if use_accuracy_compatible:
+        beta_pow_value = beta**step
+    else:
+        beta_pow_value = numpy.power(numpy.float32(beta), numpy.float32(step)).item()
+    return case.full(binding.spec.shape, beta_pow_value, dtype=binding.spec.dtype)
 
 
 def _is_tensor_config(value) -> bool:
@@ -562,6 +674,417 @@ def block_multihead_attention_values(ctx: GenerationContext, case: RuleCase):
                     "legacy_random_range", binding, high=case.dtype_eps(binding.spec.dtype)
                 ),
             )
+        else:
+            case.set_value(binding, case.value_domain("default", binding))
+
+
+@rules.register(
+    "paddle._C_ops.adam_",
+    "paddle._C_ops.adamw_",
+    "paddle._C_ops.merged_adam_",
+    fallback_key="optimizer",
+)
+def optimizer_values(ctx: GenerationContext, case: RuleCase):
+    zero_parameters = {"moment1", "moment2", "moment2_max"}
+    optimizer_step = None
+
+    def generate_value(binding):
+        nonlocal optimizer_step
+        if binding.parameter_name in zero_parameters:
+            return case.zeros(binding.spec.shape, dtype=binding.spec.dtype)
+        if case.api_name == "paddle._C_ops.adamw_" and binding.parameter_name in {
+            "beta1_pow",
+            "beta2_pow",
+        }:
+            if optimizer_step is None:
+                optimizer_step = case.randint(1, 101)
+            beta = case.arg(10, "beta1")
+            if binding.parameter_name == "beta2_pow":
+                beta = case.arg(11, "beta2")
+            return _optimizer_beta_pow_value(case, binding, beta, optimizer_step)
+        return case.value_domain("default", binding)
+
+    case.generate_all(generate_value)
+
+
+@rules.register(
+    "paddle.nn.functional.max_unpool1d",
+    "paddle.nn.functional.max_unpool2d",
+    "paddle.nn.functional.max_unpool3d",
+)
+def max_unpool_values(ctx: GenerationContext, case: RuleCase):
+    import paddle
+
+    x_binding = case.find("x")
+    indices_binding = case.find("indices")
+    if x_binding is None or indices_binding is None:
+        raise ValueError(f"rule {case.api_name} requires x and indices tensors")
+
+    kernel_size = case.arg(2, "kernel_size")
+    stride = case.arg(3, "stride")
+    padding = case.arg(4, "padding")
+    output_size = case.arg(5, "output_size")
+    kernel_size, stride, padding, pool_input_size = _max_unpool_pool_input_size(
+        case.api_name,
+        x_binding.spec.shape,
+        output_size,
+        kernel_size,
+        stride,
+        padding,
+    )
+    data_type = "float64" if x_binding.spec.dtype == "int64" else x_binding.spec.dtype
+    pool_input_spec = TensorSpec(
+        shape=tuple(pool_input_size),
+        dtype=data_type,
+        place=x_binding.spec.place,
+        is_contiguous=x_binding.spec.is_contiguous,
+        strides=x_binding.spec.strides,
+    )
+    pool_input = generate_legacy_random_range(pool_input_spec, low=-5, high=5, rng=case.rng)
+    x = paddle.to_tensor(pool_input)
+    pool_name = case.api_name.rsplit(".", 1)[-1].replace("max_unpool", "max_pool")
+    max_poolxd_func = getattr(paddle.nn.functional, pool_name)
+    x, indices = max_poolxd_func(x, kernel_size, stride, padding, return_mask=True)
+    case.set_value(x_binding, x.numpy())
+    case.set_value(indices_binding, indices.numpy())
+
+
+@rules.register("paddle.arange")
+def arange_values(ctx: GenerationContext, case: RuleCase):
+    def tensor_binding(value):
+        return case.binding_for_config(value) if case.is_tensor_config(value) else None
+
+    def rewrite_tensor(value, tensor_value):
+        binding = tensor_binding(value)
+        if binding is not None:
+            case.rewrite_value(binding, tensor_value)
+
+    def generate_step_tensor(step_config, is_positive):
+        if "int" in step_config.dtype:
+            if is_positive:
+                return case.randint(1, 10, size=step_config.shape).astype(step_config.dtype)
+            return case.randint(-10, -1, size=step_config.shape).astype(step_config.dtype)
+        if is_positive:
+            return case.uniform(0.1, 5.0, size=step_config.shape).astype(step_config.dtype)
+        return case.uniform(-5.0, -0.1, size=step_config.shape).astype(step_config.dtype)
+
+    def safe_range(low, high):
+        max_range = 100
+        if high - low > max_range:
+            if low < 0:
+                high = low + max_range
+            else:
+                low = high - max_range
+        if low >= high:
+            low = high - 10
+        return max(low, -1000), min(high, 1000)
+
+    def random_range(tensor_config, low, high):
+        if "int" in tensor_config.dtype:
+            return case.randint(low, high, size=tensor_config.shape).astype(tensor_config.dtype)
+        return case.uniform(low, high, size=tensor_config.shape).astype(tensor_config.dtype)
+
+    def run_legacy_arange_branch():
+        start_val = case.arg(0, "start", 0)
+        end_val = case.arg(1, "end", None)
+        step_val = case.arg(2, "step", 1)
+
+        if case.is_tensor_config(start_val):
+            if case.is_tensor_config(end_val):
+                if case.is_tensor_config(step_val):
+                    flag = case.choice([True, False])
+                    rewrite_tensor(step_val, generate_step_tensor(step_val, flag))
+                else:
+                    flag = step_val > 0
+                rewrite_tensor(start_val, random_range(start_val, -50, 50))
+                start = start_val.numpy_tensor.item()
+                if flag:
+                    low, high = safe_range(start + 1, start + 50)
+                else:
+                    low, high = safe_range(start - 50, start - 1)
+                rewrite_tensor(end_val, random_range(end_val, low, high))
+            elif end_val is None:
+                if case.is_tensor_config(step_val):
+                    flag = case.choice([True, False])
+                    rewrite_tensor(step_val, generate_step_tensor(step_val, flag))
+                else:
+                    flag = step_val > 0
+                if flag:
+                    if "int" in start_val.dtype:
+                        value = case.randint(1, 50, size=start_val.shape).astype(start_val.dtype)
+                    else:
+                        value = case.uniform(0.1, 50.0, size=start_val.shape).astype(
+                            start_val.dtype
+                        )
+                elif "int" in start_val.dtype:
+                    value = case.randint(-50, -1, size=start_val.shape).astype(start_val.dtype)
+                else:
+                    value = case.uniform(-50.0, -0.1, size=start_val.shape).astype(start_val.dtype)
+                rewrite_tensor(start_val, value)
+            else:
+                if case.is_tensor_config(step_val):
+                    flag = case.choice([True, False])
+                    rewrite_tensor(step_val, generate_step_tensor(step_val, flag))
+                else:
+                    flag = step_val > 0
+                if flag:
+                    low, high = safe_range(end_val - 50, end_val - 1)
+                else:
+                    low, high = safe_range(end_val + 1, end_val + 50)
+                rewrite_tensor(start_val, random_range(start_val, low, high))
+        elif case.is_tensor_config(end_val):
+            if case.is_tensor_config(step_val):
+                flag = case.choice([True, False])
+                rewrite_tensor(step_val, generate_step_tensor(step_val, flag))
+            else:
+                flag = step_val > 0
+            if flag:
+                low, high = safe_range(start_val + 1, start_val + 50)
+            else:
+                low, high = safe_range(start_val - 50, start_val - 1)
+            rewrite_tensor(end_val, random_range(end_val, low, high))
+        elif end_val is None:
+            if case.is_tensor_config(step_val):
+                flag = start_val > 0
+                rewrite_tensor(step_val, generate_step_tensor(step_val, flag))
+        elif case.is_tensor_config(step_val):
+            flag = start_val < end_val
+            rewrite_tensor(step_val, generate_step_tensor(step_val, flag))
+
+    for binding in ctx.call.tensors:
+        if case.value(binding) is None:
+            run_legacy_arange_branch()
+
+
+@rules.register("paddle.nn.functional.moe_permute")
+def moe_permute_values(ctx: GenerationContext, case: RuleCase):
+    def expert_routemap_value(binding):
+        num_experts = case.arg(4, "num_experts", 32)
+        hidden_states = case.arg(0, "hidden_states")
+        scale = case.arg(1, "scale")
+        expert_prob = case.arg(3, "expert_prob_topk")
+        tokens_per_expert = case.arg(5, "tokens_per_expert")
+        padding_alignment = case.arg(6, "padding_alignment")
+        using_ue8m0_scale = case.arg(8, "using_ue8m0_scale", False)
+        if (
+            not isinstance(num_experts, int)
+            or isinstance(num_experts, bool)
+            or not 1 <= num_experts <= 64
+        ):
+            raise ValueError("num_experts must be an integer in [1, 64]")
+        if (
+            not isinstance(padding_alignment, int)
+            or isinstance(padding_alignment, bool)
+            or padding_alignment <= 0
+            or padding_alignment & (padding_alignment - 1)
+        ):
+            raise ValueError("padding_alignment must be a positive power of 2")
+        if not case.is_tensor_config(hidden_states) or (
+            len(hidden_states.shape) != 2
+            or hidden_states.dtype not in {"bfloat16", "float32", "float8_e4m3fn"}
+        ):
+            raise ValueError("hidden_states must be a rank-2 bfloat16 or float8_e4m3fn tensor")
+        if binding.spec.dtype != "int32":
+            raise ValueError("expert_routemap_topk dtype must be int32")
+        if not case.is_tensor_config(expert_prob) or (
+            len(expert_prob.shape) != 2 or expert_prob.dtype != "float32"
+        ):
+            raise ValueError("expert_prob_topk must be a rank-2 float32 tensor")
+        seqlen, topk = binding.spec.shape[0], binding.spec.shape[1]
+        if not (hidden_states.shape[0] == seqlen and tuple(expert_prob.shape) == (seqlen, topk)):
+            raise ValueError(
+                "hidden_states, expert_routemap_topk, and expert_prob_topk "
+                "must share sequence_length and top_k dimensions"
+            )
+        if hidden_states.dtype == "float8_e4m3fn":
+            expected_scale_width = (hidden_states.shape[1] + 127) // 128
+            expected_scale_dtype = "float32"
+            if using_ue8m0_scale:
+                expected_scale_width = (expected_scale_width + 3) // 4
+                expected_scale_dtype = "int32"
+            if not (
+                case.is_tensor_config(scale)
+                and tuple(scale.shape) == (seqlen, expected_scale_width)
+                and scale.dtype == expected_scale_dtype
+            ):
+                raise ValueError(
+                    "float8 hidden_states requires scale with shape "
+                    f"[{seqlen}, {expected_scale_width}] and dtype {expected_scale_dtype}"
+                )
+        elif scale is not None:
+            raise ValueError("scale must be None when hidden_states dtype is bfloat16")
+        routemap = case.full((seqlen, topk), -1, dtype="int32")
+        if topk == 0:
+            raise ValueError("topk should be greater than 0")
+        if not isinstance(tokens_per_expert, list):
+            raise ValueError("tokens_per_expert must be a list of integers")
+        if len(tokens_per_expert) != num_experts:
+            raise ValueError("tokens_per_expert length must equal num_experts")
+        if any(
+            not isinstance(count, int) or isinstance(count, bool) for count in tokens_per_expert
+        ):
+            raise ValueError("tokens_per_expert must be a list of integers")
+        total_assignments = sum(tokens_per_expert)
+        representable = total_assignments <= seqlen * topk and not any(
+            count < 0 or count > seqlen for count in tokens_per_expert
+        )
+        if not representable:
+            raise ValueError(
+                "tokens_per_expert cannot be represented by the expert_routemap_topk shape"
+            )
+        cursor = 0
+        for expert, count in enumerate(tokens_per_expert):
+            positions = case.arange(cursor, cursor + count, dtype="int64")
+            rows = positions % seqlen
+            columns = (positions // seqlen) % topk
+            routemap[rows, columns] = expert
+            cursor += count
+        return routemap
+
+    def expert_prob_value(binding):
+        routemap_binding = case.find("expert_routemap_topk")
+        probs = case.zeros(binding.spec.shape, dtype="float32")
+        if routemap_binding is not None and case.value(routemap_binding) is not None:
+            mask = case.value(routemap_binding) >= 0
+            raw = case.random(binding.spec.shape).astype("float32") * mask
+            row_sums = raw.sum(axis=1, keepdims=True)
+            row_sums[row_sums == 0] = 1.0
+            probs = raw / row_sums
+        else:
+            probs = case.random(binding.spec.shape).astype("float32")
+            row_sums = probs.sum(axis=1, keepdims=True)
+            row_sums[row_sums == 0] = 1.0
+            probs = probs / row_sums
+        return probs
+
+    case.generate_by_parameter(
+        (
+            ("expert_routemap_topk", expert_routemap_value),
+            ("expert_prob_topk", expert_prob_value),
+        ),
+        default="default",
+    )
+
+
+@rules.register("paddle.nn.functional.moe_unpermute")
+def moe_unpermute_values(ctx: GenerationContext, case: RuleCase):
+    def expert_routemap_value(binding):
+        num_experts = case.arg(5, "num_experts", 32)
+        total_zipped_tokens = case.arg(4, "total_zipped_tokens")
+        hidden_config = case.arg(0, "hidden_states_unzipped")
+        rowmap_config = case.arg(1, "zipped_expertwise_rowmap")
+        prob_config = case.arg(3, "token_prob_unzipped")
+        if not isinstance(num_experts, int) or isinstance(num_experts, bool) or num_experts <= 0:
+            raise ValueError("num_experts must be a positive integer")
+        if (
+            not isinstance(total_zipped_tokens, int)
+            or isinstance(total_zipped_tokens, bool)
+            or total_zipped_tokens < 0
+        ):
+            raise ValueError("total_zipped_tokens must be a non-negative integer")
+        if not (
+            case.is_tensor_config(hidden_config)
+            and len(hidden_config.shape) == 2
+            and hidden_config.dtype in {"bfloat16", "float32"}
+        ):
+            raise ValueError("hidden_states_unzipped must be a rank-2 bfloat16 tensor")
+        if not (
+            case.is_tensor_config(rowmap_config)
+            and len(rowmap_config.shape) == 2
+            and rowmap_config.dtype == "int32"
+            and tuple(rowmap_config.shape) == (total_zipped_tokens, num_experts)
+        ):
+            raise ValueError(
+                "zipped_expertwise_rowmap must have shape "
+                "[total_zipped_tokens, num_experts] and dtype int32"
+            )
+        if not (
+            case.is_tensor_config(prob_config)
+            and len(prob_config.shape) in (1, 2)
+            and prob_config.shape[0] == hidden_config.shape[0]
+            and (len(prob_config.shape) == 1 or prob_config.shape[1] == 1)
+            and prob_config.dtype == "float32"
+        ):
+            raise ValueError(
+                "token_prob_unzipped must have shape "
+                "[seqlen_broadcasted] or [seqlen_broadcasted, 1] and dtype float32"
+            )
+        if binding.spec.dtype != "int32" or len(binding.spec.shape) != 2:
+            raise ValueError("expert_routemap_topk must be a rank-2 int32 tensor")
+        seqlen, topk = binding.spec.shape[0], binding.spec.shape[1]
+        if seqlen != total_zipped_tokens:
+            raise ValueError("expert_routemap_topk sequence length must equal total_zipped_tokens")
+        if topk <= 0:
+            raise ValueError("topk should be greater than 0")
+        routemap = case.full(binding.spec.shape, -1, dtype="int32")
+        max_assign = min(topk, num_experts)
+        route_count = min(hidden_config.shape[0], seqlen * max_assign)
+        positions = case.arange(route_count, dtype="int64")
+        rows = positions % seqlen
+        columns = positions // seqlen
+        routemap[rows, columns] = (rows + columns) % num_experts
+        return routemap
+
+    def rowmap_value(binding):
+        routemap_binding = case.find("expert_routemap_topk")
+        if routemap_binding is not None and not case.is_generated(routemap_binding):
+            case.set_value(routemap_binding, expert_routemap_value(routemap_binding))
+        routemap_config = case.arg(2, "expert_routemap_topk")
+        num_experts = case.arg(5, "num_experts", 32)
+        total_zipped_tokens = case.arg(4, "total_zipped_tokens")
+        hidden_config = case.arg(0, "hidden_states_unzipped")
+        seqlen = total_zipped_tokens
+        unzipped_seqlen = hidden_config.shape[0] if case.is_tensor_config(hidden_config) else seqlen
+        if binding.spec.dtype != "int32" or tuple(binding.spec.shape) != (seqlen, num_experts):
+            raise ValueError(
+                "zipped_expertwise_rowmap must have shape "
+                "[total_zipped_tokens, num_experts] and dtype int32"
+            )
+        rowmap = case.full(binding.spec.shape, -1, dtype="int32")
+        if case.is_tensor_config(routemap_config) and routemap_binding is not None:
+            routemap = case.value(routemap_binding)
+            expert_counts = case.array(
+                [case.count_nonzero(routemap == expert) for expert in range(num_experts)],
+                dtype="int64",
+            )
+            if int(expert_counts.sum()) > unzipped_seqlen:
+                raise ValueError("routemap assignments exceed hidden_states_unzipped capacity")
+            expert_offsets = case.zeros(num_experts, dtype="int64")
+            expert_offsets[1:] = case.cumsum(expert_counts[:-1])
+            expert_counters = case.zeros(num_experts, dtype="int64")
+            for row_index in range(seqlen):
+                for expert in range(num_experts):
+                    positions = case.nonzero(routemap[row_index] == expert)[0]
+                    if positions.size == 0:
+                        continue
+                    rowmap[row_index, expert] = expert_offsets[expert] + expert_counters[expert]
+                    expert_counters[expert] += 1
+        return rowmap
+
+    def token_prob_value(binding):
+        hidden_config = case.arg(0, "hidden_states_unzipped")
+        if not (
+            binding.spec.dtype == "float32"
+            and len(binding.spec.shape) in (1, 2)
+            and case.is_tensor_config(hidden_config)
+            and binding.spec.shape[0] == hidden_config.shape[0]
+            and (len(binding.spec.shape) == 1 or binding.spec.shape[1] == 1)
+        ):
+            raise ValueError(
+                "token_prob_unzipped must match the broadcasted sequence "
+                "length and have dtype float32"
+            )
+        return case.random(binding.spec.shape).astype("float32")
+
+    for binding in ctx.call.tensors:
+        if case.is_generated(binding):
+            continue
+        if binding.parameter_name == "expert_routemap_topk":
+            case.set_value(binding, expert_routemap_value(binding))
+        elif binding.parameter_name == "zipped_expertwise_rowmap":
+            case.set_value(binding, rowmap_value(binding))
+        elif binding.parameter_name == "token_prob_unzipped":
+            case.set_value(binding, token_prob_value(binding))
         else:
             case.set_value(binding, case.value_domain("default", binding))
 
@@ -1018,6 +1541,84 @@ def repeat_interleave_values(ctx: GenerationContext, case: RuleCase):
     )
 
 
+@rules.register(
+    "paddle.put_along_axis",
+    aliases=(
+        "paddle.Tensor.put_along_axis",
+        "paddle.put_along_axis_",
+        "paddle.Tensor.put_along_axis_",
+        "paddle._C_ops.put_along_axis",
+        "paddle._C_ops.put_along_axis_",
+        "paddle._C_ops.Tensor.put_along_axis",
+        "paddle._C_ops.Tensor.put_along_axis_",
+    ),
+)
+def put_along_axis_values(ctx: GenerationContext, case: RuleCase):
+    def legacy_random(binding, shape):
+        scalar_spec = TensorSpec(
+            shape=tuple(shape),
+            dtype=binding.spec.dtype,
+            place=binding.spec.place,
+            is_contiguous=binding.spec.is_contiguous,
+            strides=binding.spec.strides,
+        )
+        return generate_legacy_random_range(scalar_spec, rng=case.rng)
+
+    def indices_value(binding):
+        x_tensor = case.arg(0, "arr", case.arg(0, "x"))
+        x_shape = tuple(x_tensor.shape) if x_tensor is not None else ()
+        x_dims = len(x_shape)
+        current_shape = tuple(binding.spec.shape)
+        if len(current_shape) != x_dims:
+            new_shape = [current_shape[i] if i < len(current_shape) else 1 for i in range(x_dims)]
+            indices = case.zeros(new_shape, dtype="int64")
+            for axis in range(x_dims):
+                if axis < len(current_shape):
+                    dim_size = x_shape[axis]
+                    if dim_size > 0:
+                        axis_indices = case.choice(
+                            dim_size, size=new_shape[axis], replace=False
+                        ).astype("int64")
+                        idx_tuple = tuple(
+                            [slice(None)] * axis
+                            + [slice(None, new_shape[axis])]
+                            + [slice(None)] * (x_dims - axis - 1)
+                        )
+                        indices[idx_tuple] = axis_indices.reshape([-1] + [1] * (x_dims - axis - 1))
+            return indices
+        axis = case.arg(3, "axis", 0)
+        axis = axis if isinstance(axis, int) else 0
+        axis = axis if axis >= 0 else axis + x_dims
+        indices = case.zeros(current_shape, dtype="int64")
+        if 0 <= axis < x_dims:
+            dim_size = x_shape[axis]
+            for idx in numpy.ndindex(tuple(current_shape[:-1])):
+                indices[idx] = case.choice(dim_size, size=current_shape[-1], replace=False)
+        return indices
+
+    def values_value(binding):
+        indices_binding = case.find("indices")
+        if indices_binding is not None:
+            indices = case.value(indices_binding)
+            if tuple(indices.shape) != tuple(binding.spec.shape):
+                if numpy.prod(binding.spec.shape) == 1:
+                    return case.set_value_raw(
+                        binding,
+                        case.full(
+                            indices.shape,
+                            legacy_random(binding, ())[()],
+                            dtype=binding.spec.dtype,
+                        ),
+                    )
+                return case.set_value_raw(binding, legacy_random(binding, indices.shape))
+            return legacy_random(binding, binding.spec.shape)
+        return case.value_domain("default", binding)
+
+    case.generate_by_parameter(
+        (("indices", indices_value), ("values", values_value)), default="default"
+    )
+
+
 @rules.register("paddle.matrix_transpose")
 def matrix_transpose_values(ctx: GenerationContext, case: RuleCase):
     def x_value(binding):
@@ -1229,6 +1830,53 @@ def index_sample_values(ctx: GenerationContext, case: RuleCase):
         return case.randint(0, x_dim, size=binding.spec.shape)
 
     case.generate_by_parameter((("index", index_value),), default="default")
+
+
+@rules.register("paddle.Tensor.__getitem__")
+def tensor_getitem_values(ctx: GenerationContext, case: RuleCase):
+    def source_binding():
+        binding = case.find("arr") or case.find("x") or case.find("self")
+        if binding is None:
+            raise ValueError("Tensor.__getitem__ rule could not find source tensor")
+        return binding
+
+    def item_value(binding):
+        min_dim = min(source_binding().spec.shape)
+        numel = math.prod(binding.spec.shape)
+        if binding.spec.dtype == "bool":
+            indices = case.choice([0, 1], size=numel)
+        else:
+            indices = case.randint(0, min_dim, size=numel)
+        return indices.reshape(binding.spec.shape).astype(binding.spec.dtype)
+
+    case.generate_by_parameter((("item", item_value),), default="default")
+
+
+@rules.register("paddle.Tensor.__setitem__")
+def tensor_setitem_values(ctx: GenerationContext, case: RuleCase):
+    def source_binding():
+        binding = case.find("arr") or case.find("x") or case.find("self")
+        if binding is None:
+            raise ValueError("Tensor.__setitem__ rule could not find source tensor")
+        return binding
+
+    def item_value(binding):
+        min_dim = min(source_binding().spec.shape)
+        numel = math.prod(binding.spec.shape)
+        if binding.spec.dtype == "bool":
+            value = case.arg(2, "value")
+            if value is not None and hasattr(value, "shape"):
+                indices = case.zeros(numel, dtype="int64")
+                num_true = min(value.shape[0], numel)
+                true_indices = case.choice(numel, size=num_true, replace=False)
+                indices[true_indices] = 1
+            else:
+                indices = case.choice([0, 1], size=numel)
+        else:
+            indices = case.randint(0, min_dim, size=numel)
+        return indices.reshape(binding.spec.shape).astype(binding.spec.dtype)
+
+    case.generate_by_parameter((("item", item_value),), default="default")
 
 
 @rules.register("paddle.index_add", "paddle.index_fill")
@@ -2153,6 +2801,74 @@ def corrcoef_values(ctx: GenerationContext, case: RuleCase):
     case.generate_by_parameter((("x", x_value),), default="default")
 
 
+@rules.register(
+    "paddle.linalg.matrix_norm",
+    "paddle.linalg.matrix_rank",
+    "paddle.linalg.lu",
+    "paddle.linalg.multi_dot",
+    "paddle.linalg.norm",
+    "paddle.linalg.matrix_transpose",
+    "paddle.linalg.matrix_power",
+    "paddle.linalg.svd",
+    "paddle.linalg.svdvals",
+    "paddle.linalg.eig",
+    "paddle.linalg.eigvals",
+    "paddle.linalg.svd_lowrank",
+    "paddle.linalg.solve",
+    "paddle.linalg.triangular_solve",
+    "paddle.linalg.inv",
+    "paddle.linalg.qr",
+    "paddle.linalg.vector_norm",
+)
+def linalg_default_values(ctx: GenerationContext, case: RuleCase):
+    case.generate_all("default")
+
+
+@rules.register("paddle.linalg.pinv")
+def pinv_values(ctx: GenerationContext, case: RuleCase):
+    hermitian = bool(case.arg(2, " hermitian", False))
+    if not hermitian:
+        case.generate_all("default")
+        return
+
+    def x_value(binding):
+        if len(binding.spec.shape) not in [2, 3]:
+            raise ValueError("pinv only supports 2D or 3D tensors")
+        if binding.spec.dtype.startswith("complex"):
+            real_dtype = "float32" if binding.spec.dtype == "complex64" else "float64"
+            real = case.randn(*binding.spec.shape).astype(real_dtype)
+            imag = case.randn(*binding.spec.shape).astype(real_dtype)
+            matrix = (real + 1j * imag).astype(binding.spec.dtype)
+        else:
+            matrix = case.randn(*binding.spec.shape).astype(binding.spec.dtype)
+        if len(binding.spec.shape) == 2:
+            matrix_t = matrix.conj().T if binding.spec.dtype.startswith("complex") else matrix.T
+        else:
+            matrix_t = (
+                case.conj(matrix).swapaxes(-2, -1)
+                if binding.spec.dtype.startswith("complex")
+                else case.swapaxes(matrix, -2, -1)
+            )
+        return (matrix + matrix_t) / 2
+
+    case.generate_by_parameter((("x", x_value),), default="default")
+
+
+@rules.register("paddle.linalg.cholesky_solve", aliases=("paddle.Tensor.cholesky_solve",))
+def cholesky_solve_values(ctx: GenerationContext, case: RuleCase):
+    if case.api_name == "paddle.linalg.cholesky_solve":
+        case.generate_all("default")
+        return
+
+    def y_value(binding):
+        value = case.value_domain("legacy_random_range", binding)
+        if case.arg(2, "upper"):
+            return case.triu(value)
+        return case.tril(value)
+
+    case.generate_by_parameter((("y", y_value),), default="default")
+
+
 @rules.register("paddle.view", aliases=("paddle.Tensor.view",))
 def view_values(ctx: GenerationContext, case: RuleCase):
     def x_value(binding):
@@ -2177,7 +2893,10 @@ def view_values(ctx: GenerationContext, case: RuleCase):
     case.generate_by_parameter((("x", x_value),), default="default")
 
 
-@rules.register("paddle.pow", aliases=("paddle.Tensor.pow", "paddle.Tensor.__rpow__"))
+@rules.register(
+    "paddle.pow",
+    aliases=("paddle.Tensor.pow", "paddle.Tensor.__rpow__", "paddle.Tensor.__pow__"),
+)
 def pow_values(ctx: GenerationContext, case: RuleCase):
     def get_base_max(value, dtype_max, default_max=5):
         value_max = default_max
@@ -2466,6 +3185,10 @@ def _api_arg(case, position, name, default=None):
 
 
 def _apply_value(case, path, value):
+    _apply_value_raw(case, path, value, update_metadata=True)
+
+
+def _apply_value_raw(case, path, value, update_metadata):
     config = _tensor_config_at(case, path)
     if path.root == "args":
         config.index = path.key
@@ -2475,5 +3198,6 @@ def _apply_value(case, path, value):
         config.list_index = list(path.indices)
     array = numpy.array(value, copy=True, order="K")
     config.numpy_tensor = array
-    config.dtype = str(array.dtype)
-    config.shape = list(array.shape)
+    if update_metadata:
+        config.dtype = str(array.dtype)
+        config.shape = list(array.shape)

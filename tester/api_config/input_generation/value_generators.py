@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
+
 import numpy
 
 from .model import TensorSpec
@@ -33,6 +35,24 @@ class LegacyNumpyRNG:
 
 
 LEGACY_NUMPY_RNG = LegacyNumpyRNG()
+
+
+@dataclass(frozen=True)
+class CaseNumpyRNG(LegacyNumpyRNG):
+    """Per-case RNG facade that currently preserves legacy global RNG behavior."""
+
+    seed: int
+    config_fingerprint: str
+    runtime_mode: str
+    backend: str = "legacy-global"
+
+
+def create_case_rng(context) -> CaseNumpyRNG:
+    return CaseNumpyRNG(
+        seed=context.seed,
+        config_fingerprint=context.config_fingerprint,
+        runtime_mode=context.runtime_mode,
+    )
 
 
 def generation_dtype(dtype: str) -> str:
