@@ -118,6 +118,16 @@ class GpuMemoryDecision:
     pressure_after: bool = False
 
 
+@dataclass(frozen=True)
+class GpuMemoryState:
+    device_id: int
+    free_bytes: int
+    total_bytes: int
+    budget_bytes: int
+    reserve_bytes: int
+    live_budget_bytes: int
+
+
 def _gpu_memory_is_under_pressure(gpu_config, free_bytes, total_bytes, required_headroom_bytes):
     workers_on_gpu = max(1, int(gpu_config.workers_on_gpu or 1))
     memory_budget_bytes = max(0, int(float(gpu_config.memory_budget or 0.0) * _GIB))
@@ -561,6 +571,51 @@ class APITestBase:
         elif not self.gpu_mode_config.enabled:
             paddle.device.cuda.empty_cache()
 
+    def gpu_memory_state(self, device_id, *, budget_gib=0.0):
+        """Return physical headroom and configured live budget for one CUDA device."""
+        device_id = int(device_id)
+        with torch.cuda.device(device_id):
+            free_bytes, total_bytes = torch.cuda.mem_get_info()
+        budget_bytes = max(0, int(float(budget_gib or 0.0) * _GIB))
+        reserve_bytes = self._gpu_safety_reserve_bytes(total_bytes, budget_bytes)
+        return GpuMemoryState(
+            device_id=device_id,
+            free_bytes=int(free_bytes),
+            total_bytes=int(total_bytes),
+            budget_bytes=budget_bytes,
+            reserve_bytes=reserve_bytes,
+            live_budget_bytes=max(0, int(total_bytes) - reserve_bytes),
+        )
+
+    def release_framework_gpu_cache(
+        self,
+        framework=None,
+        *,
+        device_id=None,
+        collect_cycles=False,
+    ):
+        """Release idle allocator blocks for one or both framework runtimes."""
+        if framework not in (None, "torch", "paddle"):
+            raise ValueError(f"Unsupported framework for GPU cache release: {framework!r}")
+        if collect_cycles:
+            gc.collect()
+        if framework in (None, "torch"):
+            if device_id is None:
+                torch.cuda.empty_cache()
+            else:
+                with torch.cuda.device(int(device_id)):
+                    torch.cuda.empty_cache()
+        if framework in (None, "paddle"):
+            if device_id is None:
+                paddle.device.cuda.empty_cache()
+                return
+            current_device = paddle.device.get_device()
+            try:
+                paddle.device.set_device(f"gpu:{int(device_id)}")
+                paddle.device.cuda.empty_cache()
+            finally:
+                paddle.device.set_device(current_device)
+
     def report_compare_error(
         self,
         err,
@@ -580,16 +635,9 @@ class APITestBase:
         return log_type, fatal
 
     def need_skip(self, paddle_only=False):
-        # not support
         if "sparse" in self.api_config.api_name:
             return True
 
-        # if self.api_config.api_name in not_support_api:
-        #     return True
-        # if not paddle_only and self.api_config.api_name in rand_apis:
-        #     return True
-        # if not paddle_only and self.api_config.api_name in stochastic_behavior_apis:
-        #     return True
         if not paddle_only and self.api_config.config in torch_error_skip:
             return True
         # float8 dtypes are handled by TensorConfig / paddle_to_torch Rules;
@@ -631,25 +679,6 @@ class APITestBase:
                 return False
 
         return True
-
-        # This part seems unused in any case:
-        #
-        # valid_dtypes = {'float32', 'float64', 'float16', 'complex64', 'complex128', 'bfloat16'}
-        # if len(self.api_config.args) > 0 and isinstance(self.api_config.args[0], TensorConfig):
-        #     dtype = self.api_config.args[0].dtype
-        #     if dtype in valid_dtypes:
-        #         return True
-        # return True
-
-        # Original implementation:
-        #
-        # if not self.is_forward_only() and not (self.api_config.api_name == "paddle.assign" and len(self.paddle_args_config) and isinstance(self.paddle_args_config[0], list)) and not (self.api_config.api_name == "paddle.assign" and len(self.paddle_args_config) > 1 and self.paddle_args_config[1] is not None):
-        #     if len(self.api_config.args) > 0 and isinstance(self.api_config.args[0], TensorConfig):
-        #         dtype = self.api_config.args[0].dtype
-        #         if dtype in ['float32', 'float64', 'float16', 'complex64', 'complex128', 'bfloat16']:
-        #             return True
-        #     return True
-        # return False
 
     def ana_api_info(self):
         return self.ana_paddle_api_info() and self.ana_torch_api_info()
@@ -2153,9 +2182,7 @@ class APITestBase:
 
                     if dual_gpu:
                         budget_bytes = int(memory_budget * (1024**3)) if memory_budget > 0 else 0
-                        reserve_bytes = self._dual_comparison_safety_reserve_bytes(
-                            total_bytes, budget_bytes
-                        )
+                        reserve_bytes = self._gpu_safety_reserve_bytes(total_bytes, budget_bytes)
                         working_bytes = self._dual_comparison_workspace_bytes(
                             free_bytes, reserve_bytes
                         )
@@ -2286,7 +2313,7 @@ class APITestBase:
         return min(max_workspace, max(min_workspace, half_available))
 
     @staticmethod
-    def _dual_comparison_safety_reserve_bytes(total_bytes, budget_bytes):
+    def _gpu_safety_reserve_bytes(total_bytes, budget_bytes):
         """Keep a small physical reserve without double-counting allocator state."""
         minimum_reserve = 1 * 1024**3
         total_bytes = max(0, int(total_bytes))

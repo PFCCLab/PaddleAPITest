@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-import gc
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass, field
 
 import numpy
 import paddle
@@ -11,6 +11,38 @@ from .accuracy import process_grad_output, process_output
 from .base import CUDA_ERROR, CUDA_OOM, APITestBase, gpu_mode_memory_decision
 from .log_writer import log_comparison, log_worker
 from .paddle_to_torch import adaptive_workspace_bytes, get_converter
+
+
+@dataclass
+class _StableResultPairs:
+    torch_outputs: list = field(default_factory=list)
+    torch_grads: list = field(default_factory=list)
+    paddle_outputs: list = field(default_factory=list)
+    paddle_grads: list = field(default_factory=list)
+
+    def append(self, torch_output, torch_grads, paddle_output, paddle_grads):
+        self.torch_outputs.append(torch_output)
+        self.torch_grads.append(torch_grads)
+        self.paddle_outputs.append(paddle_output)
+        self.paddle_grads.append(paddle_grads)
+
+    def clear_all(self):
+        self.torch_outputs.clear()
+        self.torch_grads.clear()
+        self.paddle_outputs.clear()
+        self.paddle_grads.clear()
+
+    def clear_forward(self):
+        self.torch_outputs.clear()
+        self.paddle_outputs.clear()
+
+
+@dataclass
+class _DualComparisonState:
+    first_pair_comparison: object | None = None
+    first_pair_finished: bool = False
+    phased_result_residency: bool = False
+    staged_grad_slots: list = field(default_factory=list)
 
 
 class APITestAccuracyStable(APITestBase):
@@ -34,35 +66,24 @@ class APITestAccuracyStable(APITestBase):
         torch.set_printoptions(profile="short", edgeitems=2, threshold=100, linewidth=120)
         torch.set_default_device("cuda")
 
-    def move_tensor_tree_to_comparison_gpu(self, value):
-        if self.comparison_device_id is None:
-            raise RuntimeError("dual-GPU comparison device is not configured")
-        return self.move_tensor_tree_to_gpu(value, self.comparison_device_id)
+    @staticmethod
+    def _normalize_torch_result(value):
+        if isinstance(value, (torch.return_types.max, torch.return_types.min)):
+            value = value.values
+        if isinstance(value, (list, tuple)):
+            value = list(value)
+        return value
 
-    def release_compute_gpu_cache(self, framework=None, *, collect_cycles=False):
-        if collect_cycles:
-            gc.collect()
-        if framework in (None, "torch"):
-            with torch.cuda.device(0):
-                torch.cuda.empty_cache()
-        if framework in (None, "paddle"):
-            paddle.device.cuda.empty_cache()
+    @staticmethod
+    def _normalize_paddle_result(value):
+        if isinstance(value, (list, tuple)):
+            value = list(value)
+        return value
 
     def compare_first_pair(self, paddle_output, torch_output, paddle_grad, torch_grad):
         with torch.cuda.device(self.comparison_device_id):
             self.compare(paddle_output, torch_output, "P1T1")
             self.compare(paddle_grad, torch_grad, "P1T1B")
-
-    def release_comparison_gpu_cache(self):
-        with torch.cuda.device(self.comparison_device_id):
-            torch.cuda.empty_cache()
-
-        compute_device = paddle.device.get_device()
-        try:
-            paddle.device.set_device(f"gpu:{self.comparison_device_id}")
-            paddle.device.cuda.empty_cache()
-        finally:
-            paddle.device.set_device(compute_device)
 
     def _reference_workspace_bytes(self, convert_result):
         if not self.gpu_mode_config.enabled:
@@ -72,6 +93,432 @@ class APITestAccuracyStable(APITestBase):
         if not any("_workspace_bytes =" in str(line) for line in source_lines):
             return 0
         return adaptive_workspace_bytes(torch)
+
+    def _comparison_gpu_memory_state(self):
+        return self.gpu_memory_state(
+            self.comparison_device_id,
+            budget_gib=self.gpu_mode_config.comparison_memory_budget,
+        )
+
+    def _gpu_staging_headroom(self, device_id):
+        memory_state = self.gpu_memory_state(
+            device_id,
+            budget_gib=self.gpu_mode_config.memory_budget,
+        )
+        return max(0, memory_state.free_bytes - memory_state.reserve_bytes)
+
+    def _release_compute_gpu_cache(self, framework=None):
+        self.release_framework_gpu_cache(framework, device_id=0, collect_cycles=True)
+
+    def _release_comparison_gpu_cache(self):
+        self.release_framework_gpu_cache(device_id=self.comparison_device_id, collect_cycles=True)
+
+    def _move_tensor_tree_to_comparison_gpu(self, value):
+        return self.move_tensor_tree_to_gpu(value, self.comparison_device_id)
+
+    def _clear_execution_resources(self):
+        for attr_name in (
+            "torch_args",
+            "torch_kwargs",
+            "paddle_args",
+            "paddle_kwargs",
+            "paddle_merged_kwargs",
+        ):
+            if hasattr(self, attr_name):
+                delattr(self, attr_name)
+        self.outputs_grad_numpy.clear()
+        self.outputs_grad_paddleonly.clear()
+        self.clear_original_cpu_inputs()
+
+    def _projected_results_need_phasing(self, projected_bytes):
+        if not self.use_dual_gpu:
+            return False
+        memory_state = self._comparison_gpu_memory_state()
+        allocator_margin = max(1 * 1024**3, int(projected_bytes) // 20)
+        target_workspace = 256 * 1024**2
+        return (
+            int(projected_bytes) + allocator_margin + target_workspace
+            > memory_state.live_budget_bytes
+        )
+
+    def _prepare_second_torch_results(self, state, torch_result_bytes):
+        """Reserve comparison-card space before copying the T2 result family."""
+        target_workspace = 256 * 1024**2
+        memory_state = self._comparison_gpu_memory_state()
+        free_bytes = memory_state.free_bytes
+        reserve_bytes = memory_state.reserve_bytes
+        target_free = reserve_bytes + int(torch_result_bytes) + target_workspace
+        if free_bytes < target_free:
+            # P1T1 has completed, so its reduction blocks are no longer live.
+            self._release_comparison_gpu_cache()
+            memory_state = self._comparison_gpu_memory_state()
+            free_bytes = memory_state.free_bytes
+            reserve_bytes = memory_state.reserve_bytes
+
+        if free_bytes <= reserve_bytes + int(torch_result_bytes):
+            raise RuntimeError(
+                "comparison out of memory prevention: the first six result trees "
+                "exceed the comparison card's safe capacity before P2 execution"
+            )
+        if free_bytes < target_free:
+            state.phased_result_residency = True
+
+    def _place_second_paddle_results(self, pairs, state):
+        target_workspace = 256 * 1024**2
+        output_bytes = self.tensor_tree_nbytes(pairs.paddle_outputs[1])
+        grad_bytes = self.tensor_tree_nbytes(pairs.paddle_grads[1])
+
+        memory_state = self._comparison_gpu_memory_state()
+        free_bytes = memory_state.free_bytes
+        reserve_bytes = memory_state.reserve_bytes
+        unphased_new_bytes = output_bytes + grad_bytes
+        if not state.phased_result_residency and free_bytes < (
+            reserve_bytes + unphased_new_bytes + target_workspace
+        ):
+            # A completed first comparison may leave allocator cache behind.
+            # Reclaim it before deciding that live gradients must be staged.
+            self._release_comparison_gpu_cache()
+            memory_state = self._comparison_gpu_memory_state()
+            free_bytes = memory_state.free_bytes
+            reserve_bytes = memory_state.reserve_bytes
+            state.phased_result_residency = free_bytes < (
+                reserve_bytes + unphased_new_bytes + target_workspace
+            )
+
+        if not state.phased_result_residency:
+            pairs.paddle_outputs[1] = self._move_tensor_tree_to_comparison_gpu(
+                pairs.paddle_outputs[1]
+            )
+            pairs.paddle_grads[1] = self._move_tensor_tree_to_comparison_gpu(pairs.paddle_grads[1])
+            return
+
+        # P2 grad is already on the now-idle compute card. Keep it there until
+        # the forward result family has been compared and released.
+        state.staged_grad_slots.append((pairs.paddle_grads, 1))
+        required_free = reserve_bytes + output_bytes + target_workspace
+        if free_bytes < required_free:
+            self._release_compute_gpu_cache()
+            compute_headroom = self._gpu_staging_headroom(0)
+            candidates = sorted(
+                (
+                    (self.tensor_tree_nbytes(pairs.torch_grads[0]), pairs.torch_grads, 0),
+                    (self.tensor_tree_nbytes(pairs.paddle_grads[0]), pairs.paddle_grads, 0),
+                    (self.tensor_tree_nbytes(pairs.torch_grads[1]), pairs.torch_grads, 1),
+                ),
+                key=lambda candidate: candidate[0],
+                reverse=True,
+            )
+            reclaimed_bytes = 0
+            for candidate_bytes, pair, index in candidates:
+                if free_bytes + reclaimed_bytes >= required_free:
+                    break
+                if candidate_bytes <= 0 or candidate_bytes > compute_headroom:
+                    continue
+                source = pair[index]
+                pair[index] = self.move_tensor_tree_to_gpu(source, 0)
+                state.staged_grad_slots.append((pair, index))
+                compute_headroom -= candidate_bytes
+                reclaimed_bytes += candidate_bytes
+                del source
+
+            if reclaimed_bytes:
+                self._release_comparison_gpu_cache()
+                memory_state = self._comparison_gpu_memory_state()
+                free_bytes = memory_state.free_bytes
+                reserve_bytes = memory_state.reserve_bytes
+
+        # A smaller chunk is valid when the 256 MiB performance target cannot
+        # be met, but the output migration must never consume the safety reserve.
+        if free_bytes <= reserve_bytes + output_bytes:
+            raise RuntimeError(
+                "comparison out of memory prevention: the two GPU result families "
+                "exceed their safe aggregate capacity"
+            )
+        pairs.paddle_outputs[1] = self._move_tensor_tree_to_comparison_gpu(pairs.paddle_outputs[1])
+
+    def _finish_first_pair_comparison(self, state):
+        if state.first_pair_finished:
+            return
+        try:
+            if state.first_pair_comparison is not None:
+                state.first_pair_comparison.result()
+        finally:
+            state.first_pair_finished = True
+
+    def _log_dual_cleanup_error(self, cleanup_error):
+        print(
+            f"[dual_gpu_cleanup_error] {self.api_config.config}\n{cleanup_error!s}",
+            flush=True,
+        )
+
+    def _cleanup_comparison_stage(self, state, pairs, *, discard_results, release_cache):
+        """Join compare, drop result references, then release comparison allocators."""
+        if not self.use_dual_gpu:
+            if discard_results:
+                pairs.clear_all()
+            return
+        try:
+            if state.first_pair_comparison is not None:
+                self._finish_first_pair_comparison(state)
+        except Exception:
+            pairs.clear_all()
+            try:
+                self._release_comparison_gpu_cache()
+            except Exception as cleanup_error:
+                self._log_dual_cleanup_error(cleanup_error)
+            raise
+        if discard_results:
+            pairs.clear_all()
+        if release_cache:
+            self._release_comparison_gpu_cache()
+
+    def _abort_case_resources(self, state, pairs):
+        try:
+            self._cleanup_comparison_stage(state, pairs, discard_results=True, release_cache=True)
+        except Exception as cleanup_error:
+            self._log_dual_cleanup_error(cleanup_error)
+        try:
+            self._clear_execution_resources()
+        except Exception as cleanup_error:
+            self._log_dual_cleanup_error(cleanup_error)
+        if self.use_dual_gpu:
+            try:
+                self._release_compute_gpu_cache()
+            except Exception as cleanup_error:
+                self._log_dual_cleanup_error(cleanup_error)
+
+    def _start_first_pair_comparison(self, pairs, state):
+        comparison_executor = None
+        try:
+            comparison_executor = ThreadPoolExecutor(
+                max_workers=1,
+                thread_name_prefix="accuracy-stable-compare",
+            )
+            state.first_pair_comparison = comparison_executor.submit(
+                self.compare_first_pair,
+                pairs.paddle_outputs[0],
+                pairs.torch_outputs[0],
+                pairs.paddle_grads[0],
+                pairs.torch_grads[0],
+            )
+        finally:
+            # Only one task is ever submitted. Closing submission immediately
+            # lets the worker thread retire by itself when the future completes.
+            if comparison_executor is not None:
+                comparison_executor.shutdown(wait=False)
+
+    def _spill_first_iteration_if_needed(self, pairs, convert_result, probe_bytes):
+        torch_phase_bytes = self.tensor_tree_nbytes((pairs.torch_outputs[0], pairs.torch_grads[0]))
+        paddle_phase_bytes = self.tensor_tree_nbytes(
+            (pairs.paddle_outputs[0], pairs.paddle_grads[0])
+        )
+        retained_tree_bytes = torch_phase_bytes + paddle_phase_bytes
+        required_headroom_bytes = (
+            probe_bytes
+            + max(torch_phase_bytes, paddle_phase_bytes)
+            + self._reference_workspace_bytes(convert_result)
+        )
+        decision = gpu_mode_memory_decision(
+            self.gpu_mode_config,
+            request_spill=True,
+            probe_bytes=probe_bytes,
+            retained_tree_bytes=retained_tree_bytes,
+            required_headroom_bytes=required_headroom_bytes,
+        )
+        if decision.should_spill:
+            self.spill_tensor_tree_slot_to_cpu(pairs.torch_outputs)
+            self.spill_tensor_tree_slot_to_cpu(pairs.paddle_outputs)
+            self.spill_tensor_tree_slot_to_cpu(pairs.torch_grads)
+            self.spill_tensor_tree_slot_to_cpu(pairs.paddle_grads)
+
+    def _restore_staged_grad_results(self, pairs, state):
+        if not state.staged_grad_slots:
+            return
+        # Clearing the lists only drops live output references. Return their
+        # cached blocks before restoring the staged grad family.
+        self._release_comparison_gpu_cache()
+        for pair, index in state.staged_grad_slots:
+            pair[index] = self._move_tensor_tree_to_comparison_gpu(pair[index])
+        state.staged_grad_slots.clear()
+        self._release_compute_gpu_cache()
+
+    def _run_summary_comparisons(self, pairs, state):
+        # Finish all forward comparisons before touching the backward result
+        # family, so output residency does not overlap later grad diagnostics.
+        self.compare(pairs.paddle_outputs[1], pairs.torch_outputs[1], "P2T2")
+        self.compare(pairs.paddle_outputs[1], pairs.torch_outputs[0], "P2T1")
+        self.compare(pairs.paddle_outputs[0], pairs.torch_outputs[1], "P1T2")
+        self.compare(pairs.torch_outputs[0], pairs.torch_outputs[1], "T1T2")
+        self.compare(pairs.paddle_outputs[0], pairs.paddle_outputs[1], "P1P2")
+        pairs.clear_forward()
+
+        self._restore_staged_grad_results(pairs, state)
+
+        # Backward comparisons run after the forward result family is gone.
+        self.compare(pairs.paddle_grads[1], pairs.torch_grads[1], "P2T2B")
+        self.compare(pairs.paddle_grads[1], pairs.torch_grads[0], "P2T1B")
+        self.compare(pairs.paddle_grads[0], pairs.torch_grads[1], "P1T2B")
+        self.compare(pairs.torch_grads[0], pairs.torch_grads[1], "T1T2B")
+        pairs.torch_grads.clear()
+        self.compare(pairs.paddle_grads[0], pairs.paddle_grads[1], "P1P2B")
+        pairs.paddle_grads.clear()
+
+    def _run_stable_iteration(self, iter_idx, convert_result, probe_bytes, pairs, state):
+        # ======== torch ========
+        self.reset_random_state()
+        try:
+            torch_output, torch_out_grads, torch_grad_success = self.get_torch_output(
+                convert_result, iter_idx
+            )
+        except Exception:
+            self._abort_case_resources(state, pairs)
+            raise
+        if torch_output is None:
+            self._abort_case_resources(state, pairs)
+            return False
+
+        torch_output = self.detach_tensor_tree(torch_output)
+        torch_out_grads = self.detach_tensor_tree(torch_out_grads)
+        self.clear_runtime_inputs("torch")
+        if self.use_dual_gpu and iter_idx == 1:
+            # Do not put T2 results on the comparison card while P1 compare
+            # still owns its reduction workspace. Preflight the complete copy
+            # before moving either tree so a partial migration cannot OOM.
+            try:
+                self._cleanup_comparison_stage(
+                    state,
+                    pairs,
+                    discard_results=False,
+                    release_cache=False,
+                )
+                self._prepare_second_torch_results(
+                    state,
+                    self.tensor_tree_nbytes((torch_output, torch_out_grads)),
+                )
+            except Exception:
+                self._abort_case_resources(state, pairs)
+                raise
+
+        if self.use_dual_gpu:
+            try:
+                torch_output = self._move_tensor_tree_to_comparison_gpu(torch_output)
+                torch_out_grads = self._move_tensor_tree_to_comparison_gpu(torch_out_grads)
+            except Exception:
+                self._abort_case_resources(state, pairs)
+                raise
+            self._release_compute_gpu_cache("torch")
+        elif self.use_gpu_mode:
+            torch_live_bytes = self.tensor_tree_nbytes((torch_output, torch_out_grads))
+            # Release idle Torch blocks before the next Paddle execution;
+            # the two frameworks do not share caching allocators.
+            gpu_mode_memory_decision(
+                self.gpu_mode_config,
+                probe_bytes=probe_bytes,
+                retained_tree_bytes=torch_live_bytes,
+                required_headroom_bytes=probe_bytes + torch_live_bytes,
+            )
+
+        # ======== paddle ========
+        self.reset_random_state()
+        try:
+            paddle_output, paddle_out_grads = self.get_paddle_output(torch_grad_success, iter_idx)
+        except Exception:
+            self._abort_case_resources(state, pairs)
+            raise
+        if paddle_output is None:
+            self._abort_case_resources(state, pairs)
+            return False
+
+        try:
+            # Normalize API-specific output quirks before detach/move/byte
+            # accounting touches uninitialized Paddle placeholders.
+            paddle_output, torch_output = process_output(
+                self.api_config, paddle_output, torch_output
+            )
+            paddle_out_grads, torch_out_grads = process_grad_output(
+                self.api_config, paddle_out_grads, torch_out_grads
+            )
+        except Exception:
+            self._abort_case_resources(state, pairs)
+            raise
+
+        paddle_output = self.detach_tensor_tree(paddle_output)
+        paddle_out_grads = self.detach_tensor_tree(paddle_out_grads)
+        self.clear_runtime_inputs("paddle")
+        if self.use_gpu_mode and not self.use_dual_gpu:
+            gpu_mode_memory_decision(
+                self.gpu_mode_config,
+                probe_bytes=probe_bytes,
+                required_headroom_bytes=probe_bytes,
+            )
+
+        if self.use_dual_gpu:
+            # Formatting may create replacement tensors. Normalize the first
+            # result set immediately; the second Paddle result set is placed
+            # only after the residency planner sees its exact byte sizes.
+            try:
+                torch_output = self._move_tensor_tree_to_comparison_gpu(torch_output)
+                torch_out_grads = self._move_tensor_tree_to_comparison_gpu(torch_out_grads)
+                if iter_idx == 0:
+                    paddle_output = self._move_tensor_tree_to_comparison_gpu(paddle_output)
+                    paddle_out_grads = self._move_tensor_tree_to_comparison_gpu(paddle_out_grads)
+            except Exception:
+                self._abort_case_resources(state, pairs)
+                raise
+            self._release_compute_gpu_cache("paddle")
+
+        # if torch_grad_success = False, out_grads = [] and compare return
+        pairs.append(torch_output, torch_out_grads, paddle_output, paddle_out_grads)
+
+        # Pair lists own the results from here onward. Drop loop-local aliases
+        # before residency planning so relocated sources can actually be freed.
+        torch_output = None
+        paddle_output = None
+        torch_out_grads = None
+        paddle_out_grads = None
+
+        if self.use_dual_gpu:
+            try:
+                if iter_idx == 0:
+                    first_result_bytes = self.tensor_tree_nbytes(
+                        (
+                            pairs.torch_outputs[0],
+                            pairs.torch_grads[0],
+                            pairs.paddle_outputs[0],
+                            pairs.paddle_grads[0],
+                        )
+                    )
+                    state.phased_result_residency = self._projected_results_need_phasing(
+                        2 * first_result_bytes
+                    )
+                else:
+                    # P2 backward is the last consumer of the shared output-grad
+                    # seeds. Release them before using the compute card for staging.
+                    self.outputs_grad_numpy.clear()
+                    self.outputs_grad_paddleonly.clear()
+                    self._release_compute_gpu_cache()
+                    self._place_second_paddle_results(pairs, state)
+            except Exception:
+                self._abort_case_resources(state, pairs)
+                raise
+
+        if iter_idx != 0:
+            return True
+
+        if self.use_dual_gpu:
+            try:
+                self._start_first_pair_comparison(pairs, state)
+            except Exception:
+                self._abort_case_resources(state, pairs)
+                raise
+            return True
+
+        self.compare(pairs.paddle_outputs[0], pairs.torch_outputs[0], "P1T1")
+        self.compare(pairs.paddle_grads[0], pairs.torch_grads[0], "P1T1B")
+
+        if self.use_gpu_mode:
+            self._spill_first_iteration_if_needed(pairs, convert_result, probe_bytes)
+        return True
 
     def test(self):
         if self.need_skip():
@@ -105,7 +552,7 @@ class APITestAccuracyStable(APITestBase):
                 self.report_case_result("config_input", "gen_numpy_input failed")
                 return
         except Exception as err:
-            log_type, fatal = self.report_runtime_error(err, "config_input", "input")
+            _, fatal = self.report_runtime_error(err, "config_input", "input")
             if fatal:
                 raise
             return
@@ -113,452 +560,35 @@ class APITestAccuracyStable(APITestBase):
         try:
             self.save_original_inputs_to_cpu()
         except Exception as err:
-            log_type, fatal = self.report_runtime_error(err, "config_input", "input cache")
+            _, fatal = self.report_runtime_error(err, "config_input", "input cache")
             if fatal:
                 raise
             return
 
         probe_bytes = self.estimate_input_bytes()
 
-        torch_output_pair = []
-        torch_grad_pair = []
-        paddle_output_pair = []
-        paddle_grad_pair = []
-        first_pair_comparison = None
-        first_pair_comparison_finished = False
-        comparison_stage_started = False
-        torch_output = None
-        paddle_output = None
-        torch_out_grads = None
-        paddle_out_grads = None
-        phased_result_residency = False
-        staged_grad_slots = []
-
-        def finish_first_pair_comparison():
-            nonlocal first_pair_comparison_finished
-            if first_pair_comparison_finished:
-                return
-            try:
-                if first_pair_comparison is not None:
-                    first_pair_comparison.result()
-            finally:
-                first_pair_comparison_finished = True
-
-        def clear_comparison_results():
-            nonlocal torch_output, paddle_output, torch_out_grads, paddle_out_grads
-            torch_output_pair.clear()
-            torch_grad_pair.clear()
-            paddle_output_pair.clear()
-            paddle_grad_pair.clear()
-            torch_output = None
-            paddle_output = None
-            torch_out_grads = None
-            paddle_out_grads = None
-
-        def clear_execution_resources():
-            for framework in ("torch", "paddle"):
-                self.clear_runtime_inputs(framework)
-            self.outputs_grad_numpy.clear()
-            self.outputs_grad_paddleonly.clear()
-            self.clear_original_cpu_inputs()
-
-        def comparison_memory_state():
-            with torch.cuda.device(self.comparison_device_id):
-                free_bytes, total_bytes = torch.cuda.mem_get_info()
-            budget_gib = float(
-                getattr(self.gpu_mode_config, "comparison_memory_budget", 0.0) or 0.0
-            )
-            budget_bytes = int(budget_gib * (1024**3)) if budget_gib > 0 else 0
-            reserve_bytes = self._dual_comparison_safety_reserve_bytes(total_bytes, budget_bytes)
-            live_budget = (
-                min(budget_bytes, total_bytes - reserve_bytes)
-                if budget_bytes > 0
-                else total_bytes - reserve_bytes
-            )
-            return free_bytes, total_bytes, reserve_bytes, max(0, live_budget)
-
-        def projected_results_need_phasing(projected_bytes):
-            if not self.use_dual_gpu:
-                return False
-            _, _, _, live_budget = comparison_memory_state()
-            allocator_margin = max(1 * 1024**3, int(projected_bytes) // 20)
-            target_workspace = 256 * 1024**2
-            return int(projected_bytes) + allocator_margin + target_workspace > live_budget
-
-        def compute_staging_headroom():
-            with torch.cuda.device(0):
-                free_bytes, total_bytes = torch.cuda.mem_get_info()
-            reserve_bytes = self._dual_comparison_safety_reserve_bytes(total_bytes, 0)
-            return max(0, free_bytes - reserve_bytes)
-
-        def prepare_second_torch_results(torch_result_bytes):
-            """Reserve comparison-card space before copying the T2 result family."""
-            nonlocal phased_result_residency
-            target_workspace = 256 * 1024**2
-            free_bytes, _, reserve_bytes, _ = comparison_memory_state()
-            target_free = reserve_bytes + int(torch_result_bytes) + target_workspace
-            if free_bytes < target_free:
-                # P1T1 has completed, so its reduction blocks are no longer live.
-                self.release_comparison_gpu_cache()
-                free_bytes, _, reserve_bytes, _ = comparison_memory_state()
-
-            if free_bytes <= reserve_bytes + int(torch_result_bytes):
-                raise RuntimeError(
-                    "comparison out of memory prevention: the first six result trees "
-                    "exceed the comparison card's safe capacity before P2 execution"
-                )
-            if free_bytes < target_free:
-                phased_result_residency = True
-
-        def place_second_paddle_results():
-            nonlocal phased_result_residency
-            target_workspace = 256 * 1024**2
-            output_bytes = self.tensor_tree_nbytes(paddle_output_pair[1])
-            grad_bytes = self.tensor_tree_nbytes(paddle_grad_pair[1])
-
-            free_bytes, _, reserve_bytes, _ = comparison_memory_state()
-            unphased_new_bytes = output_bytes + grad_bytes
-            if not phased_result_residency and free_bytes < (
-                reserve_bytes + unphased_new_bytes + target_workspace
-            ):
-                # A completed first comparison may leave allocator cache behind.
-                # Reclaim it before deciding that live gradients must be staged.
-                self.release_comparison_gpu_cache()
-                free_bytes, _, reserve_bytes, _ = comparison_memory_state()
-                phased_result_residency = free_bytes < (
-                    reserve_bytes + unphased_new_bytes + target_workspace
-                )
-
-            if not phased_result_residency:
-                paddle_output_pair[1] = self.move_tensor_tree_to_comparison_gpu(
-                    paddle_output_pair[1]
-                )
-                paddle_grad_pair[1] = self.move_tensor_tree_to_comparison_gpu(paddle_grad_pair[1])
-                return
-
-            # P2 grad is already on the now-idle compute card. Keep it there until
-            # the forward result family has been compared and released.
-            staged_grad_slots.append((paddle_grad_pair, 1))
-            required_free = reserve_bytes + output_bytes + target_workspace
-            if free_bytes < required_free:
-                self.release_compute_gpu_cache()
-                compute_headroom = compute_staging_headroom()
-                candidates = sorted(
-                    (
-                        (self.tensor_tree_nbytes(torch_grad_pair[0]), torch_grad_pair, 0),
-                        (self.tensor_tree_nbytes(paddle_grad_pair[0]), paddle_grad_pair, 0),
-                        (self.tensor_tree_nbytes(torch_grad_pair[1]), torch_grad_pair, 1),
-                    ),
-                    key=lambda candidate: candidate[0],
-                    reverse=True,
-                )
-                reclaimed_bytes = 0
-                for candidate_bytes, pair, index in candidates:
-                    if free_bytes + reclaimed_bytes >= required_free:
-                        break
-                    if candidate_bytes <= 0 or candidate_bytes > compute_headroom:
-                        continue
-                    source = pair[index]
-                    pair[index] = self.move_tensor_tree_to_gpu(source, 0)
-                    staged_grad_slots.append((pair, index))
-                    compute_headroom -= candidate_bytes
-                    reclaimed_bytes += candidate_bytes
-                    del source
-
-                if reclaimed_bytes:
-                    self.release_comparison_gpu_cache()
-                    free_bytes, _, reserve_bytes, _ = comparison_memory_state()
-
-            # A smaller chunk is valid when the 256 MiB performance target cannot
-            # be met, but the output migration must never consume the safety reserve.
-            if free_bytes <= reserve_bytes + output_bytes:
-                raise RuntimeError(
-                    "comparison out of memory prevention: the two GPU result families "
-                    "exceed their safe aggregate capacity"
-                )
-            paddle_output_pair[1] = self.move_tensor_tree_to_comparison_gpu(paddle_output_pair[1])
-
-        def cleanup_comparison_stage(*, discard_results, release_cache):
-            """Join compare, drop result references, then release comparison allocators."""
-            if not self.use_dual_gpu:
-                if discard_results:
-                    clear_comparison_results()
-                return
-            try:
-                if comparison_stage_started:
-                    finish_first_pair_comparison()
-            except Exception:
-                clear_comparison_results()
-                try:
-                    self.release_comparison_gpu_cache()
-                except Exception as cleanup_error:
-                    print(
-                        f"[dual_gpu_cleanup_error] {self.api_config.config}\n{cleanup_error!s}",
-                        flush=True,
-                    )
-                raise
-            if discard_results:
-                clear_comparison_results()
-            if release_cache:
-                self.release_comparison_gpu_cache()
-
-        def abort_case_resources():
-            try:
-                cleanup_comparison_stage(discard_results=True, release_cache=True)
-            except Exception as cleanup_error:
-                print(
-                    f"[dual_gpu_cleanup_error] {self.api_config.config}\n{cleanup_error!s}",
-                    flush=True,
-                )
-            try:
-                clear_execution_resources()
-            except Exception as cleanup_error:
-                print(
-                    f"[dual_gpu_cleanup_error] {self.api_config.config}\n{cleanup_error!s}",
-                    flush=True,
-                )
-            if self.use_dual_gpu:
-                try:
-                    self.release_compute_gpu_cache()
-                except Exception as cleanup_error:
-                    print(
-                        f"[dual_gpu_cleanup_error] {self.api_config.config}\n{cleanup_error!s}",
-                        flush=True,
-                    )
+        pairs = _StableResultPairs()
+        dual_state = _DualComparisonState()
 
         # Every execution recreates its input from the same immutable CPU copy.
-        for _i in range(2):
-            # ======== torch ========
-            self.reset_random_state()
-            try:
-                torch_output, torch_out_grads, torch_grad_success = self.get_torch_output(
-                    convert_result, _i
-                )
-            except Exception:
-                abort_case_resources()
-                raise
-            if torch_output is None:
-                abort_case_resources()
+        for iter_idx in range(2):
+            if not self._run_stable_iteration(
+                iter_idx, convert_result, probe_bytes, pairs, dual_state
+            ):
                 return
-            torch_output = self.detach_tensor_tree(torch_output)
-            torch_out_grads = self.detach_tensor_tree(torch_out_grads)
-            self.clear_runtime_inputs("torch")
-            if self.use_dual_gpu and _i == 1:
-                # Do not put T2 results on the comparison card while P1 compare
-                # still owns its reduction workspace. Preflight the complete copy
-                # before moving either tree so a partial migration cannot OOM.
-                try:
-                    cleanup_comparison_stage(
-                        discard_results=False,
-                        release_cache=False,
-                    )
-                    prepare_second_torch_results(
-                        self.tensor_tree_nbytes((torch_output, torch_out_grads))
-                    )
-                except Exception:
-                    abort_case_resources()
-                    raise
-            if self.use_dual_gpu:
-                try:
-                    torch_output = self.move_tensor_tree_to_comparison_gpu(torch_output)
-                    torch_out_grads = self.move_tensor_tree_to_comparison_gpu(torch_out_grads)
-                except Exception:
-                    abort_case_resources()
-                    raise
-                self.release_compute_gpu_cache("torch")
-            elif self.use_gpu_mode:
-                torch_live_bytes = self.tensor_tree_nbytes((torch_output, torch_out_grads))
-                # Release idle Torch blocks before the next Paddle execution;
-                # the two frameworks do not share caching allocators.
-                gpu_mode_memory_decision(
-                    self.gpu_mode_config,
-                    probe_bytes=probe_bytes,
-                    retained_tree_bytes=torch_live_bytes,
-                    required_headroom_bytes=probe_bytes + torch_live_bytes,
-                )
-
-            # ======== paddle ========
-            self.reset_random_state()
-            try:
-                paddle_output, paddle_out_grads = self.get_paddle_output(torch_grad_success, _i)
-            except Exception:
-                abort_case_resources()
-                raise
-            if paddle_output is None:
-                abort_case_resources()
-                return
-            try:
-                # Normalize API-specific output quirks before detach/move/byte
-                # accounting touches uninitialized Paddle placeholders.
-                paddle_output, torch_output = process_output(
-                    self.api_config, paddle_output, torch_output
-                )
-                paddle_out_grads, torch_out_grads = process_grad_output(
-                    self.api_config, paddle_out_grads, torch_out_grads
-                )
-            except Exception:
-                abort_case_resources()
-                raise
-            paddle_output = self.detach_tensor_tree(paddle_output)
-            paddle_out_grads = self.detach_tensor_tree(paddle_out_grads)
-            self.clear_runtime_inputs("paddle")
-            if self.use_gpu_mode and not self.use_dual_gpu:
-                gpu_mode_memory_decision(
-                    self.gpu_mode_config,
-                    probe_bytes=probe_bytes,
-                    required_headroom_bytes=probe_bytes,
-                )
-
-            if self.use_dual_gpu:
-                # Formatting may create replacement tensors. Normalize the first
-                # result set immediately; the second Paddle result set is placed
-                # only after the residency planner sees its exact byte sizes.
-                try:
-                    torch_output = self.move_tensor_tree_to_comparison_gpu(torch_output)
-                    torch_out_grads = self.move_tensor_tree_to_comparison_gpu(torch_out_grads)
-                    if _i == 0:
-                        paddle_output = self.move_tensor_tree_to_comparison_gpu(paddle_output)
-                        paddle_out_grads = self.move_tensor_tree_to_comparison_gpu(paddle_out_grads)
-                except Exception:
-                    abort_case_resources()
-                    raise
-                self.release_compute_gpu_cache("paddle")
-
-            # ======== add to pair ========
-            # if torch_grad_success = False, out_grads = [] and compare return
-            torch_output_pair.append(torch_output)
-            torch_grad_pair.append(torch_out_grads)
-            paddle_output_pair.append(paddle_output)
-            paddle_grad_pair.append(paddle_out_grads)
-
-            # Pair lists own the results from here onward. Drop loop-local aliases
-            # before residency planning so relocated sources can actually be freed.
-            torch_output = None
-            paddle_output = None
-            torch_out_grads = None
-            paddle_out_grads = None
-
-            if self.use_dual_gpu:
-                try:
-                    if _i == 0:
-                        first_result_bytes = self.tensor_tree_nbytes(
-                            (
-                                torch_output_pair[0],
-                                torch_grad_pair[0],
-                                paddle_output_pair[0],
-                                paddle_grad_pair[0],
-                            )
-                        )
-                        phased_result_residency = projected_results_need_phasing(
-                            2 * first_result_bytes
-                        )
-                    else:
-                        # P2 backward is the last consumer of the shared output-grad
-                        # seeds. Release them before using the compute card for staging.
-                        self.outputs_grad_numpy.clear()
-                        self.outputs_grad_paddleonly.clear()
-                        self.release_compute_gpu_cache()
-                        place_second_paddle_results()
-                except Exception:
-                    abort_case_resources()
-                    raise
-            if _i != 0:
-                continue
-
-            if self.use_dual_gpu:
-                comparison_executor = None
-                try:
-                    comparison_executor = ThreadPoolExecutor(
-                        max_workers=1,
-                        thread_name_prefix="accuracy-stable-compare",
-                    )
-                    comparison_stage_started = True
-                    first_pair_comparison = comparison_executor.submit(
-                        self.compare_first_pair,
-                        paddle_output_pair[0],
-                        torch_output_pair[0],
-                        paddle_grad_pair[0],
-                        torch_grad_pair[0],
-                    )
-                except Exception:
-                    abort_case_resources()
-                    raise
-                finally:
-                    # Only one task is ever submitted. Closing submission immediately
-                    # lets the worker thread retire by itself when the future completes,
-                    # including paths that leave this method before the explicit join.
-                    if comparison_executor is not None:
-                        comparison_executor.shutdown(wait=False)
-            else:
-                self.compare(paddle_output_pair[0], torch_output_pair[0], "P1T1")
-                self.compare(paddle_grad_pair[0], torch_grad_pair[0], "P1T1B")
-
-            if self.use_dual_gpu:
-                continue
-            if not self.use_gpu_mode:
-                continue
-
-            torch_phase_bytes = self.tensor_tree_nbytes((torch_output_pair[0], torch_grad_pair[0]))
-            paddle_phase_bytes = self.tensor_tree_nbytes(
-                (paddle_output_pair[0], paddle_grad_pair[0])
-            )
-            retained_tree_bytes = torch_phase_bytes + paddle_phase_bytes
-            required_headroom_bytes = (
-                probe_bytes
-                + max(torch_phase_bytes, paddle_phase_bytes)
-                + self._reference_workspace_bytes(convert_result)
-            )
-            decision = gpu_mode_memory_decision(
-                self.gpu_mode_config,
-                request_spill=True,
-                probe_bytes=probe_bytes,
-                retained_tree_bytes=retained_tree_bytes,
-                required_headroom_bytes=required_headroom_bytes,
-            )
-            if decision.should_spill:
-                self.spill_tensor_tree_slot_to_cpu(torch_output_pair)
-                self.spill_tensor_tree_slot_to_cpu(paddle_output_pair)
-                self.spill_tensor_tree_slot_to_cpu(torch_grad_pair)
-                self.spill_tensor_tree_slot_to_cpu(paddle_grad_pair)
 
         summary_failed = False
         try:
             self.clear_original_cpu_inputs()
 
-            cleanup_comparison_stage(
+            self._cleanup_comparison_stage(
+                dual_state,
+                pairs,
                 discard_results=False,
                 release_cache=False,
             )
 
-            # ======== summary ========
-            # Finish all forward comparisons before touching the backward result
-            # family, so output residency does not overlap later grad diagnostics.
-            self.compare(paddle_output_pair[1], torch_output_pair[1], "P2T2")
-            self.compare(paddle_output_pair[1], torch_output_pair[0], "P2T1")
-            self.compare(paddle_output_pair[0], torch_output_pair[1], "P1T2")
-            self.compare(torch_output_pair[0], torch_output_pair[1], "T1T2")
-            self.compare(paddle_output_pair[0], paddle_output_pair[1], "P1P2")
-            torch_output_pair.clear()
-            paddle_output_pair.clear()
-
-            if staged_grad_slots:
-                # Clearing the lists only drops live output references. Return
-                # their cached blocks before restoring the staged grad family.
-                self.release_comparison_gpu_cache()
-                for pair, index in staged_grad_slots:
-                    pair[index] = self.move_tensor_tree_to_comparison_gpu(pair[index])
-                staged_grad_slots.clear()
-                self.release_compute_gpu_cache()
-
-            # Backward comparisons run after the forward result family is gone.
-            self.compare(paddle_grad_pair[1], torch_grad_pair[1], "P2T2B")
-            self.compare(paddle_grad_pair[1], torch_grad_pair[0], "P2T1B")
-            self.compare(paddle_grad_pair[0], torch_grad_pair[1], "P1T2B")
-            self.compare(torch_grad_pair[0], torch_grad_pair[1], "T1T2B")
-            torch_grad_pair.clear()
-            self.compare(paddle_grad_pair[0], paddle_grad_pair[1], "P1P2B")
-            paddle_grad_pair.clear()
-
+            self._run_summary_comparisons(pairs, dual_state)
             log_worker.write_stable_passes(self.api_config.config)
         except Exception:
             summary_failed = True
@@ -567,12 +597,16 @@ class APITestAccuracyStable(APITestBase):
             # Summary comparisons can fail before the success-path cleanup.
             # Clear result families first, then release both comparison allocators.
             if summary_failed:
-                abort_case_resources()
+                self._abort_case_resources(dual_state, pairs)
             else:
-                cleanup_comparison_stage(discard_results=True, release_cache=True)
+                self._cleanup_comparison_stage(
+                    dual_state,
+                    pairs,
+                    discard_results=True,
+                    release_cache=True,
+                )
 
     def get_torch_output(self, convert_result, iter_idx=0):
-        # ======== run torch forward ========:
         torch_output = None
         try:
             if not self.gen_torch_input():
@@ -583,7 +617,10 @@ class APITestAccuracyStable(APITestBase):
                 )
                 return None, None, None
 
-            exec_globals = {"torch": torch, "_adaptive_workspace_bytes": adaptive_workspace_bytes}
+            exec_globals = {
+                "torch": torch,
+                "_adaptive_workspace_bytes": adaptive_workspace_bytes,
+            }
             exec_locals = {
                 "args": self.torch_args,
                 "kwargs": self.torch_kwargs,
@@ -611,7 +648,7 @@ class APITestAccuracyStable(APITestBase):
             torch_output = exec_locals[output_var]
             paddle.base.core.eager._for_test_check_cuda_error()
         except Exception as err:
-            log_type, fatal = self.report_runtime_error(
+            _, fatal = self.report_runtime_error(
                 err,
                 "torch_error",
                 "forward",
@@ -621,7 +658,6 @@ class APITestAccuracyStable(APITestBase):
                 raise
             return None, None, None
 
-        # ======== run torch backward ========
         torch_grad_success = False
         torch_out_grads = []
         if self.need_check_grad():
@@ -667,7 +703,7 @@ class APITestAccuracyStable(APITestBase):
                         affected_comps=self._TORCH_AFFECTED_COMPS[iter_idx],
                     )
                     raise
-                log_type, fatal = self.report_runtime_error(
+                _, fatal = self.report_runtime_error(
                     err,
                     "torch_error",
                     "backward",
@@ -689,19 +725,11 @@ class APITestAccuracyStable(APITestBase):
                 )
                 raise
 
-        def process_torch_outputs(obj):
-            if isinstance(obj, (torch.return_types.max, torch.return_types.min)):
-                obj = obj.values
-            if isinstance(obj, (list, tuple)):
-                obj = list(obj)
-            return obj
-
-        torch_output = process_torch_outputs(torch_output)
-        torch_out_grads = process_torch_outputs(torch_out_grads)
+        torch_output = self._normalize_torch_result(torch_output)
+        torch_out_grads = self._normalize_torch_result(torch_out_grads)
         return torch_output, torch_out_grads, torch_grad_success
 
     def get_paddle_output(self, torch_grad_success, iter_idx=0):
-        # ======== run paddle forward ========
         paddle_output = None
         try:
             if not self.gen_paddle_input():
@@ -723,11 +751,9 @@ class APITestAccuracyStable(APITestBase):
                     if isinstance(arg, paddle.Tensor):
                         self.api_config.dtype = arg.dtype
                         break
-            # if there is no tensor in args and kwargs, use float32 as default
             if self.api_config.dtype is None:
                 self.api_config.dtype = paddle.float32
 
-            # find the first arg
             first_arg = (
                 self.paddle_args[0]
                 if len(self.paddle_args) > 0
@@ -745,7 +771,10 @@ class APITestAccuracyStable(APITestBase):
                 else:
                     if self.test_amp:
                         with paddle.amp.auto_cast():
-                            paddle_output = self.paddle_api(*self.paddle_args, **self.paddle_kwargs)
+                            paddle_output = self.paddle_api(
+                                *self.paddle_args,
+                                **self.paddle_kwargs,
+                            )
                     else:
                         paddle_output = self.paddle_api(*self.paddle_args, **self.paddle_kwargs)
             if (
@@ -753,7 +782,7 @@ class APITestAccuracyStable(APITestBase):
             ) or self.api_config.api_name == "paddle.Tensor.__setitem__":
                 paddle_output = first_arg
         except Exception as err:
-            log_type, fatal = self.report_runtime_error(
+            _, fatal = self.report_runtime_error(
                 err,
                 "paddle_error",
                 "forward",
@@ -776,7 +805,6 @@ class APITestAccuracyStable(APITestBase):
             )
             raise
 
-        # ======== run paddle backward ========
         paddle_out_grads = []
         if torch_grad_success:
             try:
@@ -849,13 +877,8 @@ class APITestAccuracyStable(APITestBase):
                 )
                 raise
 
-        def process_paddle_outputs(obj):
-            if isinstance(obj, (list, tuple)):
-                obj = list(obj)
-            return obj
-
-        paddle_output = process_paddle_outputs(paddle_output)
-        paddle_out_grads = process_paddle_outputs(paddle_out_grads)
+        paddle_output = self._normalize_paddle_result(paddle_output)
+        paddle_out_grads = self._normalize_paddle_result(paddle_out_grads)
         return paddle_output, paddle_out_grads
 
     @staticmethod

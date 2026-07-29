@@ -2399,7 +2399,7 @@ def _build_argument_parser():
         "--test_cpu",
         type=parse_bool,
         default=False,
-        help="Run Paddle in CPU mode.",
+        help="Run Paddle in CPU mode only; Torch reference still runs on GPU.",
     )
     parser.add_argument(
         "--use_cached_numpy",

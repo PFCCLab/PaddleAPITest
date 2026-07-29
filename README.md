@@ -114,6 +114,8 @@ python engineV4.py \
 
 常用附加参数包括 `--test_amp`、`--test_cpu`、`--atol`、`--rtol`、`--manual_threshold_config_file`、`--bitwise_alignment`、`--timeout`、`--random_seed`、`--generate_failed_tests` 和 `--exit_on_error`。
 
+`--test_cpu=True` 只用于验证 Paddle CPU kernel：Paddle 输入和执行切到 CPU；Torch reference 仍在 GPU 上生成和执行，用作稳定的对照实现。因此 CPU 测试仍允许也可能实际使用 GPU。
+
 ## 引擎与运行入口
 
 ### engineV4

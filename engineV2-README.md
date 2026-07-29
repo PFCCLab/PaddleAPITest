@@ -77,7 +77,7 @@
 | `--num_workers_per_gpu`          | int   | 每 GPU 的 worker 进程数（默认 1；gpu_mode 下 -1 表示每 GPU 1 个 worker）               |
 | `--gpu_ids`                      | str   | 使用的 GPU 序号，以逗号分隔或横线范围（默认 ""，"-1" 动态最大）                        |
 | `--test_amp`                     | bool  | 启用自动混合精度测试（默认 False）                                                     |
-| `--test_cpu`                     | bool  | 启用 Paddle CPU kernel 测试（默认 False）                   |
+| `--test_cpu`                     | bool  | 启用 Paddle CPU kernel 测试；Torch reference 仍在 GPU 上运行（默认 False） |
 | `--use_cached_numpy`             | bool  | 启用 Numpy 缓存（默认 False）                                                          |
 | `--log_dir`                      | str   | 日志输出路径（默认 "tester/api_config/test_log"）                                      |
 | `--atol`                         | float | 精度测试的绝对误差容忍度，仅在启用 `--accuracy` 时有效（默认 1e-2）                    |
