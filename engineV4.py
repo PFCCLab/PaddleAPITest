@@ -60,7 +60,6 @@ from tester.log_writer import (
     log_worker,
 )
 from tester.runtime_config import (
-    TestRuntimeConfig,
     limit_worker_layout,
     runtime_config_for_gpu,
 )
@@ -73,6 +72,7 @@ class GpuMemoryDeferred(Exception):
     """当 GPU 模式下的 case 需要等待更多可用显存时抛出。"""
 
 
+# 运行时透传给 test class 的选项白名单。
 VALID_TEST_ARGS = {
     "test_amp",
     "test_backward",
@@ -122,13 +122,60 @@ SANITIZER_FORWARD_ARGS = {
 }
 SANITIZER_FORWARD_ARGS_SORTED = tuple(sorted(SANITIZER_FORWARD_ARGS))
 
+# 运行时错误标记，避免在每个 case 里重复构造。
+OOM_ERROR_MARKERS = (
+    "cuda out of memory",
+    "out of memory error",
+    "resourceexhaustederror",
+    "out of memory",
+    "outofmemoryerror",
+    "cannot allocate memory",
+    "std::bad_alloc",
+    "bad allocation",
+    "memoryerror",
+    "cublas_status_alloc_failed",
+)
+CUDA_ERROR_MARKERS = (
+    "cuda error",
+    "memory corruption",
+    "illegal memory access",
+    "invalid configuration argument",
+    "invalid resource handle",
+)
+GPU_PERFORMANCE_MODES = (
+    "paddle_gpu_performance",
+    "torch_gpu_performance",
+    "paddle_torch_gpu_performance",
+)
+
+# 选择测试类的优先级顺序。
+TEST_CLASS_BY_OPTION = (
+    ("paddle_only", "APITestPaddleOnly"),
+    ("paddle_cinn", "APITestCINNVSDygraph"),
+    ("accuracy", "APITestAccuracy"),
+    ("paddle_gpu_performance", "APITestPaddleGPUPerformance"),
+    ("torch_gpu_performance", "APITestTorchGPUPerformance"),
+    ("paddle_torch_gpu_performance", "APITestPaddleTorchGPUPerformance"),
+    ("accuracy_stable_dual_gpu", "APITestAccuracyStable"),
+    ("accuracy_stable", "APITestAccuracyStable"),
+    ("paddle_custom_device", "APITestCustomDeviceVSCPU"),
+    ("custom_device_vs_gpu", "APITestPaddleDeviceVSGPU"),
+)
+
+# 设备探测命令和缓存状态。
+XPU_SMI_COMMAND = "xpu-smi"
+XPU_SMI_DEVICE_PATTERN = r"^\|\s*(\d+)\s+\S"
+ILUVATAR_SMI_COMMAND = "ixsmi"
+ILUVATAR_SMI_DEVICE_PATTERN = r"^\|\s*(\d+)\s+Iluvatar"
 DEVICE_TYPE = None
 DEVICE_TYPE_DETECTED = False
 DEVICE_COUNT = None  # 设备总数
-_MEM_SNAPSHOT = None  # 字典：gpu_id -> (total_gb, used_gb)
+_MEM_SNAPSHOT = None  # gpu_id -> (total_gb, used_gb)
 _MEM_SNAPSHOT_TS = 0.0
-_NVML_INITIALIZED = False  # 为重复显存查询保留的 NVML 会话
-_MEM_SNAPSHOT_TTL = 2.0  # 秒，快照缓存有效期
+_NVML_INITIALIZED = False  # 重复显存查询的 NVML 会话。
+_MEM_SNAPSHOT_TTL = 2.0  # 秒。
+
+# 调度与重试上限。
 MAX_TOTAL_WORKERS = 64
 MAX_EXTERNAL_KILL_RETRIES_PER_CASE = 1
 MAX_TOTAL_EXTERNAL_KILL_EVENTS = 3
@@ -150,6 +197,67 @@ class BatchRunState:
     shutdown_force: bool = False
     abort_run: bool = False
     active_tasks: int = 0
+
+
+@dataclass
+class CaseRuntimeContext:
+    started_at: float
+    gpu_id: int
+    comparison_gpu_id: int | None
+    suppress_case_tags: bool
+    runtime_config: object | None = None
+
+
+@dataclass
+class BatchConfigLoadResult:
+    api_configs: list[str]
+    all_case: int
+    read_count: int
+    skipped_non_config: int
+    duplicate_case: int
+    finish_case: int
+    removed_stale_logs: int
+
+
+@dataclass
+class BatchMessage:
+    msg_type: str
+    slot_index: int | None = None
+    config: str | None = None
+    exitcode: int | None = None
+    worker_pid: int | None = None
+    completed_offset: int | None = None
+    reason: str | None = None
+    crash_source: str = "worker"
+
+    @classmethod
+    def from_raw(cls, msg):
+        """把 batch 原始消息整理成结构化对象。"""
+        message = cls(
+            msg_type=msg[0],
+            slot_index=msg[1] if len(msg) > 1 else None,
+            config=msg[2] if len(msg) > 2 else None,
+        )
+        if message.msg_type == "done":
+            message.worker_pid = msg[3] if len(msg) > 3 else None
+            message.completed_offset = msg[4] if len(msg) > 4 else None
+        elif message.msg_type == "error":
+            message.reason = msg[3] if len(msg) > 3 else ""
+            message.worker_pid = msg[4] if len(msg) > 4 else None
+            message.completed_offset = msg[5] if len(msg) > 5 else None
+        elif message.msg_type == "deferred":
+            message.reason = msg[3] if len(msg) > 3 else "insufficient GPU memory"
+            message.worker_pid = msg[4] if len(msg) > 4 else None
+            message.completed_offset = msg[5] if len(msg) > 5 else None
+        elif message.msg_type == "crashed":
+            message.exitcode = msg[3] if len(msg) > 3 else None
+            if len(msg) > 5 and msg[5] == "child":
+                message.crash_source = "child"
+                message.worker_pid = msg[6] if len(msg) > 6 else None
+                message.completed_offset = msg[7] if len(msg) > 7 else None
+            else:
+                message.worker_pid = msg[4] if len(msg) > 4 else None
+        return message
 
 
 def cleanup(pool):
@@ -200,7 +308,10 @@ def _init_runtime_modules(options):
             paddle.set_device("gpu")
         _import_optional_runtime_module("paddlefleet_ops")
         _import_optional_runtime_module("FusedQuantOps")
-        globals().update(_load_test_classes(options))
+        import tester
+
+        test_class = _select_test_class(options)
+        globals().update({"APIConfig": tester.APIConfig, test_class.__name__: test_class})
 
 
 def _visible_gpu_ids(gpu_id, comparison_gpu_id=None):
@@ -538,21 +649,17 @@ def _sanitizer_worker_loop(
 class WorkerPool:
     """用于公平 GPU 调度的自定义进程池，每个 worker 对应一个队列。"""
 
-    def __init__(self, available_gpus, max_workers_per_gpu, options):
+    def __init__(self, available_gpus, max_workers_per_gpu, options, *, gpu_total_memory_map=None):
         # 将 argparse.Namespace 转成 SimpleNamespace，便于 worker 进程更干净地 pickle。
         if isinstance(options, argparse.Namespace):
             self.options = SimpleNamespace(**vars(options))
         else:
             self.options = options
         self.options.gpu_workers_per_gpu_map = dict(max_workers_per_gpu)
-        gpu_total_memory_map = {}
-        for gpu_id in available_gpus:
-            try:
-                gpu_total_memory_map[gpu_id] = get_memory_info(gpu_id)[0]
-            except Exception:
-                pass
-        self.options.gpu_total_memory_map = gpu_total_memory_map
-        self.options.runtime_config = TestRuntimeConfig.from_options(self.options)
+        if gpu_total_memory_map is None:
+            # 允许外部预先收集，避免主流程和进程池重复探测同一批 GPU。
+            gpu_total_memory_map = _build_gpu_total_memory_map(available_gpus)
+        self.options.gpu_total_memory_map = dict(gpu_total_memory_map)
         self.result_queue = mp.Queue()
         self.slots: list[WorkerSlot] = []
         self._shutdown_event = threading.Event()
@@ -813,7 +920,7 @@ class WorkerPool:
             log_aggregation.mark_inorder_case_complete(old_pid, completed_offset)
         if self._closed or self._shutdown_event.is_set():
             return
-        self.result_queue.put(("timeout", slot.index, config, old_pid))
+        self.result_queue.put(("timeout", slot.index, config))
         self._spawn_worker(slot)
 
     def _handle_crash(self, slot):
@@ -913,48 +1020,76 @@ class WorkerPool:
             self._close_queue(self.result_queue, cancel_join=force)
 
 
+def _smi_output(command):
+    return subprocess.check_output([command], text=True, stderr=subprocess.STDOUT)
+
+
+def _command_has_device(command, device_pattern):
+    if not shutil.which(command):
+        return False
+    try:
+        out = _smi_output(command)
+    except Exception:
+        return False
+    return any(re.match(device_pattern, line) for line in out.splitlines())
+
+
+def _count_smi_devices(command, device_pattern, *, stop_at_processes=False):
+    ids = set()
+    for line in _smi_output(command).splitlines():
+        if stop_at_processes and "Processes:" in line:
+            break
+        m = re.match(device_pattern, line)
+        if m:
+            ids.add(int(m.group(1)))
+    return len(ids)
+
+
+def _read_smi_memory_snapshot(command, device_pattern):
+    snapshot = {}
+    lines = _smi_output(command).splitlines()
+    for i, line in enumerate(lines):
+        m = re.match(device_pattern, line)
+        if not m:
+            continue
+        dev_id = int(m.group(1))
+        for mem_line in lines[i + 1 : min(i + 8, len(lines))]:
+            mm = re.search(r"(\d+)\s*MiB\s*/\s*(\d+)\s*MiB", mem_line)
+            if mm:
+                used_mib = int(mm.group(1))
+                total_mib = int(mm.group(2))
+                snapshot[dev_id] = (total_mib / 1024.0, used_mib / 1024.0)
+                break
+    return snapshot
+
+
 def detect_device_type() -> str:
     global DEVICE_TYPE, DEVICE_TYPE_DETECTED, _NVML_INITIALIZED
     if DEVICE_TYPE_DETECTED:
         return DEVICE_TYPE
 
-    # 优先尝试 NVML（NVIDIA GPU）
+    # 探测顺序决定运行后端优先级：NVIDIA GPU > XPU > Iluvatar > CPU。
     try:
         if not _NVML_INITIALIZED:
             pynvml.nvmlInit()
             _NVML_INITIALIZED = True
-        count = pynvml.nvmlDeviceGetCount()
-        if count > 0:
+        if pynvml.nvmlDeviceGetCount() > 0:
             DEVICE_TYPE = "gpu"
             DEVICE_TYPE_DETECTED = True
             return DEVICE_TYPE
     except Exception:
-        # 如果没有 NVML 或不是 NVIDIA，就忽略错误并继续探测。
+        # 没有 NVML 或不是 NVIDIA 环境时继续探测其他后端。
         pass
 
-    # 再尝试 XPU
-    if shutil.which("xpu-smi"):
-        try:
-            out = subprocess.check_output(["xpu-smi"], text=True, stderr=subprocess.STDOUT)
-            if any(re.match(r"^\|\s*\d+\s+\S", line) for line in out.splitlines()):
-                DEVICE_TYPE = "xpu"
-                DEVICE_TYPE_DETECTED = True
-                return DEVICE_TYPE
-        except Exception:
-            pass
+    for device_type, command, device_pattern in (
+        ("xpu", XPU_SMI_COMMAND, XPU_SMI_DEVICE_PATTERN),
+        ("iluvatar_gpu", ILUVATAR_SMI_COMMAND, ILUVATAR_SMI_DEVICE_PATTERN),
+    ):
+        if _command_has_device(command, device_pattern):
+            DEVICE_TYPE = device_type
+            DEVICE_TYPE_DETECTED = True
+            return DEVICE_TYPE
 
-    # 再尝试 Iluvatar
-    if shutil.which("ixsmi"):
-        try:
-            out = subprocess.check_output(["ixsmi"], text=True, stderr=subprocess.STDOUT)
-            if any(re.match(r"^\|\s*\d+\s+Iluvatar", line) for line in out.splitlines()):
-                DEVICE_TYPE = "iluvatar_gpu"
-                DEVICE_TYPE_DETECTED = True
-                return DEVICE_TYPE
-        except Exception:
-            pass
-
-    # 都没有则视为 CPU
     DEVICE_TYPE = "cpu"
     DEVICE_TYPE_DETECTED = True
     return DEVICE_TYPE
@@ -977,25 +1112,15 @@ def get_device_count() -> int:
         return count
 
     if device_type == "xpu":
-        out = subprocess.check_output(["xpu-smi"], text=True, stderr=subprocess.STDOUT)
-        ids = set()
-        for line in out.splitlines():
-            if "Processes:" in line:
-                break
-            m = re.match(r"^\|\s*(\d+)\s+\S", line)
-            if m:
-                ids.add(int(m.group(1)))
-        DEVICE_COUNT = len(ids)
+        DEVICE_COUNT = _count_smi_devices(
+            XPU_SMI_COMMAND,
+            XPU_SMI_DEVICE_PATTERN,
+            stop_at_processes=True,
+        )
         return DEVICE_COUNT
 
     if device_type == "iluvatar_gpu":
-        out = subprocess.check_output(["ixsmi"], text=True, stderr=subprocess.STDOUT)
-        ids = set()
-        for line in out.splitlines():
-            m = re.match(r"^\|\s*(\d+)\s+Iluvatar", line)
-            if m:
-                ids.add(int(m.group(1)))
-        DEVICE_COUNT = len(ids)
+        DEVICE_COUNT = _count_smi_devices(ILUVATAR_SMI_COMMAND, ILUVATAR_SMI_DEVICE_PATTERN)
         return DEVICE_COUNT
 
     # CPU 场景 / 无加速器场景
@@ -1010,37 +1135,13 @@ def _refresh_snapshot(device_type):
     if now - _MEM_SNAPSHOT_TS < _MEM_SNAPSHOT_TTL and _MEM_SNAPSHOT is not None:
         return
 
-    snapshot = {}
     if device_type == "xpu":
-        out = subprocess.check_output(["xpu-smi"], text=True, stderr=subprocess.STDOUT)
-        lines = out.splitlines()
-        for i, line in enumerate(lines):
-            m = re.match(r"^\|\s*(\d+)\s+\S", line)
-            if m:
-                dev_id = int(m.group(1))
-                for j in range(i + 1, min(i + 8, len(lines))):
-                    mm = re.search(r"(\d+)\s*MiB\s*/\s*(\d+)\s*MiB", lines[j])
-                    if mm:
-                        used_mib = int(mm.group(1))
-                        total_mib = int(mm.group(2))
-                        snapshot[dev_id] = (total_mib / 1024.0, used_mib / 1024.0)
-                        break
-
+        snapshot = _read_smi_memory_snapshot(XPU_SMI_COMMAND, XPU_SMI_DEVICE_PATTERN)
     elif device_type == "iluvatar_gpu":
-        out = subprocess.check_output(["ixsmi"], text=True, stderr=subprocess.STDOUT)
-        lines = out.splitlines()
-        for i, line in enumerate(lines):
-            m = re.match(r"^\|\s*(\d+)\s+Iluvatar", line)
-            if m:
-                dev_id = int(m.group(1))
-                for j in range(i + 1, min(i + 8, len(lines))):
-                    mm = re.search(r"(\d+)\s*MiB\s*/\s*(\d+)\s*MiB", lines[j])
-                    if mm:
-                        used_mib = int(mm.group(1))
-                        total_mib = int(mm.group(2))
-                        snapshot[dev_id] = (total_mib / 1024.0, used_mib / 1024.0)
-                        break
-
+        snapshot = _read_smi_memory_snapshot(
+            ILUVATAR_SMI_COMMAND,
+            ILUVATAR_SMI_DEVICE_PATTERN,
+        )
     else:
         # NVIDIA GPU 场景不使用快照，直接调用 NVML。
         _MEM_SNAPSHOT = None
@@ -1071,6 +1172,16 @@ def get_memory_info(gpu_id):
         return _MEM_SNAPSHOT[gpu_id]
 
     raise RuntimeError("No supported accelerator (GPU / XPU / Iluvatar) detected.")
+
+
+def _build_gpu_total_memory_map(available_gpus):
+    gpu_total_memory_map = {}
+    for gpu_id in available_gpus:
+        try:
+            gpu_total_memory_map[gpu_id] = get_memory_info(gpu_id)[0]
+        except Exception:
+            pass
+    return gpu_total_memory_map
 
 
 ARGUMENT_ERROR_PREFIX = "[argument error]"
@@ -1109,38 +1220,18 @@ def _mode_uses_torch(options):
     )
 
 
-def _load_test_classes(options):
+def _select_test_class(options):
     import tester
 
-    class_name = _selected_test_class_name(options)
-    return {
-        "APIConfig": tester.APIConfig,
-        class_name: getattr(tester, class_name),
-    }
-
-
-def _selected_test_class_name(options):
-    option_to_class_name = {
-        "paddle_only": "APITestPaddleOnly",
-        "paddle_cinn": "APITestCINNVSDygraph",
-        "accuracy": "APITestAccuracy",
-        "paddle_gpu_performance": "APITestPaddleGPUPerformance",
-        "torch_gpu_performance": "APITestTorchGPUPerformance",
-        "paddle_torch_gpu_performance": "APITestPaddleTorchGPUPerformance",
-        "accuracy_stable_dual_gpu": "APITestAccuracyStable",
-        "accuracy_stable": "APITestAccuracyStable",
-        "paddle_custom_device": "APITestCustomDeviceVSCPU",
-        "custom_device_vs_gpu": "APITestPaddleDeviceVSGPU",
-    }
-    for option, class_name in option_to_class_name.items():
-        if getattr(options, option, False):
-            return class_name
-    return "APITestAccuracy"
-
-
-def _select_test_class(options):
-    test_classes = _load_test_classes(options)
-    return test_classes[_selected_test_class_name(options)]
+    class_name = next(
+        (
+            class_name
+            for option, class_name in TEST_CLASS_BY_OPTION
+            if getattr(options, option, False)
+        ),
+        "APITestAccuracy",
+    )
+    return getattr(tester, class_name)
 
 
 def _clear_device_cache(options):
@@ -1287,7 +1378,6 @@ def _prepare_single_config_gpu(options):
     if options.test_cpu:
         options.gpu_workers_per_gpu_map = {}
         options.gpu_total_memory_map = {}
-        options.runtime_config = TestRuntimeConfig.from_options(options)
         return None
 
     _apply_single_config_gpu_defaults(options)
@@ -1299,20 +1389,8 @@ def _prepare_single_config_gpu(options):
             f"got {len(gpu_ids)} GPUs: {gpu_ids}"
         )
     os.environ["CUDA_VISIBLE_DEVICES"] = ",".join(str(gpu_id) for gpu_id in gpu_ids)
-    options.gpu_total_memory_map = {}
-    for gpu_id in gpu_ids:
-        try:
-            options.gpu_total_memory_map[gpu_id] = get_memory_info(gpu_id)[0]
-        except Exception:
-            pass
+    options.gpu_total_memory_map = _build_gpu_total_memory_map(gpu_ids)
     options.gpu_workers_per_gpu_map = dict.fromkeys(gpu_ids, 1)
-    options.runtime_config = TestRuntimeConfig.from_options(options)
-    comparison_gpu_id = gpu_ids[1] if len(gpu_ids) == 2 else None
-    options.runtime_config = runtime_config_for_gpu(
-        options,
-        gpu_ids[0],
-        comparison_gpu_id=comparison_gpu_id,
-    )
     return gpu_ids
 
 
@@ -1397,8 +1475,11 @@ def check_gpu_memory(gpu_ids, num_workers_per_gpu):
     for gpu_id in gpu_ids:
         try:
             get_memory_info(gpu_id)
-        except pynvml.NVMLError as e:
-            print(f"[warn] Failed to check GPU {gpu_id}: {e!s}", flush=True)
+        except Exception as e:
+            print(
+                f"[warn] Failed to check accelerator {gpu_id}: {type(e).__name__}: {e!s}",
+                flush=True,
+            )
             continue
         available_gpus.append(gpu_id)
         max_workers_per_gpu[gpu_id] = 1 if num_workers_per_gpu == -1 else num_workers_per_gpu
@@ -1414,22 +1495,6 @@ def limit_dual_gpu_worker_layout(available_gpus, pending_cases):
     pair_count = min(len(available_gpus) // 2, pair_budget)
     selected_gpus = list(available_gpus[: pair_count * 2])
     return selected_gpus, dict.fromkeys(selected_gpus, 1)
-
-
-def _requeue_retry_case(pending_dispatch, api_config_str):
-    """把需要重试的 case 放回 pending 队首。"""
-    pending_dispatch.insert(0, api_config_str)
-
-
-def validate_configured_worker_count(
-    configured_worker_count, *, max_total_workers=MAX_TOTAL_WORKERS
-):
-    """拒绝会创建过多进程的 worker 布局。"""
-    if configured_worker_count > max_total_workers:
-        raise ValueError(
-            f"configured worker count {configured_worker_count} exceeds the engine limit "
-            f"{max_total_workers}"
-        )
 
 
 def _handle_external_kill_retry(
@@ -1452,7 +1517,7 @@ def _handle_external_kill_retry(
     retry_count = retry_state.per_case_external_kill_retries.get(api_config_str, 0)
     if retry_count < max_case_retries:
         retry_state.per_case_external_kill_retries[api_config_str] = retry_count + 1
-        _requeue_retry_case(pending_dispatch, api_config_str)
+        pending_dispatch.appendleft(api_config_str)
         return True
 
     retry_state.unsafe_environment = True
@@ -1468,21 +1533,29 @@ def resolve_batch_worker_layout(
 ):
     """校验并裁剪当前 batch 的 worker 布局。"""
     if dual_gpu:
-        configured_worker_count = len(available_gpus) // 2
-        validate_configured_worker_count(configured_worker_count)
         available_gpus, max_workers_per_gpu = limit_dual_gpu_worker_layout(
             available_gpus,
             pending_cases,
         )
+        configured_worker_count = len(available_gpus) // 2
+        if configured_worker_count > MAX_TOTAL_WORKERS:
+            raise ValueError(
+                f"configured worker count {configured_worker_count} exceeds the engine limit "
+                f"{MAX_TOTAL_WORKERS}"
+            )
         gpu_pairs = list(zip(available_gpus[::2], available_gpus[1::2], strict=True))
     else:
-        configured_worker_count = sum(max_workers_per_gpu.values())
-        validate_configured_worker_count(configured_worker_count)
         available_gpus, max_workers_per_gpu = limit_worker_layout(
             available_gpus,
             max_workers_per_gpu,
             pending_cases,
         )
+        configured_worker_count = sum(max_workers_per_gpu.values())
+        if configured_worker_count > MAX_TOTAL_WORKERS:
+            raise ValueError(
+                f"configured worker count {configured_worker_count} exceeds the engine limit "
+                f"{MAX_TOTAL_WORKERS}"
+            )
         gpu_pairs = None
     return available_gpus, max_workers_per_gpu, gpu_pairs
 
@@ -1495,7 +1568,7 @@ def _fill_idle_workers(pool, pending_dispatch, config_iter):
         if slot is None:
             break
         if pending_dispatch:
-            config = pending_dispatch.pop(0)
+            config = pending_dispatch.popleft()
         else:
             config = next(config_iter, None)
         if config is None:
@@ -1517,46 +1590,24 @@ def _handle_batch_result(
     max_total_external_kills,
 ):
     """处理单条 case 终态消息，并维护批处理状态。"""
-    msg_type = msg[0]
-    slot_idx = msg[1]
-    config = msg[2]
-    exitcode = msg[3] if msg_type == "crashed" and len(msg) > 3 else None
-    crash_source = "worker"
-    worker_pid = None
-    completed_offset = None
-    reason = None
+    message = BatchMessage.from_raw(msg)
+    msg_type = message.msg_type
+    config = message.config
+    slot_index = message.slot_index
+    exitcode = message.exitcode
+    crash_source = message.crash_source
+    reason = message.reason
 
-    if msg_type == "done":
-        worker_pid = msg[3] if len(msg) > 3 else None
-        completed_offset = msg[4] if len(msg) > 4 else None
-    elif msg_type == "error":
-        reason = msg[3] if len(msg) > 3 else ""
-        worker_pid = msg[4] if len(msg) > 4 else None
-        completed_offset = msg[5] if len(msg) > 5 else None
-    elif msg_type == "timeout":
-        worker_pid = msg[3] if len(msg) > 3 else None
-    elif msg_type == "deferred":
-        reason = msg[3] if len(msg) > 3 else "insufficient GPU memory"
-        worker_pid = msg[4] if len(msg) > 4 else None
-        completed_offset = msg[5] if len(msg) > 5 else None
-    elif msg_type == "crashed":
-        if len(msg) > 5 and msg[5] == "child":
-            crash_source = "child"
-            worker_pid = msg[6] if len(msg) > 6 else None
-            completed_offset = msg[7] if len(msg) > 7 else None
-        else:
-            worker_pid = msg[4] if len(msg) > 4 else None
-
-    if worker_pid is not None:
-        log_aggregation.mark_inorder_case_complete(worker_pid, completed_offset)
+    if message.worker_pid is not None:
+        log_aggregation.mark_inorder_case_complete(
+            message.worker_pid,
+            message.completed_offset,
+        )
 
     worker_reusable = msg_type in ("done", "error", "deferred") or (
         msg_type == "crashed" and options.use_compute_sanitizer and crash_source == "child"
     )
-    external_kill = msg_type == "crashed" and exitcode in (
-        -signal.SIGKILL,
-        -signal.SIGTERM,
-    )
+    external_kill = msg_type == "crashed" and exitcode in (-signal.SIGKILL, -signal.SIGTERM)
     batch_state.active_tasks -= 1
 
     if external_kill:
@@ -1569,7 +1620,7 @@ def _handle_batch_result(
         ):
             log_report.print_case_notice("RETRY", config, f"exit {exitcode}")
             if worker_reusable:
-                pool.mark_idle(slot_idx)
+                pool.mark_idle(slot_index)
         else:
             log_report.print_case_notice(
                 "ABORT",
@@ -1583,7 +1634,7 @@ def _handle_batch_result(
         return
 
     if worker_reusable:
-        pool.mark_idle(slot_idx)
+        pool.mark_idle(slot_index)
 
     if msg_type == "deferred":
         pending_dispatch.append(config)
@@ -1668,8 +1719,16 @@ def _run_batch_mode(
     try:
         # batch 执行分为三段：
         # 启动 worker、处理结果、收尾日志和信号处理器。
-        print("\n--- RUNNING")
-        pool = WorkerPool(available_gpus, max_workers_per_gpu, options)
+        log_report.print_running_banner()
+        # 批量路径只在这里统一收集一次，避免池内再次探测同一批 GPU。
+        gpu_total_memory_map = _build_gpu_total_memory_map(available_gpus)
+
+        pool = WorkerPool(
+            available_gpus,
+            max_workers_per_gpu,
+            options,
+            gpu_total_memory_map=gpu_total_memory_map,
+        )
 
         def cleanup_handler(*args):
             cleanup(pool)
@@ -1694,70 +1753,13 @@ def _run_batch_mode(
             print("Workers: failed | no worker became ready", flush=True)
             batch_state.batch_exit_code = 1
             batch_state.shutdown_force = True
+            batch_state.abort_run = True
 
         config_iter = iter(api_configs)
-        pending_dispatch = []
+        pending_dispatch = deque()
         batch_state.abort_run = ready_workers == 0
 
-        # 先把当前已经空闲的 worker 填满，让首轮尽快开始。
-        if not batch_state.abort_run:
-            batch_state.active_tasks += _fill_idle_workers(pool, pending_dispatch, config_iter)
-
-        # 主循环只负责收消息、补空闲 worker、以及把结果交给专门的处理逻辑。
-        while (batch_state.active_tasks > 0 or pending_dispatch) and not batch_state.abort_run:
-            msg = pool.collect_one(timeout=5.0)
-            if msg is None:
-                if not batch_state.abort_run:
-                    batch_state.active_tasks += _fill_idle_workers(
-                        pool,
-                        pending_dispatch,
-                        config_iter,
-                    )
-                continue
-
-            if pool._handle_worker_control_message(msg):
-                if not batch_state.abort_run:
-                    batch_state.active_tasks += _fill_idle_workers(
-                        pool,
-                        pending_dispatch,
-                        config_iter,
-                    )
-                continue
-
-            msg_type = msg[0]
-
-            if msg_type == "ack":
-                slot_idx = msg[1]
-                with pool._lock:
-                    pool.slots[slot_idx].task_start_time = time.time()
-                if not batch_state.abort_run:
-                    batch_state.active_tasks += _fill_idle_workers(
-                        pool,
-                        pending_dispatch,
-                        config_iter,
-                    )
-                continue
-
-            if msg_type not in ("done", "error", "timeout", "deferred", "crashed"):
-                if not batch_state.abort_run:
-                    batch_state.active_tasks += _fill_idle_workers(
-                        pool,
-                        pending_dispatch,
-                        config_iter,
-                    )
-                continue
-
-            _handle_batch_result(
-                pool=pool,
-                options=options,
-                all_case=all_case,
-                batch_state=batch_state,
-                retry_state=retry_state,
-                pending_dispatch=pending_dispatch,
-                msg=msg,
-                max_total_external_kills=max_total_external_kills,
-            )
-
+        def refill_idle_workers():
             if not batch_state.abort_run:
                 batch_state.active_tasks += _fill_idle_workers(
                     pool,
@@ -1765,10 +1767,37 @@ def _run_batch_mode(
                     config_iter,
                 )
 
+        # 先把当前已经空闲的 worker 填满，让首轮尽快开始。
+        if not batch_state.abort_run:
+            refill_idle_workers()
+
+        # 主循环只负责收消息、补空闲 worker、以及把结果交给专门的处理逻辑。
+        while (batch_state.active_tasks > 0 or pending_dispatch) and not batch_state.abort_run:
+            msg = pool.collect_one(timeout=5.0)
+            if msg is not None and not pool._handle_worker_control_message(msg):
+                msg_type = msg[0]
+                if msg_type == "ack":
+                    slot_idx = msg[1]
+                    with pool._lock:
+                        pool.slots[slot_idx].task_start_time = time.time()
+                elif msg_type in ("done", "error", "timeout", "deferred", "crashed"):
+                    _handle_batch_result(
+                        pool=pool,
+                        options=options,
+                        all_case=all_case,
+                        batch_state=batch_state,
+                        retry_state=retry_state,
+                        pending_dispatch=pending_dispatch,
+                        msg=msg,
+                        max_total_external_kills=max_total_external_kills,
+                    )
+            refill_idle_workers()
+
     except Exception as e:
         print(f"Unexpected error: {e}", flush=True)
         batch_state.batch_exit_code = 1
         batch_state.shutdown_force = True
+        batch_state.abort_run = True
     finally:
         # 在进入 pool 清理前恢复进程级信号处理器。
         _restore_batch_signal_handlers(previous_signal_handlers)
@@ -1794,8 +1823,7 @@ def _run_batch_mode(
     return batch_state.batch_exit_code
 
 
-def run_test_case(api_config_str, options):
-    """运行指定 API 配置的单个测试 case。"""
+def _build_case_runtime_context(api_config_str, options):
     started_at = time.monotonic()
     visible_gpu_ids = tuple(
         int(value) for value in os.environ.get("CUDA_VISIBLE_DEVICES", "0").split(",")
@@ -1815,14 +1843,150 @@ def run_test_case(api_config_str, options):
             gpu=gpu_id,
             paddle_version=options.paddle_version,
         )
+    return CaseRuntimeContext(
+        started_at=started_at,
+        gpu_id=gpu_id,
+        comparison_gpu_id=comparison_gpu_id,
+        suppress_case_tags=suppress_case_tags,
+    )
+
+
+def _handle_case_exception(api_config_str, err, options):
+    err_msg = str(err).lower()
+    terminal_log_type = log_worker.get_terminal_log_type(api_config_str)
+    fatal_log_type = None
+    if any(marker in err_msg for marker in OOM_ERROR_MARKERS):
+        fatal_log_type = "oom"
+    elif terminal_log_type == "torch_error" and any(
+        marker in err_msg for marker in CUDA_ERROR_MARKERS
+    ):
+        fatal_log_type = "torch_error"
+    elif any(marker in err_msg for marker in CUDA_ERROR_MARKERS):
+        fatal_log_type = "paddle_cuda"
+    if fatal_log_type is not None:
+        exit_code = log_worker.fatal_exit_code(fatal_log_type, terminal_log_type == fatal_log_type)
+        if dump_enabled():
+            record_dump_terminal_status("engine_fatal", exit_code=exit_code, error=str(err))
+        try:
+            log_runtime.close_process_files()
+        finally:
+            try:
+                log_worker.restore_stdio()
+            finally:
+                os._exit(exit_code)
+    if terminal_log_type is not None:
+        return True
+    print(f"[test error] {api_config_str}: {err}", flush=True)
+    return False
+
+
+def _cleanup_case_runtime(options):
+    if not getattr(options, "use_gpu_mode", False):
+        gc.collect()
+    if not any(getattr(options, opt) for opt in GPU_PERFORMANCE_MODES) and not getattr(
+        options, "use_gpu_mode", False
+    ):
+        _clear_device_cache(options)
+
+
+def _validate_input_sources(options):
+    input_sources = (
+        bool(options.api_config),
+        bool(options.api_config_file),
+        bool(options.api_config_file_pattern),
+        bool(options.retest),
+    )
+    if sum(input_sources) != 1:
+        return _argument_error(
+            "exactly one of --api_config, --api_config_file, "
+            "--api_config_file_pattern, or --retest is required"
+        )
+    return None
+
+
+def _validate_test_mode(options):
+    mode = [
+        options.accuracy,
+        options.paddle_only,
+        options.paddle_cinn,
+        options.paddle_gpu_performance,
+        options.torch_gpu_performance,
+        options.paddle_torch_gpu_performance,
+        options.accuracy_stable,
+        options.paddle_custom_device,
+        options.custom_device_vs_gpu,
+    ]
+    if len([m for m in mode if m is True]) != 1:
+        return _argument_error(TEST_MODE_ERROR)
+    return None
+
+
+def _load_custom_device_options(options):
+    bos_config_path = Path("tester/bos_config.yaml")
+    if not bos_config_path.exists():
+        print(f"BOS config file not found: {bos_config_path}", flush=True)
+        return 2
+    try:
+        with open(bos_config_path, encoding="utf-8") as f:
+            bos_config_data = yaml.safe_load(f)
+        if not bos_config_data:
+            print(f"BOS config file is empty: {bos_config_path}", flush=True)
+            return 2
+        required_keys = ["bos_path", "bos_conf_path", "bcecmd_path"]
+        missing_keys = [key for key in required_keys if key not in bos_config_data]
+        if missing_keys:
+            print(f"Missing required keys in BOS config: {missing_keys}", flush=True)
+            return 2
+        options.operation_mode = options.custom_device_vs_gpu_mode
+        options.bos_path = bos_config_data["bos_path"]
+        options.bos_conf_path = bos_config_data["bos_conf_path"]
+        options.bcecmd_path = bos_config_data["bcecmd_path"]
+    except Exception as err:
+        print(f"Failed to load BOS config file {bos_config_path}: {err}", flush=True)
+        return 2
+    return None
+
+
+def _apply_runtime_environment_flags(options):
+    if options.use_gpu_mode and options.use_cached_numpy:
+        _print_argument(
+            ARGUMENT_WARNING_PREFIX,
+            "--use_cached_numpy=True is ignored because --use_gpu_mode=True uses GPU "
+            "tensor generation",
+        )
+        options.use_cached_numpy = False
+    os.environ["USE_CACHED_NUMPY"] = str(options.use_cached_numpy)
+    os.environ["USE_GPU_MODE"] = str(options.use_gpu_mode)
+    if options.bitwise_alignment:
+        options.atol = 0.0
+        options.rtol = 0.0
+
+
+def _detect_paddle_version():
+    try:
+        from importlib.metadata import version as _pkg_version
+
+        return _pkg_version("paddlepaddle-gpu")
+    except Exception:
+        try:
+            from importlib.metadata import version as _pkg_version
+
+            return _pkg_version("paddlepaddle")
+        except Exception:
+            return "unknown"
+
+
+def run_test_case(api_config_str, options):
+    """运行指定 API 配置的单个测试 case。"""
+    case_context = _build_case_runtime_context(api_config_str, options)
+    test_class = api_config = case = None
     case_status = "done"
     try:
-        runtime_config = runtime_config_for_gpu(
+        case_context.runtime_config = runtime_config_for_gpu(
             options,
-            gpu_id,
-            comparison_gpu_id=comparison_gpu_id,
+            case_context.gpu_id,
+            comparison_gpu_id=case_context.comparison_gpu_id,
         )
-
         try:
             api_config = APIConfig(api_config_str)
         except Exception as err:
@@ -1833,7 +1997,7 @@ def run_test_case(api_config_str, options):
 
         test_class = _select_test_class(options)
         kwargs = {k: v for k, v in vars(options).items() if k in VALID_TEST_ARGS}
-        kwargs["runtime_config"] = runtime_config
+        kwargs["runtime_config"] = case_context.runtime_config
         case = test_class(api_config, **kwargs)
         try:
             if dump_enabled():
@@ -1841,67 +2005,12 @@ def run_test_case(api_config_str, options):
             else:
                 case.test()
         except Exception as err:
-            err_msg = str(err).lower()
-            terminal_log_type = log_worker.get_terminal_log_type(api_config_str)
-            oom_markers = (
-                "cuda out of memory",
-                "out of memory error",
-                "resourceexhaustederror",
-                "out of memory",
-                "outofmemoryerror",
-                "cannot allocate memory",
-                "std::bad_alloc",
-                "bad allocation",
-                "memoryerror",
-                "cublas_status_alloc_failed",
-            )
-            cuda_markers = (
-                "cuda error",
-                "memory corruption",
-                "illegal memory access",
-                "invalid configuration argument",
-                "invalid resource handle",
-            )
-            fatal_log_type = None
-            if any(marker in err_msg for marker in oom_markers):
-                fatal_log_type = "oom"
-            elif terminal_log_type == "torch_error" and any(
-                marker in err_msg for marker in cuda_markers
-            ):
-                fatal_log_type = "torch_error"
-            elif any(marker in err_msg for marker in cuda_markers):
-                fatal_log_type = "paddle_cuda"
-            if fatal_log_type is not None:
-                exit_code = log_worker.fatal_exit_code(
-                    fatal_log_type, terminal_log_type == fatal_log_type
-                )
-                if dump_enabled():
-                    record_dump_terminal_status("engine_fatal", exit_code=exit_code, error=str(err))
-                try:
-                    log_runtime.close_process_files()
-                finally:
-                    try:
-                        log_worker.restore_stdio()
-                    finally:
-                        os._exit(exit_code)
-            if terminal_log_type is not None:
+            if _handle_case_exception(api_config_str, err, options):
                 return
-            # 如果不是致命错误，子进程会继续存活并上报错误。
-            print(f"[test error] {api_config_str}: {err}", flush=True)
             raise
         finally:
             del test_class, api_config, case
-            if not getattr(options, "use_gpu_mode", False):
-                gc.collect()
-            if not any(
-                getattr(options, opt)
-                for opt in (
-                    "paddle_gpu_performance",
-                    "torch_gpu_performance",
-                    "paddle_torch_gpu_performance",
-                )
-            ) and not getattr(options, "use_gpu_mode", False):
-                _clear_device_cache(options)
+            _cleanup_case_runtime(options)
 
     except GpuMemoryDeferred:
         case_status = "deferred"
@@ -1910,33 +2019,294 @@ def run_test_case(api_config_str, options):
         case_status = "error"
         raise
     finally:
-        if not suppress_case_tags:
+        if not case_context.suppress_case_tags:
             log_worker.write_case_end(
                 case_status,
                 api_config_str=api_config_str,
-                duration_ms=round((time.monotonic() - started_at) * 1000),
+                duration_ms=round((time.monotonic() - case_context.started_at) * 1000),
             )
 
 
-def main():
-    start_time = time.time()
+def _prepare_common_options(options, paddle_version):
     try:
-        set_start_method("spawn")
-    except RuntimeError:
-        pass
+        options.retest_types = log_retest.parse_retest_types(options.retest)
+    except ValueError as err:
+        return _argument_error(str(err))
 
+    normalize_accuracy_stable_dual_gpu_options(options)
+    if options.api_config and not options.test_cpu:
+        _apply_single_config_gpu_defaults(options)
+
+    common_error = _validate_input_sources(options)
+    if common_error is not None:
+        return common_error
+
+    mode_error = _validate_test_mode(options)
+    if mode_error is not None:
+        return mode_error
+
+    if not options._sanitizer_child:
+        log_report.print_run_header(options, paddle_version)
+
+    if options.use_dump:
+        if not options.api_config or options.api_config_file or options.api_config_file_pattern:
+            return _argument_error("dump only supports single --api_config runs")
+        if not (options.accuracy or options.paddle_only):
+            return _argument_error("dump currently supports only --accuracy or --paddle_only")
+
+    if options.custom_device_vs_gpu:
+        custom_device_error = _load_custom_device_options(options)
+        if custom_device_error is not None:
+            return custom_device_error
+
+    if options.test_tol and not options.accuracy:
+        _print_argument(
+            ARGUMENT_WARNING_PREFIX, "--test_tol takes effect only when --accuracy=True"
+        )
+    if options.test_backward and not options.paddle_cinn:
+        _print_argument(
+            ARGUMENT_WARNING_PREFIX, "--test_backward takes effect only when --paddle_cinn=True"
+        )
+    _apply_runtime_environment_flags(options)
+    return None
+
+
+def _run_sanitizer_child_mode(options):
     try:
-        from importlib.metadata import version as _pkg_version
-
-        paddle_version = _pkg_version("paddlepaddle-gpu")
-    except Exception:
+        _init_worker_runtime(None, None, None, options, redirect_output=False)
+        options.api_config = options.api_config.strip()
+        run_test_case(options.api_config, options)
+    except SystemExit:
+        raise
+    except Exception as err:
+        print(f"[test error] {options.api_config}: {err}", flush=True)
+        return 2
+    finally:
         try:
-            from importlib.metadata import version as _pkg_version
-
-            paddle_version = _pkg_version("paddlepaddle")
+            log_runtime.close_process_files()
         except Exception:
-            paddle_version = "unknown"
+            pass
+    return 0
 
+
+def _load_retest_configs(options, removed_stale_logs):
+    api_configs = log_retest.prepare_retest(options.retest_types)
+    removed_stale_logs = log_retest.cleanup_uncheckpointed_result_logs()
+    finish_configs = log_runtime.read_log("checkpoint")
+    api_config_count = len(api_configs)
+    skipped_non_config = 0
+    dup_case = 0
+    read_count = api_config_count
+    api_configs = sorted(api_configs - finish_configs)
+    all_case = len(api_configs)
+    finish_case = api_config_count - all_case
+    return BatchConfigLoadResult(
+        api_configs=api_configs,
+        all_case=all_case,
+        read_count=read_count,
+        skipped_non_config=skipped_non_config,
+        duplicate_case=dup_case,
+        finish_case=finish_case,
+        removed_stale_logs=removed_stale_logs,
+    )
+
+
+def _load_file_configs(options, finish_configs, removed_stale_logs):
+    if options.api_config_file_pattern:
+        import glob
+
+        config_files = []
+        patterns = options.api_config_file_pattern.split(",")
+        for pattern in patterns:
+            pattern = pattern.strip()
+            config_files.extend(glob.glob(pattern))
+        if not config_files:
+            raise FileNotFoundError(f"No config files found: {options.api_config_file_pattern}")
+        config_files.sort()
+        print("Config files to be tested:", flush=True)
+        for i, config_file in enumerate(config_files, 1):
+            print(f"{i}. {config_file}", flush=True)
+    else:
+        if not os.path.exists(options.api_config_file):
+            raise FileNotFoundError(f"No config file found: {options.api_config_file}")
+        config_files = [options.api_config_file]
+
+    api_config_count = 0
+    skipped_non_config = 0
+    api_configs = set()
+    for config_file in config_files:
+        try:
+            with open(config_file, encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    if not line.startswith("paddle."):
+                        skipped_non_config += 1
+                        continue
+                    api_config_count += 1
+                    api_configs.add(line)
+        except Exception as err:
+            raise OSError(f"Failed to read config file {config_file}: {err}") from err
+
+    dup_case = api_config_count - len(api_configs)
+    read_count = api_config_count + skipped_non_config
+    api_config_count = len(api_configs)
+    api_configs = sorted(api_configs - finish_configs)
+    all_case = len(api_configs)
+    finish_case = api_config_count - all_case
+    return BatchConfigLoadResult(
+        api_configs=api_configs,
+        all_case=all_case,
+        read_count=read_count,
+        skipped_non_config=skipped_non_config,
+        duplicate_case=dup_case,
+        finish_case=finish_case,
+        removed_stale_logs=removed_stale_logs,
+    )
+
+
+def _load_batch_configs(options, removed_stale_logs):
+    if options.retest:
+        return _load_retest_configs(options, removed_stale_logs)
+    finish_configs = log_runtime.read_log("checkpoint")
+    return _load_file_configs(options, finish_configs, removed_stale_logs)
+
+
+def _run_single_case_mode(options, start_time):
+    if options.use_compute_sanitizer:
+        return _run_single_config_with_sanitizer(options)
+
+    try:
+        _prepare_single_config_gpu(options)
+    except ValueError as err:
+        return _argument_error(str(err))
+
+    # 单 case 执行与 worker 复用同样的静默 Paddle/bootstrap 路径。
+    _init_runtime_modules(options)
+    init_log(options.log_dir)
+
+    options.api_config = options.api_config.strip()
+    single_case_error = None
+    try:
+        run_test_case(options.api_config, options)
+        log_worker.write_to_log("checkpoint", options.api_config)
+    except Exception as err:
+        single_case_error = err
+        print(f"[test error] {options.api_config}: {err}", flush=True)
+    finally:
+        log_runtime.close_process_files()
+        log_counts = log_aggregation.finalize_logs()
+        completed_case = log_counts.get("checkpoint", 0)
+        remaining_case = max(1 - completed_case, 0)
+        log_report.print_run_footer(
+            1,
+            completed_case,
+            remaining_case,
+            log_counts,
+            time.time() - start_time,
+            options.log_dir,
+        )
+    if single_case_error is not None:
+        return 1
+    return 0
+
+
+def _run_batch_case_mode(options, start_time):
+    init_log(options.log_dir)
+
+    # 批量任务重启时，从 .tmp 目录恢复已有 worker 日志。
+    if not log_aggregation.recover_logs():
+        return _argument_error(
+            "failed to recover worker logs; fix the reported log error before retrying"
+        )
+    if options.use_compute_sanitizer:
+        log_worker.clean_sanitizer_case_logs()
+    removed_stale_logs = 0 if options.retest else log_retest.cleanup_uncheckpointed_result_logs()
+
+    try:
+        batch_configs = _load_batch_configs(options, removed_stale_logs)
+    except (OSError, ValueError) as err:
+        if options.retest:
+            return _argument_error(str(err))
+        print(str(err), flush=True)
+        return 2
+
+    log_report.print_preparing_summary(
+        batch_configs.read_count,
+        batch_configs.skipped_non_config,
+        batch_configs.duplicate_case,
+        batch_configs.all_case + batch_configs.finish_case,
+        batch_configs.finish_case,
+        batch_configs.all_case,
+        removed_stale_logs=batch_configs.removed_stale_logs,
+        retest_types=options.retest_types,
+    )
+
+    api_configs = batch_configs.api_configs
+    all_case = batch_configs.all_case
+    if not api_configs:
+        if options.retest:
+            log_retest.finish_retest()
+        log_report.print_running_banner()
+        print("Workers: skipped | 0 pending", flush=True)
+        log_counts = log_aggregation.finalize_logs()
+        log_report.print_run_footer(
+            0,
+            0,
+            0,
+            log_counts,
+            time.time() - start_time,
+            options.log_dir,
+        )
+        return 0
+
+    # 校验 GPU 可见性并推导每张 GPU 的 worker 数量。
+    gpu_ids = validate_gpu_options(options)
+    available_gpus, max_workers_per_gpu = check_gpu_memory(gpu_ids, options.num_workers_per_gpu)
+    if not available_gpus:
+        print("No usable GPUs available.", flush=True)
+        return 2
+    if options.accuracy_stable_dual_gpu and len(available_gpus) != len(gpu_ids):
+        print("Not all selected GPUs are usable; no complete dual-GPU layout.", flush=True)
+        return 2
+
+    try:
+        available_gpus, max_workers_per_gpu, gpu_pairs = resolve_batch_worker_layout(
+            available_gpus,
+            max_workers_per_gpu,
+            all_case,
+            dual_gpu=options.accuracy_stable_dual_gpu,
+        )
+    except ValueError as err:
+        return _argument_error(str(err))
+
+    if (
+        options.use_compute_sanitizer
+        and _validate_sanitizer_command(options.sanitizer_command) is None
+    ):
+        return 2
+
+    log_report.print_compute_summary(
+        available_gpus,
+        max_workers_per_gpu,
+        gpu_pairs=gpu_pairs,
+    )
+
+    if options.test_cpu:
+        print(f"CPU: {cpu_count()} available | Paddle CPU mode", flush=True)
+
+    return _run_batch_mode(
+        options=options,
+        api_configs=api_configs,
+        all_case=all_case,
+        available_gpus=available_gpus,
+        max_workers_per_gpu=max_workers_per_gpu,
+        start_time=start_time,
+    )
+
+
+def _build_argument_parser():
     parser = argparse.ArgumentParser(description="Run Paddle API test cases", allow_abbrev=False)
     parser.add_argument(
         "--api_config_file",
@@ -2183,308 +2553,35 @@ def main():
         default=False,
         help=argparse.SUPPRESS,
     )
+    return parser
 
+
+def main():
+    start_time = time.time()
+    try:
+        set_start_method("spawn")
+    except RuntimeError:
+        pass
+
+    paddle_version = _detect_paddle_version()
+    parser = _build_argument_parser()
     options = parser.parse_args()
     options.paddle_version = paddle_version
     _resolve_dump_options(parser, options)
     if options.random_seed != parser.get_default("random_seed"):
         np.random.seed(options.random_seed)
-    try:
-        options.retest_types = log_retest.parse_retest_types(options.retest)
-    except ValueError as err:
-        return _argument_error(str(err))
-
-    input_sources = (
-        bool(options.api_config),
-        bool(options.api_config_file),
-        bool(options.api_config_file_pattern),
-        bool(options.retest),
-    )
-    if sum(input_sources) != 1:
-        return _argument_error(
-            "exactly one of --api_config, --api_config_file, "
-            "--api_config_file_pattern, or --retest is required"
-        )
-    normalize_accuracy_stable_dual_gpu_options(options)
-    if options.api_config and not options.test_cpu:
-        _apply_single_config_gpu_defaults(options)
-
-    mode = [
-        options.accuracy,
-        options.paddle_only,
-        options.paddle_cinn,
-        options.paddle_gpu_performance,
-        options.torch_gpu_performance,
-        options.paddle_torch_gpu_performance,
-        options.accuracy_stable,
-        options.paddle_custom_device,
-        options.custom_device_vs_gpu,
-    ]
-    if len([m for m in mode if m is True]) != 1:
-        return _argument_error(TEST_MODE_ERROR)
-    if not options._sanitizer_child:
-        log_report.print_run_header(options, paddle_version)
-    if options.use_dump:
-        if not options.api_config or options.api_config_file or options.api_config_file_pattern:
-            return _argument_error("dump only supports single --api_config runs")
-        if not (options.accuracy or options.paddle_only):
-            return _argument_error("dump currently supports only --accuracy or --paddle_only")
-
-        # 处理 custom_device_vs_gpu 模式的配置
-    bos_config_data = None
-    if options.custom_device_vs_gpu:
-        # 读取 BOS 配置文件（固定路径：tester/bos_config.yaml）
-        bos_config_path = Path("tester/bos_config.yaml")
-        if not bos_config_path.exists():
-            print(f"BOS config file not found: {bos_config_path}", flush=True)
-            return 2
-
-        try:
-            with open(bos_config_path, encoding="utf-8") as f:
-                bos_config_data = yaml.safe_load(f)
-
-            if not bos_config_data:
-                print(f"BOS config file is empty: {bos_config_path}", flush=True)
-                return 2
-
-            # 验证必需的配置项
-            required_keys = ["bos_path", "bos_conf_path", "bcecmd_path"]
-            missing_keys = [key for key in required_keys if key not in bos_config_data]
-            if missing_keys:
-                print(f"Missing required keys in BOS config: {missing_keys}", flush=True)
-                return 2
-
-            # 将配置写回 options，便于继续传递给测试类。
-            options.operation_mode = options.custom_device_vs_gpu_mode
-            options.bos_path = bos_config_data["bos_path"]
-            options.bos_conf_path = bos_config_data["bos_conf_path"]
-            options.bcecmd_path = bos_config_data["bcecmd_path"]
-
-        except Exception as e:
-            print(f"Failed to load BOS config file {bos_config_path}: {e}", flush=True)
-            return 2
-
-    if options.test_tol and not options.accuracy:
-        _print_argument(
-            ARGUMENT_WARNING_PREFIX, "--test_tol takes effect only when --accuracy=True"
-        )
-    if options.test_backward and not options.paddle_cinn:
-        _print_argument(
-            ARGUMENT_WARNING_PREFIX, "--test_backward takes effect only when --paddle_cinn=True"
-        )
-    if options.use_gpu_mode and options.use_cached_numpy:
-        _print_argument(
-            ARGUMENT_WARNING_PREFIX,
-            "--use_cached_numpy=True is ignored because --use_gpu_mode=True uses GPU "
-            "tensor generation",
-        )
-        options.use_cached_numpy = False
-    os.environ["USE_CACHED_NUMPY"] = str(options.use_cached_numpy)
-    os.environ["USE_GPU_MODE"] = str(options.use_gpu_mode)
-    if options.bitwise_alignment:
-        options.atol = 0.0
-        options.rtol = 0.0
+    common_error = _prepare_common_options(options, paddle_version)
+    if common_error is not None:
+        return common_error
 
     if options._sanitizer_child:
-        try:
-            _init_worker_runtime(None, None, None, options, redirect_output=False)
-            options.api_config = options.api_config.strip()
-            run_test_case(options.api_config, options)
-        except SystemExit:
-            raise
-        except Exception as err:
-            print(f"[test error] {options.api_config}: {err}", flush=True)
-            sys.exit(2)
-        finally:
-            try:
-                log_runtime.close_process_files()
-            except Exception:
-                pass
-        return
+        return _run_sanitizer_child_mode(options)
 
     if options.api_config:
-        if options.use_compute_sanitizer:
-            sys.exit(_run_single_config_with_sanitizer(options))
-        try:
-            _prepare_single_config_gpu(options)
-        except ValueError as err:
-            return _argument_error(str(err))
-
-        # 单 case 执行与 worker 复用同样的静默 Paddle/bootstrap 路径。
-        _init_runtime_modules(options)
-
-        init_log(options.log_dir)
-
-        options.api_config = options.api_config.strip()
-        single_case_error = None
-        try:
-            run_test_case(options.api_config, options)
-            log_worker.write_to_log("checkpoint", options.api_config)
-        except Exception as err:
-            single_case_error = err
-            print(f"[test error] {options.api_config}: {err}", flush=True)
-        finally:
-            log_runtime.close_process_files()
-            log_counts = log_aggregation.finalize_logs()
-            completed_case = log_counts.get("checkpoint", 0)
-            remaining_case = max(1 - completed_case, 0)
-            log_report.print_run_footer(
-                1,
-                completed_case,
-                remaining_case,
-                log_counts,
-                time.time() - start_time,
-                options.log_dir,
-            )
-        if single_case_error is not None:
-            sys.exit(1)
-    elif options.api_config_file or options.api_config_file_pattern or options.retest:
-        # 获取配置文件
-        if options.retest:
-            config_files = []
-        elif options.api_config_file_pattern:
-            import glob
-
-            config_files = []
-            patterns = options.api_config_file_pattern.split(",")
-            for pattern in patterns:
-                pattern = pattern.strip()
-                config_files.extend(glob.glob(pattern))
-            if not config_files:
-                print(
-                    f"No config files found: {options.api_config_file_pattern}",
-                    flush=True,
-                )
-                return 2
-            config_files.sort()
-            print("Config files to be tested:", flush=True)
-            for i, config_file in enumerate(config_files, 1):
-                print(f"{i}. {config_file}", flush=True)
-        else:
-            if not os.path.exists(options.api_config_file):
-                print(f"No config file found: {options.api_config_file}", flush=True)
-                return 2
-            config_files = [options.api_config_file]
-
-        init_log(options.log_dir)
-
-        # 当 engineV2 被中断时，从 .tmp 目录恢复。
-        if not log_aggregation.recover_logs():
-            return _argument_error(
-                "failed to recover worker logs; fix the reported log error before retrying"
-            )
-        if options.use_compute_sanitizer:
-            log_worker.clean_sanitizer_case_logs()
-        removed_stale_logs = (
-            0 if options.retest else log_retest.cleanup_uncheckpointed_result_logs()
-        )
-
-        if options.retest:
-            try:
-                api_configs = log_retest.prepare_retest(options.retest_types)
-            except (OSError, ValueError) as err:
-                return _argument_error(str(err))
-            removed_stale_logs = log_retest.cleanup_uncheckpointed_result_logs()
-            api_config_count = len(api_configs)
-            skipped_non_config = 0
-            finish_configs = log_runtime.read_log("checkpoint")
-        else:
-            finish_configs = log_runtime.read_log("checkpoint")
-            api_config_count = 0
-            skipped_non_config = 0
-            api_configs = set()
-            for config_file in config_files:
-                try:
-                    with open(config_file) as f:
-                        for line in f:
-                            line = line.strip()
-                            if not line:
-                                continue
-                            if not line.startswith("paddle."):
-                                skipped_non_config += 1
-                                continue
-                            api_config_count += 1
-                            api_configs.add(line)
-                except Exception as e:
-                    print(f"Failed to read config file {config_file}: {e}", flush=True)
-                    return 2
-        dup_case = api_config_count - len(api_configs)
-        read_count = api_config_count + skipped_non_config
-        api_config_count = len(api_configs)
-        api_configs = sorted(api_configs - finish_configs)
-        all_case = len(api_configs)
-        finish_case = api_config_count - all_case
-        log_report.print_preparing_summary(
-            read_count,
-            skipped_non_config,
-            dup_case,
-            api_config_count,
-            finish_case,
-            all_case,
-            removed_stale_logs=removed_stale_logs,
-            retest_types=options.retest_types,
-        )
-        del api_config_count, dup_case, finish_case, read_count
-
-        if not api_configs:
-            if options.retest:
-                log_retest.finish_retest()
-            print("\n--- RUNNING")
-            print("Workers: skipped | 0 pending", flush=True)
-            log_counts = log_aggregation.finalize_logs()
-            log_report.print_run_footer(
-                0,
-                0,
-                0,
-                log_counts,
-                time.time() - start_time,
-                options.log_dir,
-            )
-            return 0
-
-        # 校验 GPU 可见性并推导每张 GPU 的 worker 数量。
-        gpu_ids = validate_gpu_options(options)
-        available_gpus, max_workers_per_gpu = check_gpu_memory(gpu_ids, options.num_workers_per_gpu)
-        if not available_gpus:
-            print("No usable GPUs available.", flush=True)
-            return 2
-        if options.accuracy_stable_dual_gpu and len(available_gpus) != len(gpu_ids):
-            print("Not all selected GPUs are usable; no complete dual-GPU layout.", flush=True)
-            return 2
-
-        try:
-            available_gpus, max_workers_per_gpu, gpu_pairs = resolve_batch_worker_layout(
-                available_gpus,
-                max_workers_per_gpu,
-                all_case,
-                dual_gpu=options.accuracy_stable_dual_gpu,
-            )
-        except ValueError as err:
-            return _argument_error(str(err))
-
-        if (
-            options.use_compute_sanitizer
-            and _validate_sanitizer_command(options.sanitizer_command) is None
-        ):
-            return 2
-
-        log_report.print_compute_summary(
-            available_gpus,
-            max_workers_per_gpu,
-            gpu_pairs=gpu_pairs,
-        )
-
-        if options.test_cpu:
-            print(f"CPU: {cpu_count()} available | Paddle CPU mode", flush=True)
-
-        return _run_batch_mode(
-            options=options,
-            api_configs=api_configs,
-            all_case=all_case,
-            available_gpus=available_gpus,
-            max_workers_per_gpu=max_workers_per_gpu,
-            start_time=start_time,
-        )
+        return _run_single_case_mode(options, start_time)
+    if options.api_config_file or options.api_config_file_pattern or options.retest:
+        return _run_batch_case_mode(options, start_time)
+    return 0
 
 
 if __name__ == "__main__":
