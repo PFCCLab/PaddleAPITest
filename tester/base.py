@@ -2022,7 +2022,7 @@ class APITestBase:
         if not isinstance(expected, tensor_types):
             raise TypeError(f"Expected Paddle or Torch tensor, but got {type(expected)}")
 
-        if not dual_gpu and (not actual.is_contiguous() or not expected.is_contiguous()):
+        if not actual.is_contiguous() or not expected.is_contiguous():
             actual_shape = tuple(actual.shape)
             expected_shape = tuple(expected.shape)
             actual_dtype = self._framework_tensor_torch_dtype(actual)
