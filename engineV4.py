@@ -89,7 +89,6 @@ VALID_TEST_ARGS = {
     "bitwise_alignment",
     "exit_on_error",
     "use_gpu_mode",
-    "runtime_config",
 }
 
 SANITIZER_FORWARD_ARGS = {
@@ -108,7 +107,6 @@ SANITIZER_FORWARD_ARGS = {
     "test_cpu",
     "use_cached_numpy",
     "use_gpu_mode",
-    "log_dir",
     "atol",
     "rtol",
     "manual_threshold_config_file",
@@ -211,12 +209,15 @@ class CaseRuntimeContext:
 @dataclass
 class BatchConfigLoadResult:
     api_configs: list[str]
-    all_case: int
     read_count: int
     skipped_non_config: int
     duplicate_case: int
     finish_case: int
     removed_stale_logs: int
+
+    @property
+    def all_case(self):
+        return len(self.api_configs)
 
 
 @dataclass
@@ -258,16 +259,6 @@ class BatchMessage:
             else:
                 message.worker_pid = msg[4] if len(msg) > 4 else None
         return message
-
-
-def cleanup(pool):
-    print(f"\n{datetime.now()} Cleanup started", flush=True)
-    if pool is not None:
-        try:
-            pool.shutdown(force=True)
-        except Exception as e:
-            print(f"{datetime.now()} Error shutting down pool: {e}", flush=True)
-    print(f"{datetime.now()} Cleanup completed", flush=True)
 
 
 # ─── WorkerPool：每个 worker 独立队列的架构 ───────────────────────────────
@@ -444,26 +435,16 @@ def _worker_loop(
         pass
 
 
-def _format_cli_value(value):
-    if isinstance(value, bool):
-        return "True" if value else "False"
-    return str(value)
-
-
-def _build_sanitizer_case_command(api_config_str, options, log_dir, sanitizer_cmd=None):
-    if sanitizer_cmd is None:
-        sanitizer_cmd = shlex.split(options.sanitizer_command)
+def _build_sanitizer_case_command(api_config_str, options, sanitizer_cmd):
     cmd = [
         *sanitizer_cmd,
         sys.executable,
         str(Path(__file__).resolve()),
         f"--api_config={api_config_str}",
-        f"--log_dir={log_dir}",
+        f"--log_dir={options.log_dir}",
         "--_sanitizer_child=True",
     ]
     for key in SANITIZER_FORWARD_ARGS_SORTED:
-        if key == "log_dir":
-            continue
         value = getattr(options, key, None)
         if value is None:
             continue
@@ -471,7 +452,8 @@ def _build_sanitizer_case_command(api_config_str, options, log_dir, sanitizer_cm
             continue
         if isinstance(value, bool) and not value:
             continue
-        cmd.append(f"--{key}={_format_cli_value(value)}")
+        formatted = "True" if value is True else "False" if value is False else str(value)
+        cmd.append(f"--{key}={formatted}")
     return cmd
 
 
@@ -487,7 +469,9 @@ def _sanitizer_worker_loop(
     log_worker.redirect_stdio()
 
     child_process = None
-    sanitizer_cmd = shlex.split(options.sanitizer_command)
+    sanitizer_cmd = getattr(options, "sanitizer_cmd", None) or shlex.split(
+        options.sanitizer_command
+    )
     child_env = os.environ.copy()
     child_env["CUDA_VISIBLE_DEVICES"] = _visible_gpu_ids(gpu_id, comparison_gpu_id)
     child_env["PADDLEAPITEST_SUPPRESS_CASE_TAGS"] = "1"
@@ -529,12 +513,7 @@ def _sanitizer_worker_loop(
                 shutil.rmtree(case_log_dir)
             case_log_dir.mkdir(parents=True, exist_ok=True)
             try:
-                cmd = _build_sanitizer_case_command(
-                    api_config_str,
-                    options,
-                    options.log_dir,
-                    sanitizer_cmd=sanitizer_cmd,
-                )
+                cmd = _build_sanitizer_case_command(api_config_str, options, sanitizer_cmd)
             except ValueError as err:
                 shutil.rmtree(case_log_dir, ignore_errors=True)
                 completed_offset = log_worker.write_case_end("error", api_config_str)
@@ -1194,12 +1173,8 @@ TEST_MODE_ERROR = (
 )
 
 
-def _print_argument(prefix, message):
-    print(f"{prefix} {message}", flush=True)
-
-
 def _argument_error(message):
-    _print_argument(ARGUMENT_ERROR_PREFIX, message)
+    print(f"{ARGUMENT_ERROR_PREFIX} {message}", flush=True)
     return 2
 
 
@@ -1294,9 +1269,10 @@ def normalize_accuracy_stable_dual_gpu_options(options):
     if not getattr(options, "accuracy_stable_dual_gpu", False):
         return
     if not getattr(options, "use_gpu_mode", False):
-        _print_argument(
-            ARGUMENT_WARNING_PREFIX,
+        print(
+            f"{ARGUMENT_WARNING_PREFIX} "
             "--accuracy_stable_dual_gpu=True implies --use_gpu_mode=True; enabling GPU mode",
+            flush=True,
         )
         options.use_gpu_mode = True
     options.accuracy_stable = True
@@ -1398,18 +1374,21 @@ def _validate_sanitizer_command(command):
     try:
         sanitizer_cmd = shlex.split(command)
     except ValueError as err:
-        _print_argument(ARGUMENT_ERROR_PREFIX, f"invalid --sanitizer_command: {err}")
+        print(
+            f"{ARGUMENT_ERROR_PREFIX} invalid --sanitizer_command: {err}",
+            flush=True,
+        )
         return None
     if not sanitizer_cmd:
-        _print_argument(
-            ARGUMENT_ERROR_PREFIX,
-            "invalid --sanitizer_command: command cannot be empty",
+        print(
+            f"{ARGUMENT_ERROR_PREFIX} invalid --sanitizer_command: command cannot be empty",
+            flush=True,
         )
         return None
     if shutil.which(sanitizer_cmd[0]) is None:
-        _print_argument(
-            ARGUMENT_ERROR_PREFIX,
-            f"sanitizer executable not found: {sanitizer_cmd[0]}",
+        print(
+            f"{ARGUMENT_ERROR_PREFIX} sanitizer executable not found: {sanitizer_cmd[0]}",
+            flush=True,
         )
         return None
     return sanitizer_cmd
@@ -1423,15 +1402,13 @@ def _run_single_config_with_sanitizer(options):
     try:
         gpu_ids = _prepare_single_config_gpu(options)
     except ValueError as err:
-        _print_argument(ARGUMENT_ERROR_PREFIX, str(err))
-        return 2
+        return _argument_error(str(err))
 
     api_config = options.api_config.strip()
     cmd = _build_sanitizer_case_command(
         api_config,
         options,
-        options.log_dir,
-        sanitizer_cmd=sanitizer_cmd,
+        sanitizer_cmd,
     )
     env = os.environ.copy()
     if gpu_ids:
@@ -1731,7 +1708,13 @@ def _run_batch_mode(
         )
 
         def cleanup_handler(*args):
-            cleanup(pool)
+            print(f"\n{datetime.now()} Cleanup started", flush=True)
+            if pool is not None:
+                try:
+                    pool.shutdown(force=True)
+                except Exception as e:
+                    print(f"{datetime.now()} Error shutting down pool: {e}", flush=True)
+            print(f"{datetime.now()} Cleanup completed", flush=True)
             sys.exit(1)
 
         previous_signal_handlers = _install_batch_signal_handlers(cleanup_handler)
@@ -1851,7 +1834,7 @@ def _build_case_runtime_context(api_config_str, options):
     )
 
 
-def _handle_case_exception(api_config_str, err, options):
+def _handle_case_exception(api_config_str, err):
     err_msg = str(err).lower()
     terminal_log_type = log_worker.get_terminal_log_type(api_config_str)
     fatal_log_type = None
@@ -1949,10 +1932,11 @@ def _load_custom_device_options(options):
 
 def _apply_runtime_environment_flags(options):
     if options.use_gpu_mode and options.use_cached_numpy:
-        _print_argument(
-            ARGUMENT_WARNING_PREFIX,
+        print(
+            f"{ARGUMENT_WARNING_PREFIX} "
             "--use_cached_numpy=True is ignored because --use_gpu_mode=True uses GPU "
             "tensor generation",
+            flush=True,
         )
         options.use_cached_numpy = False
     os.environ["USE_CACHED_NUMPY"] = str(options.use_cached_numpy)
@@ -2005,7 +1989,7 @@ def run_test_case(api_config_str, options):
             else:
                 case.test()
         except Exception as err:
-            if _handle_case_exception(api_config_str, err, options):
+            if _handle_case_exception(api_config_str, err):
                 return
             raise
         finally:
@@ -2027,7 +2011,7 @@ def run_test_case(api_config_str, options):
             )
 
 
-def _prepare_common_options(options, paddle_version):
+def _prepare_common_options(options):
     try:
         options.retest_types = log_retest.parse_retest_types(options.retest)
     except ValueError as err:
@@ -2046,7 +2030,7 @@ def _prepare_common_options(options, paddle_version):
         return mode_error
 
     if not options._sanitizer_child:
-        log_report.print_run_header(options, paddle_version)
+        log_report.print_run_header(options, options.paddle_version)
 
     if options.use_dump:
         if not options.api_config or options.api_config_file or options.api_config_file_pattern:
@@ -2060,12 +2044,14 @@ def _prepare_common_options(options, paddle_version):
             return custom_device_error
 
     if options.test_tol and not options.accuracy:
-        _print_argument(
-            ARGUMENT_WARNING_PREFIX, "--test_tol takes effect only when --accuracy=True"
+        print(
+            f"{ARGUMENT_WARNING_PREFIX} --test_tol takes effect only when --accuracy=True",
+            flush=True,
         )
     if options.test_backward and not options.paddle_cinn:
-        _print_argument(
-            ARGUMENT_WARNING_PREFIX, "--test_backward takes effect only when --paddle_cinn=True"
+        print(
+            f"{ARGUMENT_WARNING_PREFIX} --test_backward takes effect only when --paddle_cinn=True",
+            flush=True,
         )
     _apply_runtime_environment_flags(options)
     return None
@@ -2089,7 +2075,7 @@ def _run_sanitizer_child_mode(options):
     return 0
 
 
-def _load_retest_configs(options, removed_stale_logs):
+def _load_retest_configs(options):
     api_configs = log_retest.prepare_retest(options.retest_types)
     removed_stale_logs = log_retest.cleanup_uncheckpointed_result_logs()
     finish_configs = log_runtime.read_log("checkpoint")
@@ -2098,11 +2084,9 @@ def _load_retest_configs(options, removed_stale_logs):
     dup_case = 0
     read_count = api_config_count
     api_configs = sorted(api_configs - finish_configs)
-    all_case = len(api_configs)
-    finish_case = api_config_count - all_case
+    finish_case = api_config_count - len(api_configs)
     return BatchConfigLoadResult(
         api_configs=api_configs,
-        all_case=all_case,
         read_count=read_count,
         skipped_non_config=skipped_non_config,
         duplicate_case=dup_case,
@@ -2153,11 +2137,9 @@ def _load_file_configs(options, finish_configs, removed_stale_logs):
     read_count = api_config_count + skipped_non_config
     api_config_count = len(api_configs)
     api_configs = sorted(api_configs - finish_configs)
-    all_case = len(api_configs)
-    finish_case = api_config_count - all_case
+    finish_case = api_config_count - len(api_configs)
     return BatchConfigLoadResult(
         api_configs=api_configs,
-        all_case=all_case,
         read_count=read_count,
         skipped_non_config=skipped_non_config,
         duplicate_case=dup_case,
@@ -2166,9 +2148,10 @@ def _load_file_configs(options, finish_configs, removed_stale_logs):
     )
 
 
-def _load_batch_configs(options, removed_stale_logs):
+def _load_batch_configs(options):
     if options.retest:
-        return _load_retest_configs(options, removed_stale_logs)
+        return _load_retest_configs(options)
+    removed_stale_logs = log_retest.cleanup_uncheckpointed_result_logs()
     finish_configs = log_runtime.read_log("checkpoint")
     return _load_file_configs(options, finish_configs, removed_stale_logs)
 
@@ -2222,10 +2205,8 @@ def _run_batch_case_mode(options, start_time):
         )
     if options.use_compute_sanitizer:
         log_worker.clean_sanitizer_case_logs()
-    removed_stale_logs = 0 if options.retest else log_retest.cleanup_uncheckpointed_result_logs()
-
     try:
-        batch_configs = _load_batch_configs(options, removed_stale_logs)
+        batch_configs = _load_batch_configs(options)
     except (OSError, ValueError) as err:
         if options.retest:
             return _argument_error(str(err))
@@ -2281,11 +2262,11 @@ def _run_batch_case_mode(options, start_time):
     except ValueError as err:
         return _argument_error(str(err))
 
-    if (
-        options.use_compute_sanitizer
-        and _validate_sanitizer_command(options.sanitizer_command) is None
-    ):
-        return 2
+    if options.use_compute_sanitizer:
+        sanitizer_cmd = _validate_sanitizer_command(options.sanitizer_command)
+        if sanitizer_cmd is None:
+            return 2
+        options.sanitizer_cmd = sanitizer_cmd
 
     log_report.print_compute_summary(
         available_gpus,
@@ -2570,7 +2551,7 @@ def main():
     _resolve_dump_options(parser, options)
     if options.random_seed != parser.get_default("random_seed"):
         np.random.seed(options.random_seed)
-    common_error = _prepare_common_options(options, paddle_version)
+    common_error = _prepare_common_options(options)
     if common_error is not None:
         return common_error
 
