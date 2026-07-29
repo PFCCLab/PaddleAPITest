@@ -2027,7 +2027,7 @@ def _te_fp8_quant_blockwise(inp, eps, power2, scale_transpose, ue8m0, method):
             sm, sn = (m + 127) // 128, (n + 127) // 128
             if ue8m0:
                 packed_sn = (sn + 3) // 4
-                scale_shape = (packed_sn, sm) if scale_transpose else (sm, packed_sn)
+                scale_shape = (packed_sn, m) if scale_transpose else (m, packed_sn)
                 scale = torch.empty(scale_shape, dtype=torch.int32, device=inp.device)
             else:
                 scale_shape = (sn, sm) if scale_transpose else (sm, sn)
@@ -2058,13 +2058,10 @@ def _te_fp8_quant_blockwise(inp, eps, power2, scale_transpose, ue8m0, method):
 
     # Handle ue8m0 packing: 4 float32 exponents -> 1 packed int32
     if ue8m0:
-        base = deq_scale.contiguous() if method == "1x128" else (deq_scale.t().contiguous() if scale_transpose else deq_scale.contiguous())
-        # base is in the final layout orientation already; pack along last dim
-        # Actually re-derive from the non-transposed deq_scale for consistent packing
         if method == "1x128":
             _base = deq_scale.t().contiguous()  # (m, scale_cols)
         else:
-            _base = deq_scale.contiguous()  # (sm, sn)
+            _base = deq_scale.unsqueeze(1).expand(-1, 128, -1).reshape(-1, deq_scale.shape[-1])[:m].contiguous()
         cols_s = _base.shape[-1]
         pad_c = (4 - (cols_s % 4)) % 4
         if pad_c:
@@ -2121,12 +2118,11 @@ def _fp8_quant_blockwise_impl(inp, eps, power2, scale_transpose, ue8m0, method, 
                 packed_cols = (scale_cols + 3) // 4
                 scale = torch.empty((packed_cols, m) if scale_transpose else (m, packed_cols), dtype=torch.int32, device=inp.device)
             else:
-                packed_sm = (sm + 3) // 4 if not scale_transpose else sm
-                packed_sn = (sn + 3) // 4 if scale_transpose else sn
+                packed_sn = (sn + 3) // 4
                 if scale_transpose:
-                    scale = torch.empty((packed_sn, sm), dtype=torch.int32, device=inp.device)
+                    scale = torch.empty((packed_sn, m), dtype=torch.int32, device=inp.device)
                 else:
-                    scale = torch.empty((sm, packed_sn), dtype=torch.int32, device=inp.device)
+                    scale = torch.empty((m, packed_sn), dtype=torch.int32, device=inp.device)
         else:
             if method == "1x128":
                 scale = torch.empty((scale_cols, m) if scale_transpose else (m, scale_cols), dtype=torch.float32, device=inp.device)
@@ -2258,6 +2254,10 @@ def _fp8_quant_blockwise_impl(inp, eps, power2, scale_transpose, ue8m0, method, 
 
     if ue8m0:
         base = deq_scale.contiguous()
+        if method == "128x128":
+            # Paddle expands one 128x128 block scale to every covered row
+            # before packing ue8m0 exponents.
+            base = base.unsqueeze(1).expand(-1, 128, -1).reshape(-1, base.shape[-1])[:m].contiguous()
         cols_s = base.shape[-1]
         pad_c = (4 - (cols_s % 4)) % 4
         if pad_c:
@@ -8437,6 +8437,7 @@ elif op_name == "fuse_weighted_swiglu_fp8_quant":
     _using_pow2_scaling = bool(arg3) if arg3 is not None else False
     _use_ue8m0 = bool(arg4) if arg4 is not None else False
     _FP8_MAX = torch.finfo(torch.float8_e4m3fn).max
+    _POW2_SCALE_MAX = float.fromhex("0x1.0p127")
     _TILE = 128
 
     _rows = _x.shape[0]
@@ -8444,6 +8445,8 @@ elif op_name == "fuse_weighted_swiglu_fp8_quant":
     _half_cols = _cols // 2
     _num_col_blocks = (_half_cols + _TILE - 1) // _TILE
     _dev = _x.device
+    _dev_cap = torch.cuda.get_device_capability(_dev) if _dev.type == "cuda" else None
+    _is_sm90 = _dev_cap == (9, 0)
 
     _output_fp8 = torch.empty([_rows, _half_cols], dtype=torch.float8_e4m3fn, device=_dev)
     _scale_out = torch.empty([_rows, _num_col_blocks], dtype=torch.float32, device=_dev)
@@ -8456,12 +8459,48 @@ elif op_name == "fuse_weighted_swiglu_fp8_quant":
     _bytes_per_row = max(1, _half_cols * (4 * 3 + 1))
     _row_chunk = max(1, min(_rows, _workspace_bytes // _bytes_per_row))
 
+    def _compute_quant_scale(
+        _amax: torch.Tensor,
+        _fp8_max: float = _FP8_MAX,
+        _pow2_scale_max: float = _POW2_SCALE_MAX,
+        _using_pow2: bool = _using_pow2_scaling,
+        _sm90: bool = _is_sm90,
+    ) -> torch.Tensor:
+        _zero_mask = _amax == 0
+        _quant_scale = torch.empty_like(_amax)
+        _quant_scale[_zero_mask] = 1.0
+        _quant_scale[~_zero_mask] = _fp8_max / _amax[~_zero_mask]
+
+        _inf_mask = torch.isinf(_quant_scale)
+        if _inf_mask.any():
+            _quant_scale = torch.where(
+                _inf_mask,
+                torch.full_like(
+                    _quant_scale,
+                    _pow2_scale_max if _using_pow2 else torch.finfo(torch.float32).max,
+                ),
+                _quant_scale,
+            )
+
+        if _using_pow2:
+            _scale_bits = _quant_scale.contiguous().view(torch.int32)
+            _scale_exp = ((_scale_bits >> 23) & 0xFF).to(torch.int32) - 127
+            _quant_scale = torch.ldexp(torch.ones_like(_quant_scale), _scale_exp)
+            if not _sm90:
+                _quant_scale = torch.where(
+                    _quant_scale == _pow2_scale_max,
+                    torch.ones_like(_quant_scale),
+                    _quant_scale,
+                )
+
+        return _quant_scale
+
     with torch.no_grad():
         for _row_start in range(0, _rows, _row_chunk):
             _row_end = min(_rows, _row_start + _row_chunk)
             _lhs = _x[_row_start:_row_end, :_half_cols].to(torch.float32)
             _rhs = _x[_row_start:_row_end, _half_cols:].to(torch.float32)
-            _lhs.mul_(torch.sigmoid(_lhs)).mul_(_rhs)
+            _lhs.mul_(1.0 / (1.0 + torch.exp(-_lhs))).mul_(_rhs)
             del _rhs
             if _prob is not None and torch.is_tensor(_prob) and _prob.numel() > 0:
                 _lhs.mul_(_prob[_row_start:_row_end].to(torch.float32).unsqueeze(-1))
@@ -8470,10 +8509,8 @@ elif op_name == "fuse_weighted_swiglu_fp8_quant":
                 _blocks = _lhs[:, :_full_cols].reshape(
                     _row_end - _row_start, _full_blocks, _TILE
                 )
-                _amax = _blocks.abs().amax(dim=-1).clamp_(min=1e-10)
-                _quant_scale = _FP8_MAX / _amax
-                if _using_pow2_scaling:
-                    _quant_scale.log2_().floor_().exp2_()
+                _amax = _blocks.abs().amax(dim=-1).to(torch.float32)
+                _quant_scale = _compute_quant_scale(_amax)
                 _scale_out[_row_start:_row_end, :_full_blocks] = _quant_scale.reciprocal()
                 _blocks.mul_(_quant_scale.unsqueeze(-1)).clamp_(-_FP8_MAX, _FP8_MAX)
                 _output_fp8[_row_start:_row_end, :_full_cols] = _blocks.to(
@@ -8483,10 +8520,8 @@ elif op_name == "fuse_weighted_swiglu_fp8_quant":
 
             if _full_cols < _half_cols:
                 _tail = _lhs[:, _full_cols:]
-                _tail_amax = _tail.abs().amax(dim=-1).clamp_(min=1e-10)
-                _tail_scale = _FP8_MAX / _tail_amax
-                if _using_pow2_scaling:
-                    _tail_scale.log2_().floor_().exp2_()
+                _tail_amax = _tail.abs().amax(dim=-1).to(torch.float32)
+                _tail_scale = _compute_quant_scale(_tail_amax)
                 _scale_out[_row_start:_row_end, _full_blocks] = _tail_scale.reciprocal()
                 _tail.mul_(_tail_scale.unsqueeze(-1)).clamp_(-_FP8_MAX, _FP8_MAX)
                 _output_fp8[_row_start:_row_end, _full_cols:] = _tail.to(
@@ -8496,15 +8531,23 @@ elif op_name == "fuse_weighted_swiglu_fp8_quant":
             del _lhs
 
     if _use_ue8m0:
-        # Pack 4 exponent columns into 1 int32 (ue8m0 format)
-        _log2_inv = torch.log2(_scale_out).round().to(torch.int32) + 127
-        _log2_inv = _log2_inv.clamp(0, 254)
+        # Pack 4 exponent columns into 1 int32 (ue8m0 format).
+        # Mirror PaddleFleet: pack the float32 exponent bits of inv_scale
+        # directly, rather than re-deriving them from log2().
+        _log2_inv = (_scale_out.contiguous().view(torch.int32) >> 23).to(
+            torch.int32
+        ) & 0xFF
         _pack_cols = _log2_inv.shape[-1]
         _pad_c = (4 - (_pack_cols % 4)) % 4
         if _pad_c:
             _log2_inv = torch.nn.functional.pad(_log2_inv, (0, _pad_c))
-        _log2_inv = _log2_inv.reshape(_log2_inv.shape[0], -1, 4)
-        _scale_packed = (_log2_inv[..., 0] | (_log2_inv[..., 1] << 8) | (_log2_inv[..., 2] << 16) | (_log2_inv[..., 3] << 24)).to(torch.int32)
+        _log2_inv = _log2_inv.reshape(_log2_inv.shape[0], _log2_inv.shape[-1] // 4, 4)
+        _scale_packed = (
+            _log2_inv[..., 0]
+            | (_log2_inv[..., 1] << 8)
+            | (_log2_inv[..., 2] << 16)
+            | (_log2_inv[..., 3] << 24)
+        ).to(torch.int32)
         result = [_output_fp8, _scale_packed]
     else:
         result = [_output_fp8, _scale_out]
@@ -8611,7 +8654,7 @@ elif op_name in ("fuse_stack_fp8_quant", "fuse_stack_transpose_fp8_quant"):
         _pad_c = (4 - (_pack_cols % 4)) % 4
         if _pad_c:
             _scale_out = torch.nn.functional.pad(_scale_out, (0, _pad_c))
-        _scale_out = _scale_out.reshape(_scale_out.shape[0], -1, 4)
+        _scale_out = _scale_out.reshape(_scale_out.shape[0], _scale_out.shape[-1] // 4, 4)
         _scale_out = (_scale_out[..., 0] | (_scale_out[..., 1] << 8) | (_scale_out[..., 2] << 16) | (_scale_out[..., 3] << 24)).to(torch.int32)
         if _output_scale_transpose:
             _scale_out = _scale_out.t().contiguous()
