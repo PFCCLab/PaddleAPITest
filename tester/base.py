@@ -1059,51 +1059,44 @@ class APITestBase:
         kwargs = collections.OrderedDict((k, _deep_copy(v)) for k, v in self.paddle_kwargs.items())
         return args, kwargs
 
+    def _collect_tensor_leaves(self, value, result, tensor_type):
+        if isinstance(value, tensor_type):
+            result.append(value)
+            return
+        if isinstance(value, (list, tuple)):
+            for item in value:
+                self._collect_tensor_leaves(item, result, tensor_type)
+            return
+        if isinstance(value, dict):
+            for item in value.values():
+                self._collect_tensor_leaves(item, result, tensor_type)
+
     def get_paddle_input_list(self):
         result = []
 
         for arg in self.paddle_args:
-            if isinstance(arg, paddle.Tensor):
-                result.append(arg)
-            elif isinstance(arg, (tuple, list)):
-                result.extend(item for item in arg if isinstance(item, paddle.Tensor))
+            self._collect_tensor_leaves(arg, result, paddle.Tensor)
 
         # 按 merged_kwargs 顺序遍历，确保 paddle 关键字参数与 torch 参数顺序一致，避免反向比较无法对应
         # torch 参数顺序通过 paddle_sig.bind 绑定，见 ana_torch_api_info()
-        if hasattr(self, "paddle_merged_kwargs_config"):
-            for key in self.paddle_merged_kwargs_config:
+        merged_kwargs_config = getattr(self, "paddle_merged_kwargs_config", None)
+        if merged_kwargs_config is not None:
+            for key in merged_kwargs_config:
                 if key in self.paddle_kwargs:
-                    value = self.paddle_kwargs[key]
-                    if isinstance(value, paddle.Tensor):
-                        result.append(value)
-                    elif isinstance(value, (tuple, list)):
-                        result.extend(item for item in value if isinstance(item, paddle.Tensor))
+                    self._collect_tensor_leaves(self.paddle_kwargs[key], result, paddle.Tensor)
         else:  #  paddle_only
             for key, value in self.paddle_kwargs.items():
-                if isinstance(value, paddle.Tensor):
-                    result.append(value)
-                elif isinstance(value, (tuple, list)):
-                    result.extend(item for item in value if isinstance(item, paddle.Tensor))
+                self._collect_tensor_leaves(value, result, paddle.Tensor)
 
         return [t for t in result if not t.stop_gradient]
 
     def get_torch_input_list(self):
         result = []
         for i in range(len(self.torch_args)):
-            if isinstance(self.torch_args[i], torch.Tensor):
-                result.append(self.torch_args[i])
-            elif isinstance(self.torch_args[i], (tuple, list)):
-                for item in self.torch_args[i]:
-                    if isinstance(item, torch.Tensor):
-                        result.append(item)
+            self._collect_tensor_leaves(self.torch_args[i], result, torch.Tensor)
 
         for _key, value in self.torch_kwargs.items():
-            if isinstance(value, torch.Tensor):
-                result.append(value)
-            elif isinstance(value, (tuple, list)):
-                for item in value:
-                    if isinstance(item, torch.Tensor):
-                        result.append(item)
+            self._collect_tensor_leaves(value, result, torch.Tensor)
 
         return [t for t in result if t.requires_grad]
 
@@ -1607,19 +1600,19 @@ class APITestBase:
         expected_paddle_tensor = expected_paddle_tensor.cpu().detach()
 
         actual_paddle_dlpack = paddle.utils.dlpack.to_dlpack(actual_paddle_tensor)  # type: ignore[reportGeneralTypeIssues]
-        torch.utils.dlpack.from_dlpack(actual_paddle_dlpack)  # type: ignore[reportGeneralTypeIssues]
+        converted_actual_tensor = torch.utils.dlpack.from_dlpack(actual_paddle_dlpack)  # type: ignore[reportGeneralTypeIssues]
 
         expected_paddle_dlpack = paddle.utils.dlpack.to_dlpack(expected_paddle_tensor)  # type: ignore[reportGeneralTypeIssues]
-        converted_paddle_tensor = torch.utils.dlpack.from_dlpack(expected_paddle_dlpack)  # type: ignore[reportGeneralTypeIssues]
+        converted_expected_tensor = torch.utils.dlpack.from_dlpack(expected_paddle_dlpack)  # type: ignore[reportGeneralTypeIssues]
 
         def error_msg(msg):
             return (
                 f"Not equal to tolerance rtol={rtol}, atol={atol}\n"
                 f"{msg}\n"
-                f"ACTUAL: (shape={converted_paddle_tensor.shape}, dtype={converted_paddle_tensor.dtype})\n"
-                f"{converted_paddle_tensor}\n"
-                f"DESIRED: (shape={converted_paddle_tensor.shape}, dtype={converted_paddle_tensor.dtype})\n"
-                f"{converted_paddle_tensor}"
+                f"ACTUAL: (shape={converted_actual_tensor.shape}, dtype={converted_actual_tensor.dtype})\n"
+                f"{converted_actual_tensor}\n"
+                f"DESIRED: (shape={converted_expected_tensor.shape}, dtype={converted_expected_tensor.dtype})\n"
+                f"{converted_expected_tensor}"
             )
 
         bitwise_alignment = getattr(self, "bitwise_alignment", False)
@@ -1628,8 +1621,8 @@ class APITestBase:
 
         try:
             torch.testing.assert_close(
-                converted_paddle_tensor,
-                converted_paddle_tensor,
+                converted_actual_tensor,
+                converted_expected_tensor,
                 rtol=rtol,
                 atol=atol,
                 equal_nan=True,
