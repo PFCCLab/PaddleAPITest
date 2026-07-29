@@ -3057,14 +3057,9 @@ elif index.dim() > 1:
             index = index.unsqueeze(0)
     result = torch.gather(x, axis, index)
 else:
-    ans = []
-    for i in index:
-        temp = torch.narrow(x, axis, i.reshape([]), 1)
-        ans.append(torch.squeeze(temp, axis))
-    if len(ans) == 0:
-        result = torch.zeros([x.shape[0],0])
-    else:
-        result = torch.stack(ans,axis)
+    if index.dtype != torch.long:
+        index = index.to(torch.long)
+    result = torch.index_select(x, axis, index)
 """
         code = Code(core=core.splitlines())
         return ConvertResult.success(paddle_api, code, is_torch_corresponding=False)
