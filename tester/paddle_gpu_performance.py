@@ -6,7 +6,6 @@ import paddle
 
 from .api_config.config_analyzer import TensorConfig
 from .base import APITestBase
-from .log_writer.log_worker import write_to_log
 
 
 def tensor_numel(tensor_config):
@@ -51,16 +50,16 @@ class APITestPaddleGPUPerformance(APITestBase):
 
     def test(self):
         if self.need_skip(paddle_only=True):
-            print("[Skip]", flush=True)
+            self.report_case_result("skip")
             return
 
         if not self.ana_paddle_api_info():
-            print("ana_paddle_api_info failed", flush=True)
+            self.report_case_result("config_parse", "ana_paddle_api_info failed")
             return
 
         try:
             if not self.gen_numpy_input():
-                print("gen_numpy_input failed")
+                self.report_case_result("config_input", "gen_numpy_input failed")
                 return
         except Exception as err:
             log_type, fatal = self.report_runtime_error(err, "config_input", "input")
@@ -70,7 +69,7 @@ class APITestPaddleGPUPerformance(APITestBase):
 
         try:
             if not self.gen_paddle_input():
-                print("gen_paddle_input failed", flush=True)
+                self.report_case_result("paddle_error", "gen_paddle_input failed")
                 return
             numel = total_numel(self.api_config)
             test_loop = 2147483647 * 20 // numel
@@ -136,10 +135,15 @@ class APITestPaddleGPUPerformance(APITestBase):
                 "failed",
             )
             if self.should_ignore_paddle_error(str(err)):
+                self.report_runtime_error(
+                    err,
+                    "paddle_error",
+                    "forward",
+                    allow_ignore_paddle=True,
+                )
                 return
-            if "CUDA error" in str(err) or "memory corruption" in str(err):
-                raise err
-            if "CUDA out of memory" in str(err) or "Out of memory error" in str(err):
+            _, fatal = self.report_runtime_error(err, "paddle_error", "forward")
+            if fatal:
                 raise err
             return
 
@@ -193,10 +197,15 @@ class APITestPaddleGPUPerformance(APITestBase):
                 "failed",
             )
             if self.should_ignore_paddle_error(str(err)):
+                self.report_runtime_error(
+                    err,
+                    "paddle_error",
+                    "backward",
+                    allow_ignore_paddle=True,
+                )
                 return
-            if "CUDA error" in str(err) or "memory corruption" in str(err):
-                raise err
-            if "CUDA out of memory" in str(err) or "Out of memory error" in str(err):
+            _, fatal = self.report_runtime_error(err, "paddle_error", "backward")
+            if fatal:
                 raise err
             return
 

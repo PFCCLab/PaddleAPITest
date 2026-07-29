@@ -17,6 +17,7 @@ from .api_config.config_analyzer import (
     get_cached_numpy_array,
 )
 from .api_config.dump_writer import DEFAULT_DUMP_DIR, DumpContext, dump_enabled
+from .log_writer import log_worker
 from .log_writer.log_comparison import log_accuracy_tolerance
 from .log_writer.log_schema import MAX_CSV_CONFIG_LENGTH
 from .log_writer.log_worker import write_to_log
@@ -471,37 +472,64 @@ class APITestBase:
         allow_ignore_paddle=False,
         *,
         tensor_position=None,
+        force_log_type=None,
+        affected_comps=None,
     ):
+        """Report one runtime error and optionally mirror its log type to stable comp logs.
+
+        force_log_type changes the emitted log bucket only; fatal/nonfatal still comes
+        from classify_runtime_error().
+        """
         err_msg = str(err)
         if phase:
             self.dump_error(f"{phase}_error", err)
         log_type, fatal = classify_runtime_error(err_msg)
         if log_type is None and allow_ignore_paddle and self.should_ignore_paddle_error(err_msg):
-            print(f"[pass] {self.api_config.config}", flush=True)
-            write_to_log("pass", self.api_config.config)
-            return "pass", False
+            log_type = "pass"
+            self.report_case_result(log_type, affected_comps=affected_comps)
+            return log_type, False
+        if force_log_type is not None:
+            log_type = force_log_type
         if log_type is None:
             log_type = default_log_type
-        head = f"[{log_type}]"
-        if phase:
-            head += f" {phase}"
-        fields = []
-        if tensor_position:
-            fields.append(f"tensor {tensor_position}")
-        prefix = " | ".join([head, *fields])
-        print(
-            (
-                f"{prefix} | {self.api_config.config}\n{err_msg}"
-                if phase or fields
-                else f"{prefix} {self.api_config.config}\n{err_msg}"
-            ),
-            flush=True,
+        self.report_case_result(
+            log_type,
+            phase=phase,
+            error=err_msg,
+            tensor_position=tensor_position,
+            affected_comps=affected_comps,
         )
-        write_to_log(log_type, self.api_config.config)
         return log_type, fatal
 
-    def reset_random_state(self, seed=42):
+    def report_case_result(
+        self,
+        log_type,
+        message=None,
+        *,
+        phase=None,
+        error=None,
+        tensor_position=None,
+        affected_comps=None,
+        write_main_log=True,
+    ):
+        """Emit one standardized case-level result and write the matching logs."""
+        log_worker.emit_case_result(
+            log_type,
+            self.api_config.config,
+            phase=phase,
+            message=message,
+            error=error,
+            tensor_position=tensor_position,
+            affected_comps=affected_comps,
+            write_main_log=write_main_log,
+        )
+        return log_type
+
+    def reset_random_state(self, seed=None):
         """Reset NumPy and framework RNGs for reproducible executions."""
+        if seed is None:
+            seed = getattr(self.runtime_config, "random_seed", 42)
+        seed = int(seed)
         numpy.random.seed(seed)
         try:
             paddle.seed(seed)

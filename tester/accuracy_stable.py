@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import gc
-import traceback
 from concurrent.futures import ThreadPoolExecutor
 
 import numpy
@@ -74,50 +73,36 @@ class APITestAccuracyStable(APITestBase):
             return 0
         return adaptive_workspace_bytes(torch)
 
-    def _broadcast_to_comp_dimensions(self, log_type, affected_comps):
-        """将执行阶段错误广播到所有受影响的 comp 维度"""
-        for comp in affected_comps:
-            log_worker.write_to_comp_log(comp, log_type, self.api_config.config)
-
     def test(self):
         if self.need_skip():
-            print(f"[skip] {self.api_config.config}", flush=True)
-            log_worker.write_to_log("skip", self.api_config.config)
+            self.report_case_result("skip")
             return
 
         if not self.ana_api_info():
-            print("ana_api_info failed", flush=True)
-            log_worker.write_to_log("config_parse", self.api_config.config)
+            self.report_case_result("config_parse", "ana_api_info failed")
             return
 
         try:
             convert_result = self.converter.convert(self.api_config.api_name)
         except Exception as e:
-            print(
-                f"[config_convert] Conversion failed for {self.api_config.config}: {e!s}",
-                flush=True,
-            )
-            log_worker.write_to_log("config_convert", self.api_config.config)
+            self.report_case_result("config_convert", f"Conversion failed: {e!s}")
             return
         if not convert_result.is_supported:
-            print(
-                f"[config_convert] Unsupported API {self.api_config.api_name}: {convert_result.error_message}",
-                flush=True,
+            self.report_case_result(
+                "config_convert",
+                f"Unsupported API {self.api_config.api_name}: {convert_result.error_message}",
             )
-            log_worker.write_to_log("config_convert", self.api_config.config)
             return
         if not convert_result.code or not convert_result.code.is_valid():
-            print(
-                f"[config_convert] No code generated for {self.api_config.api_name}",
-                flush=True,
+            self.report_case_result(
+                "config_convert",
+                f"No code generated for {self.api_config.api_name}",
             )
-            log_worker.write_to_log("config_convert", self.api_config.config)
             return
 
         try:
             if not self.gen_numpy_input():
-                print("gen_numpy_input failed")
-                log_worker.write_to_log("config_input", self.api_config.config)
+                self.report_case_result("config_input", "gen_numpy_input failed")
                 return
         except Exception as err:
             log_type, fatal = self.report_runtime_error(err, "config_input", "input")
@@ -591,7 +576,11 @@ class APITestAccuracyStable(APITestBase):
         torch_output = None
         try:
             if not self.gen_torch_input():
-                print("gen_torch_input failed", flush=True)
+                self.report_case_result(
+                    "torch_error",
+                    "gen_torch_input failed",
+                    affected_comps=self._TORCH_AFFECTED_COMPS[iter_idx],
+                )
                 return None, None, None
 
             exec_globals = {"torch": torch, "_adaptive_workspace_bytes": adaptive_workspace_bytes}
@@ -622,8 +611,12 @@ class APITestAccuracyStable(APITestBase):
             torch_output = exec_locals[output_var]
             paddle.base.core.eager._for_test_check_cuda_error()
         except Exception as err:
-            log_type, fatal = self.report_runtime_error(err, "torch_error", "forward")
-            self._broadcast_to_comp_dimensions(log_type, self._TORCH_AFFECTED_COMPS[iter_idx])
+            log_type, fatal = self.report_runtime_error(
+                err,
+                "torch_error",
+                "forward",
+                affected_comps=self._TORCH_AFFECTED_COMPS[iter_idx],
+            )
             if fatal:
                 raise
             return None, None, None
@@ -648,43 +641,51 @@ class APITestAccuracyStable(APITestBase):
             except Exception as err:
                 err_str = str(err)
                 if err_str.startswith("Too large tensor to get cached numpy: "):
-                    print(
-                        f"[config_input] {self.api_config.config}\n{err_str}",
-                        flush=True,
-                    )
-                    self._broadcast_to_comp_dimensions(
-                        "config_input", self._TORCH_AFFECTED_COMPS[iter_idx]
+                    self.report_runtime_error(
+                        err,
+                        "config_input",
+                        "backward",
+                        force_log_type="config_input",
+                        affected_comps=self._TORCH_AFFECTED_COMPS[iter_idx],
                     )
                     return None, None, None
                 if any(cuda_err in err_str for cuda_err in CUDA_OOM):
-                    print(
-                        f"[oom] backward | {self.api_config.config}\n{err_str}",
-                        flush=True,
+                    self.report_runtime_error(
+                        err,
+                        "oom",
+                        "backward",
+                        force_log_type="oom",
+                        affected_comps=self._TORCH_AFFECTED_COMPS[iter_idx],
                     )
-                    self._broadcast_to_comp_dimensions("oom", self._TORCH_AFFECTED_COMPS[iter_idx])
                     raise
                 if any(cuda_err in err_str for cuda_err in CUDA_ERROR):
-                    print(
-                        f"[torch_error] backward | {self.api_config.config}\n{err_str}",
-                        flush=True,
-                    )
-                    self._broadcast_to_comp_dimensions(
-                        "torch_error", self._TORCH_AFFECTED_COMPS[iter_idx]
+                    self.report_runtime_error(
+                        err,
+                        "torch_error",
+                        "backward",
+                        force_log_type="torch_error",
+                        affected_comps=self._TORCH_AFFECTED_COMPS[iter_idx],
                     )
                     raise
-                print(err_str, flush=True)
+                log_type, fatal = self.report_runtime_error(
+                    err,
+                    "torch_error",
+                    "backward",
+                    affected_comps=self._TORCH_AFFECTED_COMPS[iter_idx],
+                )
+                if fatal:
+                    raise
+                return None, None, None
 
             try:
                 paddle.base.core.eager._for_test_check_cuda_error()
             except Exception as err:
-                err_str = str(err)
-                print(
-                    f"[torch_error] backward | {self.api_config.config}\n{err_str}",
-                    flush=True,
-                )
-                traceback.print_exc()
-                self._broadcast_to_comp_dimensions(
-                    "torch_error", self._TORCH_AFFECTED_COMPS[iter_idx]
+                self.report_runtime_error(
+                    err,
+                    "torch_error",
+                    "backward cuda check",
+                    force_log_type="torch_error",
+                    affected_comps=self._TORCH_AFFECTED_COMPS[iter_idx],
                 )
                 raise
 
@@ -704,7 +705,11 @@ class APITestAccuracyStable(APITestBase):
         paddle_output = None
         try:
             if not self.gen_paddle_input():
-                print("gen_paddle_input failed")
+                self.report_case_result(
+                    "paddle_error",
+                    "gen_paddle_input failed",
+                    affected_comps=self._PADDLE_AFFECTED_COMPS[iter_idx],
+                )
                 return None, None
 
             # determine the dtype
@@ -753,8 +758,8 @@ class APITestAccuracyStable(APITestBase):
                 "paddle_error",
                 "forward",
                 allow_ignore_paddle=True,
+                affected_comps=self._PADDLE_AFFECTED_COMPS[iter_idx],
             )
-            self._broadcast_to_comp_dimensions(log_type, self._PADDLE_AFFECTED_COMPS[iter_idx])
             if fatal:
                 raise
             return None, None
@@ -762,8 +767,13 @@ class APITestAccuracyStable(APITestBase):
         try:
             paddle.base.core.eager._for_test_check_cuda_error()
         except Exception as err:
-            print(f"[paddle_cuda] {self.api_config.config}\n{err!s}", flush=True)
-            self._broadcast_to_comp_dimensions("paddle_cuda", self._PADDLE_AFFECTED_COMPS[iter_idx])
+            self.report_runtime_error(
+                err,
+                "paddle_cuda",
+                "forward cuda check",
+                force_log_type="paddle_cuda",
+                affected_comps=self._PADDLE_AFFECTED_COMPS[iter_idx],
+            )
             raise
 
         # ======== run paddle backward ========
@@ -784,54 +794,58 @@ class APITestAccuracyStable(APITestBase):
             except Exception as err:
                 err_str = str(err)
                 if err_str.startswith("Too large tensor to get cached numpy: "):
-                    print(
-                        f"[config_input] {self.api_config.config}\n{err_str}",
-                        flush=True,
-                    )
-                    self._broadcast_to_comp_dimensions(
-                        "config_input", self._PADDLE_AFFECTED_COMPS[iter_idx]
+                    self.report_runtime_error(
+                        err,
+                        "config_input",
+                        "backward",
+                        force_log_type="config_input",
+                        affected_comps=self._PADDLE_AFFECTED_COMPS[iter_idx],
                     )
                     return None, None
                 if self.should_ignore_paddle_error(err_str):
-                    print(f"[pass] {self.api_config.config}", flush=True)
-                    self._broadcast_to_comp_dimensions(
-                        "pass", self._PADDLE_AFFECTED_COMPS[iter_idx]
+                    self.report_runtime_error(
+                        err,
+                        "paddle_error",
+                        "backward",
+                        allow_ignore_paddle=True,
+                        affected_comps=self._PADDLE_AFFECTED_COMPS[iter_idx],
                     )
                     return None, None
                 if any(cuda_err in err_str for cuda_err in CUDA_ERROR):
-                    print(
-                        f"[paddle_cuda] backward | {self.api_config.config}\n{err_str}",
-                    )
-                    self._broadcast_to_comp_dimensions(
-                        "paddle_cuda", self._PADDLE_AFFECTED_COMPS[iter_idx]
+                    self.report_runtime_error(
+                        err,
+                        "paddle_cuda",
+                        "backward",
+                        force_log_type="paddle_cuda",
+                        affected_comps=self._PADDLE_AFFECTED_COMPS[iter_idx],
                     )
                     raise
                 if any(cuda_err in err_str for cuda_err in CUDA_OOM):
-                    print(
-                        f"[oom] backward | {self.api_config.config}\n{err_str}",
-                        flush=True,
+                    self.report_runtime_error(
+                        err,
+                        "oom",
+                        "backward",
+                        force_log_type="oom",
+                        affected_comps=self._PADDLE_AFFECTED_COMPS[iter_idx],
                     )
-                    self._broadcast_to_comp_dimensions("oom", self._PADDLE_AFFECTED_COMPS[iter_idx])
                     raise
-                print(
-                    f"[paddle_error] backward | {self.api_config.config}\n{err_str}",
-                    flush=True,
-                )
-                traceback.print_exc()
-                self._broadcast_to_comp_dimensions(
-                    "paddle_error", self._PADDLE_AFFECTED_COMPS[iter_idx]
+                self.report_runtime_error(
+                    err,
+                    "paddle_error",
+                    "backward",
+                    affected_comps=self._PADDLE_AFFECTED_COMPS[iter_idx],
                 )
                 return None, None
 
             try:
                 paddle.base.core.eager._for_test_check_cuda_error()
             except Exception as err:
-                print(
-                    f"[paddle_cuda] backward | {self.api_config.config}\n{err!s}",
-                    flush=True,
-                )
-                self._broadcast_to_comp_dimensions(
-                    "paddle_cuda", self._PADDLE_AFFECTED_COMPS[iter_idx]
+                self.report_runtime_error(
+                    err,
+                    "paddle_cuda",
+                    "backward cuda check",
+                    force_log_type="paddle_cuda",
+                    affected_comps=self._PADDLE_AFFECTED_COMPS[iter_idx],
                 )
                 raise
 
@@ -844,177 +858,229 @@ class APITestAccuracyStable(APITestBase):
         paddle_out_grads = process_paddle_outputs(paddle_out_grads)
         return paddle_output, paddle_out_grads
 
-    def compare(self, input1, input2, comp):
-        input1_missing = input1 is None or (
-            isinstance(input1, paddle.Tensor)
-            and not input1._is_initialized()
-            and int(input1.numel()) != 0
+    @staticmethod
+    def _is_missing_compare_value(value):
+        return value is None or (
+            isinstance(value, paddle.Tensor)
+            and not value._is_initialized()
+            and int(value.numel()) != 0
         )
-        input2_missing = input2 is None or (
-            isinstance(input2, paddle.Tensor)
-            and not input2._is_initialized()
-            and int(input2.numel()) != 0
+
+    def report_stable_compare_error(
+        self,
+        err,
+        comp,
+        *,
+        tensor_position=None,
+        tensor_count=1,
+    ):
+        log_type, fatal = self.report_runtime_error(
+            err,
+            "paddle_accuracy",
+            comp,
+            tensor_position=tensor_position,
+            affected_comps=(comp,),
         )
-        if input1_missing and input2_missing:
-            dtype = "None"
-            if isinstance(input1, (paddle.Tensor, torch.Tensor)):
-                dtype = str(input1.dtype)
-            elif isinstance(input2, (paddle.Tensor, torch.Tensor)):
-                dtype = str(input2.dtype)
-            log_comparison.log_accuracy_stable(
-                "Identical",
-                self.api_config.api_name,
-                self.api_config.config,
-                dtype,
-                comp,
-                tensor_index=0,
-                tensor_count=1,
+        log_worker._record_case_comparison(comp, log_type, 0, max(1, int(tensor_count or 1)))
+        if fatal:
+            raise err
+        return log_type, fatal
+
+    def _stable_leaf_count(self, input1, input2):
+        if isinstance(input1, dict) and isinstance(input2, dict) and input1.keys() == input2.keys():
+            return sum(self._stable_leaf_count(input1[key], input2[key]) for key in input1)
+        if isinstance(input1, (list, tuple)) and isinstance(input2, (list, tuple)):
+            if len(input1) != len(input2):
+                return max(len(input1), len(input2), 1)
+            return sum(
+                self._stable_leaf_count(item1, item2)
+                for item1, item2 in zip(input1, input2, strict=False)
             )
-        elif isinstance(input1, (paddle.Tensor, torch.Tensor)):
+        return 1
+
+    def _log_stable_identical_missing(self, input1, input2, comp, tensor_index, tensor_count):
+        dtype = "None"
+        if isinstance(input1, (paddle.Tensor, torch.Tensor)):
+            dtype = str(input1.dtype)
+        elif isinstance(input2, (paddle.Tensor, torch.Tensor)):
+            dtype = str(input2.dtype)
+        log_comparison.log_accuracy_stable(
+            "Identical",
+            self.api_config.api_name,
+            self.api_config.config,
+            dtype,
+            comp,
+            tensor_index=tensor_index,
+            tensor_count=tensor_count,
+        )
+
+    def _compare_stable_leaf(self, input1, input2, comp, tensor_index, tensor_count):
+        input1_missing = self._is_missing_compare_value(input1)
+        input2_missing = self._is_missing_compare_value(input2)
+        tensor_position = f"{tensor_index + 1}/{tensor_count}"
+        if input1_missing and input2_missing:
+            self._log_stable_identical_missing(
+                input1,
+                input2,
+                comp,
+                tensor_index,
+                tensor_count,
+            )
+            return True
+        if isinstance(input1, (paddle.Tensor, torch.Tensor)):
             if isinstance(input2, (paddle.Tensor, torch.Tensor)):
                 try:
                     self.assert_accuracy(
                         input1,
                         input2,
                         comp,
-                        tensor_index=0,
-                        tensor_count=1,
+                        tensor_index=tensor_index,
+                        tensor_count=tensor_count,
                     )
                 except Exception as err:
-                    self.report_compare_error(
+                    self.report_stable_compare_error(
                         err,
                         comp,
-                        tensor_position="1/1",
+                        tensor_position=tensor_position,
+                        tensor_count=tensor_count,
                     )
-                    return
-            else:
+                    return False
+                return True
+            log_comparison.log_comp_issue(
+                comp,
+                "paddle_accuracy",
+                self.api_config.config,
+                tensor_index=tensor_index,
+                tensor_count=tensor_count,
+                reason="type_mismatch",
+                actual_type=type(input1).__name__,
+                expected_type=type(input2).__name__,
+            )
+            return False
+        if isinstance(input2, (paddle.Tensor, torch.Tensor)):
+            log_comparison.log_comp_issue(
+                comp,
+                "paddle_accuracy",
+                self.api_config.config,
+                tensor_index=tensor_index,
+                tensor_count=tensor_count,
+                reason="type_mismatch",
+                actual_type=type(input1).__name__,
+                expected_type=type(input2).__name__,
+            )
+            return False
+        try:
+            self.assert_accuracy(
+                torch.tensor(input1),
+                torch.tensor(input2),
+                comp,
+                tensor_index=tensor_index,
+                tensor_count=tensor_count,
+            )
+        except Exception as err:
+            self.report_stable_compare_error(
+                err,
+                comp,
+                tensor_position=tensor_position,
+                tensor_count=tensor_count,
+            )
+            return False
+        return True
+
+    def _compare_stable_tree(self, input1, input2, comp, tensor_index, tensor_count):
+        if isinstance(input1, dict):
+            if not isinstance(input2, dict):
                 log_comparison.log_comp_issue(
                     comp,
                     "paddle_accuracy",
                     self.api_config.config,
-                    tensor_index=None,
-                    tensor_count=None,
+                    tensor_index=tensor_index,
+                    tensor_count=tensor_count,
                     reason="type_mismatch",
                     actual_type=type(input1).__name__,
                     expected_type=type(input2).__name__,
                 )
-                return
-        elif isinstance(input1, (list, tuple)):
+                return 1, False
+            if input1.keys() != input2.keys():
+                log_comparison.log_comp_issue(
+                    comp,
+                    "paddle_accuracy",
+                    self.api_config.config,
+                    tensor_index=tensor_index,
+                    tensor_count=tensor_count,
+                    reason="key_mismatch",
+                    actual_keys=list(input1.keys()),
+                    expected_keys=list(input2.keys()),
+                )
+                return max(len(input1), len(input2), 1), False
+            consumed = 0
+            for key in input1:
+                child_consumed, ok = self._compare_stable_tree(
+                    input1[key],
+                    input2[key],
+                    comp,
+                    tensor_index + consumed,
+                    tensor_count,
+                )
+                consumed += child_consumed
+                if not ok:
+                    return max(consumed, 1), False
+            return max(consumed, 1), True
+        if isinstance(input1, (list, tuple)):
             if not isinstance(input2, (list, tuple)):
                 log_comparison.log_comp_issue(
                     comp,
                     "paddle_accuracy",
                     self.api_config.config,
-                    tensor_index=None,
-                    tensor_count=None,
+                    tensor_index=tensor_index,
+                    tensor_count=tensor_count,
                     reason="type_mismatch",
                     actual_type=type(input1).__name__,
                     expected_type=type(input2).__name__,
                 )
-                return
+                return 1, False
             if len(input1) != len(input2):
                 log_comparison.log_comp_issue(
                     comp,
                     "paddle_accuracy",
                     self.api_config.config,
-                    tensor_index=None,
-                    tensor_count=None,
+                    tensor_index=tensor_index,
+                    tensor_count=tensor_count,
                     reason="count_mismatch",
                     actual_count=len(input1),
                     expected_count=len(input2),
                 )
-                return
-            tensor_count = len(input1)
-            for idx, (item1, item2) in enumerate(zip(input1, input2, strict=False)):
-                item1_missing = item1 is None or (
-                    isinstance(item1, paddle.Tensor)
-                    and not item1._is_initialized()
-                    and int(item1.numel()) != 0
-                )
-                item2_missing = item2 is None or (
-                    isinstance(item2, paddle.Tensor)
-                    and not item2._is_initialized()
-                    and int(item2.numel()) != 0
-                )
-                if item1_missing and item2_missing:
-                    dtype = "None"
-                    if isinstance(item1, (paddle.Tensor, torch.Tensor)):
-                        dtype = str(item1.dtype)
-                    elif isinstance(item2, (paddle.Tensor, torch.Tensor)):
-                        dtype = str(item2.dtype)
-                    log_comparison.log_accuracy_stable(
-                        "Identical",
-                        self.api_config.api_name,
-                        self.api_config.config,
-                        dtype,
-                        comp,
-                        tensor_index=idx,
-                        tensor_count=tensor_count,
-                    )
-                elif isinstance(item1, (paddle.Tensor, torch.Tensor)) and isinstance(
-                    item2, (paddle.Tensor, torch.Tensor)
-                ):
-                    try:
-                        self.assert_accuracy(
-                            item1,
-                            item2,
-                            comp,
-                            tensor_index=idx,
-                            tensor_count=tensor_count,
-                        )
-                    except Exception as err:
-                        self.report_compare_error(
-                            err,
-                            comp,
-                            tensor_position=f"{idx + 1}/{tensor_count}",
-                        )
-                        return
-                elif not isinstance(item1, (paddle.Tensor, torch.Tensor)) and not isinstance(
-                    item2, (paddle.Tensor, torch.Tensor)
-                ):
-                    try:
-                        self.assert_accuracy(
-                            torch.tensor(item1),
-                            torch.tensor(item2),
-                            comp,
-                            tensor_index=idx,
-                            tensor_count=tensor_count,
-                        )
-                    except Exception as err:
-                        self.report_compare_error(
-                            err,
-                            comp,
-                            tensor_position=f"{idx + 1}/{tensor_count}",
-                        )
-                        return
-                else:
-                    log_comparison.log_comp_issue(
-                        comp,
-                        "paddle_accuracy",
-                        self.api_config.config,
-                        tensor_index=idx,
-                        tensor_count=tensor_count,
-                        reason="type_mismatch",
-                        actual_type=type(item1).__name__,
-                        expected_type=type(item2).__name__,
-                    )
-                    return
-        else:
-            try:
-                self.assert_accuracy(
-                    torch.tensor(input1),
-                    torch.tensor(input2),
+                return max(len(input1), len(input2), 1), False
+            consumed = 0
+            for item1, item2 in zip(input1, input2, strict=False):
+                child_consumed, ok = self._compare_stable_tree(
+                    item1,
+                    item2,
                     comp,
-                    tensor_index=0,
-                    tensor_count=1,
+                    tensor_index + consumed,
+                    tensor_count,
                 )
-            except Exception as err:
-                self.report_compare_error(
-                    err,
-                    comp,
-                    tensor_position="1/1",
-                )
-                return
+                consumed += child_consumed
+                if not ok:
+                    return max(consumed, 1), False
+            return max(consumed, 1), True
+        if isinstance(input2, (dict, list, tuple)):
+            log_comparison.log_comp_issue(
+                comp,
+                "paddle_accuracy",
+                self.api_config.config,
+                tensor_index=tensor_index,
+                tensor_count=tensor_count,
+                reason="type_mismatch",
+                actual_type=type(input1).__name__,
+                expected_type=type(input2).__name__,
+            )
+            return 1, False
+        return 1, self._compare_stable_leaf(input1, input2, comp, tensor_index, tensor_count)
+
+    def compare(self, input1, input2, comp):
+        tensor_count = max(1, self._stable_leaf_count(input1, input2))
+        self._compare_stable_tree(input1, input2, comp, 0, tensor_count)
 
     def assert_accuracy(
         self,

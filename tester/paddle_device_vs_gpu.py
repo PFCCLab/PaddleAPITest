@@ -9,7 +9,6 @@ from pathlib import Path
 import numpy as np
 import paddle
 
-from .log_writer.log_worker import write_to_log
 from .paddle_device_vs_cpu import APITestCustomDeviceVSCPU
 
 
@@ -151,19 +150,19 @@ class APITestPaddleDeviceVSGPU(APITestCustomDeviceVSCPU):
             elif device_type == "cpu":
                 paddle.set_device("cpu")
             else:
-                print(f"[error] No custom device available", flush=True)
+                self.report_case_result("paddle_crash", "no custom device available")
                 return None, None
 
             if not self.ana_paddle_api_info():
-                print("ana_paddle_api_info failed", flush=True)
+                self.report_case_result("config_parse", "ana_paddle_api_info failed")
                 return None, None
 
             if not self.gen_numpy_input():
-                print("gen_numpy_input failed", flush=True)
+                self.report_case_result("config_input", "gen_numpy_input failed")
                 return None, None
 
             if not self.gen_paddle_input():
-                print("gen_paddle_input failed", flush=True)
+                self.report_case_result("paddle_error", "gen_paddle_input failed")
                 return None, None
 
             paddle_output = self.paddle_api(*tuple(self.paddle_args), **self.paddle_kwargs)
@@ -307,7 +306,7 @@ class APITestPaddleDeviceVSGPU(APITestCustomDeviceVSCPU):
                 f"[compare] Accuracy check passed for {self.api_config.config}",
                 flush=True,
             )
-            write_to_log("pass", self.api_config.config)
+            self.report_case_result("pass")
             return True
 
         except Exception as e:
@@ -321,9 +320,9 @@ class APITestPaddleDeviceVSGPU(APITestCustomDeviceVSCPU):
         elif self.operation_mode == "download":
             self._test_download_mode()
         else:
-            print(
-                "[error] operation_mode 不能为空，请指定 --operation_mode=upload 或 download",
-                flush=True,
+            self.report_case_result(
+                "config_parse",
+                "operation_mode is required: use upload or download",
             )
             return
 

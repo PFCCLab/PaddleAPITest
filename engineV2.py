@@ -709,8 +709,7 @@ def run_test_case(api_config_str, options):
         try:
             api_config = APIConfig(api_config_str)
         except Exception as err:
-            print(f"[config_parse] {api_config_str} {err!s}", flush=True)
-            log_worker.write_to_log("config_parse", api_config_str)
+            log_worker.emit_case_result("config_parse", api_config_str, message=str(err))
             case_status = "error"
             return completion
 

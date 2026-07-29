@@ -122,6 +122,65 @@ def write_to_comp_log(comp, log_type: LogType, line):
         _record_terminal_type(line, log_type)
 
 
+def format_case_result(
+    log_type: LogType,
+    line,
+    *,
+    phase=None,
+    message=None,
+    error=None,
+    tensor_position=None,
+):
+    """Format one case-level result line for terminal output."""
+    head = f"[{log_type}]"
+    if phase:
+        head += f" {phase}"
+    fields = []
+    if tensor_position:
+        fields.append(f"tensor {tensor_position}")
+    if message:
+        fields.append(str(message))
+    if not phase and not tensor_position and message:
+        first_line = f"{head} {message} | {line}"
+    else:
+        prefix = " | ".join([head, *fields])
+        first_line = f"{prefix} | {line}" if phase or fields else f"{prefix} {line}"
+    if error is None:
+        return first_line
+    return f"{first_line}\n{error}"
+
+
+def emit_case_result(
+    log_type: LogType,
+    line,
+    *,
+    phase=None,
+    message=None,
+    error=None,
+    tensor_position=None,
+    affected_comps=None,
+    write_main_log=True,
+):
+    """Print and record one case-level result using the shared result format."""
+    line = line.strip()
+    print(
+        format_case_result(
+            log_type,
+            line,
+            phase=phase,
+            message=message,
+            error=error,
+            tensor_position=tensor_position,
+        ),
+        flush=True,
+    )
+    if write_main_log:
+        write_to_log(log_type, line)
+    if affected_comps:
+        for comp in affected_comps:
+            write_to_comp_log(comp, log_type, line)
+
+
 def write_stable_passes(line):
     """为尚未分类的稳定性维度和主结果写入 pass。"""
     line = line.strip()
@@ -135,8 +194,7 @@ def write_stable_passes(line):
             )
             write_to_comp_log(representative, "pass", line)
     if main_terminal_type is None:
-        print(f"[pass] {line}", flush=True)
-        write_to_log("pass", line)
+        emit_case_result("pass", line)
 
 
 def merge_sanitizer_case_logs(case_log_dir):

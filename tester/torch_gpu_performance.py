@@ -6,7 +6,6 @@ import torch
 
 from .api_config.config_analyzer import TensorConfig
 from .base import APITestBase
-from .log_writer.log_worker import write_to_log
 from .paddle_to_torch import adaptive_workspace_bytes, get_converter
 
 
@@ -53,40 +52,34 @@ class APITestTorchGPUPerformance(APITestBase):
 
     def test(self):
         if self.need_skip(paddle_only=True):
-            print("[Skip]", flush=True)
+            self.report_case_result("skip")
             return
 
         if not self.ana_api_info():
-            print("ana_api_info failed", flush=True)
+            self.report_case_result("config_parse", "ana_api_info failed")
             return
 
         try:
             convert_result = self.converter.convert(self.api_config.api_name)
         except Exception as e:
-            print(
-                f"[paddle_to_torch] Conversion failed for {self.api_config.config}: {e!s}",
-                flush=True,
-            )
-            write_to_log("config_convert", self.api_config.config)
+            self.report_case_result("config_convert", f"Conversion failed: {e!s}")
             return
         if not convert_result.is_supported:
-            print(
-                f"[paddle_to_torch] Unsupported API {self.api_config.api_name}: {convert_result.error_message}",
-                flush=True,
+            self.report_case_result(
+                "config_convert",
+                f"Unsupported API {self.api_config.api_name}: {convert_result.error_message}",
             )
-            write_to_log("config_convert", self.api_config.config)
             return
         if not convert_result.code or not convert_result.code.is_valid():
-            print(
-                f"[paddle_to_torch] No code generated for {self.api_config.api_name}",
-                flush=True,
+            self.report_case_result(
+                "config_convert",
+                f"No code generated for {self.api_config.api_name}",
             )
-            write_to_log("config_convert", self.api_config.config)
             return
 
         try:
             if not self.gen_numpy_input():
-                print("gen_numpy_input failed")
+                self.report_case_result("config_input", "gen_numpy_input failed")
                 return
         except Exception as err:
             log_type, fatal = self.report_runtime_error(err, "config_input", "input")
@@ -102,7 +95,7 @@ class APITestTorchGPUPerformance(APITestBase):
             device = torch.device("cuda:0")
             torch.set_default_device(device)
             if not self.gen_torch_input():
-                print("gen_torch_input failed", flush=True)
+                self.report_case_result("torch_error", "gen_torch_input failed")
                 return
 
             # torch_args 与 torch_kwargs 是尚未映射的 torch 参数（即按 paddle 的参数顺序与关键字排列的 torch tensors）
@@ -202,9 +195,8 @@ class APITestTorchGPUPerformance(APITestBase):
                 "\tTorch\t",
                 combined,
             )
-            if "CUDA error" in str(err) or "memory corruption" in str(err):
-                raise err
-            if "CUDA out of memory" in str(err) or "Out of memory error" in str(err):
+            _, fatal = self.report_runtime_error(err, "torch_error", "forward")
+            if fatal:
                 raise err
             return
 
@@ -258,9 +250,7 @@ class APITestTorchGPUPerformance(APITestBase):
                 "\tTorch\t",
                 combined,
             )
-            print(str(err))
-            if "CUDA error" in str(err) or "memory corruption" in str(err):
-                raise err
-            if "CUDA out of memory" in str(err) or "Out of memory error" in str(err):
+            _, fatal = self.report_runtime_error(err, "torch_error", "backward")
+            if fatal:
                 raise err
             return

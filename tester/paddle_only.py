@@ -3,7 +3,6 @@ from __future__ import annotations
 import paddle
 
 from .base import APITestBase
-from .log_writer.log_worker import write_to_log
 
 # from func_timeout import func_set_timeout
 
@@ -21,14 +20,12 @@ class APITestPaddleOnly(APITestBase):
     def test(self):
         self.dump_event("api_analyze_start", mode="paddle_only")
         if self.need_skip(paddle_only=True):
-            print(f"[skip] {self.api_config.config}", flush=True)
-            write_to_log("skip", self.api_config.config)
+            self.report_case_result("skip")
             self.dump_finalize("skip")
             return
 
         if not self.ana_paddle_api_info():
-            print("ana_paddle_api_info failed", flush=True)
-            write_to_log("config_parse", self.api_config.config)
+            self.report_case_result("config_parse", "ana_paddle_api_info failed")
             self.dump_finalize("config_parse")
             return
         self.dump_event("api_analyze_done", api_name=self.api_config.api_name)
@@ -36,8 +33,7 @@ class APITestPaddleOnly(APITestBase):
         try:
             self.dump_event("numpy_input_start")
             if not self.gen_numpy_input():
-                print("gen_numpy_input failed", flush=True)
-                write_to_log("config_input", self.api_config.config)
+                self.report_case_result("config_input", "gen_numpy_input failed")
                 self.dump_finalize("config_input")
                 return
             self.dump_event("numpy_input_done")
@@ -51,8 +47,7 @@ class APITestPaddleOnly(APITestBase):
         try:
             self.dump_event("paddle_input_start")
             if not self.gen_paddle_input():
-                print("gen_paddle_input failed", flush=True)
-                write_to_log("paddle_error", self.api_config.config)
+                self.report_case_result("paddle_error", "gen_paddle_input failed")
                 self.dump_finalize("paddle_error")
                 return
             self.dump_save(
@@ -117,6 +112,5 @@ class APITestPaddleOnly(APITestBase):
             self.dump_finalize("paddle_cuda")
             raise
 
-        print(f"[pass] {self.api_config.config}", flush=True)
-        write_to_log("pass", self.api_config.config)
+        self.report_case_result("pass")
         self.dump_finalize("pass")

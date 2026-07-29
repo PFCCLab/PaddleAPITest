@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import gc
-import traceback
 
 import numpy
 import paddle
@@ -9,7 +8,6 @@ import torch
 import yaml
 
 from .base import APITestBase, gpu_mode_maybe_empty_cache
-from .log_writer.log_worker import write_to_log
 from .paddle_to_torch import adaptive_workspace_bytes, get_converter
 
 # from func_timeout import func_set_timeout
@@ -68,14 +66,12 @@ class APITestAccuracy(APITestBase):
     def test(self):
         self.dump_event("api_analyze_start", mode="accuracy")
         if self.need_skip():
-            print(f"[skip] {self.api_config.config}", flush=True)
-            write_to_log("skip", self.api_config.config)
+            self.report_case_result("skip")
             self.dump_finalize("skip")
             return
 
         if not self.ana_api_info():
-            print("ana_api_info failed", flush=True)
-            write_to_log("config_parse", self.api_config.config)
+            self.report_case_result("config_parse", "ana_api_info failed")
             self.dump_finalize("config_parse")
             return
         self.dump_event("api_analyze_done", api_name=self.api_config.api_name)
@@ -85,29 +81,23 @@ class APITestAccuracy(APITestBase):
             convert_result = self.converter.convert(self.api_config.api_name)
         except Exception as e:
             self.dump_error("config_convert_error", e)
-            print(
-                f"[config_convert] Conversion failed for {self.api_config.config}: {e!s}",
-                flush=True,
-            )
-            write_to_log("config_convert", self.api_config.config)
+            self.report_case_result("config_convert", f"Conversion failed: {e!s}")
             self.dump_finalize("config_convert")
             return
         if not convert_result.is_supported:
-            print(
-                f"[config_convert] Unsupported API {self.api_config.api_name}: {convert_result.error_message}",
-                flush=True,
+            self.report_case_result(
+                "config_convert",
+                f"Unsupported API {self.api_config.api_name}: {convert_result.error_message}",
             )
-            write_to_log("config_convert", self.api_config.config)
             self.dump_event("config_convert_error", error=convert_result.error_message)
             self.dump_finalize("config_convert")
             return
         self.dump_event("config_convert_done")
         if not convert_result.code or not convert_result.code.is_valid():
-            print(
-                f"[config_convert] No code generated for {self.api_config.api_name}",
-                flush=True,
+            self.report_case_result(
+                "config_convert",
+                f"No code generated for {self.api_config.api_name}",
             )
-            write_to_log("config_convert", self.api_config.config)
             self.dump_event("config_convert_error", error="no code generated")
             self.dump_finalize("config_convert")
             return
@@ -115,8 +105,7 @@ class APITestAccuracy(APITestBase):
         try:
             self.dump_event("numpy_input_start")
             if not self.gen_numpy_input():
-                print("gen_numpy_input failed")
-                write_to_log("config_input", self.api_config.config)
+                self.report_case_result("config_input", "gen_numpy_input failed")
                 self.dump_finalize("config_input")
                 return
             self.dump_event("numpy_input_done")
@@ -134,8 +123,7 @@ class APITestAccuracy(APITestBase):
             torch.set_default_device(device)
             self.dump_event("torch_input_start")
             if not self.gen_torch_input():
-                print("gen_torch_input failed", flush=True)
-                write_to_log("torch_error", self.api_config.config)
+                self.report_case_result("torch_error", "gen_torch_input failed")
                 self.dump_finalize("torch_error")
                 return
             self.dump_save(
@@ -211,7 +199,6 @@ class APITestAccuracy(APITestBase):
 
             paddle.base.core.eager._for_test_check_cuda_error()
         except Exception as err:
-            traceback.print_exc()
             _, fatal = self.report_runtime_error(err, "torch_error", "forward")
             self.dump_finalize("torch_error")
             if fatal:
@@ -250,9 +237,12 @@ class APITestAccuracy(APITestBase):
                 del inputs_list, result_outputs, result_outputs_grads
             except Exception as err:
                 if str(err).startswith("Too large tensor to get cached numpy: "):
-                    self.dump_error("torch_backward_error", err)
-                    print(f"[config_input] {self.api_config.config}\n{err!s}")
-                    write_to_log("config_input", self.api_config.config)
+                    self.report_runtime_error(
+                        err,
+                        "config_input",
+                        "backward",
+                        force_log_type="config_input",
+                    )
                     return
                 _, fatal = self.report_runtime_error(err, "torch_error", "backward")
                 if fatal:
@@ -311,8 +301,7 @@ class APITestAccuracy(APITestBase):
 
         try:
             if not self.gen_paddle_input():
-                print("gen_paddle_input failed")
-                write_to_log("paddle_error", self.api_config.config)
+                self.report_case_result("paddle_error", "gen_paddle_input failed")
                 return
 
             # Reseed before executing paddle so that random APIs
@@ -383,19 +372,17 @@ class APITestAccuracy(APITestBase):
             **details,
         ):
             phase = "backward" if self.is_backward else "forward"
-            fields = [f"[paddle_accuracy] {phase}"]
-            if tensor_position:
-                fields.append(f"tensor {tensor_position}")
-            fields.append(reason.replace("_", " "))
             detail_text = " | ".join(
                 f"{key.replace('_', ' ')} {value}" for key, value in details.items()
             )
-            print(
-                f"{' | '.join(fields)} | {self.api_config.config}\n{detail_text}".rstrip(),
-                flush=True,
+            self.report_case_result(
+                "paddle_accuracy",
+                reason.replace("_", " "),
+                phase=phase,
+                tensor_position=tensor_position,
+                error=detail_text or None,
             )
             self.dump_finalize("paddle_accuracy")
-            write_to_log("paddle_accuracy", self.api_config.config)
 
         def compare_paddle_and_torch(
             paddle_tensor, torch_tensor, tensor_index=0, tensor_count=1
@@ -576,11 +563,12 @@ class APITestAccuracy(APITestBase):
                 del inputs_list, result_outputs, result_outputs_grads
             except Exception as err:
                 if str(err).startswith("Too large tensor to get cached numpy: "):
-                    print(
-                        f"[config_input] backward | {self.api_config.config}\n{err!s}",
-                        flush=True,
+                    self.report_runtime_error(
+                        err,
+                        "config_input",
+                        "backward",
+                        force_log_type="config_input",
                     )
-                    write_to_log("config_input", self.api_config.config)
                     return
                 log_type, fatal = self.report_runtime_error(
                     err, "paddle_error", "backward", allow_ignore_paddle=True
@@ -667,8 +655,7 @@ class APITestAccuracy(APITestBase):
                         if not compare_paddle_and_torch(paddle_item, torch_item, i, tensor_count):
                             return
 
-        print(f"[pass] {self.api_config.config}", flush=True)
-        write_to_log("pass", self.api_config.config)
+        self.report_case_result("pass")
         self.dump_finalize("pass")
 
 
