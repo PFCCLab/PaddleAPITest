@@ -2412,6 +2412,117 @@ class APITestBase:
 
         return visit(value)
 
+    @staticmethod
+    def is_missing_compare_value(value):
+        """Return whether a compare leaf means "no value" on both accuracy paths."""
+        return value is None or (
+            isinstance(value, paddle.Tensor)
+            and not value._is_initialized()
+            and int(value.numel()) != 0
+        )
+
+    def tensor_tree_leaf_count(self, actual, expected):
+        """Count comparable leaves with the same structure rules used by compare_tensor_tree."""
+        if (
+            isinstance(actual, dict)
+            and isinstance(expected, dict)
+            and actual.keys() == expected.keys()
+        ):
+            return sum(self.tensor_tree_leaf_count(actual[key], expected[key]) for key in actual)
+        if isinstance(actual, (list, tuple)) and isinstance(expected, (list, tuple)):
+            if len(actual) != len(expected):
+                return max(len(actual), len(expected), 1)
+            return sum(
+                self.tensor_tree_leaf_count(actual_item, expected_item)
+                for actual_item, expected_item in zip(actual, expected, strict=False)
+            )
+        return 1
+
+    def compare_tensor_tree(
+        self,
+        actual,
+        expected,
+        compare_leaf,
+        report_structure_error,
+        *,
+        tensor_index=0,
+        tensor_count=None,
+    ):
+        """遍历嵌套输出结构；调用方只负责叶子比较和错误落盘。"""
+        if tensor_count is None:
+            tensor_count = max(1, self.tensor_tree_leaf_count(actual, expected))
+
+        def report(reason, index, **details):
+            report_structure_error(
+                reason,
+                tensor_position=f"{index + 1}/{tensor_count}",
+                tensor_index=index,
+                tensor_count=tensor_count,
+                **details,
+            )
+
+        def visit(left, right, index):
+            if isinstance(left, dict):
+                if not isinstance(right, dict):
+                    report(
+                        "type_mismatch",
+                        index,
+                        actual_type=type(left).__name__,
+                        expected_type=type(right).__name__,
+                    )
+                    return 1, False
+                if left.keys() != right.keys():
+                    report(
+                        "key_mismatch",
+                        index,
+                        actual_keys=list(left.keys()),
+                        expected_keys=list(right.keys()),
+                    )
+                    return max(len(left), len(right), 1), False
+                consumed = 0
+                for key in left:
+                    child_consumed, ok = visit(left[key], right[key], index + consumed)
+                    consumed += child_consumed
+                    if not ok:
+                        return max(consumed, 1), False
+                return max(consumed, 1), True
+            if isinstance(left, (list, tuple)):
+                if not isinstance(right, (list, tuple)):
+                    report(
+                        "type_mismatch",
+                        index,
+                        actual_type=type(left).__name__,
+                        expected_type=type(right).__name__,
+                    )
+                    return 1, False
+                if len(left) != len(right):
+                    report(
+                        "count_mismatch",
+                        index,
+                        actual_count=len(left),
+                        expected_count=len(right),
+                    )
+                    return max(len(left), len(right), 1), False
+                consumed = 0
+                for left_item, right_item in zip(left, right, strict=False):
+                    child_consumed, ok = visit(left_item, right_item, index + consumed)
+                    consumed += child_consumed
+                    if not ok:
+                        return max(consumed, 1), False
+                return max(consumed, 1), True
+            if isinstance(right, (dict, list, tuple)):
+                report(
+                    "type_mismatch",
+                    index,
+                    actual_type=type(left).__name__,
+                    expected_type=type(right).__name__,
+                )
+                return 1, False
+            return 1, compare_leaf(left, right, index, tensor_count)
+
+        _, ok = visit(actual, expected, tensor_index)
+        return ok
+
     def _reference_workspace_bytes(self, convert_result):
         if not self.gpu_mode_config.enabled:
             return 0

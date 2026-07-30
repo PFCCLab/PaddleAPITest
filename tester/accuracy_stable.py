@@ -7,7 +7,7 @@ import numpy
 import paddle
 import torch
 
-from .accuracy import process_grad_output, process_output
+from .accuracy_common import process_grad_output, process_output
 from .base import CUDA_ERROR, CUDA_OOM, APITestBase, gpu_mode_memory_decision
 from .log_writer import log_comparison, log_worker
 from .paddle_to_torch import adaptive_workspace_bytes, get_converter
@@ -986,14 +986,6 @@ class APITestAccuracyStable(APITestBase):
         paddle_out_grads = self._normalize_paddle_result(paddle_out_grads)
         return paddle_output, paddle_out_grads
 
-    @staticmethod
-    def _is_missing_compare_value(value):
-        return value is None or (
-            isinstance(value, paddle.Tensor)
-            and not value._is_initialized()
-            and int(value.numel()) != 0
-        )
-
     def report_stable_compare_error(
         self,
         err,
@@ -1014,18 +1006,6 @@ class APITestAccuracyStable(APITestBase):
             raise err
         return log_type, fatal
 
-    def _stable_leaf_count(self, input1, input2):
-        if isinstance(input1, dict) and isinstance(input2, dict) and input1.keys() == input2.keys():
-            return sum(self._stable_leaf_count(input1[key], input2[key]) for key in input1)
-        if isinstance(input1, (list, tuple)) and isinstance(input2, (list, tuple)):
-            if len(input1) != len(input2):
-                return max(len(input1), len(input2), 1)
-            return sum(
-                self._stable_leaf_count(item1, item2)
-                for item1, item2 in zip(input1, input2, strict=False)
-            )
-        return 1
-
     def _log_stable_identical_missing(self, input1, input2, comp, tensor_index, tensor_count):
         dtype = "None"
         if isinstance(input1, (paddle.Tensor, torch.Tensor)):
@@ -1043,8 +1023,8 @@ class APITestAccuracyStable(APITestBase):
         )
 
     def _compare_stable_leaf(self, input1, input2, comp, tensor_index, tensor_count):
-        input1_missing = self._is_missing_compare_value(input1)
-        input2_missing = self._is_missing_compare_value(input2)
+        input1_missing = self.is_missing_compare_value(input1)
+        input2_missing = self.is_missing_compare_value(input2)
         tensor_position = f"{tensor_index + 1}/{tensor_count}"
         if input1_missing and input2_missing:
             self._log_stable_identical_missing(
@@ -1115,100 +1095,29 @@ class APITestAccuracyStable(APITestBase):
             return False
         return True
 
-    def _compare_stable_tree(self, input1, input2, comp, tensor_index, tensor_count):
-        if isinstance(input1, dict):
-            if not isinstance(input2, dict):
-                log_comparison.log_comp_issue(
-                    comp,
-                    "paddle_accuracy",
-                    self.api_config.config,
-                    tensor_index=tensor_index,
-                    tensor_count=tensor_count,
-                    reason="type_mismatch",
-                    actual_type=type(input1).__name__,
-                    expected_type=type(input2).__name__,
-                )
-                return 1, False
-            if input1.keys() != input2.keys():
-                log_comparison.log_comp_issue(
-                    comp,
-                    "paddle_accuracy",
-                    self.api_config.config,
-                    tensor_index=tensor_index,
-                    tensor_count=tensor_count,
-                    reason="key_mismatch",
-                    actual_keys=list(input1.keys()),
-                    expected_keys=list(input2.keys()),
-                )
-                return max(len(input1), len(input2), 1), False
-            consumed = 0
-            for key in input1:
-                child_consumed, ok = self._compare_stable_tree(
-                    input1[key],
-                    input2[key],
-                    comp,
-                    tensor_index + consumed,
-                    tensor_count,
-                )
-                consumed += child_consumed
-                if not ok:
-                    return max(consumed, 1), False
-            return max(consumed, 1), True
-        if isinstance(input1, (list, tuple)):
-            if not isinstance(input2, (list, tuple)):
-                log_comparison.log_comp_issue(
-                    comp,
-                    "paddle_accuracy",
-                    self.api_config.config,
-                    tensor_index=tensor_index,
-                    tensor_count=tensor_count,
-                    reason="type_mismatch",
-                    actual_type=type(input1).__name__,
-                    expected_type=type(input2).__name__,
-                )
-                return 1, False
-            if len(input1) != len(input2):
-                log_comparison.log_comp_issue(
-                    comp,
-                    "paddle_accuracy",
-                    self.api_config.config,
-                    tensor_index=tensor_index,
-                    tensor_count=tensor_count,
-                    reason="count_mismatch",
-                    actual_count=len(input1),
-                    expected_count=len(input2),
-                )
-                return max(len(input1), len(input2), 1), False
-            consumed = 0
-            for item1, item2 in zip(input1, input2, strict=False):
-                child_consumed, ok = self._compare_stable_tree(
-                    item1,
-                    item2,
-                    comp,
-                    tensor_index + consumed,
-                    tensor_count,
-                )
-                consumed += child_consumed
-                if not ok:
-                    return max(consumed, 1), False
-            return max(consumed, 1), True
-        if isinstance(input2, (dict, list, tuple)):
+    def compare(self, input1, input2, comp):
+        def compare_leaf(left, right, tensor_index, tensor_count):
+            return self._compare_stable_leaf(left, right, comp, tensor_index, tensor_count)
+
+        def report_structure_error(reason, *, tensor_index=0, tensor_count=1, **details):
+            details.pop("tensor_position", None)
             log_comparison.log_comp_issue(
                 comp,
                 "paddle_accuracy",
                 self.api_config.config,
                 tensor_index=tensor_index,
                 tensor_count=tensor_count,
-                reason="type_mismatch",
-                actual_type=type(input1).__name__,
-                expected_type=type(input2).__name__,
+                reason=reason,
+                **details,
             )
-            return 1, False
-        return 1, self._compare_stable_leaf(input1, input2, comp, tensor_index, tensor_count)
 
-    def compare(self, input1, input2, comp):
-        tensor_count = max(1, self._stable_leaf_count(input1, input2))
-        self._compare_stable_tree(input1, input2, comp, 0, tensor_count)
+        # stable 模式只复用结构遍历；叶子比较仍强制 exact compare（atol/rtol 均为 0）。
+        self.compare_tensor_tree(
+            input1,
+            input2,
+            compare_leaf,
+            report_structure_error,
+        )
 
     def assert_accuracy(
         self,

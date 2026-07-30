@@ -7,14 +7,9 @@ import paddle
 import torch
 import yaml
 
+from .accuracy_common import process_grad_output, process_output
 from .base import APITestBase, gpu_mode_maybe_empty_cache
 from .paddle_to_torch import adaptive_workspace_bytes, get_converter
-
-
-def _paddle_tensor_to_torch(value):
-    return torch.utils.dlpack.from_dlpack(
-        paddle.utils.dlpack.to_dlpack(value.detach())  # type: ignore[reportGeneralTypeIssues]
-    )
 
 
 class APITestAccuracy(APITestBase):
@@ -160,31 +155,9 @@ class APITestAccuracy(APITestBase):
     def _compare_accuracy_tree(self, actual, expected, tensor_index=0, tensor_count=None):
         tensor_types = (paddle.Tensor, torch.Tensor)
 
-        def is_missing(value):
-            return value is None or (
-                isinstance(value, paddle.Tensor)
-                and not value._is_initialized()
-                and int(value.numel()) != 0
-            )
-
-        def leaf_count(left, right):
-            if isinstance(left, dict) and isinstance(right, dict) and left.keys() == right.keys():
-                return sum(leaf_count(left[key], right[key]) for key in left)
-            if isinstance(left, (list, tuple)) and isinstance(right, (list, tuple)):
-                if len(left) != len(right):
-                    return max(len(left), len(right), 1)
-                return sum(
-                    leaf_count(left_item, right_item)
-                    for left_item, right_item in zip(left, right, strict=False)
-                )
-            return 1
-
-        if tensor_count is None:
-            tensor_count = leaf_count(actual, expected)
-
-        def compare_leaf(left, right, index):
-            position = f"{index + 1}/{tensor_count}"
-            if is_missing(left) and is_missing(right):
+        def compare_leaf(left, right, index, count):
+            position = f"{index + 1}/{count}"
+            if self.is_missing_compare_value(left) and self.is_missing_compare_value(right):
                 return True
             if isinstance(left, paddle.Tensor) and isinstance(right, bool):
                 try:
@@ -207,10 +180,10 @@ class APITestAccuracy(APITestBase):
                         atol=self.get_atol(),
                         rtol=self.get_rtol(),
                         tensor_index=index,
-                        tensor_count=tensor_count,
+                        tensor_count=count,
                     )
                 except Exception as err:
-                    self._report_comparison_error(err, index, tensor_count)
+                    self._report_comparison_error(err, index, count)
                     return False
                 return True
             if isinstance(left, tensor_types) or isinstance(right, tensor_types):
@@ -229,71 +202,23 @@ class APITestAccuracy(APITestBase):
                     rtol=self.get_rtol(),
                 )
             except Exception as err:
-                self._report_comparison_error(err, index, tensor_count)
+                self._report_comparison_error(err, index, count)
                 return False
             return True
 
-        def visit(left, right, index):
-            if isinstance(left, dict):
-                if not isinstance(right, dict):
-                    self._report_structure_error(
-                        "type_mismatch",
-                        tensor_position=f"{index + 1}/{tensor_count}",
-                        actual_type=type(left).__name__,
-                        expected_type=type(right).__name__,
-                    )
-                    return 1, False
-                if left.keys() != right.keys():
-                    self._report_structure_error(
-                        "key_mismatch",
-                        tensor_position=f"{index + 1}/{tensor_count}",
-                        actual_keys=list(left.keys()),
-                        expected_keys=list(right.keys()),
-                    )
-                    return max(len(left), len(right), 1), False
-                consumed = 0
-                for key in left:
-                    child_consumed, ok = visit(left[key], right[key], index + consumed)
-                    consumed += child_consumed
-                    if not ok:
-                        return max(consumed, 1), False
-                return max(consumed, 1), True
-            if isinstance(left, (list, tuple)):
-                if not isinstance(right, (list, tuple)):
-                    self._report_structure_error(
-                        "type_mismatch",
-                        tensor_position=f"{index + 1}/{tensor_count}",
-                        actual_type=type(left).__name__,
-                        expected_type=type(right).__name__,
-                    )
-                    return 1, False
-                if len(left) != len(right):
-                    self._report_structure_error(
-                        "count_mismatch",
-                        tensor_position=f"{index + 1}/{tensor_count}",
-                        actual_count=len(left),
-                        expected_count=len(right),
-                    )
-                    return max(len(left), len(right), 1), False
-                consumed = 0
-                for left_item, right_item in zip(left, right, strict=False):
-                    child_consumed, ok = visit(left_item, right_item, index + consumed)
-                    consumed += child_consumed
-                    if not ok:
-                        return max(consumed, 1), False
-                return max(consumed, 1), True
-            if isinstance(right, (dict, list, tuple)):
-                self._report_structure_error(
-                    "type_mismatch",
-                    tensor_position=f"{index + 1}/{tensor_count}",
-                    actual_type=type(left).__name__,
-                    expected_type=type(right).__name__,
-                )
-                return 1, False
-            return 1, compare_leaf(left, right, index)
+        def report_structure_error(reason, *, tensor_position=None, **details):
+            details.pop("tensor_index", None)
+            details.pop("tensor_count", None)
+            self._report_structure_error(reason, tensor_position=tensor_position, **details)
 
-        _, ok = visit(actual, expected, tensor_index)
-        return ok
+        return self.compare_tensor_tree(
+            actual,
+            expected,
+            compare_leaf,
+            report_structure_error,
+            tensor_index=tensor_index,
+            tensor_count=tensor_count,
+        )
 
     def test(self):
         self.dump_event("api_analyze_start", mode="accuracy")
@@ -658,124 +583,3 @@ class APITestAccuracy(APITestBase):
 
         self.report_case_result("pass")
         self.dump_finalize("pass")
-
-
-def process_output(api_config, paddle_output, torch_output):
-    if api_config.api_name == "paddle.unique":
-        if "return_index=True" in api_config.config:
-            paddle_output = list(paddle_output)
-            paddle_output.pop(1)
-    elif api_config.api_name in {
-        "paddle.mode",
-        "paddle.Tensor.mode",
-        "paddle.incubate.nn.functional.fused_layer_norm",
-        "paddle.incubate.nn.functional.fused_rms_norm",
-        "paddle.kthvalue",
-        "paddle.Tensor.kthvalue",
-    }:
-        paddle_output = paddle_output[:1]
-        torch_output = torch_output[:1]
-    elif api_config.api_name in {
-        "paddle.strided_slice",
-        "paddle.vander",
-    }:
-        if any(s < 0 for s in paddle_output.strides):
-            # torch's from_dlpack now don't support negative strides
-            paddle_output = paddle_output.contiguous()
-    elif api_config.api_name == "paddle.linalg.eigh":
-        # The output of eigen vectors are not unique, because multiplying an eigen vector by -1 in the real case
-        # or by e^(i*\theta) in the complex case produces another set of valid eigen vectors of the matrix.
-        # So we test whether the elements of each coef_vector (i.e. paddle_output / torch_output for each eigen vector)
-        # are all the same and whether the |coef| == 1 for simplicity.
-        paddle_output, torch_output = list(paddle_output), list(torch_output)
-        eigvector_len = paddle_output[1].shape[-2]
-        paddle_eigvectors = paddle_output.pop(1).matrix_transpose().reshape([-1, eigvector_len])
-        torch_eigvectors = torch_output.pop(1).transpose(-1, -2).reshape((-1, eigvector_len))
-        paddle_output, torch_output = [], []
-        for i in range(paddle_eigvectors.shape[0]):
-            paddle_vector = _paddle_tensor_to_torch(paddle_eigvectors[i]).to(
-                device=torch_eigvectors.device
-            )
-            coef_vector = paddle_vector / torch_eigvectors[i]
-            if coef_vector.is_complex():
-                coef_vector = torch.complex(
-                    coef_vector.real.round(decimals=2),
-                    coef_vector.imag.round(decimals=2),
-                )
-            else:
-                coef_vector = coef_vector.round(decimals=2)
-            coef_vector_approx = torch.ones_like(coef_vector) * coef_vector[0]
-            abs_coef = coef_vector.abs().to(dtype=torch.float64)[0]
-            one = torch.ones_like(abs_coef)
-            paddle_output.append([coef_vector, abs_coef])
-            torch_output.append([coef_vector_approx, one])
-    elif api_config.api_name == "paddle._C_ops.fused_linear_param_grad_add":
-        # When has_bias=False, Paddle returns an uninitialized tensor for dbias (2nd output).
-        # Only compare the first output (dweight).
-        if isinstance(paddle_output, (list, tuple)) and len(paddle_output) > 1:
-            paddle_output = paddle_output[:1]
-        if isinstance(torch_output, (list, tuple)) and len(torch_output) > 1:
-            torch_output = torch_output[:1]
-    elif api_config.api_name == "paddle._C_ops.swiglu_grad":
-        # When y is None, Paddle returns an uninitialized placeholder tensor for dy.
-        # Only compare dx to avoid converting the uninitialized tensor to DLPack.
-        if len(api_config.args) > 1 and api_config.args[1] is None:
-            if isinstance(paddle_output, (list, tuple)) and len(paddle_output) > 1:
-                paddle_output = paddle_output[:1]
-            if isinstance(torch_output, (list, tuple)) and len(torch_output) > 1:
-                torch_output = torch_output[:1]
-    return paddle_output, torch_output
-
-
-def process_grad_output(api_config, paddle_out_grads, torch_out_grads):
-    # All configs that not compared with torch should be copied
-    # to tester/api_config/5_accuracy/accuracy_gpu_error_grads_diff.txt
-    if api_config.api_name in {
-        "paddle.nn.functional.scaled_dot_product_attention",
-    }:
-        paddle_out_grads = paddle_out_grads[:3]
-        torch_out_grads = torch_out_grads[:3]
-    elif api_config.api_name in {
-        "paddle.lerp",
-        "paddle.tensordot",
-    }:
-        paddle_out_grads = paddle_out_grads[:2]
-        torch_out_grads = torch_out_grads[:2]
-    elif api_config.api_name in {
-        "paddle.Tensor.__setitem__",
-        "paddle.Tensor.fill_diagonal_tensor",
-        "paddle.diagonal_scatter",
-        "paddle.incubate.softmax_mask_fuse",
-        "paddle.nn.functional.binary_cross_entropy",
-        "paddle.nn.functional.binary_cross_entropy_with_logits",
-        "paddle.nn.functional.cross_entropy",
-        "paddle.nn.functional.gaussian_nll_loss",
-        "paddle.nn.functional.kl_div",
-        "paddle.nn.functional.sigmoid_focal_loss",
-        "paddle.scale",
-    }:
-        paddle_out_grads = paddle_out_grads[:1]
-        torch_out_grads = torch_out_grads[:1]
-    elif api_config.api_name in {
-        "paddle.combinations",
-        "paddle.nn.utils.parameters_to_vector",
-        "paddle.cdist",
-    }:
-        paddle_out_grads = []
-        torch_out_grads = []
-    elif api_config.api_name == "paddle.linalg.cholesky_solve":
-        if len(api_config.args) > 2:
-            is_upper = api_config.args[2]
-        elif "is_upper" in api_config.kwargs:
-            is_upper = api_config.kwargs["is_upper"]
-        else:
-            is_upper = False
-        torch_out_grads[1] = (
-            torch.triu(torch_out_grads[1]) if is_upper else torch.tril(torch_out_grads[1])
-        )
-    elif api_config.api_name == "paddle.incubate.nn.functional.fused_rotary_position_embedding":
-        # Paddle only has 3 outputs/grads Q, K, V
-        valid_out_num = len([out for out in paddle_out_grads if out is not None])
-        paddle_out_grads = paddle_out_grads[:valid_out_num]
-        torch_out_grads = torch_out_grads[:valid_out_num]
-    return paddle_out_grads, torch_out_grads
