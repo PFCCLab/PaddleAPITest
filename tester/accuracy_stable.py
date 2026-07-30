@@ -86,14 +86,18 @@ class APITestAccuracyStable(APITestBase):
         return value
 
     def compare_first_pair(self, paddle_output, torch_output, paddle_grad, torch_grad):
-        with torch.cuda.device(self.comparison_device_id):
+        def run():
             self.compare(paddle_output, torch_output, "P1T1")
             self.compare(paddle_grad, torch_grad, "P1T1B")
 
+        self._run_with_torch_device(self.comparison_device_id, run)
+
     def _compare_many_on_comparison_gpu(self, comparisons):
-        with torch.cuda.device(self.comparison_device_id):
+        def run():
             for left, right, comp in comparisons:
                 self.compare(left, right, comp)
+
+        self._run_with_torch_device(self.comparison_device_id, run)
 
     def _comparison_gpu_memory_state(self):
         return self.gpu_memory_state(
@@ -106,6 +110,30 @@ class APITestAccuracyStable(APITestBase):
 
     def _release_comparison_gpu_cache(self):
         self.release_framework_gpu_cache(device_id=self.comparison_device_id, collect_cycles=True)
+
+    def _run_with_torch_device(self, device_id, callback):
+        device_id = int(device_id)
+        if not torch.cuda.is_available():
+            current_device = None
+        else:
+            try:
+                current_device = torch.cuda.current_device()
+            except Exception:
+                current_device = None
+        if current_device == device_id:
+            return callback()
+        with torch.cuda.device(device_id):
+            return callback()
+
+    def _compute_gpu_cache_needs_release(self, required_headroom_bytes):
+        memory_state = self.gpu_memory_state(0, budget_gib=self.gpu_mode_config.memory_budget)
+        return memory_state.free_bytes <= memory_state.reserve_bytes + int(
+            required_headroom_bytes or 0
+        )
+
+    def _maybe_release_compute_gpu_cache(self, required_headroom_bytes, framework=None):
+        if self._compute_gpu_cache_needs_release(required_headroom_bytes):
+            self._release_compute_gpu_cache(framework)
 
     def _move_tensor_tree_to_comparison_gpu(self, value):
         return self.move_tensor_tree_to_gpu(value, self.comparison_device_id)
@@ -177,8 +205,17 @@ class APITestAccuracyStable(APITestBase):
                 "comparison out of memory prevention: the second result family "
                 "exceeds the comparison card's safe capacity"
             )
-        self._stream_second_slot_to_comparison_gpu(pairs.paddle_outputs, 1)
-        self._stream_second_slot_to_comparison_gpu(pairs.paddle_grads, 1)
+        self._stream_second_slot_to_comparison_gpu(
+            pairs.paddle_outputs,
+            1,
+            release_compute_cache=False,
+        )
+        self._stream_second_slot_to_comparison_gpu(
+            pairs.paddle_grads,
+            1,
+            release_compute_cache=False,
+        )
+        self._release_compute_gpu_cache()
 
     def _finish_first_pair_comparison(self, state):
         if state.first_pair_finished:
@@ -321,8 +358,10 @@ class APITestAccuracyStable(APITestBase):
                 state.first_iteration_spilled = True
 
     def _compare_on_compute_gpu(self, input1, input2, comp):
-        with torch.cuda.device(0):
+        def run():
             self.compare(input1, input2, comp)
+
+        self._run_with_torch_device(0, run)
 
     def _ensure_comparison_stream_headroom(self, value):
         value_bytes = self.tensor_tree_nbytes(value)
@@ -342,7 +381,7 @@ class APITestAccuracyStable(APITestBase):
                 "would consume the comparison card's safe reserve"
             )
 
-    def _stream_second_slot_to_comparison_gpu(self, values, index):
+    def _stream_second_slot_to_comparison_gpu(self, values, index, *, release_compute_cache=True):
         source = values[index]
         self._ensure_comparison_stream_headroom(source)
         try:
@@ -360,7 +399,8 @@ class APITestAccuracyStable(APITestBase):
                 "failed on the comparison card"
             ) from err
         del source
-        self._release_compute_gpu_cache()
+        if release_compute_cache:
+            self._release_compute_gpu_cache()
 
     def _drop_second_comparison_slot(self, values, index):
         source = values[index]
@@ -545,7 +585,7 @@ class APITestAccuracyStable(APITestBase):
             except Exception:
                 self._abort_case_resources(state, pairs)
                 raise
-            self._release_compute_gpu_cache("torch")
+            self._maybe_release_compute_gpu_cache(probe_bytes, "torch")
         elif self.use_gpu_mode:
             torch_live_bytes = self.tensor_tree_nbytes((torch_output, torch_out_grads))
             # Release idle Torch blocks before the next Paddle execution;
@@ -615,7 +655,7 @@ class APITestAccuracyStable(APITestBase):
             except Exception:
                 self._abort_case_resources(state, pairs)
                 raise
-            self._release_compute_gpu_cache("paddle")
+            self._maybe_release_compute_gpu_cache(probe_bytes, "paddle")
 
         # if torch_grad_success = False, out_grads = [] and compare return
         pairs.append(torch_output, torch_out_grads, paddle_output, paddle_out_grads)

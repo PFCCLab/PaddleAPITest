@@ -586,8 +586,7 @@ class APITestBase:
     def gpu_memory_state(self, device_id, *, budget_gib=0.0):
         """Return physical headroom and configured live budget for one CUDA device."""
         device_id = int(device_id)
-        with torch.cuda.device(device_id):
-            free_bytes, total_bytes = torch.cuda.mem_get_info()
+        free_bytes, total_bytes = torch.cuda.mem_get_info(device_id)
         budget_bytes = max(0, int(float(budget_gib or 0.0) * _GIB))
         reserve_bytes = self._gpu_safety_reserve_bytes(total_bytes, budget_bytes)
         return GpuMemoryState(
@@ -2177,7 +2176,7 @@ class APITestBase:
             if actual_tensor.is_cuda and needs_chunk_budget:
                 insufficient_dual_headroom = False
                 try:
-                    free_bytes, total_bytes = torch.cuda.mem_get_info(actual_tensor.device)
+                    free_bytes, total_bytes = torch.cuda.mem_get_info(actual_tensor.device.index)
                     min_working_bytes = 256 * 1024**2
                     memory_budget = float(
                         getattr(self.gpu_mode_config, "memory_budget", 0.0) or 0.0
@@ -2568,8 +2567,8 @@ class APITestBase:
             return any(self.tensor_tree_has_gpu_tensor(item) for item in value.values())
         return False
 
-    def spill_tensor_tree_slot_to_cpu(self, values, index=0, release_cache=True):
-        """Replace one result-tree slot with a CPU copy, then release its GPU source."""
+    def spill_tensor_tree_slot_to_cpu(self, values, index=0, release_cache=False):
+        """Replace one result-tree slot with a CPU copy, then optionally release its GPU source."""
         source = values[index]
         if not self.tensor_tree_has_gpu_tensor(source):
             return False
