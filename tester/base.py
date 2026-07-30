@@ -433,6 +433,7 @@ class APITestBase:
         self.api_config.use_torch = use_torch
         self.runtime_config = runtime_config or TestRuntimeConfig()
         self.gpu_mode_config = self.runtime_config.gpu_mode
+        self.memory_governance_metrics = collections.Counter()
         self.dump_context = (
             DumpContext(
                 os.environ.get("DUMP_DIR") or DEFAULT_DUMP_DIR, api_config=api_config.config
@@ -472,7 +473,18 @@ class APITestBase:
 
     def dump_finalize(self, status, **data):
         if self.dump_context:
+            memory_governance_metrics = getattr(self, "memory_governance_metrics", None)
+            if memory_governance_metrics:
+                data.setdefault(
+                    "memory_governance_metrics",
+                    dict(memory_governance_metrics),
+                )
             self.dump_context.finalize(status, **data)
+
+    def record_memory_governance_metric(self, name, amount=1):
+        if not hasattr(self, "memory_governance_metrics"):
+            self.memory_governance_metrics = collections.Counter()
+        self.memory_governance_metrics[name] += int(amount)
 
     def report_runtime_error(
         self,
@@ -597,6 +609,7 @@ class APITestBase:
         """Release idle allocator blocks for one or both framework runtimes."""
         if framework not in (None, "torch", "paddle"):
             raise ValueError(f"Unsupported framework for GPU cache release: {framework!r}")
+        self.record_memory_governance_metric("cache_release")
         if collect_cycles:
             gc.collect()
         if framework in (None, "torch"):
@@ -2021,6 +2034,8 @@ class APITestBase:
             raise TypeError(f"Expected Paddle or Torch tensor, but got {type(actual)}")
         if not isinstance(expected, tensor_types):
             raise TypeError(f"Expected Paddle or Torch tensor, but got {type(expected)}")
+        if dual_gpu and (is_cpu_tensor(actual) or is_cpu_tensor(expected)):
+            raise RuntimeError("dual GPU comparisons require CUDA tensors on both sides")
 
         if not actual.is_contiguous() or not expected.is_contiguous():
             actual_shape = tuple(actual.shape)
@@ -2183,16 +2198,13 @@ class APITestBase:
                     if dual_gpu:
                         budget_bytes = int(memory_budget * (1024**3)) if memory_budget > 0 else 0
                         reserve_bytes = self._gpu_safety_reserve_bytes(total_bytes, budget_bytes)
-                        working_bytes = self._dual_comparison_workspace_bytes(
-                            free_bytes, reserve_bytes
+                        working_bytes = self._comparison_workspace_bytes(
+                            free_bytes, reserve_bytes, dual_gpu=True
                         )
                         insufficient_dual_headroom = working_bytes == 0
                     else:
                         reserved_bytes = torch.cuda.memory_reserved(actual_tensor.device)
-                        max_working_bytes = 32 * 1024**3
-                        # Physical headroom is a hard limit. The configured minimum
-                        # below is only a performance target when free memory permits.
-                        working_bytes = max(1, min(max_working_bytes, free_bytes // 5))
+                        working_bytes = self._comparison_workspace_bytes(free_bytes)
 
                     if memory_budget > 0 and not dual_gpu:
                         budget_headroom = max(
@@ -2201,7 +2213,7 @@ class APITestBase:
                         )
                         working_bytes = min(
                             working_bytes,
-                            max(min_working_bytes, budget_headroom // 5),
+                            max(min_working_bytes, budget_headroom // 4),
                         )
                 except Exception:
                     pass
@@ -2211,6 +2223,7 @@ class APITestBase:
                         "for a bounded GPU comparison"
                     )
             if self._should_chunk_accuracy_compare(estimated_temp_bytes, working_bytes):
+                self.record_memory_governance_metric("chunk_compare")
                 self._torch_assert_accuracy_in_chunks(
                     actual_tensor,
                     expected_tensor,
@@ -2300,17 +2313,25 @@ class APITestBase:
         return bool(estimated_temp_bytes > working_bytes)
 
     @staticmethod
+    def _comparison_workspace_bytes(free_bytes, reserve_bytes=0, dual_gpu=False):
+        """Pick a conservative comparison workspace from the remaining headroom."""
+        if dual_gpu:
+            return APITestBase._dual_comparison_workspace_bytes(free_bytes, reserve_bytes)
+        max_workspace = 32 * 1024**3
+        return max(1, min(max_workspace, int(free_bytes) // 4))
+
+    @staticmethod
     def _dual_comparison_workspace_bytes(free_bytes, reserve_bytes):
         """Choose a bounded comparison workspace from physical card headroom."""
         max_workspace = 64 * 1024**3
         min_workspace = 256 * 1024**2
         available_bytes = max(0, int(free_bytes) - int(reserve_bytes))
-        half_available = available_bytes // 2
-        if half_available <= 0:
+        if available_bytes <= 0:
             return 0
-        if half_available < min_workspace:
-            return half_available
-        return min(max_workspace, max(min_workspace, half_available))
+        target_workspace = (available_bytes * 2) // 3
+        if target_workspace < min_workspace:
+            return target_workspace
+        return min(max_workspace, max(min_workspace, target_workspace))
 
     @staticmethod
     def _gpu_safety_reserve_bytes(total_bytes, budget_bytes):
@@ -2556,6 +2577,7 @@ class APITestBase:
         del source
         if release_cache and self.gpu_mode_config.enabled:
             gpu_mode_memory_decision(self.gpu_mode_config, force=True)
+        self.record_memory_governance_metric("spill_result_tree")
         return True
 
     def detach_tensor_tree(self, value):

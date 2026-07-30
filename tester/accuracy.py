@@ -220,19 +220,7 @@ class APITestAccuracy(APITestBase):
             tensor_count=tensor_count,
         )
 
-    def test(self):
-        self.dump_event("api_analyze_start", mode="accuracy")
-        if self.need_skip():
-            self.report_case_result("skip")
-            self.dump_finalize("skip")
-            return
-
-        if not self.ana_api_info():
-            self.report_case_result("config_parse", "ana_api_info failed")
-            self.dump_finalize("config_parse")
-            return
-        self.dump_event("api_analyze_done", api_name=self.api_config.api_name)
-
+    def _convert_api(self):
         try:
             self.dump_event("config_convert_start")
             convert_result = self.converter.convert(self.api_config.api_name)
@@ -240,7 +228,7 @@ class APITestAccuracy(APITestBase):
             self.dump_error("config_convert_error", e)
             self.report_case_result("config_convert", f"Conversion failed: {e!s}")
             self.dump_finalize("config_convert")
-            return
+            return None
         if not convert_result.is_supported:
             self.report_case_result(
                 "config_convert",
@@ -248,7 +236,7 @@ class APITestAccuracy(APITestBase):
             )
             self.dump_event("config_convert_error", error=convert_result.error_message)
             self.dump_finalize("config_convert")
-            return
+            return None
         self.dump_event("config_convert_done")
         if not convert_result.code or not convert_result.code.is_valid():
             self.report_case_result(
@@ -257,24 +245,26 @@ class APITestAccuracy(APITestBase):
             )
             self.dump_event("config_convert_error", error="no code generated")
             self.dump_finalize("config_convert")
-            return
+            return None
+        return convert_result
 
+    def _generate_numpy_inputs(self):
         try:
             self.dump_event("numpy_input_start")
             if not self.gen_numpy_input():
                 self.report_case_result("config_input", "gen_numpy_input failed")
                 self.dump_finalize("config_input")
-                return
+                return False
             self.dump_event("numpy_input_done")
         except Exception as err:
             log_type, fatal = self.report_runtime_error(err, "config_input", "input")
             self.dump_finalize(log_type or "config_input")
             if fatal:
                 raise
-            return
+            return False
+        return True
 
-        probe_bytes = self.estimate_input_bytes()
-
+    def get_torch_output(self, convert_result):
         try:
             device = torch.device("cuda:0")
             torch.set_default_device(device)
@@ -282,7 +272,7 @@ class APITestAccuracy(APITestBase):
             if not self.gen_torch_input():
                 self.report_case_result("torch_error", "gen_torch_input failed")
                 self.dump_finalize("torch_error")
-                return
+                return False, None, None, False
             self.dump_save(
                 "torch_inputs",
                 {"args": self.torch_args, "kwargs": self.torch_kwargs},
@@ -358,59 +348,64 @@ class APITestAccuracy(APITestBase):
             _, fatal = self._report_runtime_error_and_finalize(err, "torch_error", "forward")
             if fatal:
                 raise
-            return
+            return False, None, None, False
 
         torch_grad_success = False
         torch_out_grads = None
-        if self.need_check_grad():
-            try:
-                self.dump_event("torch_backward_start")
-                inputs_list = self.get_torch_input_list()
-                result_outputs, result_outputs_grads = self.gen_torch_output_and_output_grad(
-                    torch_output
-                )
-                self.dump_save(
-                    "torch_backward",
-                    {
-                        "inputs": inputs_list,
-                        "outputs": result_outputs,
-                        "grad_outputs": result_outputs_grads,
-                    },
-                    framework="torch",
-                )
-                del self.torch_args, self.torch_kwargs
-                if inputs_list and result_outputs and result_outputs_grads:
-                    torch_out_grads = torch.autograd.grad(
-                        outputs=result_outputs,
-                        inputs=inputs_list,
-                        grad_outputs=result_outputs_grads,
-                        allow_unused=True,
-                    )
-                    torch_grad_success = True
-                    self.dump_save("torch_input_grads", torch_out_grads, framework="torch")
-                self.dump_event("torch_backward_done", grad_success=torch_grad_success)
-                del inputs_list, result_outputs, result_outputs_grads
-            except Exception as err:
-                if str(err).startswith("Too large tensor to get cached numpy: "):
-                    self._report_runtime_error_and_finalize(
-                        err,
-                        "config_input",
-                        "backward",
-                        force_log_type="config_input",
-                    )
-                    return
-                _, fatal = self._report_runtime_error_and_finalize(err, "torch_error", "backward")
-                if fatal:
-                    raise
-                return
-            try:
-                paddle.base.core.eager._for_test_check_cuda_error()
-            except Exception as err:
-                self._report_runtime_error_and_finalize(err, "torch_error", "backward cuda check")
-                raise
-        else:
+        if not self.need_check_grad():
             del self.torch_args, self.torch_kwargs
+            return True, torch_output, torch_out_grads, torch_grad_success
 
+        try:
+            self.dump_event("torch_backward_start")
+            inputs_list = self.get_torch_input_list()
+            result_outputs, result_outputs_grads = self.gen_torch_output_and_output_grad(
+                torch_output
+            )
+            self.dump_save(
+                "torch_backward",
+                {
+                    "inputs": inputs_list,
+                    "outputs": result_outputs,
+                    "grad_outputs": result_outputs_grads,
+                },
+                framework="torch",
+            )
+            del self.torch_args, self.torch_kwargs
+            if inputs_list and result_outputs and result_outputs_grads:
+                torch_out_grads = torch.autograd.grad(
+                    outputs=result_outputs,
+                    inputs=inputs_list,
+                    grad_outputs=result_outputs_grads,
+                    allow_unused=True,
+                )
+                torch_grad_success = True
+                self.dump_save("torch_input_grads", torch_out_grads, framework="torch")
+            self.dump_event("torch_backward_done", grad_success=torch_grad_success)
+            del inputs_list, result_outputs, result_outputs_grads
+        except Exception as err:
+            if str(err).startswith("Too large tensor to get cached numpy: "):
+                self._report_runtime_error_and_finalize(
+                    err,
+                    "config_input",
+                    "backward",
+                    force_log_type="config_input",
+                )
+                return False, None, None, False
+            _, fatal = self._report_runtime_error_and_finalize(err, "torch_error", "backward")
+            if fatal:
+                raise
+            return False, None, None, False
+        try:
+            paddle.base.core.eager._for_test_check_cuda_error()
+        except Exception as err:
+            self._report_runtime_error_and_finalize(err, "torch_error", "backward cuda check")
+            raise
+        return True, torch_output, torch_out_grads, torch_grad_success
+
+    def _prepare_torch_results_for_paddle(
+        self, convert_result, torch_output, torch_out_grads, torch_grad_success, probe_bytes
+    ):
         spill_torch_outputs = False
         if self.use_gpu_mode:
             spill_torch_outputs = self._should_spill_torch_result_tree(
@@ -441,12 +436,14 @@ class APITestAccuracy(APITestBase):
             )
         else:
             torch.cuda.empty_cache()
+        return torch_output, torch_out_grads
 
+    def get_paddle_output(self):
         try:
             if not self.gen_paddle_input():
                 self.report_case_result("paddle_error", "gen_paddle_input failed")
                 self.dump_finalize("paddle_error")
-                return
+                return False, None
 
             # Reseed before executing paddle so that random APIs
             # (paddle.uniform / normal / randn / bernoulli / dropout ...)
@@ -485,7 +482,7 @@ class APITestAccuracy(APITestBase):
             )
             if fatal or (self.exit_on_error and log_type == "paddle_error"):
                 raise
-            return
+            return False, None
 
         try:
             self.dump_save("paddle_forward_output", paddle_output, framework="paddle")
@@ -494,6 +491,83 @@ class APITestAccuracy(APITestBase):
         except Exception as err:
             self._report_runtime_error_and_finalize(err, "paddle_cuda", "forward")
             raise
+        return True, paddle_output
+
+    def get_paddle_grad(self, paddle_output):
+        paddle_out_grads = None
+        try:
+            inputs_list = self.get_paddle_input_list()
+            result_outputs, result_outputs_grads = self.gen_paddle_output_and_output_grad(
+                paddle_output
+            )
+            del self.paddle_args, self.paddle_kwargs
+            if inputs_list and result_outputs and result_outputs_grads:
+                paddle_out_grads = paddle.grad(
+                    result_outputs,
+                    inputs_list,
+                    grad_outputs=result_outputs_grads,
+                    allow_unused=True,
+                )
+            del inputs_list, result_outputs, result_outputs_grads
+        except Exception as err:
+            if str(err).startswith("Too large tensor to get cached numpy: "):
+                self._report_runtime_error_and_finalize(
+                    err,
+                    "config_input",
+                    "backward",
+                    force_log_type="config_input",
+                )
+                return False, None
+            log_type, fatal = self._report_runtime_error_and_finalize(
+                err, "paddle_error", "backward", allow_ignore_paddle=True
+            )
+            if fatal or (self.exit_on_error and log_type == "paddle_error"):
+                raise
+            return False, None
+
+        try:
+            paddle.base.core.eager._for_test_check_cuda_error()
+        except Exception as err:
+            self._report_runtime_error_and_finalize(err, "paddle_cuda", "backward cuda check")
+            raise
+        return True, paddle_out_grads
+
+    def test(self):
+        self.dump_event("api_analyze_start", mode="accuracy")
+        if self.need_skip():
+            self.report_case_result("skip")
+            self.dump_finalize("skip")
+            return
+
+        if not self.ana_api_info():
+            self.report_case_result("config_parse", "ana_api_info failed")
+            self.dump_finalize("config_parse")
+            return
+        self.dump_event("api_analyze_done", api_name=self.api_config.api_name)
+
+        convert_result = self._convert_api()
+        if convert_result is None:
+            return
+        if not self._generate_numpy_inputs():
+            return
+        probe_bytes = self.estimate_input_bytes()
+
+        torch_success, torch_output, torch_out_grads, torch_grad_success = self.get_torch_output(
+            convert_result
+        )
+        if not torch_success:
+            return
+        torch_output, torch_out_grads = self._prepare_torch_results_for_paddle(
+            convert_result,
+            torch_output,
+            torch_out_grads,
+            torch_grad_success,
+            probe_bytes,
+        )
+
+        paddle_success, paddle_output = self.get_paddle_output()
+        if not paddle_success:
+            return
 
         try:
             paddle_output, torch_output = process_output(
@@ -524,42 +598,9 @@ class APITestAccuracy(APITestBase):
             )
         if torch_grad_success:
             self.is_backward = True
-            try:
-                paddle_out_grads = None
-                inputs_list = self.get_paddle_input_list()
-                result_outputs, result_outputs_grads = self.gen_paddle_output_and_output_grad(
-                    paddle_output
-                )
-                del self.paddle_args, self.paddle_kwargs
-                if inputs_list and result_outputs and result_outputs_grads:
-                    paddle_out_grads = paddle.grad(
-                        result_outputs,
-                        inputs_list,
-                        grad_outputs=result_outputs_grads,
-                        allow_unused=True,
-                    )
-                del inputs_list, result_outputs, result_outputs_grads
-            except Exception as err:
-                if str(err).startswith("Too large tensor to get cached numpy: "):
-                    self._report_runtime_error_and_finalize(
-                        err,
-                        "config_input",
-                        "backward",
-                        force_log_type="config_input",
-                    )
-                    return
-                log_type, fatal = self._report_runtime_error_and_finalize(
-                    err, "paddle_error", "backward", allow_ignore_paddle=True
-                )
-                if fatal or (self.exit_on_error and log_type == "paddle_error"):
-                    raise
+            paddle_grad_success, paddle_out_grads = self.get_paddle_grad(paddle_output)
+            if not paddle_grad_success:
                 return
-
-            try:
-                paddle.base.core.eager._for_test_check_cuda_error()
-            except Exception as err:
-                self._report_runtime_error_and_finalize(err, "paddle_cuda", "backward cuda check")
-                raise
 
             try:
                 paddle_out_grads, torch_out_grads = process_grad_output(

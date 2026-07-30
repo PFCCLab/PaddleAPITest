@@ -90,6 +90,11 @@ class APITestAccuracyStable(APITestBase):
             self.compare(paddle_output, torch_output, "P1T1")
             self.compare(paddle_grad, torch_grad, "P1T1B")
 
+    def _compare_many_on_comparison_gpu(self, comparisons):
+        with torch.cuda.device(self.comparison_device_id):
+            for left, right, comp in comparisons:
+                self.compare(left, right, comp)
+
     def _comparison_gpu_memory_state(self):
         return self.gpu_memory_state(
             self.comparison_device_id,
@@ -148,6 +153,8 @@ class APITestAccuracyStable(APITestBase):
                 "exceed the comparison card's safe capacity before P2 execution"
             )
         if free_bytes < target_free:
+            if not state.phased_result_residency:
+                self.record_memory_governance_metric("phased_result_residency")
             state.phased_result_residency = True
 
     def _place_second_iteration_results(self, pairs):
@@ -188,12 +195,25 @@ class APITestAccuracyStable(APITestBase):
             flush=True,
         )
 
-    def _cleanup_comparison_stage(self, state, pairs, *, discard_results, release_cache):
+    def _cleanup_comparison_stage(
+        self,
+        state,
+        pairs,
+        *,
+        discard_results,
+        cache_release_policy="none",
+    ):
         """Join compare, drop result references, then release allocator cache when needed."""
+        valid_cache_release_policies = {"none", "if_pressure", "always"}
+        if cache_release_policy not in valid_cache_release_policies:
+            raise ValueError(
+                f"Unsupported cache release policy: {cache_release_policy!r}. "
+                f"Expected one of {sorted(valid_cache_release_policies)!r}"
+            )
         if not self.use_dual_gpu:
             if discard_results:
                 pairs.clear_all()
-            if release_cache and self.use_gpu_mode:
+            if cache_release_policy != "none" and self.use_gpu_mode:
                 probe_bytes = getattr(state, "probe_bytes", 0)
                 gpu_mode_memory_decision(
                     self.gpu_mode_config,
@@ -213,12 +233,26 @@ class APITestAccuracyStable(APITestBase):
             raise
         if discard_results:
             pairs.clear_all()
-        if release_cache:
+        if cache_release_policy == "always" or (
+            cache_release_policy == "if_pressure"
+            and self._comparison_gpu_cache_needs_release(getattr(state, "probe_bytes", 0))
+        ):
             self._release_comparison_gpu_cache()
+
+    def _comparison_gpu_cache_needs_release(self, required_headroom_bytes):
+        memory_state = self._comparison_gpu_memory_state()
+        return memory_state.free_bytes <= memory_state.reserve_bytes + int(
+            required_headroom_bytes or 0
+        )
 
     def _abort_case_resources(self, state, pairs):
         try:
-            self._cleanup_comparison_stage(state, pairs, discard_results=True, release_cache=True)
+            self._cleanup_comparison_stage(
+                state,
+                pairs,
+                discard_results=True,
+                cache_release_policy="always",
+            )
         except Exception as cleanup_error:
             self._log_dual_cleanup_error(cleanup_error)
         try:
@@ -290,10 +324,6 @@ class APITestAccuracyStable(APITestBase):
         with torch.cuda.device(0):
             self.compare(input1, input2, comp)
 
-    def _compare_on_comparison_gpu(self, input1, input2, comp):
-        with torch.cuda.device(self.comparison_device_id):
-            self.compare(input1, input2, comp)
-
     def _ensure_comparison_stream_headroom(self, value):
         value_bytes = self.tensor_tree_nbytes(value)
         if value_bytes <= 0:
@@ -336,32 +366,47 @@ class APITestAccuracyStable(APITestBase):
         source = values[index]
         values[index] = None
         del source
-        self._release_comparison_gpu_cache()
 
     def _run_phased_dual_summary_comparisons(self, pairs):
         self._compare_on_compute_gpu(pairs.paddle_outputs[1], pairs.torch_outputs[1], "P2T2")
 
         self._stream_second_slot_to_comparison_gpu(pairs.paddle_outputs, 1)
-        self._compare_on_comparison_gpu(pairs.paddle_outputs[1], pairs.torch_outputs[0], "P2T1")
-        self._compare_on_comparison_gpu(pairs.paddle_outputs[0], pairs.paddle_outputs[1], "P1P2")
+        self._compare_many_on_comparison_gpu(
+            [
+                (pairs.paddle_outputs[1], pairs.torch_outputs[0], "P2T1"),
+                (pairs.paddle_outputs[0], pairs.paddle_outputs[1], "P1P2"),
+            ]
+        )
         self._drop_second_comparison_slot(pairs.paddle_outputs, 1)
 
         self._stream_second_slot_to_comparison_gpu(pairs.torch_outputs, 1)
-        self._compare_on_comparison_gpu(pairs.paddle_outputs[0], pairs.torch_outputs[1], "P1T2")
-        self._compare_on_comparison_gpu(pairs.torch_outputs[0], pairs.torch_outputs[1], "T1T2")
+        self._compare_many_on_comparison_gpu(
+            [
+                (pairs.paddle_outputs[0], pairs.torch_outputs[1], "P1T2"),
+                (pairs.torch_outputs[0], pairs.torch_outputs[1], "T1T2"),
+            ]
+        )
         self._drop_second_comparison_slot(pairs.torch_outputs, 1)
         pairs.clear_forward()
 
         self._compare_on_compute_gpu(pairs.paddle_grads[1], pairs.torch_grads[1], "P2T2B")
 
         self._stream_second_slot_to_comparison_gpu(pairs.paddle_grads, 1)
-        self._compare_on_comparison_gpu(pairs.paddle_grads[1], pairs.torch_grads[0], "P2T1B")
-        self._compare_on_comparison_gpu(pairs.paddle_grads[0], pairs.paddle_grads[1], "P1P2B")
+        self._compare_many_on_comparison_gpu(
+            [
+                (pairs.paddle_grads[1], pairs.torch_grads[0], "P2T1B"),
+                (pairs.paddle_grads[0], pairs.paddle_grads[1], "P1P2B"),
+            ]
+        )
         self._drop_second_comparison_slot(pairs.paddle_grads, 1)
 
         self._stream_second_slot_to_comparison_gpu(pairs.torch_grads, 1)
-        self._compare_on_comparison_gpu(pairs.paddle_grads[0], pairs.torch_grads[1], "P1T2B")
-        self._compare_on_comparison_gpu(pairs.torch_grads[0], pairs.torch_grads[1], "T1T2B")
+        self._compare_many_on_comparison_gpu(
+            [
+                (pairs.paddle_grads[0], pairs.torch_grads[1], "P1T2B"),
+                (pairs.torch_grads[0], pairs.torch_grads[1], "T1T2B"),
+            ]
+        )
         self._drop_second_comparison_slot(pairs.torch_grads, 1)
         pairs.torch_grads.clear()
         pairs.paddle_grads.clear()
@@ -393,6 +438,7 @@ class APITestAccuracyStable(APITestBase):
                         try:
                             values[0] = self.move_tensor_tree_to_gpu(source, 0)
                             del source
+                            self.record_memory_governance_metric("cpu_restore")
                         except Exception as err:
                             err_str = str(err).lower()
                             if not any(marker.lower() in err_str for marker in CUDA_OOM):
@@ -479,7 +525,7 @@ class APITestAccuracyStable(APITestBase):
                     state,
                     pairs,
                     discard_results=False,
-                    release_cache=False,
+                    cache_release_policy="none",
                 )
                 if not state.phased_result_residency:
                     self._prepare_second_torch_results(
@@ -592,9 +638,10 @@ class APITestAccuracyStable(APITestBase):
                             pairs.paddle_grads[0],
                         )
                     )
-                    state.phased_result_residency = self._projected_results_need_phasing(
-                        2 * first_result_bytes
-                    )
+                    projected_phased = self._projected_results_need_phasing(2 * first_result_bytes)
+                    if projected_phased and not state.phased_result_residency:
+                        self.record_memory_governance_metric("phased_result_residency")
+                    state.phased_result_residency = projected_phased
                 else:
                     # P2 backward is the last consumer of the shared output-grad
                     # seeds. Release them before summary streams second results.
@@ -690,7 +737,7 @@ class APITestAccuracyStable(APITestBase):
                 execution_state,
                 pairs,
                 discard_results=False,
-                release_cache=False,
+                cache_release_policy="none",
             )
 
             self._run_summary_comparisons(pairs, execution_state)
@@ -708,7 +755,7 @@ class APITestAccuracyStable(APITestBase):
                     execution_state,
                     pairs,
                     discard_results=True,
-                    release_cache=True,
+                    cache_release_policy="if_pressure",
                 )
 
     def get_torch_output(self, convert_result, iter_idx=0):
