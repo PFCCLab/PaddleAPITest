@@ -2412,6 +2412,18 @@ class APITestBase:
 
         return visit(value)
 
+    def _reference_workspace_bytes(self, convert_result):
+        if not self.gpu_mode_config.enabled:
+            return 0
+        code = convert_result.code
+        source_lines = (*code.preprocess, *code.core, *code.postprocess)
+        if not any("_workspace_bytes =" in str(line) for line in source_lines):
+            return 0
+
+        from .paddle_to_torch import adaptive_workspace_bytes
+
+        return adaptive_workspace_bytes(torch)
+
     def tensor_tree_has_gpu_tensor(self, value):
         """Return whether a result tree contains at least one GPU tensor leaf."""
         if isinstance(value, torch.Tensor):

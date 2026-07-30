@@ -90,15 +90,6 @@ class APITestAccuracyStable(APITestBase):
             self.compare(paddle_output, torch_output, "P1T1")
             self.compare(paddle_grad, torch_grad, "P1T1B")
 
-    def _reference_workspace_bytes(self, convert_result):
-        if not self.gpu_mode_config.enabled:
-            return 0
-        code = convert_result.code
-        source_lines = (*code.preprocess, *code.core, *code.postprocess)
-        if not any("_workspace_bytes =" in str(line) for line in source_lines):
-            return 0
-        return adaptive_workspace_bytes(torch)
-
     def _comparison_gpu_memory_state(self):
         return self.gpu_memory_state(
             self.comparison_device_id,
