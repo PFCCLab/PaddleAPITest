@@ -9,7 +9,7 @@ import yaml
 
 from .accuracy_common import process_grad_output, process_output
 from .base import APITestBase, gpu_mode_maybe_empty_cache
-from .paddle_to_torch import adaptive_workspace_bytes, get_converter
+from .paddle_to_torch import ConversionKind, get_converter
 
 
 class APITestAccuracy(APITestBase):
@@ -229,7 +229,7 @@ class APITestAccuracy(APITestBase):
             self.report_case_result("config_convert", f"Conversion failed: {e!s}")
             self.dump_finalize("config_convert")
             return None
-        if not convert_result.is_supported:
+        if convert_result.kind is ConversionKind.UNSUPPORTED:
             self.report_case_result(
                 "config_convert",
                 f"Unsupported API {self.api_config.api_name}: {convert_result.error_message}",
@@ -238,7 +238,7 @@ class APITestAccuracy(APITestBase):
             self.dump_finalize("config_convert")
             return None
         self.dump_event("config_convert_done")
-        if not convert_result.code or not convert_result.code.is_valid():
+        if not convert_result.code or not convert_result.code.valid:
             self.report_case_result(
                 "config_convert",
                 f"No code generated for {self.api_config.api_name}",
@@ -286,42 +286,27 @@ class APITestAccuracy(APITestBase):
             self.reset_random_state()
             self.dump_event("torch_forward_start")
 
-            # torch_args 与 torch_kwargs 是尚未映射的 torch 参数（即按 paddle 的参数顺序与关键字排列的 torch tensors）
-            # (弃用)以下代码等价于:
-            # torch_output = Paddle2TorchConverter.execute(convert_result, self.torch_args, self.torch_kwargs)
-            # 准备执行环境，将参数(torch tensors)直接映射至locals()
-            exec_globals = {"torch": torch, "_adaptive_workspace_bytes": adaptive_workspace_bytes}
-            exec_locals = {
-                "args": self.torch_args,
-                "kwargs": self.torch_kwargs,
-                "result": None,
-                **self.torch_kwargs,
-            }
+            execution_locals = {}
             if self.api_config.api_name == "paddle.nn.functional.rnnt_loss":
                 if paddle.device.get_device() == "cpu":
-                    exec_locals["fused_log_softmax"] = False
+                    execution_locals["fused_log_softmax"] = False
 
-            # convert_result.is_torch_corresponding 为 True 时代表有对应的 Torch API
-            # 执行 *_compiled 编译好的代码速度更快，定位 compile error 时可删去 _compiled
-            code = convert_result.code
-            if code.preprocess_compiled:
-                exec(code.preprocess_compiled, exec_globals, exec_locals)
-
-            if code.core_compiled:
+            def execute_core(compiled, exec_globals, exec_locals):
                 if self.test_amp:
                     with torch.autocast(device_type="cuda"):
-                        exec(code.core_compiled, exec_globals, exec_locals)
+                        exec(compiled, exec_globals, exec_locals)
                 else:
-                    exec(code.core_compiled, exec_globals, exec_locals)
+                    exec(compiled, exec_globals, exec_locals)
 
-            if code.postprocess_compiled:
-                exec(code.postprocess_compiled, exec_globals, exec_locals)
-
-            output_var = convert_result.output_var or "result"
-            torch_output = exec_locals[output_var]
+            torch_output = self.converter.execute(
+                convert_result,
+                self.torch_args,
+                self.torch_kwargs,
+                execution_locals=execution_locals,
+                core_executor=execute_core,
+            )
             self.dump_save("torch_forward_output", torch_output, framework="torch")
             self.dump_event("torch_forward_done")
-            del exec_globals, exec_locals, output_var, code
 
             # if "paddle.Tensor." in self.api_config.api_name:
             #     api = getattr(self.torch_args[0], self.torch_api_str[self.torch_api_str.rindex(".")+1:])

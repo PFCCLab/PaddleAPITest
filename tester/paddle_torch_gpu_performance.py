@@ -8,7 +8,7 @@ from func_timeout import func_set_timeout
 
 from .api_config.config_analyzer import TensorConfig
 from .base import APITestBase
-from .paddle_to_torch import adaptive_workspace_bytes, get_converter
+from .paddle_to_torch import ConversionKind, adaptive_workspace_bytes, get_converter
 
 
 def tensor_numel(tensor_config):
@@ -677,13 +677,13 @@ class APITestPaddleTorchGPUPerformance(APITestBase):
         except Exception as e:
             self.report_case_result("config_convert", f"Conversion failed: {e!s}")
             return
-        if not convert_result.is_supported:
+        if convert_result.kind is ConversionKind.UNSUPPORTED:
             self.report_case_result(
                 "config_convert",
                 f"Unsupported API {self.api_config.api_name}: {convert_result.error_message}",
             )
             return
-        if not convert_result.code or not convert_result.code.is_valid():
+        if not convert_result.code or not convert_result.code.valid:
             self.report_case_result(
                 "config_convert",
                 f"No code generated for {self.api_config.api_name}",
@@ -837,13 +837,13 @@ class APITestPaddleTorchGPUPerformance(APITestBase):
                 if paddle.device.get_device() == "cpu":
                     exec_locals["fused_log_softmax"] = False
 
-            # convert_result.is_torch_corresponding 为 True 时代表有对应的 Torch API
+            # Only direct Torch mappings are eligible for performance comparison.
             # 执行 *_compiled 编译好的代码速度更快，定位 compile error 时可删去 _compiled
             code = convert_result.code
             if code.preprocess_compiled:
                 exec(code.preprocess_compiled, exec_globals, exec_locals)
 
-            if not convert_result.is_torch_corresponding:
+            if convert_result.kind is not ConversionKind.DIRECT:
                 combined = "combined"
 
             if code.core_compiled:

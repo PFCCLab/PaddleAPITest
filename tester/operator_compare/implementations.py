@@ -9,6 +9,7 @@ from typing import Any
 import paddle
 import torch
 from tester.api_config.config_analyzer import APIConfig, TensorConfig
+from tester.paddle_to_torch import ConversionKind
 from tester.paddle_to_torch.converter import Paddle2TorchConverter, get_converter
 
 from .config_loader import cases_from_config_lines
@@ -222,7 +223,7 @@ def run_torch_case(case: CompareCase) -> torch.Tensor:
     spec = current_spec(case)
     api_config = clone_api_config(case.tensors["api_config"], spec.dtype)
     convert_result = get_converter().convert(api_config.api_name)
-    if not convert_result.is_supported:
+    if convert_result.kind is ConversionKind.UNSUPPORTED:
         raise RuntimeError(
             convert_result.error_message or f"unsupported torch mapping: {api_config.api_name}"
         )

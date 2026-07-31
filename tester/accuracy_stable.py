@@ -10,7 +10,7 @@ import torch
 from .accuracy_common import process_grad_output, process_output
 from .base import CUDA_ERROR, CUDA_OOM, APITestBase, gpu_mode_memory_decision
 from .log_writer import log_comparison, log_worker
-from .paddle_to_torch import adaptive_workspace_bytes, get_converter
+from .paddle_to_torch import ConversionKind, get_converter
 
 _GIB = 1024**3
 _RESULT_STREAM_WORKSPACE_BYTES = 256 * 1024**2
@@ -723,13 +723,13 @@ class APITestAccuracyStable(APITestBase):
         except Exception as e:
             self.report_case_result("config_convert", f"Conversion failed: {e!s}")
             return
-        if not convert_result.is_supported:
+        if convert_result.kind is ConversionKind.UNSUPPORTED:
             self.report_case_result(
                 "config_convert",
                 f"Unsupported API {self.api_config.api_name}: {convert_result.error_message}",
             )
             return
-        if not convert_result.code or not convert_result.code.is_valid():
+        if not convert_result.code or not convert_result.code.valid:
             self.report_case_result(
                 "config_convert",
                 f"No code generated for {self.api_config.api_name}",
@@ -806,35 +806,26 @@ class APITestAccuracyStable(APITestBase):
                 )
                 return None, None, None
 
-            exec_globals = {
-                "torch": torch,
-                "_adaptive_workspace_bytes": adaptive_workspace_bytes,
-            }
-            exec_locals = {
-                "args": self.torch_args,
-                "kwargs": self.torch_kwargs,
-                "result": None,
-                **self.torch_kwargs,
-            }
+            execution_locals = {}
             if self.api_config.api_name == "paddle.nn.functional.rnnt_loss":
                 if paddle.device.get_device() == "cpu":
-                    exec_locals["fused_log_softmax"] = False
+                    execution_locals["fused_log_softmax"] = False
 
-            code = convert_result.code
+            def execute_core(compiled, exec_globals, exec_locals):
+                if self.test_amp:
+                    with torch.autocast(device_type="cuda"):
+                        exec(compiled, exec_globals, exec_locals)
+                else:
+                    exec(compiled, exec_globals, exec_locals)
+
             with torch.set_grad_enabled(self.need_check_grad()):
-                if code.preprocess_compiled:
-                    exec(code.preprocess_compiled, exec_globals, exec_locals)
-                if code.core_compiled:
-                    if self.test_amp:
-                        with torch.autocast(device_type="cuda"):
-                            exec(code.core_compiled, exec_globals, exec_locals)
-                    else:
-                        exec(code.core_compiled, exec_globals, exec_locals)
-                if code.postprocess_compiled:
-                    exec(code.postprocess_compiled, exec_globals, exec_locals)
-
-            output_var = convert_result.output_var or "result"
-            torch_output = exec_locals[output_var]
+                torch_output = self.converter.execute(
+                    convert_result,
+                    self.torch_args,
+                    self.torch_kwargs,
+                    execution_locals=execution_locals,
+                    core_executor=execute_core,
+                )
             paddle.base.core.eager._for_test_check_cuda_error()
         except Exception as err:
             _, fatal = self.report_runtime_error(

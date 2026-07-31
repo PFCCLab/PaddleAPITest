@@ -21,6 +21,31 @@ Paddle2Torch 是一个专注于将 PaddlePaddle API 转换为 PyTorch 对应实�
 
 本模块的典型应用场景包括：模型迁移、跨框架验证、混合编程等，可为深度学习开发者提供跨框架的互操作性解决方案。
 
+## 运行时配置与转换状态
+
+Paddle2Torch 统一通过 `PADDLEAPITEST_IMPL` 选择参考实现。合法值为 `torch`、`te` 和
+`apex`。未设置时，每个 Rule 使用自身声明的默认实现；当前大多数 Rule 默认为 `torch`，
+融合线性梯度 Rule 保持原有的 `te` 默认值。当全局值对当前 Rule 不适用时，该 Rule
+同样使用自己的默认实现；非法全局值会在转换前明确报错。
+转换引擎对每次调用只读取一次配置快照，同一快照同时用于生成代码和转换缓存键。
+原融合线性专用实现变量已退场，不再读取；相关作业必须改用 `PADDLEAPITEST_IMPL`。
+
+`PADDLEAPITEST_WORKERS_ON_GPU` 用于划分单个 GPU 上每个 worker 可使用的临时 workspace，
+默认值为 `1`，并且必须是正整数。该配置在 workspace 计算时校验，不影响转换代码缓存。
+
+`mapping.json` 在转换器初始化时进行 schema 校验，并拒绝重复 JSON key。所有 API 名必须以 `paddle.` 开头；
+允许的字段为 `Rule`、`torch_api`、`set_defaults`、`paddle_torch_args_map`、`torch_args`、
+`torch_kwargs`、`is_attribute` 和 `description`。未指定 `Rule` 的配置使用 `GenericRule`，
+且必须提供非空 `torch_api`；自定义 Rule 可以直接生成组合代码，因此允许省略
+`torch_api`。参数映射的键值也必须符合 schema。未知字段、错误字段类型和未注册 Rule
+会在初始化阶段报告具体 API 与字段；校验完成后的 mapping 和 Rule registry 均为只读。
+
+`ConvertResult.kind` 使用 `ConversionKind.UNSUPPORTED`、`ConversionKind.DIRECT` 和
+`ConversionKind.COMPOSITE` 表示不支持、直接 Torch 对应和组合实现。仅 `DIRECT` 适用于
+直接性能对比，`COMPOSITE` 仍是可执行的受支持转换。`Code` 和 `ConvertResult` 均不可变。
+转换阶段异常会包含 Paddle API 和 Rule 类，执行阶段异常会包含 Paddle API 及
+`preprocess`、`core` 或 `postprocess` 阶段。
+
 ## 开发文档
 
 百度内部同学请参考：
@@ -257,7 +282,7 @@ Paddle2Torch 是一个专注于将 PaddlePaddle API 转换为 PyTorch 对应实�
     result = x[slices]
     """
             code = Code(core=core.splitlines())
-            return ConvertResult.success(paddle_api, code, is_torch_corresponding=False)
+            return ConvertResult.success(paddle_api, code, kind=ConversionKind.COMPOSITE)
     ```
 
 ### 运行测试配置
@@ -369,7 +394,8 @@ if data_format == "NLC":
         return ConvertResult.success(paddle_api, code)
 ```
 
-其中 ConvertResult.success() 的 output_var 参数默认为 'result' ；is_torch_corresponding 参数默认为 True，若无直接对应的 Torch API，需手动设置为 False
+其中 `ConvertResult.success()` 的 `output_var` 参数默认为 `result`，`kind` 默认为
+`ConversionKind.DIRECT`；组合实现必须显式传入 `ConversionKind.COMPOSITE`。
 
 5. 运行测试配置
 
