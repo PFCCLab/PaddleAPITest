@@ -94,10 +94,20 @@ _TENSOR_DTYPE_BYTES = {
     "complex128": 16,
 }
 
+_OUTPUT_GRAD_DTYPES = frozenset(
+    [
+        "float16",
+        "float32",
+        "float64",
+        "bfloat16",
+        "complex64",
+        "complex128",
+    ]
+)
+
 
 def _dtype_element_size(dtype):
-    dtype_name = str(dtype).split(".")[-1]
-    return _TENSOR_DTYPE_BYTES.get(dtype_name, 4)
+    return _TENSOR_DTYPE_BYTES.get(_dtype_name(dtype), 4)
 
 
 def _tensor_element_size(value):
@@ -105,6 +115,10 @@ def _tensor_element_size(value):
         return int(value.element_size())
     except (AttributeError, TypeError, ValueError):
         return _dtype_element_size(value.dtype)
+
+
+def _dtype_name(value):
+    return str(value).split(".")[-1]
 
 
 @dataclass(frozen=True)
@@ -126,6 +140,13 @@ class GpuMemoryState:
     budget_bytes: int
     reserve_bytes: int
     live_budget_bytes: int
+
+
+@dataclass(frozen=True)
+class OutputGradSlot:
+    seed_numpy: object | None = None
+    paddle_grad: object | None = None
+    torch_grad: object | None = None
 
 
 def _gpu_memory_is_under_pressure(gpu_config, free_bytes, total_bytes, required_headroom_bytes):
@@ -441,8 +462,8 @@ class APITestBase:
             if dump_enabled()
             else None
         )
-        self.outputs_grad_numpy = []
-        self.outputs_grad_paddleonly = []
+        self.output_grad_slots = []
+        self.output_grad_slots_signature = None
         if use_torch:
             torch.set_num_threads(8)
             torch.set_printoptions(threshold=100, linewidth=120)
@@ -573,8 +594,6 @@ class APITestBase:
     def clear_runtime_inputs(self, framework):
         """Release one framework's generated inputs after an execution."""
         attr_names = [f"{framework}_args", f"{framework}_kwargs"]
-        if framework == "paddle":
-            attr_names.append("paddle_merged_kwargs")
         for attr_name in attr_names:
             if hasattr(self, attr_name):
                 delattr(self, attr_name)
@@ -1009,49 +1028,44 @@ class APITestBase:
                 kwarg_config.get_numpy_tensor(self.api_config, key=key)
         return True
 
-    def _handle_list_or_tuple_paddle(self, config_items, is_tuple=False):
-        """处理 list 或 tuple"""
-        tmp = []
-        for item in config_items:
-            if isinstance(item, (list, tuple)):
-                is_nested_tuple = isinstance(item, tuple)
-                processed_item = self._handle_list_or_tuple_paddle(item, is_tuple=is_nested_tuple)
-            elif isinstance(item, TensorConfig):
-                processed_item = item.get_paddle_tensor(self.api_config)
-                item.clear_paddle_tensor()
-            else:
-                processed_item = item
-            tmp.append(processed_item)
-        return tuple(tmp) if is_tuple else tmp
+    def _materialize_paddle_config_value(self, config_value, *, clear_tensor=True):
+        """Materialize a Paddle config tree into live values, optionally clearing cache."""
+        if isinstance(config_value, TensorConfig):
+            paddle_tensor = config_value.get_paddle_tensor(self.api_config)
+            if clear_tensor:
+                config_value.clear_paddle_tensor()
+            return paddle_tensor
+        if isinstance(config_value, list):
+            return [
+                self._materialize_paddle_config_value(item, clear_tensor=clear_tensor)
+                for item in config_value
+            ]
+        if isinstance(config_value, tuple):
+            return tuple(
+                self._materialize_paddle_config_value(item, clear_tensor=clear_tensor)
+                for item in config_value
+            )
+        return config_value
 
     def gen_paddle_input(self):
-        """Generate paddle input by config, for tensor config initlize paddle tensor by get_paddle_tensor()
+        """Generate Paddle inputs from config and materialize TensorConfig leaves.
 
-        be sure to call gen_numpy_input() before use gen_paddle_input() since gen_paddle_input() do not pass index or key to get_paddle_tensor() or get_numpy_tensor() while gen_numpy_input() pass.
+        Call gen_numpy_input() first because gen_paddle_input() does not pass
+        index or key to get_paddle_tensor() or get_numpy_tensor().
         """
         self.paddle_args = []
         self.paddle_kwargs = collections.OrderedDict()
-        self.paddle_merged_kwargs = collections.OrderedDict()
 
         for arg_config in self.paddle_args_config:
-            if isinstance(arg_config, TensorConfig):
-                self.paddle_args.append(arg_config.get_paddle_tensor(self.api_config))
-                arg_config.clear_paddle_tensor()
-            elif isinstance(arg_config, (list, tuple)):
-                is_tuple = isinstance(arg_config, tuple)
-                self.paddle_args.append(self._handle_list_or_tuple_paddle(arg_config, is_tuple))
-            else:
-                self.paddle_args.append(arg_config)
+            self.paddle_args.append(
+                self._materialize_paddle_config_value(arg_config, clear_tensor=True)
+            )
 
         for key, kwarg_config in self.paddle_kwargs_config.items():
-            if isinstance(kwarg_config, TensorConfig):
-                self.paddle_kwargs[key] = kwarg_config.get_paddle_tensor(self.api_config)
-                kwarg_config.clear_paddle_tensor()
-            elif isinstance(kwarg_config, (list, tuple)):
-                is_tuple = isinstance(kwarg_config, tuple)
-                self.paddle_kwargs[key] = self._handle_list_or_tuple_paddle(kwarg_config, is_tuple)
-            else:
-                self.paddle_kwargs[key] = kwarg_config
+            self.paddle_kwargs[key] = self._materialize_paddle_config_value(
+                kwarg_config,
+                clear_tensor=True,
+            )
 
         if len(self.paddle_args) == 0 and self.api_config.api_name.startswith("paddle.Tensor."):
             self.paddle_args.append(self.paddle_kwargs.popitem(last=False)[1])
@@ -1144,9 +1158,55 @@ class APITestBase:
     def get_cached_numpy(self, dtype, shape, generation_kind="output_grad", scale=1.0):
         return get_cached_numpy_array(dtype, shape, generation_kind=generation_kind, scale=scale)
 
-    def _make_torch_output_grad(self, shape, dtype):
+    def _make_numpy_output_grad(self, output):
+        dtype = _dtype_name(output.dtype)
+        if USE_CACHED_NUMPY:
+            dtype = "float32" if dtype == "bfloat16" else dtype
+            return self.get_cached_numpy(dtype, output.shape)
+        if "int" in dtype:
+            return numpy.random.randint(-65535, 65535, size=output.shape).astype(dtype)
+        if dtype in ["float8_e5m2", "float8_e4m3fn"]:
+            numpy_dtype = "float16"
+        elif dtype == "bfloat16":
+            numpy_dtype = "float32"
+        else:
+            numpy_dtype = dtype
+        return (numpy.random.random(output.shape) - 0.5).astype(numpy_dtype)
+
+    @staticmethod
+    def _output_grad_intermediate_dtype(dtype):
+        if dtype in ["float8_e5m2", "float8_e4m3fn"]:
+            return "float16"
+        if dtype == "bfloat16":
+            return "float32"
+        return dtype
+
+    def _numpy_output_grad_to_paddle(self, numpy_tensor, output):
+        dtype = _dtype_name(output.dtype)
+        intermediate_dtype = self._output_grad_intermediate_dtype(dtype)
+        result_output_grad = paddle.to_tensor(
+            numpy_tensor,
+            dtype=intermediate_dtype,
+            place=output.place,
+        )
+        result_output_grad.stop_gradient = False
+        if dtype in ["bfloat16", "float8_e5m2", "float8_e4m3fn"]:
+            result_output_grad = paddle.cast(result_output_grad, dtype=dtype)
+        return result_output_grad
+
+    def _numpy_output_grad_to_torch(self, numpy_tensor, output):
+        dtype = _dtype_name(output.dtype)
+        result_output_grad = torch.tensor(
+            numpy_tensor,
+            dtype=self.convert_dtype_to_torch_type(dtype) if dtype != "bfloat16" else torch.float32,
+        )
+        if dtype == "bfloat16":
+            result_output_grad = result_output_grad.to(dtype=torch.bfloat16)
+        return result_output_grad
+
+    def _make_torch_output_grad(self, shape, dtype, device=None):
         torch_dtype = self.convert_dtype_to_torch_type(dtype)
-        device = torch.device("cuda", torch.cuda.current_device())
+        device = device or torch.device("cuda", torch.cuda.current_device())
         if "int" in dtype:
             return torch.randint(-65535, 65535, tuple(shape), device=device, dtype=torch.int64).to(
                 dtype=torch_dtype
@@ -1166,48 +1226,123 @@ class APITestBase:
             dtype=torch_dtype
         )
 
-    def _make_paddle_output_grad(self, shape, dtype):
+    def _make_paddle_output_grad(self, shape, dtype, place=None):
         if "int" in dtype:
-            return paddle.randint(-65535, 65535, tuple(shape), dtype="int64").cast(dtype)
+            return paddle.randint(-65535, 65535, tuple(shape), dtype="int64", device=place).cast(
+                dtype
+            )
         if dtype in ["float8_e5m2", "float8_e4m3fn"]:
             base_dtype = "float16"
         elif dtype == "bfloat16":
             base_dtype = "float32"
         elif dtype.startswith("complex"):
             real_dtype = "float32" if dtype == "complex64" else "float64"
-            real_part = paddle.rand(tuple(shape), dtype=real_dtype) - 0.5
-            imag_part = paddle.rand(tuple(shape), dtype=real_dtype) - 0.5
+            real_part = paddle.rand(tuple(shape), dtype=real_dtype, device=place) - 0.5
+            imag_part = paddle.rand(tuple(shape), dtype=real_dtype, device=place) - 0.5
             return (real_part + 1j * imag_part).cast(dtype)
         else:
             base_dtype = dtype
-        return (paddle.rand(tuple(shape), dtype=base_dtype) - 0.5).cast(dtype)
+        return (paddle.rand(tuple(shape), dtype=base_dtype, device=place) - 0.5).cast(dtype)
 
     def _use_gpu_output_grad(self, output):
-        if not self.gpu_mode_config.enabled or "gpu" not in paddle.device.get_device():
+        if not self.gpu_mode_config.enabled:
             return False
-        dtype = str(output.dtype).split(".")[-1]
-        return dtype in ["float32", "float64", "float16", "bfloat16", "complex64", "complex128"]
+        dtype = _dtype_name(output.dtype)
+        if isinstance(output, torch.Tensor):
+            return output.device.type != "cpu" and dtype in _OUTPUT_GRAD_DTYPES
+        if isinstance(output, paddle.Tensor):
+            return output.place.is_gpu_place() and dtype in _OUTPUT_GRAD_DTYPES
+        return False
 
-    def _get_gpu_output_grad_paddleonly(self, output, index):
-        if len(self.outputs_grad_paddleonly) <= index:
-            dtype = str(output.dtype).split(".")[-1]
-            paddle_grad = self._make_paddle_output_grad(output.shape, dtype)
-            paddle_grad.stop_gradient = False
-            self.outputs_grad_paddleonly.append(paddle_grad)
-        return self.outputs_grad_paddleonly[index]
+    @staticmethod
+    def _output_grad_signature(outputs):
+        return tuple((_dtype_name(output.dtype), tuple(output.shape)) for output in outputs)
 
-    def _get_gpu_output_grad_pair(self, output, index):
-        if len(self.outputs_grad_numpy) <= index:
-            dtype = str(output.dtype).split(".")[-1]
-            torch_grad = self._make_torch_output_grad(output.shape, dtype).detach()
-            paddle_grad = paddle.utils.dlpack.from_dlpack(
-                torch.utils.dlpack.to_dlpack(torch_grad.clone())
-            )
-            paddle_grad.stop_gradient = False
-            self.outputs_grad_numpy.append((paddle_grad, torch_grad))
-        return self.outputs_grad_numpy[index]
+    @staticmethod
+    def _tensor_matches_output_place(tensor, output):
+        if isinstance(tensor, torch.Tensor) and isinstance(output, torch.Tensor):
+            tensor_device = 0 if tensor.device.index is None else int(tensor.device.index)
+            output_device = 0 if output.device.index is None else int(output.device.index)
+            return tensor.device.type == output.device.type and tensor_device == output_device
+        if isinstance(tensor, paddle.Tensor) and isinstance(output, paddle.Tensor):
+            if tensor.place.is_cpu_place() and output.place.is_cpu_place():
+                return True
+            if tensor.place.is_gpu_place() and output.place.is_gpu_place():
+                return int(tensor.place.gpu_device_id()) == int(output.place.gpu_device_id())
+        return False
+
+    def _make_gpu_paddle_output_grad_slot(self, output):
+        dtype = _dtype_name(output.dtype)
+        paddle_grad = self._make_paddle_output_grad(output.shape, dtype, place=output.place)
+        paddle_grad.stop_gradient = False
+        return OutputGradSlot(seed_numpy=paddle_grad.numpy(), paddle_grad=paddle_grad)
+
+    def _make_gpu_output_grad_pair_slot(self, output):
+        dtype = _dtype_name(output.dtype)
+        torch_grad = self._make_torch_output_grad(
+            output.shape,
+            dtype,
+            device=output.device,
+        ).detach()
+        paddle_grad = paddle.utils.dlpack.from_dlpack(
+            torch.utils.dlpack.to_dlpack(torch_grad.clone())
+        )
+        paddle_grad.stop_gradient = False
+        return OutputGradSlot(
+            seed_numpy=torch_grad.detach().cpu().numpy(),
+            paddle_grad=paddle_grad,
+            torch_grad=torch_grad,
+        )
+
+    def clear_output_grad_cache(self):
+        """Drop all cached output-grad seeds for the current execution."""
+        self.output_grad_slots.clear()
+        self.output_grad_slots_signature = None
+
+    def _output_grad_slot_to_paddle(self, slot, output):
+        if slot.paddle_grad is not None and self._tensor_matches_output_place(
+            slot.paddle_grad, output
+        ):
+            return slot.paddle_grad
+        if slot.seed_numpy is not None:
+            return self._numpy_output_grad_to_paddle(slot.seed_numpy, output)
+        if slot.torch_grad is not None:
+            return self._numpy_output_grad_to_paddle(slot.torch_grad.detach().cpu().numpy(), output)
+        raise RuntimeError("output grad slot is empty")
+
+    def _output_grad_slot_to_torch(self, slot, output):
+        if slot.torch_grad is not None and self._tensor_matches_output_place(
+            slot.torch_grad, output
+        ):
+            return slot.torch_grad
+        if slot.seed_numpy is not None:
+            return self._numpy_output_grad_to_torch(slot.seed_numpy, output)
+        if slot.paddle_grad is not None:
+            return self._numpy_output_grad_to_torch(slot.paddle_grad.numpy(), output)
+        raise RuntimeError("output grad slot is empty")
+
+    def _prepare_output_grad_slots(self, result_outputs):
+        signature = self._output_grad_signature(result_outputs)
+        if self.output_grad_slots_signature != signature:
+            self.output_grad_slots = []
+            self.output_grad_slots_signature = signature
+        if len(self.output_grad_slots) != len(result_outputs):
+            self.output_grad_slots = []
+            for output in result_outputs:
+                if self._use_gpu_output_grad(output):
+                    if isinstance(output, torch.Tensor):
+                        self.output_grad_slots.append(self._make_gpu_output_grad_pair_slot(output))
+                    else:
+                        self.output_grad_slots.append(
+                            self._make_gpu_paddle_output_grad_slot(output)
+                        )
+                else:
+                    self.output_grad_slots.append(
+                        OutputGradSlot(seed_numpy=self._make_numpy_output_grad(output))
+                    )
 
     def gen_paddle_output_and_output_grad(self, outputs):
+        """Normalize Paddle outputs and align them with cached output-grad seeds."""
         result_outputs = []
         if isinstance(outputs, paddle.Tensor):
             result_outputs.append(outputs)
@@ -1267,51 +1402,10 @@ class APITestBase:
             and str(output.dtype).split(".")[-1] in paddle_autograd_dtypes
         ]
 
+        self._prepare_output_grad_slots(result_outputs)
         result_outputs_grads = []
-        if len(self.outputs_grad_numpy) == 0 and len(self.outputs_grad_paddleonly) == 0:
-            for i, output in enumerate(result_outputs):
-                if self._use_gpu_output_grad(output):
-                    self._get_gpu_output_grad_paddleonly(output, i)
-                    continue
-                dtype = str(output.dtype).split(".")[-1]
-                if USE_CACHED_NUMPY:
-                    dtype = "float32" if dtype == "bfloat16" else dtype
-                    numpy_tensor = self.get_cached_numpy(dtype, output.shape)
-                else:
-                    if "int" in dtype:
-                        numpy_tensor = (
-                            numpy.random.randint(-65535, 65535, size=output.shape)
-                        ).astype(dtype)
-                    else:
-                        if dtype in ["float8_e5m2", "float8_e4m3fn"]:
-                            numpy_dtype = "float16"
-                        elif dtype == "bfloat16":
-                            numpy_dtype = "float32"
-                        else:
-                            numpy_dtype = dtype
-                        numpy_tensor = (numpy.random.random(output.shape) - 0.5).astype(numpy_dtype)
-                self.outputs_grad_numpy.append(numpy_tensor)
-        for paddle_grad in self.outputs_grad_paddleonly:
-            result_outputs_grads.append(paddle_grad)
-        for i, numpy_tensor in enumerate(self.outputs_grad_numpy):
-            if isinstance(numpy_tensor, tuple):
-                result_outputs_grads.append(numpy_tensor[0])
-                continue
-            dtype = str(result_outputs[i].dtype).split(".")[-1]
-            if dtype in ["float8_e5m2", "float8_e4m3fn"]:
-                intermediate_dtype = "float16"
-            elif dtype == "bfloat16":
-                intermediate_dtype = "float32"
-            else:
-                intermediate_dtype = dtype
-            result_output_grad = paddle.to_tensor(
-                numpy_tensor,
-                dtype=intermediate_dtype,
-            )
-            result_output_grad.stop_gradient = False
-            if dtype in ["bfloat16", "float8_e5m2", "float8_e4m3fn"]:
-                result_output_grad = paddle.cast(result_output_grad, dtype=dtype)
-            result_outputs_grads.append(result_output_grad)
+        for output, slot in zip(result_outputs, self.output_grad_slots, strict=True):
+            result_outputs_grads.append(self._output_grad_slot_to_paddle(slot, output))
         return result_outputs, result_outputs_grads
 
     def gen_torch_output_and_output_grad(self, outputs):
@@ -1333,39 +1427,10 @@ class APITestBase:
 
         result_outputs = [output for output in result_outputs if output.requires_grad]
 
+        self._prepare_output_grad_slots(result_outputs)
         result_outputs_grads = []
-        if len(self.outputs_grad_numpy) == 0:
-            for i, output in enumerate(result_outputs):
-                if self._use_gpu_output_grad(output):
-                    self._get_gpu_output_grad_pair(output, i)
-                    continue
-                dtype = str(output.dtype).split(".")[-1]
-                if USE_CACHED_NUMPY:
-                    dtype = "float32" if dtype == "bfloat16" else dtype
-                    numpy_tensor = self.get_cached_numpy(dtype, output.shape)
-                else:
-                    if "int" in dtype:
-                        numpy_tensor = (
-                            numpy.random.randint(-65535, 65535, size=output.shape)
-                        ).astype(dtype)
-                    else:
-                        dtype = "float32" if dtype == "bfloat16" else dtype
-                        numpy_tensor = (numpy.random.random(output.shape) - 0.5).astype(dtype)
-                self.outputs_grad_numpy.append(numpy_tensor)
-        for i, numpy_tensor in enumerate(self.outputs_grad_numpy):
-            if isinstance(numpy_tensor, tuple):
-                result_outputs_grads.append(numpy_tensor[1])
-                continue
-            dtype = str(result_outputs[i].dtype).split(".")[1]
-            result_output_grad = torch.tensor(
-                numpy_tensor,
-                dtype=self.convert_dtype_to_torch_type(dtype)
-                if dtype != "bfloat16"
-                else torch.float32,
-            )
-            if dtype == "bfloat16":
-                result_output_grad = result_output_grad.to(dtype=torch.bfloat16)
-            result_outputs_grads.append(result_output_grad)
+        for output, slot in zip(result_outputs, self.output_grad_slots, strict=True):
+            result_outputs_grads.append(self._output_grad_slot_to_torch(slot, output))
         return result_outputs, result_outputs_grads
 
     def convert_dtype_to_torch_type(self, dtype):
@@ -1467,80 +1532,6 @@ class APITestBase:
         else:
             raise ValueError(f"Unsupported dtype: {dtype}")
 
-    def gen_paddle_input_with_merged_kwargs(self):
-        self.paddle_args = []
-        self.paddle_kwargs = collections.OrderedDict()
-        self.paddle_merged_kwargs = collections.OrderedDict()
-
-        for i in range(len(self.paddle_args_config)):
-            if isinstance(self.paddle_args_config[i], TensorConfig):
-                self.paddle_args.append(
-                    self.paddle_args_config[i].get_paddle_tensor(self.api_config)
-                )
-            elif isinstance(self.paddle_args_config[i], list):
-                tmp = []
-                for j in range(len(self.paddle_args_config[i])):
-                    if isinstance(self.paddle_args_config[i][j], TensorConfig):
-                        tmp.append(self.paddle_args_config[i][j].get_paddle_tensor(self.api_config))
-                    else:
-                        tmp.append(self.paddle_args_config[i][j])
-                self.paddle_args.append(tmp)
-            elif isinstance(self.paddle_args_config[i], tuple):
-                tmp = []
-                for j in range(len(self.paddle_args_config[i])):
-                    if isinstance(self.paddle_args_config[i][j], TensorConfig):
-                        tmp.append(self.paddle_args_config[i][j].get_paddle_tensor(self.api_config))
-                    else:
-                        tmp.append(self.paddle_args_config[i][j])
-                self.paddle_args.append(tuple(tmp))
-            else:
-                self.paddle_args.append(self.paddle_args_config[i])
-
-        for key, arg_config in self.paddle_kwargs_config.items():
-            if isinstance(arg_config, TensorConfig):
-                self.paddle_kwargs[key] = arg_config.get_paddle_tensor(self.api_config)
-            elif isinstance(arg_config, list):
-                value = []
-                for i in range(len(arg_config)):
-                    if isinstance(arg_config[i], TensorConfig):
-                        value.append(arg_config[i].get_paddle_tensor(self.api_config))
-                    else:
-                        value.append(arg_config[i])
-                self.paddle_kwargs[key] = value
-            elif isinstance(arg_config, tuple):
-                tmp = []
-                for i in range(len(arg_config)):
-                    if isinstance(arg_config[i], TensorConfig):
-                        tmp.append(arg_config[i].get_paddle_tensor(self.api_config))
-                    else:
-                        tmp.append(arg_config[i])
-                self.paddle_kwargs[key] = tuple(tmp)
-            else:
-                self.paddle_kwargs[key] = arg_config
-
-        for key, arg_config in self.paddle_merged_kwargs_config.items():
-            if isinstance(arg_config, TensorConfig):
-                self.paddle_merged_kwargs[key] = arg_config.get_paddle_tensor(self.api_config)
-            elif isinstance(arg_config, list):
-                value = []
-                for i in range(len(arg_config)):
-                    if isinstance(arg_config[i], TensorConfig):
-                        value.append(arg_config[i].get_paddle_tensor(self.api_config))
-                    else:
-                        value.append(arg_config[i])
-                self.paddle_merged_kwargs[key] = value
-            elif isinstance(arg_config, tuple):
-                tmp = []
-                for i in range(len(arg_config)):
-                    if isinstance(arg_config[i], TensorConfig):
-                        tmp.append(arg_config[i].get_paddle_tensor(self.api_config))
-                    else:
-                        tmp.append(arg_config[i])
-                self.paddle_merged_kwargs[key] = tuple(tmp)
-            else:
-                self.paddle_merged_kwargs[key] = arg_config
-        return True
-
     def copy_torch_input(self):
         def _deep_copy(data):
             if isinstance(data, torch.Tensor):
@@ -1553,54 +1544,38 @@ class APITestBase:
         kwargs = collections.OrderedDict((k, _deep_copy(v)) for k, v in self.torch_kwargs.items())
         return args, kwargs
 
-    def _handle_list_or_tuple_torch(self, config_items, is_tuple=False):
-        """处理 list 或 tuple"""
-        tmp = []
-        for item in config_items:
-            if isinstance(item, (list, tuple)):
-                is_nested_tuple = isinstance(item, tuple)
-                processed_item = self._handle_list_or_tuple_torch(item, is_tuple=is_nested_tuple)
-            elif isinstance(item, TensorConfig):
-                processed_item = item.get_torch_tensor(self.api_config)
-                item.clear_torch_tensor()
-            else:
-                processed_item = item
-            tmp.append(processed_item)
-        return tuple(tmp) if is_tuple else tmp
+    def _materialize_torch_config_value(self, config_value, *, convert_dtype=False):
+        """Materialize a Torch config tree and translate explicit dtype values."""
+        if isinstance(config_value, TensorConfig):
+            torch_tensor = config_value.get_torch_tensor(self.api_config)
+            config_value.clear_torch_tensor()
+            return torch_tensor
+        if isinstance(config_value, list):
+            return [self._materialize_torch_config_value(item) for item in config_value]
+        if isinstance(config_value, tuple):
+            return tuple(self._materialize_torch_config_value(item) for item in config_value)
+        if convert_dtype or isinstance(
+            config_value, (paddle.dtype, paddle.base.libpaddle.VarDesc.VarType)
+        ):
+            return self.convert_dtype_to_torch_type(config_value)
+        return config_value
 
     def gen_torch_input(self):
-        """Generate torch input by config, for tensor config initlize torch tensor by get_torch_tensor()
+        """Generate Torch inputs from config and materialize TensorConfig leaves.
 
-        be sure to call gen_numpy_input() before use gen_torch_input() since gen_torch_input() do not pass index or key to get_torch_tensor() or get_numpy_tensor() while gen_numpy_input() pass.
+        Call gen_numpy_input() first because gen_torch_input() does not pass
+        index or key to get_torch_tensor() or get_numpy_tensor().
         """
         self.torch_args = []
         self.torch_kwargs = collections.OrderedDict()
         for arg_config in self.torch_args_config:
-            if isinstance(arg_config, TensorConfig):
-                self.torch_args.append(arg_config.get_torch_tensor(self.api_config))
-                arg_config.clear_torch_tensor()
-            elif isinstance(arg_config, (list, tuple)):
-                is_tuple = isinstance(arg_config, tuple)
-                self.torch_args.append(self._handle_list_or_tuple_torch(arg_config, is_tuple))
-            elif isinstance(arg_config, (paddle.dtype, paddle.base.libpaddle.VarDesc.VarType)):
-                self.torch_args.append(self.convert_dtype_to_torch_type(arg_config))
-            else:
-                self.torch_args.append(arg_config)
+            self.torch_args.append(self._materialize_torch_config_value(arg_config))
 
         for key, arg_config in self.torch_kwargs_config.items():
-            if isinstance(arg_config, TensorConfig):
-                self.torch_kwargs[key] = arg_config.get_torch_tensor(self.api_config)
-                arg_config.clear_torch_tensor()
-            elif isinstance(arg_config, (list, tuple)):
-                is_tuple = isinstance(arg_config, tuple)
-                self.torch_kwargs[key] = self._handle_list_or_tuple_torch(arg_config, is_tuple)
-            elif (
-                isinstance(arg_config, (paddle.dtype, paddle.base.libpaddle.VarDesc.VarType))
-                or key == "dtype"
-            ):
-                self.torch_kwargs[key] = self.convert_dtype_to_torch_type(arg_config)
-            else:
-                self.torch_kwargs[key] = arg_config
+            self.torch_kwargs[key] = self._materialize_torch_config_value(
+                arg_config,
+                convert_dtype=key == "dtype",
+            )
 
         if (
             self.api_config.api_name[-1] == "_" and self.api_config.api_name[-2:] != "__"
@@ -2346,22 +2321,15 @@ class APITestBase:
         pass
 
     def clear_tensor(self):
-        if not hasattr(self, "torch_kwargs_config"):
+        if not self._clear_tensor_config_cache("clear_tensor"):
             return
-        for _key, arg_config in self.torch_kwargs_config.items():
-            if isinstance(arg_config, TensorConfig):
-                arg_config.clear_tensor()
-            elif isinstance(arg_config, (list, tuple)):
-                for i in range(len(arg_config)):
-                    if isinstance(arg_config[i], TensorConfig):
-                        arg_config[i].clear_tensor()
         if self.gpu_mode_config.enabled:
             gpu_mode_maybe_empty_cache(self.gpu_mode_config)
         else:
             torch.cuda.empty_cache()
             paddle.device.cuda.empty_cache()
 
-    def _for_each_tensor_config(self, callback):
+    def _for_each_tensor_config(self, callback, *roots):
         """Apply callback to every TensorConfig in the parsed argument tree."""
         seen = set()
 
@@ -2377,60 +2345,104 @@ class APITestBase:
                 for item in value.values():
                     visit(item)
 
-        for value in getattr(self, "paddle_args_config", ()):
+        if not roots:
+            roots = (
+                getattr(self, "paddle_args_config", ()),
+                getattr(self, "paddle_kwargs_config", {}),
+            )
+        for value in roots:
             visit(value)
-        visit(getattr(self, "paddle_kwargs_config", {}))
+
+    def _tensor_config_roots(self):
+        return (
+            getattr(self, "paddle_args_config", ()),
+            getattr(self, "paddle_kwargs_config", {}),
+            getattr(self, "paddle_merged_kwargs_config", {}),
+            getattr(self, "torch_args_config", ()),
+            getattr(self, "torch_kwargs_config", {}),
+        )
+
+    def _clear_tensor_config_cache(self, clear_method_name):
+        roots = self._tensor_config_roots()
+        if not any(roots):
+            return False
+        self._for_each_tensor_config(
+            lambda config: getattr(config, clear_method_name)(),
+            *roots,
+        )
+        return True
+
+    def _map_tensor_tree(self, value, tensor_mapper):
+        if isinstance(value, (torch.Tensor, paddle.Tensor)):
+            return tensor_mapper(value)
+        if isinstance(value, list):
+            return [self._map_tensor_tree(item, tensor_mapper) for item in value]
+        if isinstance(value, tuple):
+            return tuple(self._map_tensor_tree(item, tensor_mapper) for item in value)
+        if isinstance(value, dict):
+            return type(value)(
+                (key, self._map_tensor_tree(item, tensor_mapper)) for key, item in value.items()
+            )
+        return value
 
     def move_tensor_tree_to_cpu(self, value):
         """Recursively move framework tensors to CPU without changing containers."""
-        if isinstance(value, (torch.Tensor, paddle.Tensor)):
-            return value.cpu()
-        if isinstance(value, list):
-            return [self.move_tensor_tree_to_cpu(item) for item in value]
-        if isinstance(value, tuple):
-            return tuple(self.move_tensor_tree_to_cpu(item) for item in value)
-        if isinstance(value, dict):
-            return type(value)(
-                (key, self.move_tensor_tree_to_cpu(item)) for key, item in value.items()
-            )
-        return value
+        return self._map_tensor_tree(value, lambda tensor: tensor.cpu())
 
     def move_tensor_tree_to_gpu(self, value, device_id):
         """Recursively move framework tensors to one logical GPU."""
-        if isinstance(value, torch.Tensor):
-            return value.to(
-                device=torch.device("cuda", device_id),
-                non_blocking=False,
-            )
-        if isinstance(value, paddle.Tensor):
-            return value.cuda(device_id=device_id, blocking=True)
-        if isinstance(value, list):
-            return [self.move_tensor_tree_to_gpu(item, device_id) for item in value]
-        if isinstance(value, tuple):
-            return tuple(self.move_tensor_tree_to_gpu(item, device_id) for item in value)
-        if isinstance(value, dict):
-            return type(value)(
-                (key, self.move_tensor_tree_to_gpu(item, device_id)) for key, item in value.items()
-            )
-        return value
 
-    def tensor_tree_nbytes(self, value):
-        """Estimate logical bytes held by unique tensor leaves in a result tree."""
+        def move_tensor(tensor):
+            if isinstance(tensor, torch.Tensor):
+                return tensor.to(
+                    device=torch.device("cuda", device_id),
+                    non_blocking=False,
+                )
+            return tensor.cuda(device_id=device_id, blocking=True)
+
+        return self._map_tensor_tree(value, move_tensor)
+
+    def iter_unique_tensor_tree_leaves(self, value):
+        """Yield unique framework tensor leaves from a result tree."""
         seen = set()
 
         def visit(item):
             if isinstance(item, (torch.Tensor, paddle.Tensor)):
                 if id(item) in seen:
-                    return 0
+                    return
                 seen.add(id(item))
-                return int(item.numel()) * _tensor_element_size(item)
+                yield item
+                return
             if isinstance(item, (list, tuple)):
-                return sum(visit(child) for child in item)
+                for child in item:
+                    yield from visit(child)
+                return
             if isinstance(item, dict):
-                return sum(visit(child) for child in item.values())
-            return 0
+                for child in item.values():
+                    yield from visit(child)
 
-        return visit(value)
+        yield from visit(value)
+
+    @staticmethod
+    def tensor_is_gpu(value):
+        if isinstance(value, torch.Tensor):
+            return value.device.type != "cpu"
+        if isinstance(value, paddle.Tensor):
+            return value.place.is_gpu_place()
+        return False
+
+    @staticmethod
+    def tensor_gpu_device_id(value):
+        if isinstance(value, torch.Tensor):
+            return 0 if value.device.index is None else int(value.device.index)
+        return int(value.place.gpu_device_id())
+
+    def tensor_tree_nbytes(self, value):
+        """Estimate logical bytes held by unique tensor leaves in a result tree."""
+        return sum(
+            int(tensor.numel()) * _tensor_element_size(tensor)
+            for tensor in self.iter_unique_tensor_tree_leaves(value)
+        )
 
     @staticmethod
     def is_missing_compare_value(value):
@@ -2557,48 +2569,62 @@ class APITestBase:
 
     def tensor_tree_has_gpu_tensor(self, value):
         """Return whether a result tree contains at least one GPU tensor leaf."""
-        if isinstance(value, torch.Tensor):
-            return value.device.type != "cpu"
-        if isinstance(value, paddle.Tensor):
-            return not value.place.is_cpu_place()
-        if isinstance(value, (list, tuple)):
-            return any(self.tensor_tree_has_gpu_tensor(item) for item in value)
-        if isinstance(value, dict):
-            return any(self.tensor_tree_has_gpu_tensor(item) for item in value.values())
-        return False
+        return any(
+            self.tensor_is_gpu(tensor) for tensor in self.iter_unique_tensor_tree_leaves(value)
+        )
+
+    def tensor_tree_gpu_device_ids(self, value):
+        """Collect unique CUDA device ids used by a result tree."""
+        device_ids = []
+        seen_device_ids = set()
+
+        def add_device_id(device_id):
+            device_id = int(device_id)
+            if device_id not in seen_device_ids:
+                seen_device_ids.add(device_id)
+                device_ids.append(device_id)
+
+        for tensor in self.iter_unique_tensor_tree_leaves(value):
+            if self.tensor_is_gpu(tensor):
+                add_device_id(self.tensor_gpu_device_id(tensor))
+        return device_ids
 
     def spill_tensor_tree_slot_to_cpu(self, values, index=0, release_cache=False):
         """Replace one result-tree slot with a CPU copy, then optionally release its GPU source."""
         source = values[index]
         if not self.tensor_tree_has_gpu_tensor(source):
             return False
+        device_ids = self.tensor_tree_gpu_device_ids(source)
         values[index] = self.move_tensor_tree_to_cpu(source)
         del source
         if release_cache and self.gpu_mode_config.enabled:
-            gpu_mode_memory_decision(self.gpu_mode_config, force=True)
+            for device_id in device_ids:
+                try:
+                    self.release_framework_gpu_cache(
+                        device_id=device_id,
+                        collect_cycles=True,
+                    )
+                except Exception:
+                    pass
         self.record_memory_governance_metric("spill_result_tree")
         return True
 
     def detach_tensor_tree(self, value):
         """Detach every framework tensor while preserving the argument tree."""
-        if isinstance(value, (torch.Tensor, paddle.Tensor)):
-            return value.detach()
-        if isinstance(value, list):
-            return [self.detach_tensor_tree(item) for item in value]
-        if isinstance(value, tuple):
-            return tuple(self.detach_tensor_tree(item) for item in value)
-        if isinstance(value, dict):
-            return type(value)((key, self.detach_tensor_tree(item)) for key, item in value.items())
-        return value
+        return self._map_tensor_tree(value, lambda tensor: tensor.detach())
 
     def save_original_inputs_to_cpu(self):
         """Save config inputs on CPU before either framework can mutate them."""
         self._for_each_tensor_config(
-            lambda config: config.save_original_tensor_to_cpu(self.api_config)
+            lambda config: config.save_original_tensor_to_cpu(self.api_config),
+            *self._tensor_config_roots(),
         )
 
     def clear_original_cpu_inputs(self):
-        self._for_each_tensor_config(lambda config: config.clear_original_cpu_tensor())
+        self._for_each_tensor_config(
+            lambda config: config.clear_original_cpu_tensor(),
+            *self._tensor_config_roots(),
+        )
 
     def estimate_input_bytes(self):
         """Estimate total configured input bytes for memory probe gating."""
@@ -2609,34 +2635,20 @@ class APITestBase:
             dtype = getattr(config, "dtype", "float32")
             total_bytes += int(config.numel()) * _dtype_element_size(dtype)
 
-        self._for_each_tensor_config(visit)
+        self._for_each_tensor_config(visit, *self._tensor_config_roots())
         return total_bytes
 
     def clear_paddle_tensor(self):
-        if not hasattr(self, "torch_kwargs_config"):
+        if not self._clear_tensor_config_cache("clear_paddle_tensor"):
             return
-        for _key, arg_config in self.torch_kwargs_config.items():
-            if isinstance(arg_config, TensorConfig):
-                arg_config.clear_paddle_tensor()
-            elif isinstance(arg_config, (list, tuple)):
-                for i in range(len(arg_config)):
-                    if isinstance(arg_config[i], TensorConfig):
-                        arg_config[i].clear_paddle_tensor()
         if self.gpu_mode_config.enabled:
             gpu_mode_maybe_empty_cache(self.gpu_mode_config)
         else:
             paddle.device.cuda.empty_cache()
 
     def clear_torch_tensor(self, probe_bytes=None):
-        if not hasattr(self, "torch_kwargs_config"):
+        if not self._clear_tensor_config_cache("clear_torch_tensor"):
             return
-        for _key, arg_config in self.torch_kwargs_config.items():
-            if isinstance(arg_config, TensorConfig):
-                arg_config.clear_torch_tensor()
-            elif isinstance(arg_config, (list, tuple)):
-                for i in range(len(arg_config)):
-                    if isinstance(arg_config[i], TensorConfig):
-                        arg_config[i].clear_torch_tensor()
         if self.gpu_mode_config.enabled:
             gpu_mode_maybe_empty_cache(
                 self.gpu_mode_config,
@@ -2646,15 +2658,8 @@ class APITestBase:
             torch.cuda.empty_cache()
 
     def clear_numpy_tensor(self):
-        if not hasattr(self, "torch_kwargs_config"):
+        if not self._clear_tensor_config_cache("clear_numpy_tensor"):
             return
-        for _key, arg_config in self.torch_kwargs_config.items():
-            if isinstance(arg_config, TensorConfig):
-                arg_config.clear_numpy_tensor()
-            elif isinstance(arg_config, (list, tuple)):
-                for i in range(len(arg_config)):
-                    if isinstance(arg_config[i], TensorConfig):
-                        arg_config[i].clear_numpy_tensor()
 
     def is_forward_only(self):
         api = self.api_config.api_name[self.api_config.api_name.rindex(".") + 1 :]

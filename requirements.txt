@@ -1,7 +1,7 @@
 paddlepaddle-gpu
 pre-commit==2.17.0
 torch==2.12.0
-torchvision
+torchvision==0.27.0
 torchaudio
 numpy
 pandas
@@ -13,4 +13,4 @@ typer
 tqdm
 
 # Optional for Transformer Engine test cases:
-# uv pip install --no-build-isolation "transformer_engine[pytorch]"
+# uv pip install --no-build-isolation "transformer_engine[pytorch]" --force-reinstall

@@ -144,12 +144,10 @@ class APITestAccuracyStable(APITestBase):
             "torch_kwargs",
             "paddle_args",
             "paddle_kwargs",
-            "paddle_merged_kwargs",
         ):
             if hasattr(self, attr_name):
                 delattr(self, attr_name)
-        self.outputs_grad_numpy.clear()
-        self.outputs_grad_paddleonly.clear()
+        self.clear_output_grad_cache()
         self.clear_original_cpu_inputs()
 
     def _projected_results_need_phasing(self, projected_bytes):
@@ -685,8 +683,7 @@ class APITestAccuracyStable(APITestBase):
                 else:
                     # P2 backward is the last consumer of the shared output-grad
                     # seeds. Release them before summary streams second results.
-                    self.outputs_grad_numpy.clear()
-                    self.outputs_grad_paddleonly.clear()
+                    self.clear_output_grad_cache()
                     self._release_compute_gpu_cache()
                     if not state.phased_result_residency:
                         self._place_second_iteration_results(pairs)
