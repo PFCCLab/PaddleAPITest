@@ -11,7 +11,7 @@ import torch
 
 from . import rules
 from .config import ConversionEnvironment, read_conversion_environment
-from .rules import BaseRule, ConversionKind, ConvertResult, adaptive_workspace_bytes
+from .rules import BaseRule, ConversionKind, ConvertResult, GenericRule, adaptive_workspace_bytes
 
 _MAPPING_FIELDS = frozenset(
     {
@@ -47,27 +47,29 @@ class Paddle2TorchConverter:
         mapping_data: Mapping[str, Any] | None = None,
         extra_rules: Mapping[str, type[BaseRule]] | None = None,
     ):
-        rule_classes = dict(rules.get_rule_registry())
+        api_rules = dict(rules.get_rule_registry())
         if extra_rules:
-            for rule_name, rule_class in extra_rules.items():
-                if rule_name != rule_class.__name__:
+            for paddle_api, rule_class in extra_rules.items():
+                if paddle_api not in rule_class.PADDLE_APIS:
                     raise ValueError(
-                        f"Rule registry key {rule_name!r} does not match {rule_class.__name__!r}"
+                        f"Extra Rule {rule_class.__name__} does not declare {paddle_api!r}"
                     )
                 if not issubclass(rule_class, BaseRule):
-                    raise TypeError(f"Rule {rule_name!r} must inherit from BaseRule")
-                if rule_name in rule_classes and rule_classes[rule_name] is not rule_class:
-                    raise ValueError(f"Rule {rule_name!r} is already registered")
-                rule_classes[rule_name] = rule_class
-        if mapping_data is None:
+                    raise TypeError(f"Rule for {paddle_api!r} must inherit from BaseRule")
+                if paddle_api in api_rules and api_rules[paddle_api] is not rule_class:
+                    raise ValueError(f"Rule for {paddle_api!r} is already registered")
+                api_rules[paddle_api] = rule_class
+        require_complete_registry = mapping_data is None
+        if require_complete_registry:
             mapping_data = self._load_mapping_file()
-        self._validate_mapping(mapping_data, rule_classes)
+        self._validate_mapping(
+            mapping_data,
+            api_rules,
+            require_complete_registry=require_complete_registry,
+        )
         self._mapping = self._freeze_mapping(mapping_data)
         self._rules = MappingProxyType(
-            {
-                paddle_api: rule_classes[mapping.get("Rule", "GenericRule")]
-                for paddle_api, mapping in self._mapping.items()
-            }
+            {paddle_api: api_rules.get(paddle_api, GenericRule) for paddle_api in self._mapping}
         )
         self._cached_results: dict[tuple[str, ConversionEnvironment], ConvertResult] = {}
         self._cache_lock = threading.Lock()
@@ -106,7 +108,9 @@ class Paddle2TorchConverter:
     @staticmethod
     def _validate_mapping(
         paddle2torch_mapping: Any,
-        rule_cls_map: Mapping[str, type[BaseRule]],
+        api_rules: Mapping[str, type[BaseRule]],
+        *,
+        require_complete_registry: bool = False,
     ) -> None:
         if not isinstance(paddle2torch_mapping, Mapping):
             raise ValueError("Paddle-to-Torch mapping root must be an object")
@@ -130,12 +134,19 @@ class Paddle2TorchConverter:
                         f"Mapping field {paddle_api}.{field_name} must be "
                         f"{expected_name}, got {type(value).__name__}"
                     )
-            rule_name = mapping.get("Rule", "GenericRule")
-            if not rule_name:
-                raise ValueError(f"Mapping field {paddle_api}.Rule must not be empty")
-            if rule_name not in rule_cls_map:
-                raise ValueError(f"Unknown rule {rule_name!r} configured for {paddle_api}")
-            if rule_name == "GenericRule" and not mapping.get("torch_api"):
+            configured_rule = mapping.get("Rule")
+            registered_rule = api_rules.get(paddle_api)
+            if registered_rule is None:
+                if configured_rule is not None:
+                    raise ValueError(
+                        f"Mapping for {paddle_api} configures unknown Rule {configured_rule!r}"
+                    )
+            elif configured_rule != registered_rule.__name__:
+                raise ValueError(
+                    f"Mapping for {paddle_api} must configure Rule "
+                    f"{registered_rule.__name__!r}, got {configured_rule!r}"
+                )
+            if registered_rule is None and not mapping.get("torch_api"):
                 raise ValueError(
                     f"Mapping field {paddle_api}.torch_api is required for GenericRule"
                 )
@@ -162,6 +173,13 @@ class Paddle2TorchConverter:
                     )
             if any(not isinstance(arg, str) for arg in mapping.get("torch_args", [])):
                 raise ValueError(f"Mapping field {paddle_api}.torch_args requires string values")
+        if require_complete_registry:
+            missing_apis = set(api_rules) - set(paddle2torch_mapping)
+            if missing_apis:
+                raise ValueError(
+                    "Registered Rules are missing mapping entries: "
+                    + ", ".join(sorted(missing_apis))
+                )
 
     def convert(self, paddle_api: str) -> ConvertResult:
         """将 Paddle API 转换为 Torch API
@@ -215,7 +233,7 @@ class Paddle2TorchConverter:
     def execute(
         convert_result: ConvertResult,
         torch_args: list,
-        torch_kwargs: Mapping[str, Any],
+        bound_arguments: Mapping[str, Any],
         *,
         execution_locals: Mapping[str, Any] | None = None,
         core_executor: Callable[[Any, dict[str, Any], dict[str, Any]], None] | None = None,
@@ -225,7 +243,7 @@ class Paddle2TorchConverter:
         Args:
             convert_result (ConvertResult): 转换结果对象
             torch_args (List): 传递给 Paddle API 的含有 Torch Tensors 的位置参数列表
-            torch_kwargs (OrderedDict): 传递给 Paddle API 的含有 Torch Tensors 的关键字参数字典
+            bound_arguments (Mapping): 按 Paddle 参数名绑定的 Torch 输入
             execution_locals (Mapping): 额外注入生成代码执行环境的局部变量
             core_executor (Callable): 可选的 core 阶段执行器，用于包裹 AMP 等调用方上下文
 
@@ -245,10 +263,10 @@ class Paddle2TorchConverter:
         # 准备执行环境，将参数(torch tensors)直接映射至locals
         exec_globals = {"torch": torch, "_adaptive_workspace_bytes": adaptive_workspace_bytes}
         exec_locals = {
-            "args": torch_args,
-            "kwargs": torch_kwargs,
+            "positional_arguments": torch_args,
+            "bound_arguments": bound_arguments,
             "result": None,
-            **torch_kwargs,
+            **bound_arguments,
         }
         if execution_locals:
             exec_locals.update(execution_locals)

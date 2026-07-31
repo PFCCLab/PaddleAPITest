@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import copy
-import inspect
 from collections import OrderedDict
 from collections.abc import Callable, Iterable
 from typing import Any
@@ -10,6 +9,7 @@ import paddle
 import torch
 from tester.api_config.config_analyzer import APIConfig, TensorConfig
 from tester.paddle_to_torch import ConversionKind
+from tester.paddle_to_torch.arguments import bind_paddle_arguments
 from tester.paddle_to_torch.converter import Paddle2TorchConverter, get_converter
 
 from .config_loader import cases_from_config_lines
@@ -18,17 +18,6 @@ from .spec import CompareCase, CompareSuite, ImplementationSpec
 CustomRunner = Callable[[CompareCase, ImplementationSpec], torch.Tensor]
 
 CUSTOM_IMPLEMENTATIONS: dict[str, CustomRunner] = {}
-MANUAL_ARGUMENT_NAMES: dict[str, tuple[str, ...]] = {
-    "paddle._C_ops.fused_linear_param_grad_add": (
-        "x",
-        "dout",
-        "dweight",
-        "dbias",
-        "multi_precision",
-        "has_bias",
-    ),
-}
-SIGNATURE_ARGUMENT_NAMES: dict[str, tuple[str, ...]] = {}
 
 
 def register_custom_implementation(name: str, runner: CustomRunner) -> None:
@@ -228,8 +217,18 @@ def run_torch_case(case: CompareCase) -> torch.Tensor:
             convert_result.error_message or f"unsupported torch mapping: {api_config.api_name}"
         )
     torch_args = materialize_torch_args(api_config.args, api_config)
-    torch_kwargs = bind_torch_kwargs(api_config, torch_args)
-    output = Paddle2TorchConverter.execute(convert_result, torch_args, torch_kwargs)
+    torch_keyword = OrderedDict(
+        (key, materialize_torch_value(value, api_config))
+        for key, value in api_config.kwargs.items()
+    )
+    bound_arguments = bind_paddle_arguments(
+        api_config.api_name,
+        torch_args,
+        torch_keyword,
+    )
+    if bound_arguments is None:
+        raise RuntimeError(f"no argument binding contract for {api_config.api_name}")
+    output = Paddle2TorchConverter.execute(convert_result, torch_args, bound_arguments)
     return to_torch_tensor(output)
 
 
@@ -238,44 +237,6 @@ def current_spec(case: CompareCase) -> ImplementationSpec:
         return case.tensors["_current_spec"]
     except KeyError as err:
         raise RuntimeError("operator compare runner missing current implementation spec") from err
-
-
-def bind_torch_kwargs(api_config: APIConfig, torch_args: list[Any]) -> OrderedDict[str, Any]:
-    named_values = bind_api_arguments(api_config, torch_args)
-    named_values.update(
-        (key, materialize_torch_value(value, api_config))
-        for key, value in api_config.kwargs.items()
-    )
-    return OrderedDict((key, value) for key, value in named_values.items() if value is not None)
-
-
-def bind_api_arguments(api_config: APIConfig, torch_args: list[Any]) -> OrderedDict[str, Any]:
-    argument_names = argument_names_for_api(api_config.api_name)
-    return OrderedDict(
-        (name, torch_args[index])
-        for index, name in enumerate(argument_names)
-        if index < len(torch_args)
-    )
-
-
-def argument_names_for_api(api_name: str) -> tuple[str, ...]:
-    if api_name in MANUAL_ARGUMENT_NAMES:
-        return MANUAL_ARGUMENT_NAMES[api_name]
-    if api_name not in SIGNATURE_ARGUMENT_NAMES:
-        SIGNATURE_ARGUMENT_NAMES[api_name] = signature_argument_names(api_name)
-    return SIGNATURE_ARGUMENT_NAMES[api_name]
-
-
-def signature_argument_names(api_name: str) -> tuple[str, ...]:
-    try:
-        signature = inspect.signature(eval(api_name))
-    except (TypeError, ValueError):
-        return ()
-    return tuple(
-        name
-        for name, parameter in signature.parameters.items()
-        if parameter.kind in (parameter.POSITIONAL_ONLY, parameter.POSITIONAL_OR_KEYWORD)
-    )
 
 
 def materialize_paddle_args(values: Iterable[Any], api_config: APIConfig) -> list[Any]:
