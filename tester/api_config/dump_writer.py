@@ -546,9 +546,13 @@ def tensor_to_numpy(obj: Any, meta: dict[str, Any]) -> np.ndarray | None:
         tensor = obj.detach().cpu().contiguous()
         try:
             return tensor.numpy()
-        except Exception:
-            meta["stored_as"] = "raw_uint8"
-            return np.frombuffer(tensor.numpy(force=True).tobytes(), dtype=np.uint8)
+        except Exception as err:
+            raw = _torch_tensor_to_raw_uint8_numpy(tensor)
+            if raw is not None:
+                meta["stored_as"] = "raw_uint8"
+                return raw
+            meta["error"] = f"{type(err).__name__}: {err}"
+            return None
     if isinstance(obj, np.ndarray):
         meta.update({"kind": "ndarray", "dtype": str(obj.dtype), "shape": list(obj.shape)})
         return obj
@@ -593,6 +597,20 @@ def _make_yaml_safe(value: Any) -> Any:
     if isinstance(value, (str, int, float, bool)) or value is None:
         return value
     return str(value)
+
+
+def _torch_tensor_to_raw_uint8_numpy(obj: Any) -> np.ndarray | None:
+    try:
+        import torch
+    except Exception:
+        return None
+
+    try:
+        tensor = obj
+        tensor = tensor.detach().cpu().contiguous()
+        return tensor.view(torch.uint8).numpy()
+    except Exception:
+        return None
 
 
 def _now_text() -> str:

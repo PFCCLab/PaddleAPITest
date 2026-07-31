@@ -42,9 +42,7 @@ export FLAGS_check_nan_inf=true
 
 # ── PaddleAPITest 运行策略 ────────────────────────────────────
 # PADDLEAPITEST_IMPL: FP8 blockwise 参考实现，torch（默认）| te。
-# PADDLEAPITEST_GPU_MEMORY_POLICY: GPU mode 显存策略，conservative（默认）| aggressive。
 # export PADDLEAPITEST_IMPL=torch
-# export PADDLEAPITEST_GPU_MEMORY_POLICY=conservative
 
 # ── 输入输出 ──────────────────────────────────────────────────
 # input 三选一：--api_config / --api_config_file / --api_config_file_pattern
@@ -55,6 +53,8 @@ FILE_INPUT="tester/api_config/5_accuracy/accuracy_1.txt"
 LOG_DIR="tester/api_config/test_log"
 
 # ── GPU / worker 调度 ─────────────────────────────────────────
+# dual GPU 模式要求 NUM_WORKERS_PER_GPU=1，且选中 GPU 数量至少为 2 且为偶数。
+# GPU_IDS 可不连续，引擎按规范化后的顺序两两配对。
 NUM_GPUS=-1
 NUM_WORKERS_PER_GPU=1
 GPU_IDS="-1"
@@ -74,6 +74,8 @@ TEST_MODE_ARGS=(
     # --paddle_torch_gpu_performance=True
     # 稳定性测试
     # --accuracy_stable=True
+    # 双卡稳定性测试；自身等价于 accuracy_stable，并隐式启用 use_gpu_mode
+    # --accuracy_stable_dual_gpu=True
     # 自定义设备对比
     # --paddle_custom_device=True
     # --custom_device_vs_gpu=True

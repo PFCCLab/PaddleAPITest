@@ -65,6 +65,7 @@
         "torch_gpu_performance": {"type": "boolean", "description": "对应 --torch_gpu_performance。"},
         "paddle_torch_gpu_performance": {"type": "boolean", "description": "对应 --paddle_torch_gpu_performance。"},
         "accuracy_stable": {"type": "boolean", "description": "对应 --accuracy_stable。"},
+        "accuracy_stable_dual_gpu": {"type": "boolean", "description": "对应 --accuracy_stable_dual_gpu；隐式启用 accuracy_stable 和 use_gpu_mode，每个 worker 使用一对 GPU。"},
         "paddle_custom_device": {"type": "boolean", "description": "对应 --paddle_custom_device。"},
         "custom_device_vs_gpu": {"type": "boolean", "description": "对应 --custom_device_vs_gpu。"},
         "test_amp": {"type": "boolean", "description": "对应 --test_amp。"},

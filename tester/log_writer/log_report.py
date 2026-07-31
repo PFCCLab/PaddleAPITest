@@ -21,6 +21,10 @@ def format_duration(seconds):
     return f"{seconds:.2f} s"
 
 
+def _print_section_banner(title):
+    print(f"\n--- {title}")
+
+
 def print_run_header(options, paddle_version):
     """按参数名分组打印一次测试的有效配置。"""
     modes = (
@@ -46,7 +50,7 @@ def print_run_header(options, paddle_version):
 
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
     print(f">>> TEST RUN | {timestamp} | Paddle {paddle_version} | PID {os.getpid()}")
-    print("\n--- OPTIONS")
+    _print_section_banner("OPTIONS")
     files = [
         source_option,
         ("--log_dir", options.log_dir),
@@ -77,12 +81,9 @@ def print_run_header(options, paddle_version):
             gpu_ids_display = options.gpu_ids
         compute = [("--gpu_ids", gpu_ids_display)]
         if options.use_gpu_mode:
-            compute.extend(
-                [
-                    ("--use_gpu_mode", True),
-                    ("--gpu_memory_policy", options.gpu_memory_policy),
-                ]
-            )
+            compute.append(("--use_gpu_mode", True))
+            if getattr(options, "accuracy_stable_dual_gpu", False):
+                compute.append(("--accuracy_stable_dual_gpu", True))
         elif options.use_cached_numpy:
             compute.append(("--use_cached_numpy", True))
         compute.append(("--num_workers_per_gpu", options.num_workers_per_gpu))
@@ -106,7 +107,7 @@ def print_preparing_summary(
     retest_types,
 ):
     """打印配置读取和断点续跑摘要。"""
-    print("\n--- PREPARING")
+    _print_section_banner("PREPARING")
     if removed_stale_logs:
         print(f"Cleanup: {removed_stale_logs} stale result entries removed (not in checkpoint)")
     if retest_types:
@@ -117,13 +118,24 @@ def print_preparing_summary(
     print(f"Cases: {total_case} total | {checkpointed_case} checkpointed | {pending_case} pending")
 
 
-def print_compute_summary(available_gpus, max_workers_per_gpu):
+def print_running_banner():
+    """打印批量执行开始的章节标题。"""
+    _print_section_banner("RUNNING")
+
+
+def print_compute_summary(available_gpus, max_workers_per_gpu, gpu_pairs=None):
     """打印实际选中的 GPU 和 worker 布局。"""
-    total_workers = sum(max_workers_per_gpu.values())
+    total_workers = len(gpu_pairs) if gpu_pairs is not None else sum(max_workers_per_gpu.values())
     print(f"Compute: {len(available_gpus)} GPUs | {total_workers} workers")
-    layout = " | ".join(
-        f"GPU {gpu_id}: {workers}" for gpu_id, workers in sorted(max_workers_per_gpu.items())
-    )
+    if gpu_pairs is not None:
+        layout = " | ".join(
+            f"Pair {index}: GPU {compute_gpu} compute + GPU {comparison_gpu} compare"
+            for index, (compute_gpu, comparison_gpu) in enumerate(gpu_pairs)
+        )
+    else:
+        layout = " | ".join(
+            f"GPU {gpu_id}: {workers}" for gpu_id, workers in sorted(max_workers_per_gpu.items())
+        )
     print(f"Layout: {layout}")
 
 
@@ -165,7 +177,7 @@ def print_run_footer(total_case, tested_case, remaining_case, log_counts, elapse
     overall_total = max(total_case, completed_case + remaining_case)
     failed_case = max(completed_case - counts.get("pass", 0) - counts.get("skip", 0), 0)
     progress = completed_case / overall_total * 100 if overall_total else 100.0
-    print("\n--- RESULT")
+    _print_section_banner("RESULT")
     print(f"Progress: {completed_case} / {overall_total} | {progress:.1f}%")
     print(
         f"Cases: {counts.get('pass', 0)} pass | {failed_case} fail | "

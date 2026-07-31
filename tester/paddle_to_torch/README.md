@@ -21,6 +21,61 @@ Paddle2Torch 是一个专注于将 PaddlePaddle API 转换为 PyTorch 对应实�
 
 本模块的典型应用场景包括：模型迁移、跨框架验证、混合编程等，可为深度学习开发者提供跨框架的互操作性解决方案。
 
+## 运行时配置与转换状态
+
+Paddle2Torch 统一通过 `PADDLEAPITEST_IMPL` 选择参考实现。合法值为 `torch`、`te` 和
+`apex`。未设置时，每个 Rule 使用自身声明的默认实现；当前大多数 Rule 默认为 `torch`，
+融合线性梯度 Rule 保持原有的 `te` 默认值。当全局值对当前 Rule 不适用时，该 Rule
+同样使用自己的默认实现；非法全局值会在转换前明确报错。
+转换引擎对每次调用只读取一次配置快照，同一快照同时用于生成代码和转换缓存键。
+原融合线性专用实现变量已退场，不再读取；相关作业必须改用 `PADDLEAPITEST_IMPL`。
+
+`PADDLEAPITEST_WORKERS_ON_GPU` 用于划分单个 GPU 上每个 worker 可使用的临时 workspace，
+默认值为 `1`，并且必须是正整数。该配置在 workspace 计算时校验，不影响转换代码缓存。
+
+`mapping.json` 在转换器初始化时进行 schema 校验，并拒绝重复 JSON key。所有 API 名必须以 `paddle.` 开头；
+允许的字段为 `Rule`、`torch_api`、`set_defaults`、`paddle_torch_args_map`、`torch_args`、
+`torch_kwargs`、`is_attribute` 和 `description`。转换器按 Rule 的 `PADDLE_APIS` 注册表选择
+自定义 Rule；`mapping.json` 中对应条目的 `Rule` 字段是便于按 API 查找类名的索引，必须
+与注册表中的实际类名完全一致。没有注册自定义 Rule 的配置不得声明 `Rule`，使用
+`GenericRule` 且必须提供非空 `torch_api`。默认完整 mapping 还必须覆盖注册表中的每个
+API。参数映射的键值也必须符合 schema。未知字段、错误字段类型及 Rule 索引不一致会在
+初始化阶段报告具体 API 与字段；校验完成后的 mapping 和 Rule registry 均为只读。
+
+`ConvertResult.kind` 使用 `ConversionKind.UNSUPPORTED`、`ConversionKind.DIRECT` 和
+`ConversionKind.COMPOSITE` 表示不支持、直接 Torch 对应和组合实现。仅 `DIRECT` 适用于
+直接性能对比，`COMPOSITE` 仍是可执行的受支持转换。`Code` 和 `ConvertResult` 均不可变。
+转换阶段异常会包含 Paddle API 和 Rule 类，执行阶段异常会包含 Paddle API 及
+`preprocess`、`core` 或 `postprocess` 阶段。
+
+## Rule 编写规范
+
+新增 Rule 必须遵守以下规范，存量 Rule 在后续修改时逐步迁移。Rule 按实现方式分为三类：
+
+- **Mapping Rule**：只涉及默认值、参数改名、位置参数或关键字参数调整，必须仅使用
+  `mapping.json`，不新增 Rule 类。
+- **Adaptation Rule**：核心是一次明确的 Torch API 调用，但调用前后需要 dtype、shape、
+  layout 或输出结构适配，使用 `ConversionKind.DIRECT`。
+- **Reference Rule**：使用多个 Torch 操作、控制流、自定义数学实现或外部 kernel，使用
+  `ConversionKind.COMPOSITE`。
+
+Paddle 签名默认值由共享参数绑定器统一应用。`mapping.json` 的 `set_defaults` 只用于无签名
+API 或转换阶段新增的局部变量；Rule 不应再次手写相同默认值或参数映射。
+`build_result()` 自动按“默认值、Rule preprocess、参数映射”的固定顺序组装 preprocess。
+Rule 只编写自定义参数归一化，且归一化命名参数而不是提前构造或修改 `_kwargs`。
+
+Rule 使用 `build_result()` 构造结果，并显式声明 `DIRECT` 或 `COMPOSITE`。三个代码阶段的
+职责固定如下：
+
+- `preprocess`：Rule 自定义的参数归一化、必要 import 和局部辅助函数；默认值和参数映射由
+  `build_result()` 自动插入。
+- `core`：执行参考实现，并将结果写入 `result`。
+- `postprocess`：恢复 Paddle 的输出 dtype、layout 或数据结构。
+
+存在多个参考实现的 Rule 在类上声明 `SUPPORTED_IMPLEMENTATIONS` 和
+`DEFAULT_IMPLEMENTATION`，并通过无参数的 `select_implementation()` 选择实现。Rule
+不得直接读取实现环境变量，也不得在显式选择的外部实现不可用时静默回退。
+
 ## 开发文档
 
 百度内部同学请参考：
@@ -69,19 +124,35 @@ Paddle2Torch 是一个专注于将 PaddlePaddle API 转换为 PyTorch 对应实�
 7. 在测试配置中搜索 paddle.crop ，可以看到 shape 中允许 -1，说明该维度的大小由 x 和 offsets 推断，我们也需要支持此种配置。
 
     ```python
-    paddle.crop(x=Tensor([2, 3, 3, 3],"float64"), shape=list[2,1,-1,2,], offsets=list[0,0,1,1,], )
+    paddle.crop(
+        x=Tensor([2, 3, 3, 3], "float64"),
+        shape=list[
+            2,
+            1,
+            -1,
+            2,
+        ],
+        offsets=list[
+            0,
+            0,
+            1,
+            1,
+        ],
+    )
     ```
 
 ### 编写转换代码
 
-8. 在编写代码前，测试环境已经将 paddle.crop 的所有参数放置于变量 `arg` 、`kwargs` 和 执行环境 `locals()` 中，我们可以通过 `kwargs.get('var')` 、 `locals().get('var')` 或直接使用 `var` 获取参数（ 未提供 `var` 参数时直接访问会抛出 `NameError` 错误，而 `get()` 获取可以设定默认值）。
+8. 在编写代码前，共享参数绑定器已经根据 Paddle 签名将位置参数和关键字参数统一绑定，
+   并以 Paddle 参数名放入执行环境 `locals()`。新 Rule 直接读取必需参数；可选参数应在
+   mapping 的 `set_defaults` 中声明后直接读取。未提供的必需参数直接访问时会抛出
+   `NameError`。原始 `args`、`kwargs` 仅作为尚未迁移完成的内部执行桥，不属于 Rule
+   编写接口。
 
     首先单独构造出 slices 可用的 shape 与 offsets 参数，使用 list 来表示（默认所有参数均是符合文档描述的，不需要再验证和抛出错误）：
 
     ```python
     ndim = x.dim()
-    offsets = locals().get('offsets')
-    shape = locals().get('shape')
 
     if offsets is None:
         offsets = [0] * ndim
@@ -113,7 +184,7 @@ Paddle2Torch 是一个专注于将 PaddlePaddle API 转换为 PyTorch 对应实�
     使用 Torch 切片操作，将结果保存至 result 中（ x 一定存在于 `locals()` 中，不需要再使用 `get()` ）：
 
     ```python
-    result = x[slices]
+    result = x[tuple(slices)]
     ```
 
     至此，转换代码编写完成.
@@ -145,7 +216,7 @@ Paddle2Torch 是一个专注于将 PaddlePaddle API 转换为 PyTorch 对应实�
         shape = [x.size(i) - offsets[i] if s == -1 else s for i, s in enumerate(shape)]
         slices = [slice(offsets[i], offsets[i] + shape[i]) for i in range(ndim)]
 
-        return x[slices]
+        return x[tuple(slices)]
 
 
     x = torch.arange(16).reshape(4, 4)
@@ -175,7 +246,7 @@ Paddle2Torch 是一个专注于将 PaddlePaddle API 转换为 PyTorch 对应实�
             "torch_api": "torch api 名称",
             "set_defaults":{
                 "_description1": "默认值设置字典，键为参数名，值为默认值",
-                "_description2": "建议参考官方文档设置默认值，不会覆盖已有参数值，功能等效于 var = locals().get('var', value)"
+                "_description2": "仅在命名参数缺失时赋值，不覆盖调用方传入值"
             },
             "paddle_torch_args_map": {
                 "_description": "参数名映射字典，键对应 paddle，值对应 torch",
@@ -189,23 +260,20 @@ Paddle2Torch 是一个专注于将 PaddlePaddle API 转换为 PyTorch 对应实�
         }
     ```
 
-11. 若需要编写转换代码，既需要在 mapping.json 中注册，也需要在 rules.py 中定义类。注册规则为：
-    
-    ```json
-        "<api_name>": {
-            "Rule": "自定义 Rule 类的类名"
-        }
-    ```
+11. 若需要编写转换代码，在 `rules.py` 中定义类并通过 `PADDLE_APIS` 声明精确 API；
+    同时在 `mapping.json` 的 API 条目中填写同名 `Rule` 字段，作为从 API 定位实现类的
+    检索索引。转换器运行时仍直接按 API 注册表选择 Rule，并在初始化时校验两者一致。
 
-    此外，也可以添加更多的常规配置，以减少 Rule 类代码的编写量（需要在 Rule 类中主动调用 apply_generic() 方法，返回 defaults_code 与 map_code ）：
+    此外，也可以添加更多的常规配置，以减少 Rule 类代码的编写量。`build_result()` 会
+    自动把默认值与参数映射加入 preprocess：
 
     ```json
         "<api_name>": {
-            "Rule": "自定义 Rule 类的类名",
+            "Rule": "CropRule",
             "torch_api": "torch api 名称",
             "set_defaults":{
                 "_description1": "默认值设置字典，键为参数名，值为默认值",
-                "_description2": "建议参考官方文档设置默认值，不会覆盖已有参数值，功能等效于 var = locals().get('var', value)"
+                "_description2": "仅在命名参数缺失时赋值，不覆盖调用方传入值"
             },
             "paddle_torch_args_map": {
                 "_description": "参数名映射字典，键对应 paddle，值对应 torch"
@@ -213,18 +281,22 @@ Paddle2Torch 是一个专注于将 PaddlePaddle API 转换为 PyTorch 对应实�
         }
     ```
 
-    对于 paddle.crop 而言，直接在 mapping.json 的 "c" 条目下注册 Rule 类：
+    对于 `paddle.crop`，Rule 直接声明 API 所有权：
 
-    ```json
-        "paddle.crop":{
-            "Rule": "CropRule"
-        },
+    ```python
+    class CropRule(BaseRule):
+        PADDLE_APIS = ("paddle.crop",)
     ```
-12. Rule 类的定义需要继承自抽象基类 BaseRule，并实现 apply() 方法，否则无法执行转换。基类定义为：
+
+    因此 `paddle.crop` 条目的 `Rule` 必须为 `"CropRule"`。重命名 Rule 或调整
+    `PADDLE_APIS` 时必须同步更新 mapping；不一致会在转换器初始化时直接失败。
+12. Rule 类需要继承 BaseRule、声明 `PADDLE_APIS` 并实现 `apply()` 方法，否则无法执行转换。基类定义为：
 
     ```python
     class BaseRule(ABC):
     """转换规则的抽象基类"""
+
+    PADDLE_APIS: tuple[str, ...] = ()
 
     @abstractmethod
     def apply(self, paddle_api: str) -> ConvertResult:
@@ -235,11 +307,11 @@ Paddle2Torch 是一个专注于将 PaddlePaddle API 转换为 PyTorch 对应实�
 
     ```python
     class CropRule(BaseRule):
+        PADDLE_APIS = ("paddle.crop",)
+
         def apply(self, paddle_api: str) -> ConvertResult:
             core = """
     ndim = x.dim()
-    offsets = locals().get('offsets')
-    shape = locals().get('shape')
     if offsets is None:
         offsets = [0] * ndim
     elif isinstance(offsets, (list, tuple)):
@@ -254,10 +326,13 @@ Paddle2Torch 是一个专注于将 PaddlePaddle API 转换为 PyTorch 对应实�
         shape = shape.tolist()
     shape = [x.size(i) - offsets[i] if s == -1 else s for i, s in enumerate(shape)]
     slices = [slice(offsets[i], offsets[i] + shape[i]) for i in range(ndim)]
-    result = x[slices]
+    result = x[tuple(slices)]
     """
-            code = Code(core=core.splitlines())
-            return ConvertResult.success(paddle_api, code, is_torch_corresponding=False)
+            return self.build_result(
+                paddle_api,
+                kind=ConversionKind.COMPOSITE,
+                core=core,
+            )
     ```
 
 ### 运行测试配置
@@ -272,7 +347,7 @@ Paddle2Torch 是一个专注于将 PaddlePaddle API 转换为 PyTorch 对应实�
 
 ### 其他情况
 
-14.  如果 Paddle API 的行为实在难以通过 Torch 表达，可暂时不对其进行支持。可为其注册 ErrorRule 类或直接不做处理，并将所有相关配置合并至未通过 accuracy 测试的 api_config_paddleonly_*.txt 中。
+14. 如果 Paddle API 的行为实在难以通过 Torch 表达，可暂时不注册 mapping，并将所有相关配置合并至未通过 accuracy 测试的 api_config_paddleonly_*.txt 中。
 
 ## 高级Rule指南
 
@@ -300,7 +375,7 @@ paddle.nn.functional.conv1d(x, weight, bias=None, stride=1, padding=0, dilation=
 
 3. 编写转换配置
    
-因为 paddle.nn.functional.conv1d 参数较多、默认值丰富，因此我们可以在 mapping.json 中注册 Conv1dRule 后，编写默认值设置 set_defaults 与参数映射表 paddle_torch_args_map，减少 Rule 类编写量：
+因为 paddle.nn.functional.conv1d 参数较多，因此在 mapping.json 中编写转换层默认值与参数映射表，减少 Rule 类编写量：
 
 ```json
     "paddle.nn.functional.conv1d": {
@@ -328,17 +403,19 @@ paddle.nn.functional.conv1d(x, weight, bias=None, stride=1, padding=0, dilation=
 
 4. 编写转换代码
 
-在 rules.py 中编写 Conv1dRule 类，需要手动调用 apply_generic() 方法，获取 defaults_code、map_code 代码块（通过解析 mapping.json 的配置获得，无需再手动 *设置默认值* 或 *参数映射*）
+在 rules.py 中编写 Conv1dRule 类。Rule 只负责 data format、padding 等语义归一化；
+`build_result()` 根据 mapping.json 自动生成默认值与参数映射代码。
 
 然后编写 preprocess（预处理）、core（核心执行）、postprocess（后处理）代码块
 
-最终将所有可执行代码分割为字符串列表，组装为 Code 数据类（需在 Code 初始化时提供所有代码，否则不会进行预编译），并通过 ConvertResult.success() 返回：
+最终通过 `build_result()` 组装并预编译三个代码阶段，同时显式声明转换类型：
 
 ```python
 class Conv1dRule(BaseRule):
+    PADDLE_APIS = ("paddle.nn.functional.conv1d",)
+
     def apply(self, paddle_api: str) -> ConvertResult:
-        defaults_code, map_code = self.apply_generic()
-        pre = """
+        preprocess = """
 if data_format == "NLC":
     x = x.permute(0, 2, 1)
 stride = tuple(stride) if isinstance(stride, list) else stride
@@ -357,19 +434,21 @@ elif isinstance(padding, list):
         padding = tuple(padding)
 """
         core = f"result = {self.torch_api}(**_kwargs)"
-        post = """
+        postprocess = """
 if data_format == "NLC":
     result = result.permute(0, 2, 1)
 """
-        code = Code(
-            preprocess=defaults_code + pre.splitlines() + map_code,
-            core=[core],
-            postprocess=post.splitlines(),
+        return self.build_result(
+            paddle_api,
+            kind=ConversionKind.DIRECT,
+            preprocess=preprocess,
+            core=core,
+            postprocess=postprocess,
         )
-        return ConvertResult.success(paddle_api, code)
 ```
 
-其中 ConvertResult.success() 的 output_var 参数默认为 'result' ；is_torch_corresponding 参数默认为 True，若无直接对应的 Torch API，需手动设置为 False
+其中 `build_result()` 的 `output_var` 参数默认为 `result`；`kind` 必须显式传入
+`ConversionKind.DIRECT` 或 `ConversionKind.COMPOSITE`。
 
 5. 运行测试配置
 

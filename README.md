@@ -53,7 +53,7 @@ python engineV4.py \
   --num_gpus=1
 ```
 
-配置包含双引号时用单引号包裹 `--api_config`；单配置模式最多使用一块 GPU。未指定 `--gpu_ids` 和 `--num_gpus` 时默认使用 GPU 0。
+配置包含双引号时用单引号包裹 `--api_config`。普通单配置模式最多使用一块 GPU；`accuracy_stable_dual_gpu` 单配置使用一对 GPU。未指定 `--gpu_ids` 和 `--num_gpus` 时，两种模式分别默认使用 GPU 0 和 GPU 0/1。
 
 ### 批量运行
 
@@ -104,6 +104,7 @@ python engineV4.py \
 | `--paddle_only=True` | 执行 Paddle API，检查配置解析和 Paddle 支持情况 |
 | `--accuracy=True` | 比较 Paddle 与等价 Torch API 的前向输出和梯度 |
 | `--accuracy_stable=True` | Paddle/Torch 分别执行两轮，同时检查跨框架精度与框架内稳定性 |
+| `--accuracy_stable_dual_gpu=True` | 与 accuracy-stable 等价，每个 worker 使用一张计算卡和一张全量比较卡 |
 | `--paddle_cinn=True` | 比较 Paddle 动态图与 CINN；可配合 `--test_backward=True` |
 | `--paddle_gpu_performance=True` | 测量 Paddle GPU 性能 |
 | `--torch_gpu_performance=True` | 测量 Torch GPU 性能 |
@@ -113,6 +114,8 @@ python engineV4.py \
 
 常用附加参数包括 `--test_amp`、`--test_cpu`、`--atol`、`--rtol`、`--manual_threshold_config_file`、`--bitwise_alignment`、`--timeout`、`--random_seed`、`--generate_failed_tests` 和 `--exit_on_error`。
 
+`--test_cpu=True` 只用于验证 Paddle CPU kernel：Paddle 输入和执行切到 CPU；Torch reference 仍在 GPU 上生成和执行，用作稳定的对照实现。因此 CPU 测试仍允许也可能实际使用 GPU。
+
 ## 引擎与运行入口
 
 ### engineV4
@@ -121,7 +124,7 @@ python engineV4.py \
 
 ### engineV2
 
-`engineV2.py` 使用 Pebble `ProcessPool`。除调度方式和 engineV4 专属 compute-sanitizer 外，其测试模式、GPU mode、显存策略、dump 和主要参数与 engineV4 对齐。详见 [engineV2 文档](engineV2-README.md)。
+`engineV2.py` 使用 Pebble `ProcessPool`。除调度方式和 engineV4 专属 compute-sanitizer 外，其测试模式、双卡 accuracy-stable、GPU mode、动态显存管理、dump 和主要参数与 engineV4 对齐。详见 [engineV2 文档](engineV2-README.md)。
 
 ### 其他入口
 
@@ -137,21 +140,16 @@ python run.py -c test_pipeline/run_config.yaml
 
 模型配置集可以使用 `${APITEST_MODEL}` 占位，示例见 [generic configs 文档](test_pipeline/generic_configs/README.md)。
 
-## GPU Mode 与显存策略
+## GPU Mode 与动态显存管理
 
 `--use_gpu_mode=True` 在 GPU 上生成 Tensor 并进行比较，复用 CUDA allocator，适用于大规模 `accuracy_stable` 测试。此模式会忽略 `--use_cached_numpy=True`。
 
-进程级环境变量 `PADDLEAPITEST_GPU_MEMORY_POLICY` 控制显存使用的激进程度：
-
-| 值 | 行为 | 建议场景 |
-| --- | --- | --- |
-| `conservative` | 默认值；首轮输出和梯度转移到 CPU，并在显存压力下释放缓存 | 大 Tensor、未知 shape、优先避免 OOM |
-| `aggressive` | 首轮输出和梯度继续驻留 GPU，减少同步和 D2H 开销 | 已知的小 shape 配置集、优先吞吐 |
-
-策略在启动时固定，不按 case 切换或 OOM 自动重试。大 Tensor 使用 `conservative`：
+GPU mode 不需要选择固定显存策略。框架会在 Torch/Paddle 阶段边界查询整卡空闲显存，
+按下一阶段输入、已观测输出/梯度和 reference workspace 估算 headroom；有压力时先释放两个
+框架的 allocator cache 并重新查询，只有 headroom 仍不足时才将第一轮结果逐棵转移到 CPU。
+小 shape 在显存充足时不会执行不必要的 D2H。
 
 ```bash
-PADDLEAPITEST_GPU_MEMORY_POLICY=conservative \
 python engineV4.py \
   --accuracy_stable=True \
   --use_gpu_mode=True \
@@ -161,18 +159,28 @@ python engineV4.py \
   --log_dir=tester/api_config/test_log_big_tensor
 ```
 
-小 shape 配置可用 `aggressive`：
+该流程始终保留不可变 CPU 输入快照、四次真实执行、全部稳定性比较和大结果分块比较。
+
+### Accuracy Stable 双卡模式
+
+`--accuracy_stable_dual_gpu=True` 为每个 worker 原子分配一对 GPU。单个进程同时看到两张卡：逻辑 `gpu:0` 负责输入生成、T1/P1/T2/P2 前向与反向，逻辑 `gpu:1` 保存每轮完整输出和输入梯度并执行原有全量比较。
 
 ```bash
-PADDLEAPITEST_GPU_MEMORY_POLICY=aggressive \
 python engineV4.py \
-  --accuracy_stable=True \
+  --accuracy_stable_dual_gpu=True \
   --use_gpu_mode=True \
-  --api_config_file=tester/api_config/7_0_size/0_size_tensor_1_8_1.txt \
-  --log_dir=tester/api_config/test_log_0size
+  --api_config_file=tester/api_config/8_big_tensor/big_tensor_merged.txt \
+  --gpu_ids=0-7 \
+  --num_gpus=8 \
+  --num_workers_per_gpu=1 \
+  --log_dir=tester/api_config/test_log_big_tensor_dual_gpu
 ```
 
-两种策略都保留 CPU 输入快照和大结果分块比较。
+`--accuracy_stable_dual_gpu=True` 本身就是一种 accuracy-stable 测试模式，并隐式启用 `--use_gpu_mode=True`。如果没有显式传入 GPU mode，引擎会打印参数 warning 后继续执行。GPU 按规范化后的 `--gpu_ids` 顺序两两配对，例如 `--gpu_ids=0,2,5,7` 产生 `(0,2)`、`(5,7)` 两个 worker。该模式要求至少两张且 GPU 总数为偶数，并要求 `--num_workers_per_gpu=1`；单条 `--api_config` 默认使用 GPU 0/1，也可以显式指定任意两张卡。
+
+每次 Torch/Paddle backward 都在计算卡完成，随后将 detach 后的完整 output 和 input grad 搬到比较卡。dual 模式不进行 CPU spill、NumPy CPU fallback、采样、shape 裁剪、分布式 shard 或跨卡 autograd；所有元素仍在比较卡上参与比较。小 Tensor 直接调用 `torch.testing.assert_close`，大 Tensor 在比较卡上使用有界分块工作区完成等价的全量比较。
+
+双卡模式只能释放跨阶段驻留结果造成的计算卡压力；如果任意一次完整 forward/backward 自身已经超过单张计算卡显存，该模式无法将单个算子的 workspace 透明拆到两张卡。
 
 ## 并行、日志与恢复
 
@@ -257,7 +265,7 @@ PaddleAPITest/
 │   ├── accuracy.py             # Paddle/Torch 精度测试
 │   ├── accuracy_stable.py      # 跨框架精度和重复执行稳定性
 │   ├── base.py                 # 测试基类、输入生成与比较
-│   ├── runtime_config.py       # worker 运行配置和 GPU 显存策略
+│   ├── runtime_config.py       # worker 运行配置和 GPU 显存预算
 │   └── *_performance.py        # 性能测试实现
 └── tools/                      # 配置集、日志和错误分析工具
 ```

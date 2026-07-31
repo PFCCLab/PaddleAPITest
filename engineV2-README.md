@@ -71,12 +71,13 @@
 | `--torch_gpu_performance`        | bool  | 运行 Torch 性能测试（默认 False）                                                      |
 | `--paddle_torch_gpu_performance` | bool  | 运行 Paddle vs Torch 性能测试（默认 False）                                            |
 | `--accuracy_stable`              | bool  | 启用稳定性测试（默认 False）                                                           |
+| `--accuracy_stable_dual_gpu`     | bool  | 每个稳定性 worker 使用一张计算卡和一张全量比较卡；隐式启用 accuracy_stable 与 gpu_mode |
 | `--paddle_custom_device`         | bool  | 运行Custom Device或者XPU的API与CPU的精度对比（默认 False）                              |
 | `--num_gpus`                     | int   | 使用的 GPU 数量（默认 -1，-1 动态最大）                                                |
 | `--num_workers_per_gpu`          | int   | 每 GPU 的 worker 进程数（默认 1；gpu_mode 下 -1 表示每 GPU 1 个 worker）               |
 | `--gpu_ids`                      | str   | 使用的 GPU 序号，以逗号分隔或横线范围（默认 ""，"-1" 动态最大）                        |
 | `--test_amp`                     | bool  | 启用自动混合精度测试（默认 False）                                                     |
-| `--test_cpu`                     | bool  | 启用 Paddle CPU 模式测试（默认 False）                                                 |
+| `--test_cpu`                     | bool  | 启用 Paddle CPU kernel 测试；Torch reference 仍在 GPU 上运行（默认 False） |
 | `--use_cached_numpy`             | bool  | 启用 Numpy 缓存（默认 False）                                                          |
 | `--log_dir`                      | str   | 日志输出路径（默认 "tester/api_config/test_log"）                                      |
 | `--atol`                         | float | 精度测试的绝对误差容忍度，仅在启用 `--accuracy` 时有效（默认 1e-2）                    |
@@ -91,6 +92,17 @@
 | `--bitwise_alignment`            | bool  | 是否进行诸位对齐对比，开启后所有的api的精度对比都按照atol=0.0,rtol = 0.0的精度对比结果(默认False)|
 | `--generate_failed_tests`        | bool  | 是否为失败的测试用例生成可复现的测试文件。开启后，当测试失败时，会在`failed_tests`目录下生成独立的Python测试文件，便于后续复现和调试（默认False）|
 | `--exit_on_error`                | bool  | 是否在精度测试出现`paddle_error`或者 `accuracy_error`  错误时立即退出测试进程(exit code 为1)。默认为False，测试进程会继续执行 |
+
+双卡稳定性模式要求 `--num_workers_per_gpu=1`，并选择至少两张且数量为偶数的 GPU。GPU ID 可以不连续，引擎按规范化顺序两两配对。例如：
+
+```bash
+python engineV2.py \
+  --accuracy_stable_dual_gpu=True \
+  --api_config_file=tester/api_config/8_big_tensor/big_tensor_merged.txt \
+  --gpu_ids=0,2,5,7 \
+  --num_gpus=4 \
+  --num_workers_per_gpu=1
+```
 
 ### 示例命令
 

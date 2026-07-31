@@ -16,6 +16,7 @@ output:
   log_dir: "test_${APITEST_MODEL}_log_1M_paddleonly"
 engine_args:
   paddle_only: true
+  use_gpu_mode: true
   num_gpus: -1
   num_workers_per_gpu: 1
   timeout: 1200
