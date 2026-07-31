@@ -46,6 +46,33 @@ Paddle2Torch 统一通过 `PADDLEAPITEST_IMPL` 选择参考实现。合法值为
 转换阶段异常会包含 Paddle API 和 Rule 类，执行阶段异常会包含 Paddle API 及
 `preprocess`、`core` 或 `postprocess` 阶段。
 
+## Rule 编写规范
+
+新增 Rule 必须遵守以下规范，存量 Rule 在后续修改时逐步迁移。Rule 按实现方式分为三类：
+
+- **Mapping Rule**：只涉及默认值、参数改名、位置参数或关键字参数调整，必须仅使用
+  `mapping.json`，不新增 Rule 类。
+- **Adaptation Rule**：核心是一次明确的 Torch API 调用，但调用前后需要 dtype、shape、
+  layout 或输出结构适配，使用 `ConversionKind.DIRECT`。
+- **Reference Rule**：使用多个 Torch 操作、控制流、自定义数学实现或外部 kernel，使用
+  `ConversionKind.COMPOSITE`。
+
+参数默认值由 `build_default_code()` 生成，参数映射由
+`build_argument_map_code()` 生成。默认值与参数名的事实来源必须是 `mapping.json`；Rule
+不应再次手写相同默认值或映射。自定义参数归一化放在两者之间，core 只读取归一化后的
+直接变量或 `_args`、`_kwargs`，不得继续混用 `locals().get()`、`kwargs.get()` 和直接变量。
+
+Rule 使用 `build_result()` 构造结果，并显式声明 `DIRECT` 或 `COMPOSITE`。三个代码阶段的
+职责固定如下：
+
+- `preprocess`：默认值、参数映射、参数归一化、必要 import 和局部辅助函数。
+- `core`：执行参考实现，并将结果写入 `result`。
+- `postprocess`：恢复 Paddle 的输出 dtype、layout 或数据结构。
+
+存在多个参考实现的 Rule 在类上声明 `SUPPORTED_IMPLEMENTATIONS` 和
+`DEFAULT_IMPLEMENTATION`，并通过无参数的 `select_implementation()` 选择实现。Rule
+不得直接读取实现环境变量，也不得在显式选择的外部实现不可用时静默回退。
+
 ## 开发文档
 
 百度内部同学请参考：
@@ -99,7 +126,9 @@ Paddle2Torch 统一通过 `PADDLEAPITEST_IMPL` 选择参考实现。合法值为
 
 ### 编写转换代码
 
-8. 在编写代码前，测试环境已经将 paddle.crop 的所有参数放置于变量 `arg` 、`kwargs` 和 执行环境 `locals()` 中，我们可以通过 `kwargs.get('var')` 、 `locals().get('var')` 或直接使用 `var` 获取参数（ 未提供 `var` 参数时直接访问会抛出 `NameError` 错误，而 `get()` 获取可以设定默认值）。
+8. 在编写代码前，测试环境已经将 paddle.crop 的参数放置于 `args`、`kwargs` 和执行环境
+   `locals()` 中。可选参数只在 preprocess 中通过 `locals().get('var')` 读取并归一化；core
+   直接使用归一化后的变量。未提供的必需参数直接访问时会抛出 `NameError`。
 
     首先单独构造出 slices 可用的 shape 与 offsets 参数，使用 list 来表示（默认所有参数均是符合文档描述的，不需要再验证和抛出错误）：
 
@@ -222,7 +251,8 @@ Paddle2Torch 统一通过 `PADDLEAPITEST_IMPL` 选择参考实现。合法值为
         }
     ```
 
-    此外，也可以添加更多的常规配置，以减少 Rule 类代码的编写量（需要在 Rule 类中主动调用 apply_generic() 方法，返回 defaults_code 与 map_code ）：
+    此外，也可以添加更多的常规配置，以减少 Rule 类代码的编写量（Rule 类分别调用
+    `build_default_code()` 与 `build_argument_map_code()` 生成对应代码阶段）：
 
     ```json
         "<api_name>": {
@@ -281,8 +311,11 @@ Paddle2Torch 统一通过 `PADDLEAPITEST_IMPL` 选择参考实现。合法值为
     slices = [slice(offsets[i], offsets[i] + shape[i]) for i in range(ndim)]
     result = x[slices]
     """
-            code = Code(core=core.splitlines())
-            return ConvertResult.success(paddle_api, code, kind=ConversionKind.COMPOSITE)
+            return self.build_result(
+                paddle_api,
+                kind=ConversionKind.COMPOSITE,
+                core=core,
+            )
     ```
 
 ### 运行测试配置
@@ -297,7 +330,7 @@ Paddle2Torch 统一通过 `PADDLEAPITEST_IMPL` 选择参考实现。合法值为
 
 ### 其他情况
 
-14.  如果 Paddle API 的行为实在难以通过 Torch 表达，可暂时不对其进行支持。可为其注册 ErrorRule 类或直接不做处理，并将所有相关配置合并至未通过 accuracy 测试的 api_config_paddleonly_*.txt 中。
+14. 如果 Paddle API 的行为实在难以通过 Torch 表达，可暂时不注册 mapping，并将所有相关配置合并至未通过 accuracy 测试的 api_config_paddleonly_*.txt 中。
 
 ## 高级Rule指南
 
@@ -353,17 +386,19 @@ paddle.nn.functional.conv1d(x, weight, bias=None, stride=1, padding=0, dilation=
 
 4. 编写转换代码
 
-在 rules.py 中编写 Conv1dRule 类，需要手动调用 apply_generic() 方法，获取 defaults_code、map_code 代码块（通过解析 mapping.json 的配置获得，无需再手动 *设置默认值* 或 *参数映射*）
+在 rules.py 中编写 Conv1dRule 类，分别调用 `build_default_code()` 和
+`build_argument_map_code()` 获取默认值与参数映射代码块（通过解析 mapping.json 的配置获得，无需再手动 *设置默认值* 或 *参数映射*）。
 
 然后编写 preprocess（预处理）、core（核心执行）、postprocess（后处理）代码块
 
-最终将所有可执行代码分割为字符串列表，组装为 Code 数据类（需在 Code 初始化时提供所有代码，否则不会进行预编译），并通过 ConvertResult.success() 返回：
+最终通过 `build_result()` 组装并预编译三个代码阶段，同时显式声明转换类型：
 
 ```python
 class Conv1dRule(BaseRule):
     def apply(self, paddle_api: str) -> ConvertResult:
-        defaults_code, map_code = self.apply_generic()
-        pre = """
+        defaults_code = self.build_default_code()
+        map_code = self.build_argument_map_code()
+        preprocess = """
 if data_format == "NLC":
     x = x.permute(0, 2, 1)
 stride = tuple(stride) if isinstance(stride, list) else stride
@@ -382,20 +417,21 @@ elif isinstance(padding, list):
         padding = tuple(padding)
 """
         core = f"result = {self.torch_api}(**_kwargs)"
-        post = """
+        postprocess = """
 if data_format == "NLC":
     result = result.permute(0, 2, 1)
 """
-        code = Code(
-            preprocess=defaults_code + pre.splitlines() + map_code,
-            core=[core],
-            postprocess=post.splitlines(),
+        return self.build_result(
+            paddle_api,
+            kind=ConversionKind.DIRECT,
+            preprocess=defaults_code + preprocess.splitlines() + map_code,
+            core=core,
+            postprocess=postprocess,
         )
-        return ConvertResult.success(paddle_api, code)
 ```
 
-其中 `ConvertResult.success()` 的 `output_var` 参数默认为 `result`，`kind` 默认为
-`ConversionKind.DIRECT`；组合实现必须显式传入 `ConversionKind.COMPOSITE`。
+其中 `build_result()` 的 `output_var` 参数默认为 `result`；`kind` 必须显式传入
+`ConversionKind.DIRECT` 或 `ConversionKind.COMPOSITE`。
 
 5. 运行测试配置
 
