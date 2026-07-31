@@ -10,7 +10,7 @@ import numpy
 import paddle
 import yaml
 
-from .api_config.dump_writer import DEFAULT_DUMP_DIR, DumpContext, dump_enabled
+from .dump_writer import DEFAULT_DUMP_DIR, DumpContext, dump_enabled
 from .input_generation.input_bind import (
     bind_parameters,
     get_arg,

@@ -44,13 +44,12 @@ if TYPE_CHECKING:
         APITestTorchGPUPerformance,
     )
 
-from tester.api_config.dump_writer import (
+from tester.dump_writer import (
     dump_enabled,
     parse_strict_bool,
     record_dump_terminal_status,
     resolve_dump_options,
 )
-from tester.api_config.sanitizer_output import analyze_sanitizer_output
 from tester.log_writer import (
     init_log,
     log_aggregation,
@@ -63,6 +62,7 @@ from tester.runtime_config import (
     limit_worker_layout,
     runtime_config_for_gpu,
 )
+from tester.sanitizer_output import analyze_sanitizer_output
 
 os.environ["FLAGS_use_system_allocator"] = "1"
 os.environ["NVIDIA_TF32_OVERRIDE"] = "0"

@@ -37,7 +37,7 @@ if TYPE_CHECKING:
         APITestTorchGPUPerformance,
     )
 
-from tester.api_config.dump_writer import (
+from tester.dump_writer import (
     dump_enabled,
     parse_strict_bool,
     record_dump_terminal_status,
