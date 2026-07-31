@@ -1,0 +1,138 @@
+# Project regression config summary
+
+- max_per_api: 5
+- incomplete_api_keys_policy: included
+- excluded_size_policies: 1M, 0size
+- excluded_api_policies: paddle.empty, paddle.empty_like
+- regression_api_keys: 114
+- regression_configs: 473
+- incomplete_api_keys: 32
+- last_refinement_blocked_configs: 1
+- last_refinement_paddle_accuracy: 1
+
+## Last validation
+
+- log_dir: /tmp/project_regression_1785489586
+- command: source /root/.venv-lihaoyang08/bin/activate && REGRESSION_LOG_DIR=/tmp/project_regression_1785489586 tools/regression/regression_runner.sh
+- compute: 8 GPUs, 4 workers per GPU
+- paddle_only: 473 pass, 0 fail
+- accuracy: 473 pass, 0 fail
+- error_stat_paddle_bitwise: 0
+- error_stat_non_bitwise: 0
+
+## API key coverage
+
+- paddle.Tensor.__div__: 3
+- paddle.Tensor.__floordiv__: 5
+- paddle.Tensor.__getitem__: 5
+- paddle.Tensor.__mod__: 5
+- paddle.Tensor.__pow__: 5
+- paddle.Tensor.__rmod__: 1
+- paddle.Tensor.__rpow__: 5
+- paddle.Tensor.__rtruediv__: 5
+- paddle.Tensor.__setitem__: 5
+- paddle.Tensor.__truediv__: 5
+- paddle.Tensor.argmax: 5
+- paddle.Tensor.cholesky_solve: 5
+- paddle.Tensor.clip: 5
+- paddle.Tensor.cumsum: 5
+- paddle.Tensor.divide: 5
+- paddle.Tensor.expand: 5
+- paddle.Tensor.gather_nd: 5
+- paddle.Tensor.index_select: 5
+- paddle.Tensor.mod: 1
+- paddle.Tensor.pow: 5
+- paddle.Tensor.remainder: 1
+- paddle.Tensor.repeat_interleave: 5
+- paddle.Tensor.reshape: 5
+- paddle.Tensor.rsqrt: 2
+- paddle.Tensor.sqrt: 5
+- paddle.Tensor.take_along_axis: 2
+- paddle.Tensor.tile: 5
+- paddle.Tensor.topk: 5
+- paddle.Tensor.view: 5
+- paddle._C_ops.adamw_: 5
+- paddle.arange: 5
+- paddle.argmax: 5
+- paddle.argmin: 5
+- paddle.atan2: 2
+- paddle.bincount: 5
+- paddle.chunk: 5
+- paddle.clip: 5
+- paddle.concat: 5
+- paddle.divide: 5
+- paddle.dot: 5
+- paddle.expand: 5
+- paddle.eye: 5
+- paddle.floor_divide: 5
+- paddle.floor_mod: 1
+- paddle.full: 5
+- paddle.gather: 5
+- paddle.gather_nd: 5
+- paddle.geometric.segment_max: 5
+- paddle.geometric.segment_min: 4
+- paddle.geometric.send_uv: 5
+- paddle.incubate.segment_max: 1
+- paddle.incubate.segment_mean: 1
+- paddle.incubate.segment_min: 1
+- paddle.incubate.segment_sum: 1
+- paddle.index_fill: 5
+- paddle.index_sample: 4
+- paddle.index_select: 5
+- paddle.linalg.cholesky_solve: 5
+- paddle.linalg.cond: 5
+- paddle.linalg.lstsq: 1
+- paddle.linalg.lu: 5
+- paddle.linalg.matrix_norm: 2
+- paddle.linalg.matrix_power: 1
+- paddle.linalg.matrix_rank: 5
+- paddle.linalg.matrix_transpose: 1
+- paddle.linalg.multi_dot: 5
+- paddle.linalg.norm: 5
+- paddle.linalg.pinv: 1
+- paddle.linalg.qr: 5
+- paddle.linalg.triangular_solve: 2
+- paddle.linalg.vector_norm: 3
+- paddle.linspace: 5
+- paddle.matrix_transpose: 5
+- paddle.max: 5
+- paddle.mean: 5
+- paddle.min: 4
+- paddle.mod: 5
+- paddle.multiplex: 1
+- paddle.nn.functional.cross_entropy: 3
+- paddle.nn.functional.dropout: 5
+- paddle.nn.functional.embedding: 5
+- paddle.nn.functional.gather_tree: 5
+- paddle.nn.functional.gaussian_nll_loss: 2
+- paddle.nn.functional.margin_cross_entropy: 1
+- paddle.nn.functional.max_unpool1d: 1
+- paddle.nn.functional.max_unpool2d: 1
+- paddle.nn.functional.max_unpool3d: 3
+- paddle.nn.functional.one_hot: 5
+- paddle.nn.functional.sequence_mask: 5
+- paddle.nn.functional.softmax: 3
+- paddle.nn.functional.zeropad2d: 5
+- paddle.ones: 5
+- paddle.pow: 5
+- paddle.prod: 4
+- paddle.put_along_axis: 5
+- paddle.remainder: 5
+- paddle.repeat_interleave: 5
+- paddle.reshape: 5
+- paddle.rsqrt: 5
+- paddle.shard_index: 5
+- paddle.slice: 5
+- paddle.split: 5
+- paddle.sqrt: 5
+- paddle.squeeze: 5
+- paddle.strided_slice: 4
+- paddle.sum: 5
+- paddle.take: 5
+- paddle.take_along_axis: 5
+- paddle.tile: 5
+- paddle.topk: 5
+- paddle.unflatten: 5
+- paddle.unsqueeze: 5
+- paddle.view: 5
+- paddle.zeros: 5

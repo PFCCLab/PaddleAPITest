@@ -1895,7 +1895,7 @@ def gather_nd_values(ctx: InputGenerationContext, case: RuleCase):
     def index_value(binding):
         x_shape = case.arg(0, "x").shape
         index_shape = case.arg(1, "index").shape
-        result = case.zeros(index_shape)
+        result = case.zeros(index_shape, dtype=binding.spec.dtype)
         for index in range(index_shape[-1]):
             result[..., index] = case.randint(0, x_shape[index], size=result[..., index].shape)
         return result
@@ -2207,7 +2207,7 @@ def scatter_nd_values(ctx: InputGenerationContext, case: RuleCase):
     def index_value(binding):
         output_shape = case.arg(2, "shape")
         if output_shape and len(output_shape):
-            result = case.zeros(binding.spec.shape)
+            result = case.zeros(binding.spec.shape, dtype=binding.spec.dtype)
             for axis in range(len(output_shape)):
                 if axis >= binding.spec.shape[-1]:
                     break
@@ -2226,7 +2226,7 @@ def scatter_nd_values(ctx: InputGenerationContext, case: RuleCase):
 def scatter_nd_add_values(ctx: InputGenerationContext, case: RuleCase):
     def index_value(binding):
         x_shape = case.arg(0, "x").shape
-        result = case.zeros(binding.spec.shape)
+        result = case.zeros(binding.spec.shape, dtype=binding.spec.dtype)
         for axis in range(binding.spec.shape[-1]):
             result[..., axis] = case.randint(
                 -x_shape[axis],
