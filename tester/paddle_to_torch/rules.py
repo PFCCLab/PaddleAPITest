@@ -13,7 +13,6 @@ from typing import Any
 
 from .config import (
     ConversionEnvironment,
-    read_conversion_environment,
     read_workers_on_gpu,
     select_implementation,
 )
@@ -23,6 +22,8 @@ _WORKSPACE_PROBE_TTL = 0.25
 _WORKSPACE_PROBE_CACHE: dict[tuple[int | None, int], tuple[float, int]] = {}
 _WORKSPACE_PROBE_LOCK = threading.Lock()
 _RULE_REGISTRY: dict[str, type] = {}
+_RULE_REGISTRY_VIEW = MappingProxyType(_RULE_REGISTRY)
+_RULE_REGISTRY_FROZEN = False
 
 
 def adaptive_workspace_bytes(torch_module) -> int:
@@ -61,8 +62,6 @@ class Code:
     preprocess: Sequence[str] = field(default_factory=tuple)
     core: Sequence[str] = field(default_factory=tuple)
     postprocess: Sequence[str] = field(default_factory=tuple)
-    valid: bool = field(init=False, default=True)
-    error_message: str | None = field(init=False, default=None)
     preprocess_compiled: types.CodeType | None = field(init=False, default=None)
     core_compiled: types.CodeType | None = field(init=False, default=None)
     postprocess_compiled: types.CodeType | None = field(init=False, default=None)
@@ -71,24 +70,17 @@ class Code:
         object.__setattr__(self, "preprocess", tuple(self.preprocess))
         object.__setattr__(self, "core", tuple(self.core))
         object.__setattr__(self, "postprocess", tuple(self.postprocess))
-        try:
-            object.__setattr__(
-                self,
-                "preprocess_compiled",
-                self._compile(self.preprocess, "preprocess"),
-            )
-            object.__setattr__(self, "core_compiled", self._compile(self.core, "core"))
-            object.__setattr__(
-                self,
-                "postprocess_compiled",
-                self._compile(self.postprocess, "postprocess"),
-            )
-        except Exception as exc:
-            object.__setattr__(self, "preprocess_compiled", None)
-            object.__setattr__(self, "core_compiled", None)
-            object.__setattr__(self, "postprocess_compiled", None)
-            object.__setattr__(self, "valid", False)
-            object.__setattr__(self, "error_message", str(exc))
+        object.__setattr__(
+            self,
+            "preprocess_compiled",
+            self._compile(self.preprocess, "preprocess"),
+        )
+        object.__setattr__(self, "core_compiled", self._compile(self.core, "core"))
+        object.__setattr__(
+            self,
+            "postprocess_compiled",
+            self._compile(self.postprocess, "postprocess"),
+        )
 
     @classmethod
     def _compile(cls, code_lines: Sequence[str], stage: str) -> types.CodeType | None:
@@ -120,6 +112,10 @@ class ConvertResult:
     error_message: str | None = None
 
     def __post_init__(self):
+        if not isinstance(self.kind, ConversionKind):
+            raise TypeError(
+                f"Conversion kind must be ConversionKind, got {type(self.kind).__name__}"
+            )
         if self.kind is ConversionKind.UNSUPPORTED:
             if self.code is not None:
                 raise ValueError(
@@ -132,8 +128,6 @@ class ConvertResult:
             return
         if self.code is None:
             raise ValueError(f"Supported conversion for {self.paddle_api} requires code")
-        if not self.code.valid:
-            raise ValueError(f"Supported conversion for {self.paddle_api} requires valid code")
         if self.error_message is not None:
             raise ValueError(
                 f"Supported conversion for {self.paddle_api} cannot contain an error message"
@@ -150,8 +144,6 @@ class ConvertResult:
         if kind is ConversionKind.UNSUPPORTED:
             raise ValueError("ConvertResult.success requires a supported conversion kind")
         code_obj = Code(core=code) if isinstance(code, list) else code
-        if not code_obj.valid:
-            raise ValueError(f"Invalid generated code for {paddle_api}: {code_obj.error_message}")
         return cls(
             paddle_api,
             kind=kind,
@@ -171,23 +163,28 @@ class ConvertResult:
 class BaseRule(ABC):
     """转换规则的抽象基类"""
 
-    _conversion_environment: ConversionEnvironment | None = None
+    def __init__(self, conversion_environment: ConversionEnvironment):
+        self._conversion_environment = conversion_environment
 
     def __init_subclass__(cls, *, register: bool = True, **kwargs):
         super().__init_subclass__(**kwargs)
         if not register:
             return
+        if _RULE_REGISTRY_FROZEN:
+            raise RuntimeError(
+                "The built-in Rule registry is frozen; pass additional Rules to the converter"
+            )
         existing = _RULE_REGISTRY.get(cls.__name__)
         if existing is not None and existing is not cls:
             raise RuntimeError(f"Duplicate Paddle-to-Torch Rule class {cls.__name__}")
         _RULE_REGISTRY[cls.__name__] = cls
 
-    def set_conversion_environment(self, environment: ConversionEnvironment) -> None:
-        self._conversion_environment = environment
-
     def select_implementation(self, *, supported: set[str], default: str) -> str:
-        environment = self._conversion_environment or read_conversion_environment()
-        return select_implementation(environment, supported=supported, default=default)
+        return select_implementation(
+            self._conversion_environment,
+            supported=supported,
+            default=default,
+        )
 
     @abstractmethod
     def apply(self, paddle_api: str) -> ConvertResult:
@@ -247,7 +244,7 @@ class BaseRule(ABC):
 
 
 def get_rule_registry() -> Mapping[str, type[BaseRule]]:
-    return MappingProxyType(dict(_RULE_REGISTRY))
+    return _RULE_REGISTRY_VIEW
 
 
 class GenericRule(BaseRule):
@@ -305,15 +302,6 @@ class GenericRule(BaseRule):
                 core = [f"result = {self.torch_api}(*_args, **_kwargs)"]
         code = Code(preprocess=pre, core=core, postprocess=post)
         return ConvertResult.success(paddle_api, code)
-
-
-class ErrorRule(BaseRule):
-    def __init__(self, message: str = "Error Rule"):
-        super().__init__()
-        self.message = message
-
-    def apply(self, paddle_api: str) -> ConvertResult:
-        return ConvertResult.error(paddle_api, self.message)
 
 
 # a
@@ -8643,3 +8631,6 @@ else:
 """
         code = Code(core=core.splitlines())
         return ConvertResult.success(paddle_api, code, kind=ConversionKind.COMPOSITE)
+
+
+_RULE_REGISTRY_FROZEN = True

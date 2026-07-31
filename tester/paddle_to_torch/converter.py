@@ -29,12 +29,13 @@ _MAPPING_FIELD_TYPES = {
     "Rule": str,
     "description": str,
     "is_attribute": bool,
-    "paddle_torch_args_map": dict,
-    "set_defaults": dict,
+    "paddle_torch_args_map": Mapping,
+    "set_defaults": Mapping,
     "torch_api": str,
-    "torch_args": list,
-    "torch_kwargs": dict,
+    "torch_args": (list, tuple),
+    "torch_kwargs": Mapping,
 }
+_MAPPING_SCALAR_TYPES = (str, int, float, bool, type(None))
 
 
 class Paddle2TorchConverter:
@@ -98,14 +99,9 @@ class Paddle2TorchConverter:
             )
         if isinstance(value, list):
             return tuple(cls._freeze_mapping(item) for item in value)
+        if isinstance(value, tuple):
+            return tuple(cls._freeze_mapping(item) for item in value)
         return value
-
-    @staticmethod
-    def _cache_key(
-        paddle_api: str,
-        environment: ConversionEnvironment,
-    ) -> tuple[str, ConversionEnvironment]:
-        return paddle_api, environment
 
     @staticmethod
     def _validate_mapping(
@@ -117,7 +113,7 @@ class Paddle2TorchConverter:
         for paddle_api, mapping in paddle2torch_mapping.items():
             if not isinstance(paddle_api, str) or not paddle_api.startswith("paddle."):
                 raise ValueError(f"Invalid Paddle API name {paddle_api!r}")
-            if not isinstance(mapping, dict):
+            if not isinstance(mapping, Mapping):
                 raise ValueError(f"Mapping for {paddle_api} must be an object")
             unknown_fields = set(mapping) - _MAPPING_FIELDS
             if unknown_fields:
@@ -126,9 +122,13 @@ class Paddle2TorchConverter:
             for field_name, value in mapping.items():
                 expected_type = _MAPPING_FIELD_TYPES[field_name]
                 if not isinstance(value, expected_type):
+                    expected_types = (
+                        expected_type if isinstance(expected_type, tuple) else (expected_type,)
+                    )
+                    expected_name = " or ".join(item.__name__ for item in expected_types)
                     raise ValueError(
                         f"Mapping field {paddle_api}.{field_name} must be "
-                        f"{expected_type.__name__}, got {type(value).__name__}"
+                        f"{expected_name}, got {type(value).__name__}"
                     )
             rule_name = mapping.get("Rule", "GenericRule")
             if not rule_name:
@@ -140,10 +140,14 @@ class Paddle2TorchConverter:
                     f"Mapping field {paddle_api}.torch_api is required for GenericRule"
                 )
             for field_name in ("set_defaults", "torch_kwargs"):
-                for key in mapping.get(field_name, {}):
+                for key, value in mapping.get(field_name, {}).items():
                     if not isinstance(key, str) or not key:
                         raise ValueError(
                             f"Mapping field {paddle_api}.{field_name} requires non-empty string keys"
+                        )
+                    if not isinstance(value, _MAPPING_SCALAR_TYPES):
+                        raise ValueError(
+                            f"Mapping field {paddle_api}.{field_name} requires scalar values"
                         )
             for paddle_name, torch_name in mapping.get("paddle_torch_args_map", {}).items():
                 if not isinstance(paddle_name, str) or not paddle_name:
@@ -173,7 +177,7 @@ class Paddle2TorchConverter:
             environment = read_conversion_environment()
         except ValueError as exc:
             raise ValueError(f"Cannot convert {paddle_api}: {exc}") from exc
-        cache_key = self._cache_key(paddle_api, environment)
+        cache_key = (paddle_api, environment)
 
         with self._cache_lock:
             try:
@@ -191,8 +195,7 @@ class Paddle2TorchConverter:
                 self._cached_results[cache_key] = result
                 return result
 
-            rule = rule_cls()
-            rule.set_conversion_environment(environment)
+            rule = rule_cls(environment)
             try:
                 rule.read_mapping(self._mapping[paddle_api])
                 result = rule.apply(paddle_api)

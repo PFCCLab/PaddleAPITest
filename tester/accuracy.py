@@ -238,14 +238,6 @@ class APITestAccuracy(APITestBase):
             self.dump_finalize("config_convert")
             return None
         self.dump_event("config_convert_done")
-        if not convert_result.code or not convert_result.code.valid:
-            self.report_case_result(
-                "config_convert",
-                f"No code generated for {self.api_config.api_name}",
-            )
-            self.dump_event("config_convert_error", error="no code generated")
-            self.dump_finalize("config_convert")
-            return None
         return convert_result
 
     def _generate_numpy_inputs(self):

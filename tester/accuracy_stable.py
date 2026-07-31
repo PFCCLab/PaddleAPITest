@@ -729,12 +729,6 @@ class APITestAccuracyStable(APITestBase):
                 f"Unsupported API {self.api_config.api_name}: {convert_result.error_message}",
             )
             return
-        if not convert_result.code or not convert_result.code.valid:
-            self.report_case_result(
-                "config_convert",
-                f"No code generated for {self.api_config.api_name}",
-            )
-            return
 
         try:
             if not self.gen_numpy_input():
