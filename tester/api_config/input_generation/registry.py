@@ -1,4 +1,4 @@
-"""迁移后输入生成规则的装饰器注册中心。"""
+"""输入生成规则的装饰器注册中心。"""
 
 from __future__ import annotations
 
@@ -10,10 +10,12 @@ from dataclasses import dataclass
 
 import numpy
 
-from .case_model import GenerationContext, TensorSpec
-from .logical_values import TensorPayload, attach_payloads
+from .input_bind import InputGenerationContext
+from .input_values import InputValue, attach_values
+from .input_values import input_value as read_input_value
 from .tensor_config import not_zero_apis
-from .value_sampling import (
+from .tensor_view import TensorView
+from .value_sample import (
     create_case_rng,
     generate_abs_plus_one,
     generate_binary01,
@@ -45,8 +47,8 @@ from .value_sampling import (
 
 ValueGenerator = Callable[..., numpy.ndarray]
 CaseValueGenerator = Callable[[object], numpy.ndarray]
-RuleFunction = Callable[[GenerationContext, "RuleCase"], None]
-FallbackFunction = Callable[[GenerationContext], str | None]
+RuleFunction = Callable[[InputGenerationContext, "RuleCase"], None]
+BlockerFunction = Callable[[InputGenerationContext], str | None]
 _RAW_WRITE = object()
 
 
@@ -93,34 +95,28 @@ class RegisteredRule:
 
     api_names: tuple[str, ...]
     function: RuleFunction
-    fallback_key: str
-    fallback: FallbackFunction | None = None
+    block_key: str
+    blocker: BlockerFunction | None = None
     allow_gpu: bool = True
     allow_cached: bool = True
 
-    @property
-    def rule_id(self) -> str:
-        return self.api_names[0]
-
-    def fallback_reason(self, context: GenerationContext) -> str | None:
+    def block_reason(self, context: InputGenerationContext) -> str | None:
         from .tensor_config import USE_CACHED_NUMPY
 
-        # 先做阻断判断，避免在失败路径上消耗 RNG。
         if context.gpu_enabled and not self.allow_gpu:
-            return f"{self.fallback_key}-strategy-gpu-not-migrated"
+            return f"{self.block_key}-gpu-blocked"
 
         if USE_CACHED_NUMPY and not self.allow_cached:
-            return f"{self.fallback_key}-strategy-cache-not-migrated"
-        if self.fallback is not None:
-            return self.fallback(context)
+            return f"{self.block_key}-cache-blocked"
+        if self.blocker is not None:
+            return self.blocker(context)
         return None
 
-    def generate(self, context: GenerationContext, case: object) -> bool:
+    def generate(self, context: InputGenerationContext, case: object) -> bool:
         rule_case = RuleCase(context, case)
         self.function(context, rule_case)
-        # 只有所有 TensorConfig 都产出逻辑值，规则才算完成。
         rule_case.require_complete()
-        attach_payloads(case, rule_case.payload_items())
+        attach_values(case, rule_case.payload_items())
         rule_case.rng.commit()
         return True
 
@@ -132,14 +128,14 @@ class RuleCase:
     它让规则作者只关心“生成什么值”，而不需要关心 payload 存储、去重和提交时机。
     """
 
-    def __init__(self, context: GenerationContext, raw_case: object):
+    def __init__(self, context: InputGenerationContext, raw_case: object):
         self.context = context
         self.raw_case = raw_case
         self.rng = create_case_rng(context)
         # 用路径去重，避免同一个 Tensor 被重复写入。
         self._generated_paths = set()
-        # payload 以 ArgPath 为键，物化层只消费逻辑值。
-        self._payload_by_path: dict[object, TensorPayload] = {}
+        # payload 以 InputPath 为键，物化层只消费逻辑值。
+        self._payload_by_path: dict[object, InputValue] = {}
 
     def generate_all(self, generator: str, low=None, high=None):
         for binding in self.context.call.tensors:
@@ -172,7 +168,6 @@ class RuleCase:
     def generate_by_parameter(
         self, parameter_generators, default: str | CaseValueGenerator | None = None
     ):
-        # 遍历顺序必须保持 BoundCall.tensors 的顺序，才能复现历史 RNG 结果。
         normalized = []
         for parameter_name, generator in parameter_generators:
             names = (parameter_name,) if isinstance(parameter_name, str) else tuple(parameter_name)
@@ -189,7 +184,6 @@ class RuleCase:
                 self._generate_binding(binding, generator)
 
     def require_complete(self):
-        # 缺失值应当视为规则 bug，而不是交给物化层补默认值。
         missing = [
             str(binding.path)
             for binding in self.context.call.tensors
@@ -218,22 +212,19 @@ class RuleCase:
     def set_value(self, binding, value):
         if binding.path in self._generated_paths:
             raise ValueError(f"rule generated tensor twice: {binding.path}")
-        self._payload_by_path[binding.path] = TensorPayload(binding.path, value)
+        self._payload_by_path[binding.path] = InputValue(binding.path, value)
         _apply_value(self.raw_case, binding.path, value)
         self._generated_paths.add(binding.path)
 
     def rewrite_value(self, binding, value):
-        self._payload_by_path[binding.path] = TensorPayload(binding.path, value)
+        self._payload_by_path[binding.path] = InputValue(binding.path, value)
         _apply_value(self.raw_case, binding.path, value)
         self._generated_paths.add(binding.path)
 
     def set_value_raw(self, binding, value):
         if binding.path in self._generated_paths:
             raise ValueError(f"rule generated tensor twice: {binding.path}")
-        self._payload_by_path[binding.path] = TensorPayload(
-            binding.path, value, update_metadata=False
-        )
-        # 原始写入保留 TensorConfig 元数据，专给少量历史边界路径使用。
+        self._payload_by_path[binding.path] = InputValue(binding.path, value, update_metadata=False)
         _apply_value_raw(self.raw_case, binding.path, value, update_metadata=False)
         self._generated_paths.add(binding.path)
         return _RAW_WRITE
@@ -254,10 +245,8 @@ class RuleCase:
         payload = self.payload(binding)
         if payload is not None:
             return payload.value
-        from .logical_values import logical_value
-
         config = _tensor_config_at(self.raw_case, binding.path)
-        return logical_value(self.raw_case, config)
+        return read_input_value(self.raw_case, config)
 
     def payload(self, binding):
         return self._payload_by_path.get(binding.path)
@@ -404,8 +393,8 @@ class RuleRegistry:
         self,
         *api_names: str,
         aliases: tuple[str, ...] = (),
-        fallback_key: str | None = None,
-        fallback: FallbackFunction | None = None,
+        block_key: str | None = None,
+        blocker: BlockerFunction | None = None,
         allow_gpu: bool = True,
         allow_cached: bool = True,
     ):
@@ -420,8 +409,8 @@ class RuleRegistry:
             rule = RegisteredRule(
                 api_names=names,
                 function=function,
-                fallback_key=fallback_key or names[0],
-                fallback=fallback,
+                block_key=block_key or names[0],
+                blocker=blocker,
                 allow_gpu=allow_gpu,
                 allow_cached=allow_cached,
             )
@@ -527,12 +516,12 @@ rules = RuleRegistry()
 
 
 @rules.register("paddle.add", "paddle.logical_not", "paddle.concat")
-def default_values(ctx: GenerationContext, case: RuleCase):
+def default_values(ctx: InputGenerationContext, case: RuleCase):
     case.generate_all("default")
 
 
 @rules.register("paddle.incubate.nn.functional.fused_act_dequant")
-def fused_act_dequant_values(ctx: GenerationContext, case: RuleCase):
+def fused_act_dequant_values(ctx: InputGenerationContext, case: RuleCase):
     def x_scale_value(binding):
         if binding.spec.dtype == "int32":
             exponent = case.randint(120, 128, size=binding.spec.shape, dtype="int32")
@@ -543,7 +532,7 @@ def fused_act_dequant_values(ctx: GenerationContext, case: RuleCase):
 
 
 @rules.register("paddle.incubate.nn.functional.variable_length_memory_efficient_attention")
-def variable_length_memory_efficient_attention_values(ctx: GenerationContext, case: RuleCase):
+def variable_length_memory_efficient_attention_values(ctx: InputGenerationContext, case: RuleCase):
     def seq_lens_value(binding):
         query = case.arg(0, "query")
         q_seq_len = query.shape[2]
@@ -573,7 +562,7 @@ def variable_length_memory_efficient_attention_values(ctx: GenerationContext, ca
 @rules.register(
     "paddle.incubate.nn.functional.block_multihead_attention",
 )
-def block_multihead_attention_values(ctx: GenerationContext, case: RuleCase):
+def block_multihead_attention_values(ctx: InputGenerationContext, case: RuleCase):
     qkv = case.arg(0, "qkv")
     seq_lens_encoder = case.arg(3, "seq_lens_encoder")
     batch_size = seq_lens_encoder.shape[0]
@@ -651,9 +640,9 @@ def block_multihead_attention_values(ctx: GenerationContext, case: RuleCase):
     "paddle._C_ops.adam_",
     "paddle._C_ops.adamw_",
     "paddle._C_ops.merged_adam_",
-    fallback_key="optimizer",
+    block_key="optimizer",
 )
-def optimizer_values(ctx: GenerationContext, case: RuleCase):
+def optimizer_values(ctx: InputGenerationContext, case: RuleCase):
     zero_parameters = {"moment1", "moment2", "moment2_max"}
     optimizer_step = None
 
@@ -681,7 +670,7 @@ def optimizer_values(ctx: GenerationContext, case: RuleCase):
     "paddle.nn.functional.max_unpool2d",
     "paddle.nn.functional.max_unpool3d",
 )
-def max_unpool_values(ctx: GenerationContext, case: RuleCase):
+def max_unpool_values(ctx: InputGenerationContext, case: RuleCase):
     import paddle
 
     x_binding = case.find("x")
@@ -702,7 +691,7 @@ def max_unpool_values(ctx: GenerationContext, case: RuleCase):
         padding,
     )
     data_type = "float64" if x_binding.spec.dtype == "int64" else x_binding.spec.dtype
-    pool_input_spec = TensorSpec(
+    pool_input_spec = TensorView(
         shape=tuple(pool_input_size),
         dtype=data_type,
         place=x_binding.spec.place,
@@ -719,7 +708,7 @@ def max_unpool_values(ctx: GenerationContext, case: RuleCase):
 
 
 @rules.register("paddle.arange")
-def arange_values(ctx: GenerationContext, case: RuleCase):
+def arange_values(ctx: InputGenerationContext, case: RuleCase):
     def tensor_binding(value):
         return case.binding_for_config(value) if case.is_tensor_config(value) else None
 
@@ -826,7 +815,7 @@ def arange_values(ctx: GenerationContext, case: RuleCase):
 
 
 @rules.register("paddle.nn.functional.moe_permute")
-def moe_permute_values(ctx: GenerationContext, case: RuleCase):
+def moe_permute_values(ctx: InputGenerationContext, case: RuleCase):
     def expert_routemap_value(binding):
         num_experts = case.arg(4, "num_experts", 32)
         hidden_states = case.arg(0, "hidden_states")
@@ -936,7 +925,7 @@ def moe_permute_values(ctx: GenerationContext, case: RuleCase):
 
 
 @rules.register("paddle.nn.functional.moe_unpermute")
-def moe_unpermute_values(ctx: GenerationContext, case: RuleCase):
+def moe_unpermute_values(ctx: InputGenerationContext, case: RuleCase):
     def expert_routemap_value(binding):
         num_experts = case.arg(5, "num_experts", 32)
         total_zipped_tokens = case.arg(4, "total_zipped_tokens")
@@ -1059,22 +1048,22 @@ def moe_unpermute_values(ctx: GenerationContext, case: RuleCase):
 
 
 @rules.register(*tuple(sorted(not_zero_apis)))
-def nonzero_values(ctx: GenerationContext, case: RuleCase):
+def nonzero_values(ctx: InputGenerationContext, case: RuleCase):
     case.generate_all("nonzero")
 
 
 @rules.register("paddle.bernoulli")
-def bernoulli_probability(ctx: GenerationContext, case: RuleCase):
+def bernoulli_probability(ctx: InputGenerationContext, case: RuleCase):
     case.generate_all("unit_interval")
 
 
 @rules.register("paddle.standard_gamma")
-def standard_gamma_unit_interval(ctx: GenerationContext, case: RuleCase):
+def standard_gamma_unit_interval(ctx: InputGenerationContext, case: RuleCase):
     case.generate_all("unit_interval")
 
 
 @rules.register("paddle.poisson")
-def poisson_unit_interval(ctx: GenerationContext, case: RuleCase):
+def poisson_unit_interval(ctx: InputGenerationContext, case: RuleCase):
     case.generate_all("unit_interval")
 
 
@@ -1082,7 +1071,7 @@ def poisson_unit_interval(ctx: GenerationContext, case: RuleCase):
     "paddle.sqrt",
     aliases=("paddle.Tensor.sqrt",),
 )
-def sqrt_nonnegative(ctx: GenerationContext, case: RuleCase):
+def sqrt_nonnegative(ctx: InputGenerationContext, case: RuleCase):
     case.generate_all("uniform", low=0, high=1000)
 
 
@@ -1090,12 +1079,12 @@ def sqrt_nonnegative(ctx: GenerationContext, case: RuleCase):
     "paddle.rsqrt",
     aliases=("paddle.Tensor.rsqrt",),
 )
-def rsqrt_positive(ctx: GenerationContext, case: RuleCase):
+def rsqrt_positive(ctx: InputGenerationContext, case: RuleCase):
     case.generate_all("uniform", low=1e-7, high=1000)
 
 
 @rules.register("paddle.clip", aliases=("paddle.Tensor.clip",))
-def clip_values(ctx: GenerationContext, case: RuleCase):
+def clip_values(ctx: InputGenerationContext, case: RuleCase):
     x_binding = case.find("x")
     min_binding = case.find("min")
     max_binding = case.find("max")
@@ -1124,24 +1113,24 @@ def clip_values(ctx: GenerationContext, case: RuleCase):
 
 
 @rules.register("paddle.multiply")
-def multiply_values(ctx: GenerationContext, case: RuleCase):
+def multiply_values(ctx: InputGenerationContext, case: RuleCase):
     case.generate_all("multiply")
 
 
 @rules.register(
     "paddle.nn.functional.binary_cross_entropy",
 )
-def binary_cross_entropy_values(ctx: GenerationContext, case: RuleCase):
+def binary_cross_entropy_values(ctx: InputGenerationContext, case: RuleCase):
     case.generate_all("unit_interval")
 
 
 @rules.register("paddle.nn.functional.alpha_dropout")
-def alpha_dropout_values(ctx: GenerationContext, case: RuleCase):
+def alpha_dropout_values(ctx: InputGenerationContext, case: RuleCase):
     case.generate_by_parameter((("x", "unit_interval"),), default="default")
 
 
 @rules.register("paddle.nn.functional.conv2d_transpose")
-def conv2d_transpose_values(ctx: GenerationContext, case: RuleCase):
+def conv2d_transpose_values(ctx: InputGenerationContext, case: RuleCase):
     def tensor_value(binding):
         if "int" in binding.spec.dtype:
             return case.randint(-65535, 65535, size=binding.spec.shape).astype(binding.spec.dtype)
@@ -1154,7 +1143,7 @@ def conv2d_transpose_values(ctx: GenerationContext, case: RuleCase):
 
 
 @rules.register("paddle.vision.ops.distribute_fpn_proposals")
-def distribute_fpn_proposals_values(ctx: GenerationContext, case: RuleCase):
+def distribute_fpn_proposals_values(ctx: InputGenerationContext, case: RuleCase):
     state = {"num": None}
 
     def fpn_rois_value(binding):
@@ -1200,7 +1189,7 @@ def distribute_fpn_proposals_values(ctx: GenerationContext, case: RuleCase):
 
 
 @rules.register("paddle.vision.ops.generate_proposals")
-def generate_proposals_values(ctx: GenerationContext, case: RuleCase):
+def generate_proposals_values(ctx: InputGenerationContext, case: RuleCase):
     def random_value(binding):
         return case.random(binding.spec.shape, dtype=binding.spec.dtype)
 
@@ -1234,7 +1223,7 @@ def generate_proposals_values(ctx: GenerationContext, case: RuleCase):
 
 
 @rules.register("paddle.vision.ops.nms")
-def nms_values(ctx: GenerationContext, case: RuleCase):
+def nms_values(ctx: InputGenerationContext, case: RuleCase):
     def boxes_value(binding):
         boxes = case.zeros(binding.spec.shape, dtype=binding.spec.dtype)
         for index in range(binding.spec.shape[0]):
@@ -1264,7 +1253,7 @@ def nms_values(ctx: GenerationContext, case: RuleCase):
     "paddle.vision.ops.roi_pool",
     "paddle.vision.ops.psroi_pool",
 )
-def roi_pool_values(ctx: GenerationContext, case: RuleCase):
+def roi_pool_values(ctx: InputGenerationContext, case: RuleCase):
     state = {"x_shape": None, "boxes_shape": None}
 
     def x_value(binding):
@@ -1323,17 +1312,17 @@ def roi_pool_values(ctx: GenerationContext, case: RuleCase):
     "paddle.gammaincc",
     "paddle.linspace",
 )
-def zero_65535_or_unit_values(ctx: GenerationContext, case: RuleCase):
+def zero_65535_or_unit_values(ctx: InputGenerationContext, case: RuleCase):
     case.generate_all("int_zero_65535_else_unit")
 
 
 @rules.register("paddle.dot")
-def dot_values(ctx: GenerationContext, case: RuleCase):
+def dot_values(ctx: InputGenerationContext, case: RuleCase):
     case.generate_all("int_minus127_127_else_default")
 
 
 @rules.register("paddle.normal")
-def normal_values(ctx: GenerationContext, case: RuleCase):
+def normal_values(ctx: InputGenerationContext, case: RuleCase):
     case.generate_by_parameter(
         (
             ("mean", "signed_half_interval"),
@@ -1344,17 +1333,17 @@ def normal_values(ctx: GenerationContext, case: RuleCase):
 
 
 @rules.register("paddle.ones")
-def ones_shape(ctx: GenerationContext, case: RuleCase):
+def ones_shape(ctx: InputGenerationContext, case: RuleCase):
     case.generate_all("ones_shape")
 
 
 @rules.register("paddle.zeros")
-def zeros_shape(ctx: GenerationContext, case: RuleCase):
+def zeros_shape(ctx: InputGenerationContext, case: RuleCase):
     case.generate_all("int_zero_2048_no_cast")
 
 
 @rules.register("paddle.eye")
-def eye_shape(ctx: GenerationContext, case: RuleCase):
+def eye_shape(ctx: InputGenerationContext, case: RuleCase):
     case.generate_all("int_zero_2048_no_cast")
 
 
@@ -1363,7 +1352,7 @@ def eye_shape(ctx: GenerationContext, case: RuleCase):
     "paddle.Tensor.tile",
     "paddle.tile",
 )
-def shape_parameter_values(ctx: GenerationContext, case: RuleCase):
+def shape_parameter_values(ctx: InputGenerationContext, case: RuleCase):
     case.generate_by_parameter(
         ((("size", "scale_factor", "repeat_times"), "int_one_128"),),
         default="default",
@@ -1371,7 +1360,7 @@ def shape_parameter_values(ctx: GenerationContext, case: RuleCase):
 
 
 @rules.register("paddle.nn.functional.upsample")
-def upsample_values(ctx: GenerationContext, case: RuleCase):
+def upsample_values(ctx: InputGenerationContext, case: RuleCase):
     case.generate_by_parameter(
         (
             ("size", "int_one_128"),
@@ -1384,7 +1373,7 @@ def upsample_values(ctx: GenerationContext, case: RuleCase):
 @rules.register(
     "paddle.nn.functional.gaussian_nll_loss",
 )
-def gaussian_nll_loss_values(ctx: GenerationContext, case: RuleCase):
+def gaussian_nll_loss_values(ctx: InputGenerationContext, case: RuleCase):
     case.generate_by_parameter(
         ((("var", "variance"), "unit_interval_plus_one"),),
         default="default",
@@ -1394,19 +1383,19 @@ def gaussian_nll_loss_values(ctx: GenerationContext, case: RuleCase):
 @rules.register(
     "paddle.nn.functional.hinge_embedding_loss",
 )
-def hinge_embedding_loss_values(ctx: GenerationContext, case: RuleCase):
+def hinge_embedding_loss_values(ctx: InputGenerationContext, case: RuleCase):
     case.generate_by_parameter((("label", "hinge_labels"),), default="default")
 
 
 @rules.register(
     "paddle.nn.functional.sigmoid_focal_loss",
 )
-def sigmoid_focal_loss_values(ctx: GenerationContext, case: RuleCase):
+def sigmoid_focal_loss_values(ctx: InputGenerationContext, case: RuleCase):
     case.generate_by_parameter((("label", "binary_0_1"),), default="default")
 
 
 @rules.register("paddle.full")
-def full_values(ctx: GenerationContext, case: RuleCase):
+def full_values(ctx: InputGenerationContext, case: RuleCase):
     case.generate_by_parameter(
         (
             ("shape", "int_zero_64"),
@@ -1417,17 +1406,17 @@ def full_values(ctx: GenerationContext, case: RuleCase):
 
 
 @rules.register("paddle.standard_normal")
-def standard_normal_shape(ctx: GenerationContext, case: RuleCase):
+def standard_normal_shape(ctx: InputGenerationContext, case: RuleCase):
     case.generate_by_parameter((("shape", "int_one_128"),), default="default")
 
 
 @rules.register("paddle.logspace")
-def logspace_values(ctx: GenerationContext, case: RuleCase):
+def logspace_values(ctx: InputGenerationContext, case: RuleCase):
     case.generate_by_parameter((("num", "int_one_65535_no_cast"),), default="default")
 
 
 @rules.register("paddle.quantile")
-def quantile_values(ctx: GenerationContext, case: RuleCase):
+def quantile_values(ctx: InputGenerationContext, case: RuleCase):
     case.generate_by_parameter((("q", "quantile_q"),), default="default")
 
 
@@ -1435,7 +1424,7 @@ def quantile_values(ctx: GenerationContext, case: RuleCase):
     "paddle.remainder",
     aliases=("paddle.Tensor.remainder",),
 )
-def remainder_values(ctx: GenerationContext, case: RuleCase):
+def remainder_values(ctx: InputGenerationContext, case: RuleCase):
     case.generate_by_parameter((("y", "remainder_rhs"),), default="default")
 
 
@@ -1444,17 +1433,17 @@ def remainder_values(ctx: GenerationContext, case: RuleCase):
     "paddle.nn.functional.dropout2d",
     "paddle.nn.functional.dropout3d",
 )
-def dropout_values(ctx: GenerationContext, case: RuleCase):
+def dropout_values(ctx: InputGenerationContext, case: RuleCase):
     case.generate_by_parameter((("p", "dropout_probability"),), default="default")
 
 
 @rules.register("paddle.atan2")
-def atan2_values(ctx: GenerationContext, case: RuleCase):
+def atan2_values(ctx: InputGenerationContext, case: RuleCase):
     case.generate_all("unit_interval_plus_one")
 
 
 @rules.register("paddle.bincount")
-def bincount_values(ctx: GenerationContext, case: RuleCase):
+def bincount_values(ctx: InputGenerationContext, case: RuleCase):
     def integer_value(binding):
         return case.randint(0, 65535, size=binding.spec.shape).astype(binding.spec.dtype)
 
@@ -1470,7 +1459,7 @@ def bincount_values(ctx: GenerationContext, case: RuleCase):
 @rules.register(
     "paddle.nn.functional.adaptive_avg_pool2d", "paddle.nn.functional.adaptive_avg_pool3d"
 )
-def adaptive_avg_pool_values(ctx: GenerationContext, case: RuleCase):
+def adaptive_avg_pool_values(ctx: InputGenerationContext, case: RuleCase):
     def output_size(binding):
         x_shape = case.arg(0, "x").shape
         return case.randint(1, 2 * max(x_shape), size=binding.spec.shape).astype(binding.spec.dtype)
@@ -1482,7 +1471,7 @@ def adaptive_avg_pool_values(ctx: GenerationContext, case: RuleCase):
 
 
 @rules.register("paddle.empty")
-def empty_values(ctx: GenerationContext, case: RuleCase):
+def empty_values(ctx: InputGenerationContext, case: RuleCase):
     case.generate_by_parameter((("shape", "empty_shape"),), default="default")
 
 
@@ -1490,7 +1479,7 @@ def empty_values(ctx: GenerationContext, case: RuleCase):
     "paddle.repeat_interleave",
     aliases=("paddle.Tensor.repeat_interleave",),
 )
-def repeat_interleave_values(ctx: GenerationContext, case: RuleCase):
+def repeat_interleave_values(ctx: InputGenerationContext, case: RuleCase):
     def axis_value(binding):
         x = case.arg(0, "x")
         input_dims = len(x.shape)
@@ -1521,9 +1510,9 @@ def repeat_interleave_values(ctx: GenerationContext, case: RuleCase):
         "paddle._C_ops.Tensor.put_along_axis_",
     ),
 )
-def put_along_axis_values(ctx: GenerationContext, case: RuleCase):
+def put_along_axis_values(ctx: InputGenerationContext, case: RuleCase):
     def random_tensor_value(binding, shape):
-        scalar_spec = TensorSpec(
+        scalar_spec = TensorView(
             shape=tuple(shape),
             dtype=binding.spec.dtype,
             place=binding.spec.place,
@@ -1588,7 +1577,7 @@ def put_along_axis_values(ctx: GenerationContext, case: RuleCase):
 
 
 @rules.register("paddle.matrix_transpose")
-def matrix_transpose_values(ctx: GenerationContext, case: RuleCase):
+def matrix_transpose_values(ctx: InputGenerationContext, case: RuleCase):
     def x_value(binding):
         shape = binding.spec.shape if len(binding.spec.shape) >= 2 else (2, 2)
         dtype = binding.spec.dtype
@@ -1600,7 +1589,7 @@ def matrix_transpose_values(ctx: GenerationContext, case: RuleCase):
 
 
 @rules.register("paddle.nn.functional.softmax")
-def softmax_values(ctx: GenerationContext, case: RuleCase):
+def softmax_values(ctx: InputGenerationContext, case: RuleCase):
     def axis_value(binding):
         x_shape = case.arg(0, "x").shape
         return case.value_domain("uniform", binding, low=-len(x_shape), high=len(x_shape))
@@ -1615,7 +1604,7 @@ def softmax_values(ctx: GenerationContext, case: RuleCase):
 
 
 @rules.register("paddle.nn.functional.zeropad2d")
-def zeropad2d_values(ctx: GenerationContext, case: RuleCase):
+def zeropad2d_values(ctx: InputGenerationContext, case: RuleCase):
     def padding_value(binding):
         return case.value_domain("uniform", binding, low=0, high=10)
 
@@ -1629,7 +1618,7 @@ def zeropad2d_values(ctx: GenerationContext, case: RuleCase):
 
 
 @rules.register("paddle.nn.functional.pad")
-def pad_values(ctx: GenerationContext, case: RuleCase):
+def pad_values(ctx: InputGenerationContext, case: RuleCase):
     def pad_value(binding):
         x_shape = case.arg(0, "x").shape
         return case.value_domain("uniform", binding, low=0, high=min(x_shape))
@@ -1638,7 +1627,7 @@ def pad_values(ctx: GenerationContext, case: RuleCase):
 
 
 @rules.register("paddle.nn.functional.class_center_sample")
-def class_center_sample_values(ctx: GenerationContext, case: RuleCase):
+def class_center_sample_values(ctx: InputGenerationContext, case: RuleCase):
     def label_value(binding):
         num_classes = case.arg(1, "num_classes")
         return case.randint(0, num_classes, size=binding.spec.shape).astype(binding.spec.dtype)
@@ -1647,18 +1636,18 @@ def class_center_sample_values(ctx: GenerationContext, case: RuleCase):
 
 
 @rules.register("paddle.shard_index")
-def shard_index_values(ctx: GenerationContext, case: RuleCase):
-    def input_value(binding):
+def shard_index_values(ctx: InputGenerationContext, case: RuleCase):
+    def input_binding(binding):
         index_num = case.arg(1, "index_num")
         if index_num is None:
             index_num = case.randint(1, 1000)
         return case.randint(0, index_num, size=binding.spec.shape).astype(binding.spec.dtype)
 
-    case.generate_by_parameter((("input", input_value),), default="default")
+    case.generate_by_parameter((("input", input_binding),), default="default")
 
 
 @rules.register("paddle.incubate.nn.functional.masked_multihead_attention")
-def masked_multihead_attention_values(ctx: GenerationContext, case: RuleCase):
+def masked_multihead_attention_values(ctx: InputGenerationContext, case: RuleCase):
     def sequence_lengths(binding):
         return case.value_domain("random_range", binding, low=1)
 
@@ -1679,7 +1668,7 @@ def masked_multihead_attention_values(ctx: GenerationContext, case: RuleCase):
     "paddle.argmin",
     aliases=("paddle.Tensor.argmax", "paddle.Tensor.argmin"),
 )
-def argminmax_values(ctx: GenerationContext, case: RuleCase):
+def argminmax_values(ctx: InputGenerationContext, case: RuleCase):
     def axis_value(binding):
         x_shape = case.arg(0, "x").shape
         min_dim = len(x_shape)
@@ -1689,7 +1678,7 @@ def argminmax_values(ctx: GenerationContext, case: RuleCase):
 
 
 @rules.register("paddle.cumsum", aliases=("paddle.Tensor.cumsum",))
-def cumsum_values(ctx: GenerationContext, case: RuleCase):
+def cumsum_values(ctx: InputGenerationContext, case: RuleCase):
     def axis_value(binding):
         x_shape = case.arg(0, "x").shape
         return case.randint(-len(x_shape), len(x_shape), size=binding.spec.shape)
@@ -1700,7 +1689,7 @@ def cumsum_values(ctx: GenerationContext, case: RuleCase):
 @rules.register(
     "paddle.mean", "paddle.max", "paddle.min", "paddle.prod", "paddle.sum", "paddle.squeeze"
 )
-def reduction_axis_values(ctx: GenerationContext, case: RuleCase):
+def reduction_axis_values(ctx: InputGenerationContext, case: RuleCase):
     def axis_value(binding):
         x_shape = case.arg(0, "x").shape
         max_dim = max(len(x_shape), 1)
@@ -1723,7 +1712,7 @@ def reduction_axis_values(ctx: GenerationContext, case: RuleCase):
 
 
 @rules.register("paddle.unsqueeze")
-def unsqueeze_values(ctx: GenerationContext, case: RuleCase):
+def unsqueeze_values(ctx: InputGenerationContext, case: RuleCase):
     def axis_value(binding):
         x_shape = case.arg(0, "x").shape
         max_dim = len(x_shape) + 1
@@ -1746,7 +1735,7 @@ def unsqueeze_values(ctx: GenerationContext, case: RuleCase):
 
 
 @rules.register("paddle.unflatten", aliases=("paddle.Tensor.unflatten",))
-def unflatten_values(ctx: GenerationContext, case: RuleCase):
+def unflatten_values(ctx: InputGenerationContext, case: RuleCase):
     def axis_value(binding):
         x_shape = case.arg(0, "x").shape
         return case.randint(0, len(x_shape), size=binding.spec.shape).astype(binding.spec.dtype)
@@ -1755,7 +1744,7 @@ def unflatten_values(ctx: GenerationContext, case: RuleCase):
 
 
 @rules.register("paddle.topk", aliases=("paddle.Tensor.topk",))
-def topk_values(ctx: GenerationContext, case: RuleCase):
+def topk_values(ctx: InputGenerationContext, case: RuleCase):
     def x_value(binding):
         dtype = binding.spec.dtype
         if dtype == "bfloat16" or dtype in {"float8_e4m3fn", "float8_e5m2"}:
@@ -1790,7 +1779,7 @@ def topk_values(ctx: GenerationContext, case: RuleCase):
 
 
 @rules.register("paddle.index_sample")
-def index_sample_values(ctx: GenerationContext, case: RuleCase):
+def index_sample_values(ctx: InputGenerationContext, case: RuleCase):
     def index_value(binding):
         x_dim = case.arg(0, "x").shape[1]
         return case.randint(0, x_dim, size=binding.spec.shape)
@@ -1799,7 +1788,7 @@ def index_sample_values(ctx: GenerationContext, case: RuleCase):
 
 
 @rules.register("paddle.Tensor.__getitem__")
-def tensor_getitem_values(ctx: GenerationContext, case: RuleCase):
+def tensor_getitem_values(ctx: InputGenerationContext, case: RuleCase):
     def source_binding():
         binding = case.find("arr") or case.find("x") or case.find("self")
         if binding is None:
@@ -1819,7 +1808,7 @@ def tensor_getitem_values(ctx: GenerationContext, case: RuleCase):
 
 
 @rules.register("paddle.Tensor.__setitem__")
-def tensor_setitem_values(ctx: GenerationContext, case: RuleCase):
+def tensor_setitem_values(ctx: InputGenerationContext, case: RuleCase):
     def source_binding():
         binding = case.find("arr") or case.find("x") or case.find("self")
         if binding is None:
@@ -1846,7 +1835,7 @@ def tensor_setitem_values(ctx: GenerationContext, case: RuleCase):
 
 
 @rules.register("paddle.index_add", "paddle.index_fill")
-def index_update_values(ctx: GenerationContext, case: RuleCase):
+def index_update_values(ctx: InputGenerationContext, case: RuleCase):
     def index_value(binding):
         axis = case.arg(2, "axis")
         if axis is None:
@@ -1868,7 +1857,7 @@ def index_update_values(ctx: GenerationContext, case: RuleCase):
 
 
 @rules.register("paddle.take")
-def take_values(ctx: GenerationContext, case: RuleCase):
+def take_values(ctx: InputGenerationContext, case: RuleCase):
     def index_value(binding):
         x = case.arg(0, "x")
         dim_size = math.prod(x.shape)
@@ -1878,7 +1867,7 @@ def take_values(ctx: GenerationContext, case: RuleCase):
 
 
 @rules.register("paddle.gather", aliases=("paddle.Tensor.gather",))
-def gather_values(ctx: GenerationContext, case: RuleCase):
+def gather_values(ctx: InputGenerationContext, case: RuleCase):
     def index_value(binding):
         x = case.arg(0, "x")
         if case.has_kwarg("axis"):
@@ -1902,7 +1891,7 @@ def gather_values(ctx: GenerationContext, case: RuleCase):
 
 
 @rules.register("paddle.gather_nd", aliases=("paddle.Tensor.gather_nd",))
-def gather_nd_values(ctx: GenerationContext, case: RuleCase):
+def gather_nd_values(ctx: InputGenerationContext, case: RuleCase):
     def index_value(binding):
         x_shape = case.arg(0, "x").shape
         index_shape = case.arg(1, "index").shape
@@ -1915,7 +1904,7 @@ def gather_nd_values(ctx: GenerationContext, case: RuleCase):
 
 
 @rules.register("paddle.index_select", aliases=("paddle.Tensor.index_select",))
-def index_select_values(ctx: GenerationContext, case: RuleCase):
+def index_select_values(ctx: InputGenerationContext, case: RuleCase):
     def index_value(binding):
         axis = case.arg(2, "axis")
         if axis is None:
@@ -1929,7 +1918,7 @@ def index_select_values(ctx: GenerationContext, case: RuleCase):
 
 
 @rules.register("paddle.take_along_axis", aliases=("paddle.Tensor.take_along_axis",))
-def take_along_axis_values(ctx: GenerationContext, case: RuleCase):
+def take_along_axis_values(ctx: InputGenerationContext, case: RuleCase):
     def indices_value(binding):
         arr_shape = case.arg(0, "arr").shape
         axis = case.arg(2, "axis")
@@ -1956,12 +1945,12 @@ def take_along_axis_values(ctx: GenerationContext, case: RuleCase):
 
 
 @rules.register("paddle.index_put", aliases=("paddle.Tensor.index_put",))
-def index_put_values(ctx: GenerationContext, case: RuleCase):
+def index_put_values(ctx: InputGenerationContext, case: RuleCase):
     case.generate_all("default")
 
 
 @rules.register("paddle.multiplex")
-def multiplex_values(ctx: GenerationContext, case: RuleCase):
+def multiplex_values(ctx: InputGenerationContext, case: RuleCase):
     def index_value(binding):
         inputs = case.arg(0, "inputs")
         return case.randint(0, len(inputs), size=binding.spec.shape).astype(binding.spec.dtype)
@@ -1979,7 +1968,7 @@ def multiplex_values(ctx: GenerationContext, case: RuleCase):
     "paddle.incubate.segment_mean",
     "paddle.incubate.segment_min",
 )
-def segment_values(ctx: GenerationContext, case: RuleCase):
+def segment_values(ctx: InputGenerationContext, case: RuleCase):
     def segment_ids_value(binding):
         batch_size = case.arg(0, "x").shape[0]
         max_segments = case.randint(1, batch_size + 1)
@@ -1994,7 +1983,7 @@ def segment_values(ctx: GenerationContext, case: RuleCase):
     "paddle.geometric.send_uv",
     "paddle.geometric.send_ue_recv",
 )
-def geometric_send_values(ctx: GenerationContext, case: RuleCase):
+def geometric_send_values(ctx: InputGenerationContext, case: RuleCase):
     def index_value(binding):
         num_nodes = case.arg(0, "x").shape[0]
         return case.randint(0, num_nodes, size=binding.spec.shape).astype(binding.spec.dtype)
@@ -2006,7 +1995,7 @@ def geometric_send_values(ctx: GenerationContext, case: RuleCase):
 
 
 @rules.register("paddle.geometric.sample_neighbors")
-def sample_neighbors_values(ctx: GenerationContext, case: RuleCase):
+def sample_neighbors_values(ctx: InputGenerationContext, case: RuleCase):
     def row_value(binding):
         colptr_shape = case.arg(1, "colptr").shape
         num_nodes = colptr_shape[0] - 1
@@ -2048,7 +2037,7 @@ def sample_neighbors_values(ctx: GenerationContext, case: RuleCase):
 
 
 @rules.register("paddle.reshape", aliases=("paddle.Tensor.reshape",))
-def reshape_values(ctx: GenerationContext, case: RuleCase):
+def reshape_values(ctx: InputGenerationContext, case: RuleCase):
     state = {
         "shape": None,
         "maxvalue": None,
@@ -2110,7 +2099,7 @@ def reshape_values(ctx: GenerationContext, case: RuleCase):
 
 
 @rules.register("paddle.slice")
-def slice_values(ctx: GenerationContext, case: RuleCase):
+def slice_values(ctx: InputGenerationContext, case: RuleCase):
     state = {
         "shape": None,
         "indice": 0,
@@ -2121,7 +2110,7 @@ def slice_values(ctx: GenerationContext, case: RuleCase):
     def axes():
         return case.arg(1, "axes")
 
-    def input_value(binding):
+    def input_binding(binding):
         if state["shape"] is None:
             state["shape"] = binding.spec.shape
         return case.value_domain("default", binding)
@@ -2188,7 +2177,7 @@ def slice_values(ctx: GenerationContext, case: RuleCase):
 
     case.generate_by_parameter(
         (
-            ("input", input_value),
+            ("input", input_binding),
             ("starts", starts_value),
             ("ends", ends_value),
         ),
@@ -2197,7 +2186,7 @@ def slice_values(ctx: GenerationContext, case: RuleCase):
 
 
 @rules.register("paddle.scatter")
-def scatter_values(ctx: GenerationContext, case: RuleCase):
+def scatter_values(ctx: InputGenerationContext, case: RuleCase):
     def index_value(binding):
         x = case.arg(0, "x")
         first_dim = x.shape[0]
@@ -2214,7 +2203,7 @@ def scatter_values(ctx: GenerationContext, case: RuleCase):
 
 
 @rules.register("paddle.scatter_nd")
-def scatter_nd_values(ctx: GenerationContext, case: RuleCase):
+def scatter_nd_values(ctx: InputGenerationContext, case: RuleCase):
     def index_value(binding):
         output_shape = case.arg(2, "shape")
         if output_shape and len(output_shape):
@@ -2234,7 +2223,7 @@ def scatter_nd_values(ctx: GenerationContext, case: RuleCase):
 
 
 @rules.register("paddle.scatter_nd_add")
-def scatter_nd_add_values(ctx: GenerationContext, case: RuleCase):
+def scatter_nd_add_values(ctx: InputGenerationContext, case: RuleCase):
     def index_value(binding):
         x_shape = case.arg(0, "x").shape
         result = case.zeros(binding.spec.shape)
@@ -2250,7 +2239,7 @@ def scatter_nd_add_values(ctx: GenerationContext, case: RuleCase):
 
 
 @rules.register("paddle.strided_slice")
-def strided_slice_values(ctx: GenerationContext, case: RuleCase):
+def strided_slice_values(ctx: InputGenerationContext, case: RuleCase):
     def axes_value(binding):
         x = case.arg(0, "x")
         return case.randint(0, len(x.shape), size=binding.spec.shape).astype(binding.spec.dtype)
@@ -2292,7 +2281,7 @@ def strided_slice_values(ctx: GenerationContext, case: RuleCase):
 
 
 @rules.register("paddle.tensordot")
-def tensordot_values(ctx: GenerationContext, case: RuleCase):
+def tensordot_values(ctx: InputGenerationContext, case: RuleCase):
     state = {"shape1": None, "shape2": None, "tensor1": None}
 
     def x_value(binding):
@@ -2375,7 +2364,7 @@ def tensordot_values(ctx: GenerationContext, case: RuleCase):
 
 
 @rules.register("paddle.nn.functional.embedding")
-def embedding_values(ctx: GenerationContext, case: RuleCase):
+def embedding_values(ctx: InputGenerationContext, case: RuleCase):
     def ids_value(binding):
         weight_config = case.arg(1, "weight")
         vocab_size = case.randint(10, 1000)
@@ -2396,7 +2385,7 @@ def embedding_values(ctx: GenerationContext, case: RuleCase):
 
 
 @rules.register("paddle.nn.functional.affine_grid")
-def affine_grid_values(ctx: GenerationContext, case: RuleCase):
+def affine_grid_values(ctx: InputGenerationContext, case: RuleCase):
     def out_shape_value(binding):
         theta_shape = case.arg(0, "theta").shape
         values = case.randint(1, 128, size=binding.spec.shape).astype(binding.spec.dtype)
@@ -2407,7 +2396,7 @@ def affine_grid_values(ctx: GenerationContext, case: RuleCase):
 
 
 @rules.register("paddle.nn.functional.hsigmoid_loss")
-def hsigmoid_loss_values(ctx: GenerationContext, case: RuleCase):
+def hsigmoid_loss_values(ctx: InputGenerationContext, case: RuleCase):
     def label_value(binding):
         num_classes = case.arg(2, "num_classes")
         return case.randint(0, num_classes, size=binding.spec.shape).astype(binding.spec.dtype)
@@ -2427,7 +2416,7 @@ def hsigmoid_loss_values(ctx: GenerationContext, case: RuleCase):
 
 
 @rules.register("paddle.nn.functional.margin_cross_entropy")
-def margin_cross_entropy_values(ctx: GenerationContext, case: RuleCase):
+def margin_cross_entropy_values(ctx: InputGenerationContext, case: RuleCase):
     def label_value(binding):
         logits = case.arg(0, "logits")
         return case.randint(0, logits.shape[1], size=binding.spec.shape).astype(binding.spec.dtype)
@@ -2436,7 +2425,7 @@ def margin_cross_entropy_values(ctx: GenerationContext, case: RuleCase):
 
 
 @rules.register("paddle.nn.functional.multi_margin_loss")
-def multi_margin_loss_values(ctx: GenerationContext, case: RuleCase):
+def multi_margin_loss_values(ctx: InputGenerationContext, case: RuleCase):
     def label_value(binding):
         logits = case.arg(0, "input")
         return case.randint(0, logits.shape[1], size=binding.spec.shape).astype(binding.spec.dtype)
@@ -2445,7 +2434,7 @@ def multi_margin_loss_values(ctx: GenerationContext, case: RuleCase):
 
 
 @rules.register("paddle.nn.functional.dice_loss")
-def dice_loss_values(ctx: GenerationContext, case: RuleCase):
+def dice_loss_values(ctx: InputGenerationContext, case: RuleCase):
     def label_value(binding):
         tensor = case.arg(0, "input")
         return case.randint(0, tensor.shape[-1], size=binding.spec.shape).astype(binding.spec.dtype)
@@ -2454,7 +2443,7 @@ def dice_loss_values(ctx: GenerationContext, case: RuleCase):
 
 
 @rules.register("paddle.nn.functional.nll_loss")
-def nll_loss_values(ctx: GenerationContext, case: RuleCase):
+def nll_loss_values(ctx: InputGenerationContext, case: RuleCase):
     def label_value(binding):
         input_config = case.arg(0, "input")
         n_classes = case.randint(5, 50) if input_config is None else input_config.shape[1]
@@ -2464,7 +2453,7 @@ def nll_loss_values(ctx: GenerationContext, case: RuleCase):
 
 
 @rules.register("paddle.nn.functional.adaptive_log_softmax_with_loss")
-def adaptive_log_softmax_with_loss_values(ctx: GenerationContext, case: RuleCase):
+def adaptive_log_softmax_with_loss_values(ctx: InputGenerationContext, case: RuleCase):
     def label_value(binding):
         cutoffs = case.arg(4, "cutoffs")
         n_classes = cutoffs[-1]
@@ -2479,7 +2468,7 @@ def adaptive_log_softmax_with_loss_values(ctx: GenerationContext, case: RuleCase
 
 
 @rules.register("paddle.nn.functional.cross_entropy")
-def cross_entropy_values(ctx: GenerationContext, case: RuleCase):
+def cross_entropy_values(ctx: InputGenerationContext, case: RuleCase):
     def label_value(binding):
         input_shape = case.arg(0, "input").shape
         axis = case.arg(7, "axis", -1)
@@ -2510,7 +2499,7 @@ def cross_entropy_values(ctx: GenerationContext, case: RuleCase):
 
 
 @rules.register("paddle.nn.functional.ctc_loss")
-def ctc_loss_values(ctx: GenerationContext, case: RuleCase):
+def ctc_loss_values(ctx: InputGenerationContext, case: RuleCase):
     def labels_value(binding):
         num_classes = case.arg(0, "log_probs").shape[2] - 1
         blank = case.arg(4, "blank", 0)
@@ -2559,7 +2548,7 @@ def ctc_loss_values(ctx: GenerationContext, case: RuleCase):
 
 
 @rules.register("paddle.nn.functional.sequence_mask")
-def sequence_mask_values(ctx: GenerationContext, case: RuleCase):
+def sequence_mask_values(ctx: InputGenerationContext, case: RuleCase):
     def x_value(binding):
         maxlen_config = case.arg(1, "maxlen")
         provided_maxlen = None
@@ -2580,7 +2569,7 @@ def sequence_mask_values(ctx: GenerationContext, case: RuleCase):
 
 
 @rules.register("paddle.nn.functional.softmax_with_cross_entropy")
-def softmax_with_cross_entropy_values(ctx: GenerationContext, case: RuleCase):
+def softmax_with_cross_entropy_values(ctx: InputGenerationContext, case: RuleCase):
     def label_value(binding):
         logits = case.arg(0, "logits")
         if not hasattr(logits, "shape"):
@@ -2599,7 +2588,7 @@ def softmax_with_cross_entropy_values(ctx: GenerationContext, case: RuleCase):
 
 
 @rules.register("paddle.linalg.cholesky")
-def cholesky_values(ctx: GenerationContext, case: RuleCase):
+def cholesky_values(ctx: InputGenerationContext, case: RuleCase):
     def x_value(binding):
         if len(binding.spec.shape) < 2 or binding.spec.shape[-1] != binding.spec.shape[-2]:
             raise ValueError(
@@ -2620,7 +2609,7 @@ def cholesky_values(ctx: GenerationContext, case: RuleCase):
 
 
 @rules.register("paddle.linalg.cov")
-def covariance_values(ctx: GenerationContext, case: RuleCase):
+def covariance_values(ctx: InputGenerationContext, case: RuleCase):
     def observation_count():
         x_shape = case.arg(0, "x").shape
         rowvar = case.arg(1, "rowvar")
@@ -2654,7 +2643,7 @@ def covariance_values(ctx: GenerationContext, case: RuleCase):
 
 
 @rules.register("paddle.linalg.eigh", "paddle.linalg.eigvalsh")
-def eigen_symmetric_values(ctx: GenerationContext, case: RuleCase):
+def eigen_symmetric_values(ctx: InputGenerationContext, case: RuleCase):
     def x_value(binding):
         if len(binding.spec.shape) < 2 or binding.spec.shape[-1] != binding.spec.shape[-2]:
             raise ValueError(
@@ -2680,7 +2669,7 @@ def eigen_symmetric_values(ctx: GenerationContext, case: RuleCase):
 
 
 @rules.register("paddle.linalg.lstsq")
-def lstsq_values(ctx: GenerationContext, case: RuleCase):
+def lstsq_values(ctx: InputGenerationContext, case: RuleCase):
     def matrix_value(binding):
         if len(binding.spec.shape) < 2:
             raise ValueError("Shape must have at least 2 dimensions for lstsq x")
@@ -2692,7 +2681,7 @@ def lstsq_values(ctx: GenerationContext, case: RuleCase):
 
 
 @rules.register("paddle.linalg.lu_unpack")
-def lu_unpack_values(ctx: GenerationContext, case: RuleCase):
+def lu_unpack_values(ctx: InputGenerationContext, case: RuleCase):
     def x_value(binding):
         if len(binding.spec.shape) < 2:
             raise ValueError("Shape must have at least 2 dimensions for LU matrix")
@@ -2715,7 +2704,7 @@ def lu_unpack_values(ctx: GenerationContext, case: RuleCase):
 
 
 @rules.register("paddle.linalg.cond")
-def condition_values(ctx: GenerationContext, case: RuleCase):
+def condition_values(ctx: InputGenerationContext, case: RuleCase):
     def x_value(binding):
         matrix_size = binding.spec.shape[-1]
         tensor = case.random(binding.spec.shape, dtype=binding.spec.dtype)
@@ -2726,7 +2715,7 @@ def condition_values(ctx: GenerationContext, case: RuleCase):
 
 
 @rules.register("paddle.linalg.det", "paddle.linalg.slogdet")
-def determinant_values(ctx: GenerationContext, case: RuleCase):
+def determinant_values(ctx: InputGenerationContext, case: RuleCase):
     def x_value(binding):
         if len(binding.spec.shape) < 2:
             raise AssertionError("Input must be at least 2D.")
@@ -2749,7 +2738,7 @@ def determinant_values(ctx: GenerationContext, case: RuleCase):
 
 
 @rules.register("paddle.linalg.pca_lowrank")
-def pca_lowrank_values(ctx: GenerationContext, case: RuleCase):
+def pca_lowrank_values(ctx: InputGenerationContext, case: RuleCase):
     def x_value(binding):
         return case.randn(*binding.spec.shape).astype(binding.spec.dtype)
 
@@ -2757,7 +2746,7 @@ def pca_lowrank_values(ctx: GenerationContext, case: RuleCase):
 
 
 @rules.register("paddle.linalg.corrcoef")
-def corrcoef_values(ctx: GenerationContext, case: RuleCase):
+def corrcoef_values(ctx: InputGenerationContext, case: RuleCase):
     def x_value(binding):
         if binding.spec.dtype == "float16":
             return case.randn(*binding.spec.shape).astype(binding.spec.dtype) * 1e-3
@@ -2785,12 +2774,12 @@ def corrcoef_values(ctx: GenerationContext, case: RuleCase):
     "paddle.linalg.qr",
     "paddle.linalg.vector_norm",
 )
-def linalg_default_values(ctx: GenerationContext, case: RuleCase):
+def linalg_default_values(ctx: InputGenerationContext, case: RuleCase):
     case.generate_all("default")
 
 
 @rules.register("paddle.linalg.pinv")
-def pinv_values(ctx: GenerationContext, case: RuleCase):
+def pinv_values(ctx: InputGenerationContext, case: RuleCase):
     hermitian = bool(case.arg(2, " hermitian", False))
     if not hermitian:
         case.generate_all("default")
@@ -2820,7 +2809,7 @@ def pinv_values(ctx: GenerationContext, case: RuleCase):
 
 
 @rules.register("paddle.linalg.cholesky_solve", aliases=("paddle.Tensor.cholesky_solve",))
-def cholesky_solve_values(ctx: GenerationContext, case: RuleCase):
+def cholesky_solve_values(ctx: InputGenerationContext, case: RuleCase):
     if case.api_name == "paddle.linalg.cholesky_solve":
         case.generate_all("default")
         return
@@ -2835,7 +2824,7 @@ def cholesky_solve_values(ctx: GenerationContext, case: RuleCase):
 
 
 @rules.register("paddle.view", aliases=("paddle.Tensor.view",))
-def view_values(ctx: GenerationContext, case: RuleCase):
+def view_values(ctx: InputGenerationContext, case: RuleCase):
     def x_value(binding):
         if binding.spec.dtype == "uint8":
             target = str(case.arg(1, "shape_or_dtype", ""))
@@ -2862,7 +2851,7 @@ def view_values(ctx: GenerationContext, case: RuleCase):
     "paddle.pow",
     aliases=("paddle.Tensor.pow", "paddle.Tensor.__rpow__", "paddle.Tensor.__pow__"),
 )
-def pow_values(ctx: GenerationContext, case: RuleCase):
+def pow_values(ctx: InputGenerationContext, case: RuleCase):
     def get_base_max(value, dtype_max, default_max=5):
         value_max = default_max
         if value <= 0:
@@ -2922,7 +2911,7 @@ def pow_values(ctx: GenerationContext, case: RuleCase):
 
 
 @rules.register("paddle.nn.functional.rnnt_loss")
-def rnnt_loss_values(ctx: GenerationContext, case: RuleCase):
+def rnnt_loss_values(ctx: InputGenerationContext, case: RuleCase):
     def logits(binding):
         shape = binding.spec.shape if len(binding.spec.shape) == 4 else (3, 4, 3, 5)
         return case.random(shape, dtype=binding.spec.dtype)
@@ -2950,7 +2939,7 @@ def rnnt_loss_values(ctx: GenerationContext, case: RuleCase):
 
 
 @rules.register("paddle.chunk")
-def chunk_values(ctx: GenerationContext, case: RuleCase):
+def chunk_values(ctx: InputGenerationContext, case: RuleCase):
     def axis_value(binding):
         x_tensor = case.arg(0, "x")
         chunks = case.arg(1, "chunks")
@@ -2976,7 +2965,7 @@ def chunk_values(ctx: GenerationContext, case: RuleCase):
 
 
 @rules.register("paddle.split")
-def split_values(ctx: GenerationContext, case: RuleCase):
+def split_values(ctx: InputGenerationContext, case: RuleCase):
     def axis_value(binding):
         x_shape = case.arg(0, "x").shape
         num_or_sections = case.arg(1, "num_or_sections")
@@ -3026,7 +3015,7 @@ def split_values(ctx: GenerationContext, case: RuleCase):
 
 
 @rules.register("paddle.expand", aliases=("paddle.Tensor.expand",))
-def expand_values(ctx: GenerationContext, case: RuleCase):
+def expand_values(ctx: InputGenerationContext, case: RuleCase):
     def shape_value(binding):
         x_shape = case.arg(0, "x").shape
         shape_index = binding.path.indices[0] if binding.path.indices else 0
@@ -3045,7 +3034,7 @@ def expand_values(ctx: GenerationContext, case: RuleCase):
 
 
 @rules.register("paddle.nn.functional.gather_tree")
-def gather_tree_values(ctx: GenerationContext, case: RuleCase):
+def gather_tree_values(ctx: InputGenerationContext, case: RuleCase):
     def parents_value(binding):
         sequences = case.arg(0, "sequences")
         if hasattr(sequences, "shape") and len(sequences.shape) >= 3:
@@ -3064,7 +3053,7 @@ def gather_tree_values(ctx: GenerationContext, case: RuleCase):
 
 
 @rules.register("paddle.multinomial")
-def multinomial_values(ctx: GenerationContext, case: RuleCase):
+def multinomial_values(ctx: InputGenerationContext, case: RuleCase):
     x_binding = case.find("x")
     num_samples_binding = case.find("num_samples")
     if x_binding is not None:
@@ -3089,7 +3078,7 @@ def multinomial_values(ctx: GenerationContext, case: RuleCase):
 
 
 @rules.register("paddle.nn.functional.one_hot")
-def one_hot_values(ctx: GenerationContext, case: RuleCase):
+def one_hot_values(ctx: InputGenerationContext, case: RuleCase):
     x_binding = case.find("x")
     num_classes_binding = case.find("num_classes")
     num_classes_config = case.arg(1, "num_classes")
@@ -3155,7 +3144,6 @@ def _apply_value(case, path, value):
 
 def _apply_value_raw(case, path, value, update_metadata):
     config = _tensor_config_at(case, path)
-    # 兼容物化层仍会查看 TensorConfig 上的 index/key/list_index。
     if path.root == "args":
         config.index = path.key
     else:

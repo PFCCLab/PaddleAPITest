@@ -10,10 +10,11 @@ import paddle
 import yaml
 
 from .api_config.dump_writer import DEFAULT_DUMP_DIR, DumpContext, dump_enabled
-from .api_config.input_generation.signature_binding import (
-    bind_args,
+from .api_config.input_generation.input_bind import (
+    bind_parameters,
     get_arg,
 )
+from .api_config.input_generation.input_values import input_value
 from .api_config.input_generation.tensor_config import (
     USE_CACHED_NUMPY,
     TensorConfig,
@@ -429,7 +430,7 @@ class APITestBase:
             self.torch_args_config = self.api_config.args
             return True
 
-        resolution = bind_args(
+        resolution = bind_parameters(
             api_name,
             self.api_config.args,
             self.api_config.kwargs,
@@ -466,9 +467,7 @@ class APITestBase:
                     list_index=current_list_index,
                 )
             elif isinstance(item, TensorConfig):
-                processed_item = item.get_numpy_tensor(
-                    self.api_config, index=index, key=key, list_index=current_list_index
-                )
+                processed_item = input_value(self.api_config, item)
             else:
                 processed_item = item
             tmp.append(processed_item)
@@ -521,7 +520,7 @@ class APITestBase:
             for i, item in enumerate(config_items):
                 if isinstance(item, TensorConfig):
                     item.fill_numpy_tensor(final_dims[tensor_idx])
-                    tmp[i] = item.get_numpy_tensor(self.api_config)
+                    tmp[i] = input_value(self.api_config, item)
                     tensor_idx += 1
         return tuple(tmp) if is_tuple else tmp
 
@@ -659,7 +658,7 @@ class APITestBase:
     def gen_paddle_input(self):
         """Generate paddle input by config, for tensor config initlize paddle tensor by get_paddle_tensor()
 
-        be sure to call gen_numpy_input() before use gen_paddle_input() since gen_paddle_input() do not pass index or key to get_paddle_tensor() or get_numpy_tensor() while gen_numpy_input() pass.
+        be sure to call gen_numpy_input() before use gen_paddle_input() since gen_paddle_input() do not pass index or key to get_paddle_tensor() while gen_numpy_input() pass.
         """
         self.paddle_args = []
         self.paddle_kwargs = collections.OrderedDict()
@@ -784,7 +783,7 @@ class APITestBase:
         return get_cached_numpy_array(dtype, shape, generation_kind=generation_kind, scale=scale)
 
     def _make_torch_output_grad(self, shape, dtype):
-        torch_dtype = self.convert_dtype_to_torch_type(dtype)
+        torch_dtype = self.to_torch_dtype(dtype)
         device = torch.device("cuda", torch.cuda.current_device())
         if "int" in dtype:
             return torch.randint(-65535, 65535, tuple(shape), device=device, dtype=torch.int64).to(
@@ -998,16 +997,14 @@ class APITestBase:
             dtype = str(result_outputs[i].dtype).split(".")[1]
             result_output_grad = torch.tensor(
                 numpy_tensor,
-                dtype=self.convert_dtype_to_torch_type(dtype)
-                if dtype != "bfloat16"
-                else torch.float32,
+                dtype=self.to_torch_dtype(dtype) if dtype != "bfloat16" else torch.float32,
             )
             if dtype == "bfloat16":
                 result_output_grad = result_output_grad.to(dtype=torch.bfloat16)
             result_outputs_grads.append(result_output_grad)
         return result_outputs, result_outputs_grads
 
-    def convert_dtype_to_torch_type(self, dtype):
+    def to_torch_dtype(self, dtype):
         # for python built-in types, mappings are int -> torch.int64, bool -> torch.bool, float -> torch.float64, complex -> torch.complex128, None -> None
         if dtype in [
             "float32",
@@ -1208,10 +1205,7 @@ class APITestBase:
         return tuple(tmp) if is_tuple else tmp
 
     def gen_torch_input(self):
-        """Generate torch input by config, for tensor config initlize torch tensor by get_torch_tensor()
-
-        be sure to call gen_numpy_input() before use gen_torch_input() since gen_torch_input() do not pass index or key to get_torch_tensor() or get_numpy_tensor() while gen_numpy_input() pass.
-        """
+        """Generate torch input by config."""
         self.torch_args = []
         self.torch_kwargs = collections.OrderedDict()
         for arg_config in self.torch_args_config:
@@ -1222,7 +1216,7 @@ class APITestBase:
                 is_tuple = isinstance(arg_config, tuple)
                 self.torch_args.append(self._handle_list_or_tuple_torch(arg_config, is_tuple))
             elif isinstance(arg_config, (paddle.dtype, paddle.base.libpaddle.VarDesc.VarType)):
-                self.torch_args.append(self.convert_dtype_to_torch_type(arg_config))
+                self.torch_args.append(self.to_torch_dtype(arg_config))
             else:
                 self.torch_args.append(arg_config)
 
@@ -1237,7 +1231,7 @@ class APITestBase:
                 isinstance(arg_config, (paddle.dtype, paddle.base.libpaddle.VarDesc.VarType))
                 or key == "dtype"
             ):
-                self.torch_kwargs[key] = self.convert_dtype_to_torch_type(arg_config)
+                self.torch_kwargs[key] = self.to_torch_dtype(arg_config)
             else:
                 self.torch_kwargs[key] = arg_config
 
@@ -1751,12 +1745,10 @@ class APITestBase:
 
     def save_original_inputs_to_cpu(self):
         """Save config inputs on CPU before either framework can mutate them."""
-        self._for_each_tensor_config(
-            lambda config: config.save_original_tensor_to_cpu(self.api_config)
-        )
+        self._for_each_tensor_config(lambda config: config.save_cpu_copy(self.api_config))
 
     def clear_original_cpu_inputs(self):
-        self._for_each_tensor_config(lambda config: config.clear_original_cpu_tensor())
+        self._for_each_tensor_config(lambda config: config.clear_cpu_copy())
 
     def estimate_input_bytes(self):
         """Estimate total configured input bytes for memory probe gating."""

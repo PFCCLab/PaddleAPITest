@@ -9,38 +9,35 @@ from pathlib import Path
 from typing import Any
 
 
-def _generate_tensor_code_using_get_numpy_tensor(
+def _generate_tensor_code_for_tensor(
     tensor_config,
     var_name: str,
     api_config_var: str,
     index: int = None,
     key: str = None,
 ) -> str:
-    """生成使用TensorConfig.get_numpy_tensor()的Python代码，与paddle_device_vs_cpu.py中的逻辑一致"""
+    """生成读取 TensorConfig 值的 Python 代码。"""
     shape_str = str(tensor_config.shape)
     dtype_str = tensor_config.dtype
-    original_dtype_str = dtype_str
 
     if index is not None:
         return (
             f"# 生成tensor: shape={shape_str}, dtype={dtype_str}\n"
             f"{var_name}_cfg = TensorConfig({shape_str}, '{dtype_str}')\n"
-            f"{var_name}_cfg.get_numpy_tensor({api_config_var}, index={index})\n"
-            f"{var_name} = {var_name}_cfg.numpy_tensor"
+            f"{var_name} = {var_name}_cfg.get_initialized_value({api_config_var}, arg_pos={index})"
         )
     elif key is not None:
         return (
             f"# 生成tensor: shape={shape_str}, dtype={dtype_str}\n"
             f"{var_name}_cfg = TensorConfig({shape_str}, '{dtype_str}')\n"
-            f"{var_name}_cfg.get_numpy_tensor({api_config_var}, key='{key}')\n"
-            f"{var_name} = {var_name}_cfg.numpy_tensor"
+            f"{var_name} = {var_name}_cfg.get_initialized_value({api_config_var}, arg_name='{key}')"
         )
     else:
-        # 如果没有index和key，使用get_random_numpy_tensor作为fallback
+        # 如果没有 index 和 key，就直接生成随机 NumPy 值。
         return (
             f"# 生成随机tensor: shape={shape_str}, dtype={dtype_str}\n"
             f"{var_name}_cfg = TensorConfig({shape_str}, '{dtype_str}')\n"
-            f"{var_name} = {var_name}_cfg.get_random_numpy_tensor(shape={shape_str}, data_type='{dtype_str}')"
+            f"{var_name} = {var_name}_cfg.random_numpy(shape={shape_str}, data_type='{dtype_str}')"
         )
 
 
@@ -165,7 +162,6 @@ def _generate_test_code(
 
     from .api_config.input_generation.tensor_config import TensorConfig
 
-    # 使用TensorConfig.get_numpy_tensor()方法生成数据，与paddle_device_vs_cpu.py中的逻辑一致
     for i, (var_name, tensor_config) in enumerate(args_configs):
         if isinstance(tensor_config, (list, tuple)):
             code_lines.append(f"# 位置参数 {var_name} (list/tuple)")
@@ -174,9 +170,7 @@ def _generate_test_code(
                 if isinstance(item, TensorConfig):
                     item_var = f"{var_name}_item_{j}"
                     code_lines.append(
-                        _generate_tensor_code_using_get_numpy_tensor(
-                            item, item_var, "api_config", index=i
-                        )
+                        _generate_tensor_code_for_tensor(item, item_var, "api_config", index=i)
                     )
                     tensor_var = f"{item_var}_tensor"
                     # 对于bfloat16，需要先用float32创建，然后cast
@@ -198,9 +192,7 @@ def _generate_test_code(
         elif isinstance(tensor_config, TensorConfig):
             code_lines.append(f"# 位置参数 {var_name}")
             code_lines.append(
-                _generate_tensor_code_using_get_numpy_tensor(
-                    tensor_config, var_name, "api_config", index=i
-                )
+                _generate_tensor_code_for_tensor(tensor_config, var_name, "api_config", index=i)
             )
             tensor_var = f"{var_name}_tensor"
             # 对于bfloat16，需要先用float32创建，然后cast
@@ -214,7 +206,6 @@ def _generate_test_code(
             tensor_vars[var_name] = tensor_var
             all_inputs.append(tensor_var)
 
-    # 处理kwargs，使用TensorConfig.get_numpy_tensor()方法
     for key, tensor_config in kwargs_configs.items():
         if isinstance(tensor_config, (list, tuple)):
             code_lines.append(f"# 关键字参数 {key} (list/tuple)")
@@ -223,9 +214,7 @@ def _generate_test_code(
                 if isinstance(item, TensorConfig):
                     item_var = f"kwarg_{key}_item_{j}"
                     code_lines.append(
-                        _generate_tensor_code_using_get_numpy_tensor(
-                            item, item_var, "api_config", key=key
-                        )
+                        _generate_tensor_code_for_tensor(item, item_var, "api_config", key=key)
                     )
                     tensor_var = f"{item_var}_tensor"
                     # 对于bfloat16，需要先用float32创建，然后cast
@@ -248,9 +237,7 @@ def _generate_test_code(
             code_lines.append(f"# 关键字参数 {key}")
             var_name = f"kwarg_{key}"
             code_lines.append(
-                _generate_tensor_code_using_get_numpy_tensor(
-                    tensor_config, var_name, "api_config", key=key
-                )
+                _generate_tensor_code_for_tensor(tensor_config, var_name, "api_config", key=key)
             )
             tensor_var = f"{var_name}_tensor"
             # 对于bfloat16，需要先用float32创建，然后cast

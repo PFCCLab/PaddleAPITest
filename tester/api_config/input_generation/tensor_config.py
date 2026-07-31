@@ -11,9 +11,9 @@ import numpy
 import paddle
 import yaml
 
-from .logical_values import clear_logical_value, logical_value, write_logical_value
+from .input_values import clear_input_value, input_value, write_input_value
 
-# 优化器的零填充位置属于物化层兼容数据。
+# 优化器的零填充位置属于物化层专用数据。
 OPTIMIZER_APIS = {
     "paddle._C_ops.adamw_": {3: "zeros", 4: "zeros", 5: "zeros"},
     "paddle._C_ops.adam_": {3: "zeros", 4: "zeros", 5: "zeros"},
@@ -168,8 +168,8 @@ def generate_unique_array(num_items, float_dtype):
 class TensorConfig:
     """一次参数位置上的可变 Tensor 配置。
 
-    这个类同时承担三件事：保存参数元信息、缓存不同框架的物化结果，以及在
-    legacy/v2 混合阶段维持逻辑值与框架张量的一致性。
+    这个类同时承担三件事：保存参数元信息、缓存不同框架的物化结果，以及维护
+    逻辑值与框架张量的一致性。
     """
 
     def __init__(self, shape, dtype, place=None, is_contiguous=True, strides=None):
@@ -380,35 +380,29 @@ class TensorConfig:
         dtype = dtype or self.dtype
         if not self.is_contiguous and self.strides is not None:
             source_dtype = "float16" if dtype in FLOAT8_DTYPES else dtype
-            values = self._make_gpu_paddle_dense_tensor(source_dtype)
-            return self._make_gpu_strided_paddle_tensor_from_values(values, api_config, dtype)
-        return self._set_paddle_autograd(
-            self._make_gpu_paddle_dense_tensor(dtype), api_config, dtype
-        )
+            values = self._gpu_paddle_dense(source_dtype)
+            return self._gpu_strided_paddle(values, api_config, dtype)
+        return self._set_paddle_autograd(self._gpu_paddle_dense(dtype), api_config, dtype)
 
     def _make_gpu_torch_tensor(self, api_config, dtype=None):
         dtype = dtype or self.dtype
         if not self.is_contiguous and self.strides is not None:
             source_dtype = "float16" if dtype in FLOAT8_DTYPES else dtype
-            values = self._make_gpu_torch_dense_tensor(source_dtype)
-            return self._make_gpu_strided_torch_tensor_from_values(values, api_config, dtype)
-        return self._set_torch_autograd(self._make_gpu_torch_dense_tensor(dtype), api_config, dtype)
+            values = self._gpu_torch_dense(source_dtype)
+            return self._gpu_strided_torch(values, api_config, dtype)
+        return self._set_torch_autograd(self._gpu_torch_dense(dtype), api_config, dtype)
 
     def _make_gpu_tensor_pair(self, api_config, dtype=None):
         dtype = dtype or self.dtype
         source_dtype = "float16" if dtype in FLOAT8_DTYPES else dtype
-        torch_source = self._make_gpu_torch_dense_tensor(source_dtype)
+        torch_source = self._gpu_torch_dense(source_dtype)
         paddle_source = paddle.utils.dlpack.from_dlpack(
             torch.utils.dlpack.to_dlpack(torch_source.detach())
         )
         if not self.is_contiguous and self.strides is not None:
             try:
-                paddle_tensor = self._make_gpu_strided_paddle_tensor_from_values(
-                    paddle_source, api_config, dtype
-                )
-                torch_tensor = self._make_gpu_strided_torch_tensor_from_values(
-                    torch_source, api_config, dtype
-                )
+                paddle_tensor = self._gpu_strided_paddle(paddle_source, api_config, dtype)
+                torch_tensor = self._gpu_strided_torch(torch_source, api_config, dtype)
                 return paddle_tensor, torch_tensor
             finally:
                 del torch_source, paddle_source
@@ -493,15 +487,9 @@ class TensorConfig:
         cfg = self.get_arg(api_config, arg_pos, kwargs_name)
         if isinstance(cfg, TensorConfig):
             max_idx = len(cfg.shape)
-            return self.get_random_numpy_tensor([], data_type=self.dtype, min=0, max=max_idx)
+            return self.random_numpy([], data_type=self.dtype, min=0, max=max_idx)
         else:
             raise ValueError(f"Invalid axis config={cfg} in {api_config.api_name}")
-
-    def get_numpy_tensor(self, api_config, index=None, key=None, **kwargs):
-        raise RuntimeError(
-            "TensorConfig.get_numpy_tensor() has been retired; use APITestBase.gen_numpy_input() "
-            "and the v2 rule dispatcher instead."
-        )
 
     def get_paddle_tensor(self, api_config):
         if self.paddle_tensor is None:
@@ -518,7 +506,7 @@ class TensorConfig:
             if self._logical_numpy_tensor(api_config) is None and self._use_gpu(api_config):
                 return self.get_gpu_paddle_tensor(api_config)
             if not self.is_contiguous and self.strides is not None:
-                self.paddle_tensor = self._create_strided_paddle_tensor(api_config)
+                self.paddle_tensor = self._create_paddle_strided(api_config)
                 print(
                     f"[non-contiguous] target strides: {self.strides}, "
                     f"actual strides: {self.paddle_tensor.strides}, "
@@ -602,7 +590,7 @@ class TensorConfig:
             if self._logical_numpy_tensor(api_config) is None and self._use_gpu(api_config):
                 return self.get_gpu_torch_tensor(api_config)
             if not self.is_contiguous and self.strides is not None:
-                self.torch_tensor = self._create_strided_torch_tensor(api_config)
+                self.torch_tensor = self._create_torch_strided(api_config)
             else:
                 needs_cast = self.dtype in CAST_THROUGH_INTERMEDIATE_DTYPES
                 if needs_cast:
@@ -663,13 +651,12 @@ class TensorConfig:
         return tensor
 
     def _logical_numpy_tensor(self, api_config):
-        # 优先使用 RuleCase 的 payload；只有缺失时才回退到 legacy numpy_tensor。
-        return logical_value(api_config, self)
+        return input_value(api_config, self)
 
     def clear_tensor(self, api_config=None):
         if api_config is not None:
             # 清理 TensorConfig 时，也要清掉其关联的逻辑 payload。
-            clear_logical_value(api_config, self)
+            clear_input_value(api_config, self)
         self.torch_tensor = None
         self.paddle_tensor = None
         self.numpy_tensor = None
@@ -686,7 +673,7 @@ class TensorConfig:
 
     def clear_numpy_tensor(self, api_config=None):
         if api_config is not None:
-            clear_logical_value(api_config, self)
+            clear_input_value(api_config, self)
         del self.numpy_tensor
         self.numpy_tensor = None
 
@@ -755,12 +742,12 @@ class TensorConfig:
         # 未初始化时返回 None，因为 numpy_tensor 本身就是 None。
         if arg_pos is not None and 0 <= arg_pos < len(api_config.args):
             if isinstance(api_config.args[arg_pos], TensorConfig):
-                return logical_value(api_config, api_config.args[arg_pos])
+                return input_value(api_config, api_config.args[arg_pos])
             else:
                 return api_config.args[arg_pos]
         if arg_name and arg_name in api_config.kwargs:
             if isinstance(api_config.kwargs[arg_name], TensorConfig):
-                return logical_value(api_config, api_config.kwargs[arg_name])
+                return input_value(api_config, api_config.kwargs[arg_name])
             else:
                 return api_config.kwargs[arg_name]
         # 参数不在 api_config 中时返回 None。
@@ -787,20 +774,20 @@ class TensorConfig:
             and 0 <= arg_pos < len(api_config.args)
             and isinstance(api_config.args[arg_pos], TensorConfig)
         ):
-            write_logical_value(api_config, api_config.args[arg_pos], value)
+            write_input_value(api_config, api_config.args[arg_pos], value)
         elif (
             arg_name
             and arg_name in api_config.kwargs
             and isinstance(api_config.kwargs[arg_name], TensorConfig)
         ):
-            write_logical_value(api_config, api_config.kwargs[arg_name], value)
+            write_input_value(api_config, api_config.kwargs[arg_name], value)
         else:
             raise ValueError(
                 f"argument at position {arg_pos} or name '{arg_name}' is not of type TensorConfig."
             )
 
-    def get_random_numpy_tensor(self, shape=None, data_type=None, min=None, max=None):
-        """按 shape 和 dtype 生成位于 [min, max) 的随机 NumPy Tensor。"""
+    def random_numpy(self, shape=None, data_type=None, min=None, max=None):
+        """按 shape 和 dtype 生成位于 [min, max) 的随机 NumPy 数组。"""
         if "int" in data_type:
             min = min if min is not None else -65535
             max = max if max is not None else 65535
@@ -818,16 +805,3 @@ class TensorConfig:
             max = max if max is not None else numpy.finfo(dtype).max / 2
             numpy_tensor = (numpy.random.uniform(min, max, size=shape)).astype(dtype)
         return numpy_tensor
-
-
-TensorConfig.convert_dtype_to_torch_type = TensorConfig.to_torch_dtype
-TensorConfig._make_gpu_paddle_dense_tensor = TensorConfig._gpu_paddle_dense
-TensorConfig._make_gpu_torch_low_temp_dense_tensor = TensorConfig._gpu_torch_pat_dense
-TensorConfig._make_gpu_torch_dense_tensor = TensorConfig._gpu_torch_dense
-TensorConfig._make_gpu_strided_paddle_tensor_from_values = TensorConfig._gpu_strided_paddle
-TensorConfig._make_gpu_strided_torch_tensor_from_values = TensorConfig._gpu_strided_torch
-TensorConfig.get_random_axis_on_tensor = TensorConfig.random_axis
-TensorConfig._create_strided_paddle_tensor = TensorConfig._create_paddle_strided
-TensorConfig._create_strided_torch_tensor = TensorConfig._create_torch_strided
-TensorConfig.save_original_tensor_to_cpu = TensorConfig.save_cpu_copy
-TensorConfig.clear_original_cpu_tensor = TensorConfig.clear_cpu_copy
