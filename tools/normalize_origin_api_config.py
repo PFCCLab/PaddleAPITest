@@ -1,5 +1,5 @@
 # import os
-# from tester.api_config.input_generation.tensor_config import TensorConfig
+# from tester.input_generation.tensor_config import TensorConfig
 # from tester.api_config.parser import APIConfig
 
 # DIR_PATH = os.path.dirname(os.path.realpath(__file__))[0:os.path.dirname(os.path.realpath(__file__)).index("PaddleAPITest")+13]

@@ -14,7 +14,7 @@ from .input_path import InputPath
 from .tensor_config import TensorConfig
 from .tensor_view import TensorView
 
-BASE_CONFIG = Path(__file__).resolve().parents[2] / "base_config.yaml"
+BASE_CONFIG = Path(__file__).resolve().parents[1] / "base_config.yaml"
 
 # C-ops 别名映射留在这里，确保调度层不依赖 inspect 逻辑。
 COPS_PUBLIC_ALIASES = {

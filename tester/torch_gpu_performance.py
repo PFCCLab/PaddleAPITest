@@ -4,8 +4,8 @@ import time
 
 import torch
 
-from .api_config.input_generation.tensor_config import TensorConfig
 from .base import APITestBase
+from .input_generation.tensor_config import TensorConfig
 from .paddle_to_torch import ConversionKind, adaptive_workspace_bytes, get_converter
 
 

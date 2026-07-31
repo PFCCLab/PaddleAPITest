@@ -174,9 +174,9 @@ def init_logging(output_dir: Path) -> None:
 
 
 def install_stage_hooks(recorder: StageRecorder, mode: str) -> None:
-    from tester.api_config.input_generation.tensor_config import TensorConfig
     from tester.api_config.parser import APIConfig
     from tester.base import APITestBase
+    from tester.input_generation.tensor_config import TensorConfig
 
     patch_public_methods(APIConfig, recorder)
     patch_public_methods(TensorConfig, recorder)
@@ -314,7 +314,7 @@ def write_summary_csv(path: Path, values: dict[tuple[int, str], float], stages: 
 
 
 def write_cache_events_csv(path: Path) -> None:
-    from tester.api_config.input_generation import tensor_config
+    from tester.input_generation import tensor_config
 
     cached_numpy_events = getattr(tensor_config, "cached_numpy_events", [])
     cached_gpu_input_events = getattr(tensor_config, "cached_gpu_input_events", [])

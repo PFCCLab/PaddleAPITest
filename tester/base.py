@@ -11,12 +11,12 @@ import paddle
 import yaml
 
 from .api_config.dump_writer import DEFAULT_DUMP_DIR, DumpContext, dump_enabled
-from .api_config.input_generation.input_bind import (
+from .input_generation.input_bind import (
     bind_parameters,
     get_arg,
 )
-from .api_config.input_generation.input_values import input_value
-from .api_config.input_generation.tensor_config import (
+from .input_generation.input_values import input_value
+from .input_generation.tensor_config import (
     USE_CACHED_NUMPY,
     TensorConfig,
     get_cached_numpy_array,
@@ -821,7 +821,7 @@ class APITestBase:
         return tuple(processed_indices) if is_tuple else processed_indices
 
     def gen_numpy_input(self):
-        from .api_config.input_generation.dispatch import dispatch_input
+        from .input_generation.dispatch import dispatch_input
 
         return dispatch_input(self)
 

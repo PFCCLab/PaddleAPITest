@@ -4,8 +4,8 @@ import time
 
 import paddle
 
-from .api_config.input_generation.tensor_config import TensorConfig
 from .base import APITestBase
+from .input_generation.tensor_config import TensorConfig
 
 
 def tensor_numel(tensor_config):

@@ -43,7 +43,7 @@ def _generate_tensor_code_for_tensor(
 
 def _extract_tensor_config_from_item(config_item):
     """提取TensorConfig信息"""
-    from .api_config.input_generation.tensor_config import TensorConfig
+    from .input_generation.tensor_config import TensorConfig
 
     if isinstance(config_item, TensorConfig):
         return config_item
@@ -61,7 +61,7 @@ def _extract_tensor_configs(
     api_config, args_config, kwargs_config
 ) -> tuple[list[tuple[str, Any]], dict[str, Any]]:
     """从API配置中提取所有TensorConfig信息"""
-    from .api_config.input_generation.tensor_config import TensorConfig
+    from .input_generation.tensor_config import TensorConfig
 
     args_configs = []
     kwargs_configs = {}
@@ -127,7 +127,7 @@ def _generate_test_code(
         "import paddle",
         "import numpy",
         "import torch",
-        "from tester.api_config.input_generation.tensor_config import TensorConfig",
+        "from tester.input_generation.tensor_config import TensorConfig",
         "from tester.api_config.parser import APIConfig",
         "",
         f"# 创建API配置对象",
@@ -160,7 +160,7 @@ def _generate_test_code(
     all_inputs = []
     tensor_vars = {}
 
-    from .api_config.input_generation.tensor_config import TensorConfig
+    from .input_generation.tensor_config import TensorConfig
 
     for i, (var_name, tensor_config) in enumerate(args_configs):
         if isinstance(tensor_config, (list, tuple)):
@@ -442,7 +442,7 @@ def generate_reproducible_test_file(
                     if tensor_config is not None:
                         args_configs.append((f"arg_{i}", tensor_config))
                     else:
-                        from .api_config.input_generation.tensor_config import TensorConfig
+                        from .input_generation.tensor_config import TensorConfig
 
                         if not isinstance(arg_config, TensorConfig):
                             non_tensor_args.append((i, arg_config))
@@ -453,7 +453,7 @@ def generate_reproducible_test_file(
                     if tensor_config is not None:
                         kwargs_configs[key] = tensor_config
                     else:
-                        from .api_config.input_generation.tensor_config import TensorConfig
+                        from .input_generation.tensor_config import TensorConfig
 
                         if not isinstance(kwarg_config, TensorConfig):
                             non_tensor_kwargs[key] = kwarg_config

@@ -6,8 +6,8 @@ import paddle
 import torch
 from func_timeout import func_set_timeout
 
-from .api_config.input_generation.tensor_config import TensorConfig
 from .base import APITestBase
+from .input_generation.tensor_config import TensorConfig
 from .paddle_to_torch import ConversionKind, adaptive_workspace_bytes, get_converter
 
 

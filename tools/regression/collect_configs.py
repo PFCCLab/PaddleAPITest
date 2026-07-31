@@ -4,8 +4,8 @@ import argparse
 from collections import Counter, OrderedDict
 from pathlib import Path
 
-from tester.api_config.input_generation.registry import API_RULE_REGISTRY
 from tester.api_config.parser import APIConfig
+from tester.input_generation.registry import API_RULE_REGISTRY
 from tester.paddle_to_torch import get_converter
 
 DEFAULT_SOURCES = (

@@ -43,7 +43,7 @@ CAST_THROUGH_INTERMEDIATE_DTYPES = frozenset(["bfloat16"]) | FLOAT8_DTYPES
 
 
 def _load_forward_only_apis():
-    config_path = os.path.join(os.path.dirname(__file__), "..", "..", "base_config.yaml")
+    config_path = os.path.join(os.path.dirname(__file__), "..", "base_config.yaml")
     with open(config_path, encoding="utf-8") as f:
         return frozenset(yaml.safe_load(f).get("forward_only_apis", []))
 

@@ -2,8 +2,8 @@ from __future__ import annotations
 
 import random
 
-from tester.api_config.input_generation.tensor_config import TensorConfig
 from tester.api_config.parser import analyse_configs
+from tester.input_generation.tensor_config import TensorConfig
 from tqdm import tqdm
 
 

@@ -6,14 +6,17 @@ import collections
 import copy
 import math
 import re
+import sys
+from pathlib import Path
 
 import numpy
 import paddle
 
 if __package__:
-    from .input_generation.tensor_config import TensorConfig
+    from ..input_generation.tensor_config import TensorConfig
 else:
-    from input_generation.tensor_config import TensorConfig
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+    from tester.input_generation.tensor_config import TensorConfig
 
 
 class APIConfig:

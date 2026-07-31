@@ -6,8 +6,8 @@ from pathlib import Path
 
 import numpy
 import paddle
-from tester.api_config.input_generation.tensor_config import TensorConfig
 from tester.api_config.parser import analyse_configs
+from tester.input_generation.tensor_config import TensorConfig
 from tqdm import tqdm
 
 
