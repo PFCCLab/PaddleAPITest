@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from .model import ArgPath
+from .case_model import ArgPath
 
 
 @dataclass(frozen=True)
@@ -27,6 +27,7 @@ def _tensor_value_at_path(api_config, path: ArgPath):
 
 
 def attach_payloads(api_config, payloads):
+    # 同时保留有序 payload 和对象 id 索引：规则要顺序，物化要查找速度。
     payloads = tuple(payloads)
     payload_by_tensor_id = {}
     for payload in payloads:
@@ -48,6 +49,7 @@ def payload_for_tensor(api_config, tensor_config):
 
 
 def logical_value(api_config, tensor_config):
+    # v2 生成后以 payload 为准；numpy_tensor 只作为历史回退。
     payload = payload_for_tensor(api_config, tensor_config)
     if payload is not None:
         return payload.value
@@ -55,6 +57,7 @@ def logical_value(api_config, tensor_config):
 
 
 def write_logical_value(api_config, tensor_config, value, update_metadata=True):
+    # 同步 payload 与 TensorConfig，兼容混合的 legacy/v2 调用方。
     payload = payload_for_tensor(api_config, tensor_config)
     if payload is not None:
         old_payload = payload
@@ -74,6 +77,7 @@ def write_logical_value(api_config, tensor_config, value, update_metadata=True):
 
 
 def clear_logical_value(api_config, tensor_config):
+    # 旧调用方可能不带 payload 清理，这里按最佳努力处理。
     payload = payload_for_tensor(api_config, tensor_config)
     payload_by_tensor_id = getattr(api_config, _PAYLOAD_BY_TENSOR_ID_ATTR, None)
     if payload_by_tensor_id is not None:

@@ -11,7 +11,14 @@ import numpy
 import paddle
 import yaml
 
-from .signature_mappings import OPTIMIZER_APIS
+from .logical_values import clear_logical_value, logical_value, write_logical_value
+
+# 优化器的零填充位置属于物化层兼容数据。
+OPTIMIZER_APIS = {
+    "paddle._C_ops.adamw_": {3: "zeros", 4: "zeros", 5: "zeros"},
+    "paddle._C_ops.adam_": {3: "zeros", 4: "zeros", 5: "zeros"},
+    "paddle._C_ops.merged_adam_": {3: "zeros", 4: "zeros", 5: "zeros"},
+}
 
 
 class _LazyTorch:
@@ -159,6 +166,12 @@ def generate_unique_array(num_items, float_dtype):
 
 
 class TensorConfig:
+    """一次参数位置上的可变 Tensor 配置。
+
+    这个类同时承担三件事：保存参数元信息、缓存不同框架的物化结果，以及在
+    legacy/v2 混合阶段维持逻辑值与框架张量的一致性。
+    """
+
     def __init__(self, shape, dtype, place=None, is_contiguous=True, strides=None):
         self.shape = shape
         self.dtype = dtype
@@ -195,7 +208,7 @@ class TensorConfig:
     def __repr__(self):
         return self.__str__()
 
-    def convert_dtype_to_torch_type(self, dtype):
+    def to_torch_dtype(self, dtype):
         if dtype in ["float32", numpy.float32]:
             return torch.float32
         elif dtype in ["float16", numpy.float16]:
@@ -262,7 +275,7 @@ class TensorConfig:
             tensor = tensor.detach().requires_grad_(True)
         return tensor
 
-    def _make_gpu_paddle_dense_tensor(self, dtype=None):
+    def _gpu_paddle_dense(self, dtype=None):
         dtype = dtype or self.dtype
         shape = tuple(self.shape)
         if dtype == "bool":
@@ -277,9 +290,9 @@ class TensorConfig:
         base_dtype = "float16" if dtype in FLOAT8_DTYPES else "float32"
         return ((paddle.rand(shape, dtype=base_dtype) - 0.5) * 1.2).cast(dtype)
 
-    def _make_gpu_torch_low_temp_dense_tensor(self, dtype, pattern_dtype=None):
+    def _gpu_torch_pat_dense(self, dtype, pattern_dtype=None):
         pattern_dtype = pattern_dtype or torch.float32
-        torch_dtype = self.convert_dtype_to_torch_type(dtype)
+        torch_dtype = self.to_torch_dtype(dtype)
         shape = tuple(self.shape)
         device = torch.device("cuda", torch.cuda.current_device())
         tensor = torch.empty(shape, device=device, dtype=torch_dtype)
@@ -306,9 +319,9 @@ class TensorConfig:
                 offset = next_offset
         return tensor
 
-    def _make_gpu_torch_dense_tensor(self, dtype=None):
+    def _gpu_torch_dense(self, dtype=None):
         dtype = dtype or self.dtype
-        torch_dtype = self.convert_dtype_to_torch_type(dtype)
+        torch_dtype = self.to_torch_dtype(dtype)
         shape = tuple(self.shape)
         device = torch.device("cuda", torch.cuda.current_device())
         if dtype == "bool":
@@ -323,14 +336,14 @@ class TensorConfig:
             imag_part = (torch.rand(shape, device=device, dtype=real_dtype) - 0.5) * 1.2
             return (real_part + 1j * imag_part).to(dtype=torch_dtype)
         if dtype in FLOAT8_DTYPES:
-            return self._make_gpu_torch_low_temp_dense_tensor(dtype, pattern_dtype=torch.float16)
+            return self._gpu_torch_pat_dense(dtype, pattern_dtype=torch.float16)
         if dtype in ("float16", "bfloat16"):
-            return self._make_gpu_torch_low_temp_dense_tensor(dtype, pattern_dtype=torch.float32)
+            return self._gpu_torch_pat_dense(dtype, pattern_dtype=torch.float32)
         return ((torch.rand(shape, device=device, dtype=torch.float32) - 0.5) * 1.2).to(
             dtype=torch_dtype
         )
 
-    def _make_gpu_strided_paddle_tensor_from_values(self, values, api_config, dtype=None):
+    def _gpu_strided_paddle(self, values, api_config, dtype=None):
         dtype = dtype or self.dtype
         intermediate_dtype = "float16" if dtype in FLOAT8_DTYPES else dtype
         flat_tensor = paddle.zeros(
@@ -346,12 +359,10 @@ class TensorConfig:
             tensor = paddle.as_strided(flat_tensor, self.shape, self.strides)
         return self._set_paddle_autograd(tensor, api_config, dtype)
 
-    def _make_gpu_strided_torch_tensor_from_values(self, values, api_config, dtype=None):
+    def _gpu_strided_torch(self, values, api_config, dtype=None):
         dtype = dtype or self.dtype
         device = torch.device("cuda", torch.cuda.current_device())
-        intermediate_dtype = (
-            torch.float16 if dtype in FLOAT8_DTYPES else self.convert_dtype_to_torch_type(dtype)
-        )
+        intermediate_dtype = torch.float16 if dtype in FLOAT8_DTYPES else self.to_torch_dtype(dtype)
         flat_tensor = torch.zeros(
             self._strided_storage_size(),
             dtype=intermediate_dtype,
@@ -361,7 +372,7 @@ class TensorConfig:
         if self.numel() > 0:
             tensor.copy_(values.to(dtype=intermediate_dtype))
         if dtype in FLOAT8_DTYPES:
-            flat_tensor = flat_tensor.to(dtype=self.convert_dtype_to_torch_type(dtype))
+            flat_tensor = flat_tensor.to(dtype=self.to_torch_dtype(dtype))
             tensor = torch.as_strided(flat_tensor, tuple(self.shape), tuple(self.strides))
         return self._set_torch_autograd(tensor, api_config, dtype)
 
@@ -403,7 +414,7 @@ class TensorConfig:
                 del torch_source, paddle_source
         if dtype in FLOAT8_DTYPES:
             paddle_tensor = paddle_source.cast(dtype)
-            torch_tensor = torch_source.to(dtype=self.convert_dtype_to_torch_type(dtype))
+            torch_tensor = torch_source.to(dtype=self.to_torch_dtype(dtype))
             del torch_source, paddle_source
         else:
             paddle_tensor = paddle_source
@@ -442,7 +453,7 @@ class TensorConfig:
 
     def generate_random_axes(self, api_config):
         x_shape = self.get_arg(api_config, 0, "x").shape
-        max_dim = max(len(x_shape), 1)  # scalar
+        max_dim = max(len(x_shape), 1)  # 标量时至少按 1 维处理。
 
         if len(self.shape) == 0:
             dim = numpy.random.randint(0, max_dim)
@@ -478,7 +489,7 @@ class TensorConfig:
             f"Expected a 0-D or 1-D Tensor, but got shape {self.shape}."
         )
 
-    def get_random_axis_on_tensor(self, api_config, arg_pos, kwargs_name):
+    def random_axis(self, api_config, arg_pos, kwargs_name):
         cfg = self.get_arg(api_config, arg_pos, kwargs_name)
         if isinstance(cfg, TensorConfig):
             max_idx = len(cfg.shape)
@@ -549,8 +560,8 @@ class TensorConfig:
                 storage_size += (self.shape[i] - 1) * self.strides[i]
         return storage_size
 
-    def _create_strided_paddle_tensor(self, api_config):
-        """Create a non-contiguous paddle tensor from the shared logical numpy input."""
+    def _create_paddle_strided(self, api_config):
+        """基于共享逻辑 NumPy 输入创建非连续 Paddle Tensor。"""
         flag_name = "FLAGS_check_nan_inf"
         original_flag = paddle.get_flags([flag_name])
         paddle.set_flags({flag_name: False})
@@ -599,7 +610,7 @@ class TensorConfig:
                         torch.float32 if self.dtype == "bfloat16" else torch.float16
                     )
                 else:
-                    intermediate_torch_dtype = self.convert_dtype_to_torch_type(self.dtype)
+                    intermediate_torch_dtype = self.to_torch_dtype(self.dtype)
                 requires_grad = self._requires_autograd(api_config)
                 self.torch_tensor = torch.tensor(
                     self._logical_numpy_tensor(api_config),
@@ -607,9 +618,7 @@ class TensorConfig:
                     requires_grad=requires_grad and not needs_cast,
                 )
                 if needs_cast:
-                    self.torch_tensor = self.torch_tensor.to(
-                        dtype=self.convert_dtype_to_torch_type(self.dtype)
-                    )
+                    self.torch_tensor = self.torch_tensor.to(dtype=self.to_torch_dtype(self.dtype))
                     if requires_grad:
                         self.torch_tensor = self.torch_tensor.detach().requires_grad_(True)
         if TEST_NON_CONTIGUOUS:
@@ -621,14 +630,14 @@ class TensorConfig:
             return torch.permute(self.torch_tensor, self.shuffle_dims)
         return self.torch_tensor
 
-    def _create_strided_torch_tensor(self, api_config):
-        """Create a non-contiguous torch tensor from the shared logical numpy input."""
+    def _create_torch_strided(self, api_config):
+        """基于共享逻辑 NumPy 输入创建非连续 Torch Tensor。"""
         device = torch.device("cuda:0") if torch.cuda.is_available() else torch.device("cpu")
         needs_intermediate = self.dtype in FLOAT8_DTYPES
         if needs_intermediate:
             intermediate_torch_dtype = torch.float16
         else:
-            intermediate_torch_dtype = self.convert_dtype_to_torch_type(self.dtype)
+            intermediate_torch_dtype = self.to_torch_dtype(self.dtype)
 
         flat_tensor = torch.empty(
             self._strided_storage_size(),
@@ -646,7 +655,7 @@ class TensorConfig:
                 )
             )
         if self.dtype in FLOAT8_DTYPES:
-            flat_tensor = flat_tensor.to(dtype=self.convert_dtype_to_torch_type(self.dtype))
+            flat_tensor = flat_tensor.to(dtype=self.to_torch_dtype(self.dtype))
             tensor = torch.as_strided(flat_tensor, self.shape, self.strides)
 
         if self._requires_autograd(api_config):
@@ -654,14 +663,12 @@ class TensorConfig:
         return tensor
 
     def _logical_numpy_tensor(self, api_config):
-        from .payload import logical_value
-
+        # 优先使用 RuleCase 的 payload；只有缺失时才回退到 legacy numpy_tensor。
         return logical_value(api_config, self)
 
     def clear_tensor(self, api_config=None):
         if api_config is not None:
-            from .payload import clear_logical_value
-
+            # 清理 TensorConfig 时，也要清掉其关联的逻辑 payload。
             clear_logical_value(api_config, self)
         self.torch_tensor = None
         self.paddle_tensor = None
@@ -679,8 +686,6 @@ class TensorConfig:
 
     def clear_numpy_tensor(self, api_config=None):
         if api_config is not None:
-            from .payload import clear_logical_value
-
             clear_logical_value(api_config, self)
         del self.numpy_tensor
         self.numpy_tensor = None
@@ -691,8 +696,8 @@ class TensorConfig:
         if not is_gpu_mode():
             torch.cuda.empty_cache()
 
-    def save_original_tensor_to_cpu(self, api_config):
-        """Keep one immutable CPU copy used to recreate isolated test inputs."""
+    def save_cpu_copy(self, api_config):
+        """保留一份不可变 CPU 副本，用于重建隔离后的测试输入。"""
         if self.cpu_tensor is not None:
             return
         tensor = self.get_torch_tensor(api_config)
@@ -700,7 +705,7 @@ class TensorConfig:
         self.paddle_tensor = None
         self.torch_tensor = None
 
-    def clear_original_cpu_tensor(self):
+    def clear_cpu_copy(self):
         self.cpu_tensor = None
 
     def fill_numpy_tensor(self, full_value):
@@ -746,26 +751,22 @@ class TensorConfig:
         return default
 
     def get_initialized_value(self, api_config, arg_pos=None, arg_name=None):
-        """Get the initialized numpy_tensor value from the api_config instead of the TensorConfig"""
-        # for uninitialized numpy_tensor, return None implicitly as numpy_tensor is None
+        """从 api_config 中取已初始化的 numpy_tensor，而不是直接读当前 TensorConfig。"""
+        # 未初始化时返回 None，因为 numpy_tensor 本身就是 None。
         if arg_pos is not None and 0 <= arg_pos < len(api_config.args):
             if isinstance(api_config.args[arg_pos], TensorConfig):
-                from .payload import logical_value
-
                 return logical_value(api_config, api_config.args[arg_pos])
             else:
                 return api_config.args[arg_pos]
         if arg_name and arg_name in api_config.kwargs:
             if isinstance(api_config.kwargs[arg_name], TensorConfig):
-                from .payload import logical_value
-
                 return logical_value(api_config, api_config.kwargs[arg_name])
             else:
                 return api_config.kwargs[arg_name]
-        # for args that does not appear in api_config
+        # 参数不在 api_config 中时返回 None。
         if arg_pos >= len(api_config.args) or arg_name not in api_config.kwargs:
             return None
-        # error case
+        # 下面处理参数不合法的错误分支。
         if arg_pos is None and arg_name is None:
             raise ValueError("either arg_pos or arg_name must be provided.")
         elif arg_pos:
@@ -774,10 +775,10 @@ class TensorConfig:
                     f"argument position {arg_pos} is out of range for api_config with {len(api_config.args)} arguments."
                 )
             else:
-                # case type(api_config.args[arg_pos]) != TensorConfig:
+                # args[arg_pos] 不是 TensorConfig。
                 raise TypeError(f"argument at position {arg_pos} is not of type TensorConfig.")
         else:
-            # case type(api_config.kwargs[arg_name]) != TensorConfig:
+            # kwargs[arg_name] 不是 TensorConfig。
             raise TypeError(f"argument '{arg_name}' is not of type TensorConfig.")
 
     def set_tensor_arg_value(self, api_config, arg_pos=None, arg_name=None, value=None):
@@ -786,16 +787,12 @@ class TensorConfig:
             and 0 <= arg_pos < len(api_config.args)
             and isinstance(api_config.args[arg_pos], TensorConfig)
         ):
-            from .payload import write_logical_value
-
             write_logical_value(api_config, api_config.args[arg_pos], value)
         elif (
             arg_name
             and arg_name in api_config.kwargs
             and isinstance(api_config.kwargs[arg_name], TensorConfig)
         ):
-            from .payload import write_logical_value
-
             write_logical_value(api_config, api_config.kwargs[arg_name], value)
         else:
             raise ValueError(
@@ -803,7 +800,7 @@ class TensorConfig:
             )
 
     def get_random_numpy_tensor(self, shape=None, data_type=None, min=None, max=None):
-        """Generate a random numpy tensor with data in [min, max) given shape and data_type"""
+        """按 shape 和 dtype 生成位于 [min, max) 的随机 NumPy Tensor。"""
         if "int" in data_type:
             min = min if min is not None else -65535
             max = max if max is not None else 65535
@@ -821,3 +818,16 @@ class TensorConfig:
             max = max if max is not None else numpy.finfo(dtype).max / 2
             numpy_tensor = (numpy.random.uniform(min, max, size=shape)).astype(dtype)
         return numpy_tensor
+
+
+TensorConfig.convert_dtype_to_torch_type = TensorConfig.to_torch_dtype
+TensorConfig._make_gpu_paddle_dense_tensor = TensorConfig._gpu_paddle_dense
+TensorConfig._make_gpu_torch_low_temp_dense_tensor = TensorConfig._gpu_torch_pat_dense
+TensorConfig._make_gpu_torch_dense_tensor = TensorConfig._gpu_torch_dense
+TensorConfig._make_gpu_strided_paddle_tensor_from_values = TensorConfig._gpu_strided_paddle
+TensorConfig._make_gpu_strided_torch_tensor_from_values = TensorConfig._gpu_strided_torch
+TensorConfig.get_random_axis_on_tensor = TensorConfig.random_axis
+TensorConfig._create_strided_paddle_tensor = TensorConfig._create_paddle_strided
+TensorConfig._create_strided_torch_tensor = TensorConfig._create_torch_strided
+TensorConfig.save_original_tensor_to_cpu = TensorConfig.save_cpu_copy
+TensorConfig.clear_original_cpu_tensor = TensorConfig.clear_cpu_copy

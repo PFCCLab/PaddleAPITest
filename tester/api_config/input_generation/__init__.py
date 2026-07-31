@@ -1,6 +1,6 @@
-"""Test input generation, configuration, and materialization primitives."""
+"""输入生成、配置与物化的基础原语。"""
 
-from .payload import TensorPayload
+from .logical_values import TensorPayload
 from .tensor_config import (
     USE_CACHED_NUMPY,
     TensorConfig,

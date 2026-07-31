@@ -1,4 +1,4 @@
-"""Decorator registry for migrated input-generation rules."""
+"""迁移后输入生成规则的装饰器注册中心。"""
 
 from __future__ import annotations
 
@@ -10,37 +10,37 @@ from dataclasses import dataclass
 
 import numpy
 
-from .model import GenerationContext, TensorSpec
-from .payload import TensorPayload, attach_payloads
+from .case_model import GenerationContext, TensorSpec
+from .logical_values import TensorPayload, attach_payloads
 from .tensor_config import not_zero_apis
-from .value_generators import (
+from .value_sampling import (
     create_case_rng,
-    generate_abs_unit_plus_one,
-    generate_binary_0_1,
+    generate_abs_plus_one,
+    generate_binary01,
     generate_default,
-    generate_dropout_probability,
+    generate_dropout_prob,
     generate_empty_shape,
-    generate_full_fill_value,
-    generate_hinge_labels,
-    generate_int_minus127_127_else_default,
-    generate_int_one_128,
-    generate_int_one_2048,
-    generate_int_one_65535_no_cast,
-    generate_int_zero_64,
-    generate_int_zero_1024,
-    generate_int_zero_2048_no_cast,
-    generate_int_zero_65535_else_unit,
-    generate_legacy_random_range,
+    generate_fill_value,
+    generate_hinge_label,
+    generate_int_64,
+    generate_int_128,
+    generate_int_1024,
+    generate_int_2048,
+    generate_int_2048_raw,
+    generate_int_65535_raw,
+    generate_int_or_default,
+    generate_int_or_unit,
     generate_multiply,
     generate_nonzero,
     generate_normal_std,
     generate_ones_shape,
-    generate_quantile_q,
-    generate_remainder_rhs,
-    generate_signed_half_interval,
+    generate_quantile,
+    generate_random_range,
+    generate_remainder,
+    generate_signed_half,
     generate_uniform,
     generate_unit_interval,
-    generate_unit_interval_plus_one,
+    generate_unit_plus_one,
 )
 
 ValueGenerator = Callable[..., numpy.ndarray]
@@ -50,48 +50,46 @@ FallbackFunction = Callable[[GenerationContext], str | None]
 _RAW_WRITE = object()
 
 
+# 这些描述符字符串要保持稳定，因为规则体直接依赖它们。
 _VALUE_GENERATORS: dict[str, ValueGenerator] = {
     "default": lambda spec, low, high, rng: generate_default(spec, rng),
     "nonzero": lambda spec, low, high, rng: generate_nonzero(spec, rng),
     "unit_interval": lambda spec, low, high, rng: generate_unit_interval(spec, rng),
     "multiply": lambda spec, low, high, rng: generate_multiply(spec, rng),
-    "unit_interval_plus_one": lambda spec, low, high, rng: generate_unit_interval_plus_one(
-        spec, rng
-    ),
-    "signed_half_interval": lambda spec, low, high, rng: generate_signed_half_interval(spec, rng),
+    "unit_interval_plus_one": lambda spec, low, high, rng: generate_unit_plus_one(spec, rng),
+    "signed_half_interval": lambda spec, low, high, rng: generate_signed_half(spec, rng),
     "normal_std": lambda spec, low, high, rng: generate_normal_std(spec, rng),
-    "dropout_probability": lambda spec, low, high, rng: generate_dropout_probability(spec, rng),
-    "full_fill_value": lambda spec, low, high, rng: generate_full_fill_value(spec, rng),
-    "quantile_q": lambda spec, low, high, rng: generate_quantile_q(spec, rng),
-    "remainder_rhs": lambda spec, low, high, rng: generate_remainder_rhs(spec, rng),
-    "int_zero_1024": lambda spec, low, high, rng: generate_int_zero_1024(spec, rng),
-    "int_zero_64": lambda spec, low, high, rng: generate_int_zero_64(spec, rng),
-    "int_zero_2048_no_cast": lambda spec, low, high, rng: generate_int_zero_2048_no_cast(spec, rng),
+    "dropout_probability": lambda spec, low, high, rng: generate_dropout_prob(spec, rng),
+    "full_fill_value": lambda spec, low, high, rng: generate_fill_value(spec, rng),
+    "quantile_q": lambda spec, low, high, rng: generate_quantile(spec, rng),
+    "remainder_rhs": lambda spec, low, high, rng: generate_remainder(spec, rng),
+    "int_zero_1024": lambda spec, low, high, rng: generate_int_1024(spec, rng),
+    "int_zero_64": lambda spec, low, high, rng: generate_int_64(spec, rng),
+    "int_zero_2048_no_cast": lambda spec, low, high, rng: generate_int_2048_raw(spec, rng),
     "empty_shape": lambda spec, low, high, rng: generate_empty_shape(spec, rng),
-    "int_one_128": lambda spec, low, high, rng: generate_int_one_128(spec, rng),
-    "int_one_2048": lambda spec, low, high, rng: generate_int_one_2048(spec, rng),
-    "int_one_65535_no_cast": lambda spec, low, high, rng: generate_int_one_65535_no_cast(spec, rng),
+    "int_one_128": lambda spec, low, high, rng: generate_int_128(spec, rng),
+    "int_one_2048": lambda spec, low, high, rng: generate_int_2048(spec, rng),
+    "int_one_65535_no_cast": lambda spec, low, high, rng: generate_int_65535_raw(spec, rng),
     "ones_shape": lambda spec, low, high, rng: generate_ones_shape(spec, rng),
-    "int_zero_65535_else_unit": lambda spec, low, high, rng: generate_int_zero_65535_else_unit(
+    "int_zero_65535_else_unit": lambda spec, low, high, rng: generate_int_or_unit(spec, rng),
+    "int_minus127_127_else_default": lambda spec, low, high, rng: generate_int_or_default(
         spec, rng
     ),
-    "int_minus127_127_else_default": lambda spec,
-    low,
-    high,
-    rng: generate_int_minus127_127_else_default(spec, rng),
-    "binary_0_1": lambda spec, low, high, rng: generate_binary_0_1(spec, rng),
-    "hinge_labels": lambda spec, low, high, rng: generate_hinge_labels(spec, rng),
-    "abs_unit_plus_one": lambda spec, low, high, rng: generate_abs_unit_plus_one(spec, rng),
+    "binary_0_1": lambda spec, low, high, rng: generate_binary01(spec, rng),
+    "hinge_labels": lambda spec, low, high, rng: generate_hinge_label(spec, rng),
+    "abs_unit_plus_one": lambda spec, low, high, rng: generate_abs_plus_one(spec, rng),
     "uniform": lambda spec, low, high, rng: generate_uniform(spec, low, high, rng),
-    "legacy_random_range": lambda spec, low, high, rng: generate_legacy_random_range(
-        spec, low, high, rng
-    ),
+    "random_range": lambda spec, low, high, rng: generate_random_range(spec, low, high, rng),
 }
 
 
 @dataclass(frozen=True)
 class RegisteredRule:
-    """One decorator-registered case rule."""
+    """一条通过装饰器注册的 case 级规则。
+
+    这里保存的是规则的元信息和执行入口，不保存 API 约束逻辑本身。
+    规则函数负责描述参数关系，`RegisteredRule` 负责门控、完整性检查和提交。
+    """
 
     api_names: tuple[str, ...]
     function: RuleFunction
@@ -107,6 +105,7 @@ class RegisteredRule:
     def fallback_reason(self, context: GenerationContext) -> str | None:
         from .tensor_config import USE_CACHED_NUMPY
 
+        # 先做阻断判断，避免在失败路径上消耗 RNG。
         if context.gpu_enabled and not self.allow_gpu:
             return f"{self.fallback_key}-strategy-gpu-not-migrated"
 
@@ -119,6 +118,7 @@ class RegisteredRule:
     def generate(self, context: GenerationContext, case: object) -> bool:
         rule_case = RuleCase(context, case)
         self.function(context, rule_case)
+        # 只有所有 TensorConfig 都产出逻辑值，规则才算完成。
         rule_case.require_complete()
         attach_payloads(case, rule_case.payload_items())
         rule_case.rng.commit()
@@ -126,13 +126,19 @@ class RegisteredRule:
 
 
 class RuleCase:
-    """Mutable case helper exposed to decorator-registered rules."""
+    """规则编写时可操作的 case 视图。
+
+    `RuleCase` 负责把一次 API 调用中的所有 TensorConfig、随机状态和逻辑值操作串起来。
+    它让规则作者只关心“生成什么值”，而不需要关心 payload 存储、去重和提交时机。
+    """
 
     def __init__(self, context: GenerationContext, raw_case: object):
         self.context = context
         self.raw_case = raw_case
         self.rng = create_case_rng(context)
+        # 用路径去重，避免同一个 Tensor 被重复写入。
         self._generated_paths = set()
+        # payload 以 ArgPath 为键，物化层只消费逻辑值。
         self._payload_by_path: dict[object, TensorPayload] = {}
 
     def generate_all(self, generator: str, low=None, high=None):
@@ -166,6 +172,7 @@ class RuleCase:
     def generate_by_parameter(
         self, parameter_generators, default: str | CaseValueGenerator | None = None
     ):
+        # 遍历顺序必须保持 BoundCall.tensors 的顺序，才能复现历史 RNG 结果。
         normalized = []
         for parameter_name, generator in parameter_generators:
             names = (parameter_name,) if isinstance(parameter_name, str) else tuple(parameter_name)
@@ -182,6 +189,7 @@ class RuleCase:
                 self._generate_binding(binding, generator)
 
     def require_complete(self):
+        # 缺失值应当视为规则 bug，而不是交给物化层补默认值。
         missing = [
             str(binding.path)
             for binding in self.context.call.tensors
@@ -225,6 +233,7 @@ class RuleCase:
         self._payload_by_path[binding.path] = TensorPayload(
             binding.path, value, update_metadata=False
         )
+        # 原始写入保留 TensorConfig 元数据，专给少量历史边界路径使用。
         _apply_value_raw(self.raw_case, binding.path, value, update_metadata=False)
         self._generated_paths.add(binding.path)
         return _RAW_WRITE
@@ -245,7 +254,7 @@ class RuleCase:
         payload = self.payload(binding)
         if payload is not None:
             return payload.value
-        from .payload import logical_value
+        from .logical_values import logical_value
 
         config = _tensor_config_at(self.raw_case, binding.path)
         return logical_value(self.raw_case, config)
@@ -385,7 +394,7 @@ class RuleCase:
 
 
 class RuleRegistry:
-    """Fail-fast decorator registry."""
+    """失败即止的装饰器注册表。"""
 
     def __init__(self):
         self._rules: list[RegisteredRule] = []
@@ -445,7 +454,7 @@ def _normalize_names(values, field_name: str) -> tuple[str, ...]:
     return names
 
 
-def _max_unpool_pool_input_size(
+def _max_unpool_input_size(
     api_name: str,
     x_shape,
     unpool_output_size,
@@ -497,7 +506,7 @@ def _max_unpool_pool_input_size(
     return kernel_size, stride, padding, pool_input_size
 
 
-def _optimizer_beta_pow_value(case: RuleCase, binding, beta, step):
+def _optimizer_beta_pow(case: RuleCase, binding, beta, step):
     import paddle
 
     use_accuracy_compatible = paddle.get_flags("FLAGS_use_accuracy_compatible_kernel")[
@@ -538,13 +547,13 @@ def variable_length_memory_efficient_attention_values(ctx: GenerationContext, ca
     def seq_lens_value(binding):
         query = case.arg(0, "query")
         q_seq_len = query.shape[2]
-        return case.value_domain("legacy_random_range", binding, 1, q_seq_len)
+        return case.value_domain("random_range", binding, 1, q_seq_len)
 
     def kv_seq_lens_value(binding):
         key = case.arg(1, "key")
         value = case.arg(2, "value")
         max_seq_len = min(key.shape[2], value.shape[2])
-        return case.value_domain("legacy_random_range", binding, 1, max_seq_len)
+        return case.value_domain("random_range", binding, 1, max_seq_len)
 
     def mask_value(binding):
         return case.randint(0, 2, size=binding.spec.shape).astype(
@@ -626,15 +635,13 @@ def block_multihead_attention_values(ctx: GenerationContext, case: RuleCase):
         elif binding.parameter_name == "padding_offsets":
             set_padding_offsets(binding)
         elif binding.parameter_name in positive_range_parameters:
-            case.set_value(binding, case.value_domain("legacy_random_range", binding, low=0))
+            case.set_value(binding, case.value_domain("random_range", binding, low=0))
         elif binding.parameter_name == "max_enc_len_this_time":
             case.set_value(binding, seq_len_array(binding))
         elif binding.parameter_name in {"mask", "tgt_mask"}:
             case.set_value(
                 binding,
-                case.value_domain(
-                    "legacy_random_range", binding, high=case.dtype_eps(binding.spec.dtype)
-                ),
+                case.value_domain("random_range", binding, high=case.dtype_eps(binding.spec.dtype)),
             )
         else:
             case.set_value(binding, case.value_domain("default", binding))
@@ -663,7 +670,7 @@ def optimizer_values(ctx: GenerationContext, case: RuleCase):
             beta = case.arg(10, "beta1")
             if binding.parameter_name == "beta2_pow":
                 beta = case.arg(11, "beta2")
-            return _optimizer_beta_pow_value(case, binding, beta, optimizer_step)
+            return _optimizer_beta_pow(case, binding, beta, optimizer_step)
         return case.value_domain("default", binding)
 
     case.generate_all(generate_value)
@@ -686,7 +693,7 @@ def max_unpool_values(ctx: GenerationContext, case: RuleCase):
     stride = case.arg(3, "stride")
     padding = case.arg(4, "padding")
     output_size = case.arg(5, "output_size")
-    kernel_size, stride, padding, pool_input_size = _max_unpool_pool_input_size(
+    kernel_size, stride, padding, pool_input_size = _max_unpool_input_size(
         case.api_name,
         x_binding.spec.shape,
         output_size,
@@ -702,7 +709,7 @@ def max_unpool_values(ctx: GenerationContext, case: RuleCase):
         is_contiguous=x_binding.spec.is_contiguous,
         strides=x_binding.spec.strides,
     )
-    pool_input = generate_legacy_random_range(pool_input_spec, low=-5, high=5, rng=case.rng)
+    pool_input = generate_random_range(pool_input_spec, low=-5, high=5, rng=case.rng)
     x = paddle.to_tensor(pool_input)
     pool_name = case.api_name.rsplit(".", 1)[-1].replace("max_unpool", "max_pool")
     max_poolxd_func = getattr(paddle.nn.functional, pool_name)
@@ -746,7 +753,7 @@ def arange_values(ctx: GenerationContext, case: RuleCase):
             return case.randint(low, high, size=tensor_config.shape).astype(tensor_config.dtype)
         return case.uniform(low, high, size=tensor_config.shape).astype(tensor_config.dtype)
 
-    def run_legacy_arange_branch():
+    def handle_arange_relation():
         start_val = case.arg(0, "start", 0)
         end_val = case.arg(1, "end", None)
         step_val = case.arg(2, "step", 1)
@@ -815,7 +822,7 @@ def arange_values(ctx: GenerationContext, case: RuleCase):
 
     for binding in ctx.call.tensors:
         if case.value(binding) is None:
-            run_legacy_arange_branch()
+            handle_arange_relation()
 
 
 @rules.register("paddle.nn.functional.moe_permute")
@@ -1096,22 +1103,22 @@ def clip_values(ctx: GenerationContext, case: RuleCase):
     max_config = case.arg(2, "max")
 
     if case.is_tensor_config(min_config) and case.is_tensor_config(max_config):
-        min_value = case.value_domain("legacy_random_range", min_binding)
-        max_value = case.value_domain("legacy_random_range", max_binding, low=min_value)
+        min_value = case.value_domain("random_range", min_binding)
+        max_value = case.value_domain("random_range", max_binding, low=min_value)
         case.set_value(min_binding, min_value)
         case.set_value(max_binding, max_value)
     elif min_config is not None and max_config is not None:
         if case.is_tensor_config(min_config) and isinstance(max_config, (int, float)):
-            min_value = case.value_domain("legacy_random_range", min_binding, high=max_config)
+            min_value = case.value_domain("random_range", min_binding, high=max_config)
             case.set_value(min_binding, min_value)
         elif case.is_tensor_config(max_config) and isinstance(min_config, (int, float)):
-            max_value = case.value_domain("legacy_random_range", max_binding, low=min_config)
+            max_value = case.value_domain("random_range", max_binding, low=min_config)
             case.set_value(max_binding, max_value)
 
     if x_binding is not None:
         case.set_value(
             x_binding,
-            case.value_domain("legacy_random_range", x_binding),
+            case.value_domain("random_range", x_binding),
         )
     case.generate_remaining("default")
 
@@ -1515,7 +1522,7 @@ def repeat_interleave_values(ctx: GenerationContext, case: RuleCase):
     ),
 )
 def put_along_axis_values(ctx: GenerationContext, case: RuleCase):
-    def legacy_random(binding, shape):
+    def random_tensor_value(binding, shape):
         scalar_spec = TensorSpec(
             shape=tuple(shape),
             dtype=binding.spec.dtype,
@@ -1523,7 +1530,7 @@ def put_along_axis_values(ctx: GenerationContext, case: RuleCase):
             is_contiguous=binding.spec.is_contiguous,
             strides=binding.spec.strides,
         )
-        return generate_legacy_random_range(scalar_spec, rng=case.rng)
+        return generate_random_range(scalar_spec, rng=case.rng)
 
     def indices_value(binding):
         x_tensor = case.arg(0, "arr", case.arg(0, "x"))
@@ -1567,12 +1574,12 @@ def put_along_axis_values(ctx: GenerationContext, case: RuleCase):
                         binding,
                         case.full(
                             indices.shape,
-                            legacy_random(binding, ())[()],
+                            random_tensor_value(binding, ())[()],
                             dtype=binding.spec.dtype,
                         ),
                     )
-                return case.set_value_raw(binding, legacy_random(binding, indices.shape))
-            return legacy_random(binding, binding.spec.shape)
+                return case.set_value_raw(binding, random_tensor_value(binding, indices.shape))
+            return random_tensor_value(binding, binding.spec.shape)
         return case.value_domain("default", binding)
 
     case.generate_by_parameter(
@@ -1600,7 +1607,7 @@ def softmax_values(ctx: GenerationContext, case: RuleCase):
 
     case.generate_by_parameter(
         (
-            ("x", "legacy_random_range"),
+            ("x", "random_range"),
             ("axis", axis_value),
         ),
         default="default",
@@ -1614,7 +1621,7 @@ def zeropad2d_values(ctx: GenerationContext, case: RuleCase):
 
     case.generate_by_parameter(
         (
-            ("x", "legacy_random_range"),
+            ("x", "random_range"),
             ("padding", padding_value),
         ),
         default="default",
@@ -1653,7 +1660,7 @@ def shard_index_values(ctx: GenerationContext, case: RuleCase):
 @rules.register("paddle.incubate.nn.functional.masked_multihead_attention")
 def masked_multihead_attention_values(ctx: GenerationContext, case: RuleCase):
     def sequence_lengths(binding):
-        return case.value_domain("legacy_random_range", binding, low=1)
+        return case.value_domain("random_range", binding, low=1)
 
     def rotary_tensor(binding):
         return case.value_domain("uniform", binding, low=0, high=1000)
@@ -2819,7 +2826,7 @@ def cholesky_solve_values(ctx: GenerationContext, case: RuleCase):
         return
 
     def y_value(binding):
-        value = case.value_domain("legacy_random_range", binding)
+        value = case.value_domain("random_range", binding)
         if case.arg(2, "upper"):
             return case.triu(value)
         return case.tril(value)
@@ -2905,11 +2912,11 @@ def pow_values(ctx: GenerationContext, case: RuleCase):
         if isinstance(const, numbers.Number):
             value_max = get_max(const, case.dtype_max(dtype), default_max)
             if is_base_arg and int(const) != const:
-                return case.value_domain("legacy_random_range", binding, low=0, high=value_max)
-            return case.value_domain("legacy_random_range", binding, low=-value_max, high=value_max)
+                return case.value_domain("random_range", binding, low=0, high=value_max)
+            return case.value_domain("random_range", binding, low=-value_max, high=value_max)
         if is_base_arg:
-            return case.value_domain("legacy_random_range", binding, low=0, high=default_max)
-        return case.value_domain("legacy_random_range", binding, low=-default_max, high=default_max)
+            return case.value_domain("random_range", binding, low=0, high=default_max)
+        return case.value_domain("random_range", binding, low=-default_max, high=default_max)
 
     case.generate_all(value)
 
@@ -3148,6 +3155,7 @@ def _apply_value(case, path, value):
 
 def _apply_value_raw(case, path, value, update_metadata):
     config = _tensor_config_at(case, path)
+    # 兼容物化层仍会查看 TensorConfig 上的 index/key/list_index。
     if path.root == "args":
         config.index = path.key
     else:

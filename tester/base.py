@@ -10,8 +10,8 @@ import paddle
 import yaml
 
 from .api_config.dump_writer import DEFAULT_DUMP_DIR, DumpContext, dump_enabled
-from .api_config.input_generation.signature_mappings import (
-    bind_api_arguments,
+from .api_config.input_generation.signature_binding import (
+    bind_args,
     get_arg,
 )
 from .api_config.input_generation.tensor_config import (
@@ -429,7 +429,7 @@ class APITestBase:
             self.torch_args_config = self.api_config.args
             return True
 
-        resolution = bind_api_arguments(
+        resolution = bind_args(
             api_name,
             self.api_config.args,
             self.api_config.kwargs,
@@ -637,9 +637,9 @@ class APITestBase:
         return tuple(processed_indices) if is_tuple else processed_indices
 
     def gen_numpy_input(self):
-        from .api_config.input_generation.dispatcher import dispatch_input_generation
+        from .api_config.input_generation.dispatch import dispatch_input
 
-        return dispatch_input_generation(self)
+        return dispatch_input(self)
 
     def _handle_list_or_tuple_paddle(self, config_items, is_tuple=False):
         """处理 list 或 tuple"""

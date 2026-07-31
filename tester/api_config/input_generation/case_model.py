@@ -1,4 +1,4 @@
-"""Immutable models used by the input generation pipeline."""
+"""输入生成管线使用的不可变数据模型。"""
 
 from __future__ import annotations
 
@@ -8,6 +8,9 @@ from dataclasses import dataclass
 
 @dataclass(frozen=True)
 class ArgPath:
+    """一次 API 调用中 Tensor 的稳定路径标识。"""
+
+    # 这个路径不受 TensorConfig 可变字段影响，规则和 payload 都依赖它。
     root: str
     key: int | str
     indices: tuple[int, ...] = ()
@@ -47,6 +50,9 @@ class ArgPath:
 
 @dataclass(frozen=True)
 class TensorSpec:
+    """供值生成器消费的 TensorConfig 只读快照。"""
+
+    # 这里只保留值域生成需要的字段，避免规则直接触碰可变 TensorConfig。
     shape: tuple[int, ...]
     dtype: str
     place: str | None
@@ -83,6 +89,9 @@ class TensorBinding:
 
 @dataclass(frozen=True)
 class BoundCall:
+    """规则侧看到的一次 APIConfig 绑定结果。"""
+
+    # 规则只读取这个对象，不再自己做签名解析或参数重排。
     api_name: str
     binding_source: str
     parameter_bindings: tuple[ParameterBinding, ...]
@@ -105,6 +114,9 @@ class BoundCall:
 
 @dataclass(frozen=True)
 class GenerationContext:
+    """一次 case 的运行时上下文。"""
+
+    # 运行时标志在这里一次性快照，规则不应直接读全局状态。
     call: BoundCall
     config_fingerprint: str
     seed: int
@@ -118,7 +130,7 @@ class GenerationContext:
         call,
         config_text,
         seed=0,
-        runtime_mode="legacy",
+        runtime_mode="v2",
         use_torch=True,
         gpu_enabled=False,
     ):
