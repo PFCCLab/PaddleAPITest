@@ -26,7 +26,7 @@ Expected: all ten package files appear under `tester/input_generation/`, and `te
 - [ ] **Step 2: Confirm internal imports remain package-relative**
 
 ```bash
-rg -n 'from \.|import \' tester/input_generation --glob '*.py'
+rg -n '^(from \.|import )' tester/input_generation --glob '*.py'
 ```
 
 Expected: internal imports refer only to sibling modules and do not mention `tester.api_config.input_generation`.
@@ -163,4 +163,3 @@ git status --short --branch
 ```
 
 Expected: no whitespace errors, only the planned path migration is present, and no unresolved or untracked migration artifacts remain.
-
