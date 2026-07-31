@@ -121,6 +121,7 @@ class RegisteredRule:
         self.function(context, rule_case)
         rule_case.require_complete()
         attach_payloads(case, rule_case.payload_items())
+        rule_case.rng.commit()
         return True
 
 
@@ -241,8 +242,13 @@ class RuleCase:
         return None
 
     def value(self, binding):
+        payload = self.payload(binding)
+        if payload is not None:
+            return payload.value
+        from .payload import logical_value
+
         config = _tensor_config_at(self.raw_case, binding.path)
-        return config.numpy_tensor
+        return logical_value(self.raw_case, config)
 
     def payload(self, binding):
         return self._payload_by_path.get(binding.path)
@@ -308,8 +314,8 @@ class RuleCase:
     def full(self, shape, fill_value, dtype=None):
         return numpy.full(shape, fill_value, dtype=dtype)
 
-    def choice(self, values, size=None, replace=True):
-        return self.rng.choice(values, size=size, replace=replace)
+    def choice(self, values, size=None, replace=True, p=None):
+        return self.rng.choice(values, size=size, replace=replace, p=p)
 
     def python_choice(self, values):
         return random.choice(values)
@@ -439,49 +445,6 @@ def _normalize_names(values, field_name: str) -> tuple[str, ...]:
     return names
 
 
-def _dropout_fallback(context: GenerationContext) -> str | None:
-    if any(binding.parameter_name == "axis" for binding in context.call.tensors):
-        return "dropout-strategy-axis-not-migrated"
-    return None
-
-
-def _bincount_fallback(context: GenerationContext) -> str | None:
-    for binding in context.call.tensors:
-        if binding.parameter_name in {"x", "minlength"} and "int" not in binding.spec.dtype:
-            return "paddle.bincount-non-int-tensor-not-migrated"
-    return None
-
-
-def _repeat_interleave_fallback(context: GenerationContext) -> str | None:
-    if any(binding.parameter_name == "axis" for binding in context.call.tensors):
-        return "repeat_interleave-axis-not-migrated"
-    return None
-
-
-def _unflatten_fallback(context: GenerationContext) -> str | None:
-    if any(binding.parameter_name == "shape" for binding in context.call.tensors):
-        return "unflatten-shape-not-migrated"
-    return None
-
-
-def _conv2d_transpose_fallback(context: GenerationContext) -> str | None:
-    if any(binding.parameter_name == "output_size" for binding in context.call.tensors):
-        return "conv2d-transpose-output-size-not-migrated"
-    return None
-
-
-def _generate_proposals_fallback(context: GenerationContext) -> str | None:
-    if any(binding.parameter_name == "variances" for binding in context.call.tensors):
-        return "generate-proposals-variances-noop-not-migrated"
-    return None
-
-
-def _block_multihead_attention_fallback(context: GenerationContext) -> str | None:
-    if any(binding.parameter_name == "rope_emb" for binding in context.call.tensors):
-        return "block-multihead-attention-rope-emb-place-not-migrated"
-    return None
-
-
 def _max_unpool_pool_input_size(
     api_name: str,
     x_shape,
@@ -600,7 +563,6 @@ def variable_length_memory_efficient_attention_values(ctx: GenerationContext, ca
 
 @rules.register(
     "paddle.incubate.nn.functional.block_multihead_attention",
-    fallback=_block_multihead_attention_fallback,
 )
 def block_multihead_attention_values(ctx: GenerationContext, case: RuleCase):
     qkv = case.arg(0, "qkv")
@@ -797,7 +759,7 @@ def arange_values(ctx: GenerationContext, case: RuleCase):
                 else:
                     flag = step_val > 0
                 rewrite_tensor(start_val, random_range(start_val, -50, 50))
-                start = start_val.numpy_tensor.item()
+                start = case.value(case.find("start")).item()
                 if flag:
                     low, high = safe_range(start + 1, start + 50)
                 else:
@@ -1171,7 +1133,7 @@ def alpha_dropout_values(ctx: GenerationContext, case: RuleCase):
     case.generate_by_parameter((("x", "unit_interval"),), default="default")
 
 
-@rules.register("paddle.nn.functional.conv2d_transpose", fallback=_conv2d_transpose_fallback)
+@rules.register("paddle.nn.functional.conv2d_transpose")
 def conv2d_transpose_values(ctx: GenerationContext, case: RuleCase):
     def tensor_value(binding):
         if "int" in binding.spec.dtype:
@@ -1230,7 +1192,7 @@ def distribute_fpn_proposals_values(ctx: GenerationContext, case: RuleCase):
     )
 
 
-@rules.register("paddle.vision.ops.generate_proposals", fallback=_generate_proposals_fallback)
+@rules.register("paddle.vision.ops.generate_proposals")
 def generate_proposals_values(ctx: GenerationContext, case: RuleCase):
     def random_value(binding):
         return case.random(binding.spec.shape, dtype=binding.spec.dtype)
@@ -1474,7 +1436,6 @@ def remainder_values(ctx: GenerationContext, case: RuleCase):
     "paddle.nn.functional.dropout",
     "paddle.nn.functional.dropout2d",
     "paddle.nn.functional.dropout3d",
-    fallback=_dropout_fallback,
 )
 def dropout_values(ctx: GenerationContext, case: RuleCase):
     case.generate_by_parameter((("p", "dropout_probability"),), default="default")
@@ -1485,7 +1446,7 @@ def atan2_values(ctx: GenerationContext, case: RuleCase):
     case.generate_all("unit_interval_plus_one")
 
 
-@rules.register("paddle.bincount", fallback=_bincount_fallback)
+@rules.register("paddle.bincount")
 def bincount_values(ctx: GenerationContext, case: RuleCase):
     def integer_value(binding):
         return case.randint(0, 65535, size=binding.spec.shape).astype(binding.spec.dtype)
@@ -1777,9 +1738,7 @@ def unsqueeze_values(ctx: GenerationContext, case: RuleCase):
     case.generate_by_parameter((("axis", axis_value),), default="default")
 
 
-@rules.register(
-    "paddle.unflatten", aliases=("paddle.Tensor.unflatten",), fallback=_unflatten_fallback
-)
+@rules.register("paddle.unflatten", aliases=("paddle.Tensor.unflatten",))
 def unflatten_values(ctx: GenerationContext, case: RuleCase):
     def axis_value(binding):
         x_shape = case.arg(0, "x").shape
@@ -2294,7 +2253,7 @@ def strided_slice_values(ctx: GenerationContext, case: RuleCase):
         axes_arg = case.arg(1, "axes")
         axes = axes_arg
         if not isinstance(axes, list):
-            axes = axes.numpy_tensor
+            axes = case.value(case.find("axes"))
         list_index_path = case.binding_list_index(binding)
         if list_index_path is None:
             return case.value_domain("default", binding)
@@ -2305,9 +2264,8 @@ def strided_slice_values(ctx: GenerationContext, case: RuleCase):
                 binding.spec.dtype
             )
         if parameter == "ends":
-            starts = case.arg(2, "starts")
             return case.randint(
-                starts[list_index].numpy_tensor + 1,
+                case.value(case.find("starts"))[list_index] + 1,
                 x.shape[axes[list_index]],
                 size=binding.spec.shape,
             ).astype(binding.spec.dtype)

@@ -64,12 +64,12 @@ API 特例、`startswith` family 或动态集合规则都会被 catch-all 静默
 
 ### 3.1 当前迁移阶段目标
 
-- 默认执行路径保持 legacy，不影响现有任务。
-- v2 只接管经过验证的显式 API allowlist。
+- 默认执行路径已切换到 v2。
+- v2 只接管经过验证的显式 API allowlist，未注册 API fail fast。
 - 同一 seed 下保持 NumPy 数组 dtype、shape、bytes 和最终 RNG 状态一致。
-- GPU 或 cache 尚未迁移时，在调用新 rule/value generator 前回退 legacy。
-- 未迁移 API 继续调用原来的完整 case 生成循环。
-- 将规则命中、回退原因和 legacy 使用情况变为可观测信息。
+- GPU 或 cache 尚未迁移时，在调用新 rule/value generator 前 fail fast。
+- frozen CPU fixture 仅作为治理对照，不再是生产 fallback。
+- 将规则命中、阻塞原因和 v2 dispatch / frozen fixture 使用情况变为可观测信息。
 
 ### 3.2 长期目标
 
@@ -137,8 +137,8 @@ value generator 接收 `TensorSpec`，不直接读取或修改 `TensorConfig`。
 `BoundCall` 将配置中的 args/kwargs 绑定到 API 参数名，并收集所有 Tensor 的
 `ArgPath + TensorSpec`。它解决“位置 1 到底是 `y`、`axis` 还是其他参数”的问题。
 
-绑定层当前仍以 shadow 和 v2 命中路径为主。legacy 默认和未注册 API fallback 不会
-加载或执行 binding，避免新增副作用。
+绑定层当前由 shadow verifier 和 v2 命中路径共同保护。未注册 API 在生产路径 fail fast；
+固定 seed 治理对照使用冻结 v2 CPU fixture，不再现场调用 legacy 生成函数。
 
 ### 4.4 `GenerationContext`
 
@@ -184,15 +184,16 @@ metadata。当前 `RuleCase.set_value_raw()` 只作为迁移期兼容桥接使�
 `RuleCase` 必须保证：
 
 - 每个 Tensor path 最多生成一次。
-- rule 结束时所有 Tensor path 都已生成，或在任何 RNG 调用前 fallback。
+- rule 结束时所有 Tensor path 都已生成，或在任何 RNG 调用前 fail fast。
 - 生成顺序与 legacy 可对照。
 - 跨参数关系通过 `RuleCase` 的返回值、引用或 validator 表达，而不是读写其他
   `TensorConfig.numpy_tensor`。
 - rule 作者不直接调用 `numpy`、`numpy.random` 或 `LEGACY_NUMPY_RNG`。数组构造和随机数
   通过 `case.array()`、`case.zeros()`、`case.ones()`、`case.random()`、
   `case.randint()`、`case.choice()`、`case.value_domain()` 等包装接口完成；当前这些接口
-  通过 `CaseNumpyRNG(backend="legacy-global")` 代理全局 NumPy RNG，并记录 case 的
-  seed/fingerprint/runtime metadata，后续再切换为真正独立的 case-owned RNG state。
+  通过 `CaseNumpyRNG(backend="case-owned-legacy-state")` 使用 case-owned
+  `RandomState` 副本，并记录 case 的 seed/fingerprint/runtime metadata；规则成功后才
+  commit 回全局 NumPy RNG，失败规则不会污染全局状态。
 - rule 作者通过 `case.arg(position, name, default)`、`case.kwarg(name, default)`、
   `case.has_kwarg(name)` 和 `case.is_tensor_config(value)` 读取 API 配置形态；不要在规则体中
   直接访问 `raw_case.args/kwargs` 或调用 `_tensor_config_at()`。
@@ -225,7 +226,7 @@ Value generator 回答“给定一个 `TensorSpec`，应该生成怎样的逻辑
 ### 5.2 Decorator Rule 与 API_RULE_REGISTRY
 
 当前 API 关联使用 `registry.py` 中的 decorator registry。每条规则用
-`@rules.register(...)` 声明 API、alias 和可选 fallback，然后在函数体中写出
+`@rules.register(...)` 声明 API、alias 和可选阻塞条件，然后在函数体中写出
 完整 case 的初始化流程：
 
 ```python
@@ -267,7 +268,7 @@ label/loss 等跨参数规则会继续使用同一个 rule 形态，只扩展 `R
 - `generate_by_parameter()` 只用于简单参数名到通用 value domain 的分派，或用于保持 legacy
   Tensor 遍历/RNG 顺序；不应把大量 API 独有逻辑隐藏到模块级 helper 后再交给它调用。
 - 少数 legacy 分支会命中 API 但不写入某个 Tensor，例如
-  `generate_proposals.variances`。这类配置必须在任何 RNG 调用前 fallback，不能擅自补
+  `generate_proposals.variances`。这类配置必须在任何 RNG 调用前 fail fast，不能擅自补
   default 值改变 legacy 可观测结果。
 
 ### 5.3 为什么必须分开
@@ -279,7 +280,7 @@ value generator 直接判断 API 名称，大型条件链只会换一个文件�
 因此边界是：
 
 ```text
-API allowlist、参数顺序、跨参数关系和 fallback 归 @rules.register rule
+API allowlist、参数顺序、跨参数关系和阻塞条件归 @rules.register rule
 dtype/shape/value domain 归 value generator
 API_RULE_REGISTRY 只是 decorator 产物，用于调度查找
 ```
@@ -298,7 +299,7 @@ def clip_values(ctx, case):
 
 其中：
 
-- `@rules.register(...)` 是唯一 API 规则注册方式，负责 API allowlist、alias、fallback hook
+- `@rules.register(...)` 是唯一 API 规则注册方式，负责 API allowlist、alias、阻塞条件
   和冲突检测。
 - rule 函数是 API 初始化语义的唯一可读入口；简单 API 可以只写
   `case.generate_all(default())`，复杂 API 写出参数之间的关系。
@@ -315,7 +316,7 @@ def clip_values(ctx, case):
   后端预生成逻辑只作为 rule-local helper 存在。
 - 共享 optimizer family（例如 `OPTIMIZER_APIS`）已经收口到专用 decorator rule，不再属于
   deferred 处理面。
-- 不支持的配置必须在任何 RNG 调用前 fallback，例如 rule 显式设置
+- 不支持的配置必须在任何 RNG 调用前 fail fast，例如 rule 显式设置
   `allow_gpu=False` / `allow_cached=False`，或 rule 暂不支持 `dropout.axis` 这类关系参数。
 
 领域拆分后的长期目录可以是：
@@ -343,15 +344,17 @@ input_generation/
 
 入口为 `APITestBase.gen_numpy_input()`，由 dispatcher 选择执行路径。
 
-### 6.1 默认 legacy
+### 6.1 默认 v2
 
 ```text
-PADDLEAPITEST_INPUT_GENERATOR 未设置或为 legacy
-  -> 记录 legacy dispatch
-  -> 调用原完整 case 生成循环
+PADDLEAPITEST_INPUT_GENERATOR 未设置或为 v2
+  -> API_RULE_REGISTRY 按完整 api_name 查找 decorator rule
+  -> 构建 BoundCall / GenerationContext
+  -> 执行 decorator rule
+  -> 写入 payload 并同步兼容 TensorConfig.numpy_tensor
 ```
 
-这是当前生产默认值，因此注册新规则不会自动改变现有测试任务。
+这是当前生产默认值，legacy 不再作为 runtime mode 暴露。
 
 ### 6.2 v2 命中规则
 
@@ -359,25 +362,25 @@ PADDLEAPITEST_INPUT_GENERATOR 未设置或为 legacy
 PADDLEAPITEST_INPUT_GENERATOR=v2
   -> API_RULE_REGISTRY 按完整 api_name 查找 decorator rule
   -> 构建 BoundCall / GenerationContext
-  -> 检查 rule 级 fallback 条件
+  -> 检查 rule 级阻塞条件
   -> 执行 decorator rule
-  -> 写入对应 TensorConfig
+  -> 写入 payload 并同步兼容 TensorConfig.numpy_tensor
 ```
 
 ### 6.3 v2 未命中或不支持
 
 ```text
 未注册 API
-  -> fallback_reason = no-registered-rule
-  -> 调用 legacy 完整 case 循环
+  -> blocked_reason = no-registered-rule
+  -> 抛出 RuntimeError
 
 已注册但当前 runtime mode 被 rule 显式禁用
-  -> 在 rule 消耗 RNG 前记录 fallback
-  -> 调用 legacy 完整 case 循环
+  -> 在 rule 消耗 RNG 前记录 blocked
+  -> 抛出 RuntimeError
 ```
 
-回退单位必须是完整 case，不能先生成部分参数再调用 legacy，否则 RNG 顺序和参数间
-关系都会改变。
+退场阶段不再回退 legacy。legacy 生成函数仅由治理工具直接调用，用于固定 seed oracle
+对照；生产 dispatcher 不再调用它。
 
 ## 7. 为什么使用显式 Allowlist
 
@@ -428,7 +431,7 @@ schema 保留，值由 decorator 的主 API 自动派生。
 | `remainder_values` | int `y` 为正值域，其他 dtype default | `paddle.remainder`、`paddle.Tensor.remainder` |
 | `dropout_values` | `p` 为 legacy `[0,1.1]` clamp 到 1，其他 Tensor default | `paddle.nn.functional.dropout`、`dropout2d`、`dropout3d` |
 | `atan2_values` | `[1,2)` | `paddle.atan2` |
-| `bincount_values` | `x/minlength` 为 legacy integer `[0,65535)`，非 int 提前 fallback | `paddle.bincount` |
+| `bincount_values` | `x/minlength` 为 legacy integer `[0,65535)`，不支持的非 int 组合提前 fail fast | `paddle.bincount` |
 | `adaptive_avg_pool_values` | `output_size` 上界来自 `x.shape` | `paddle.nn.functional.adaptive_avg_pool2d`、`adaptive_avg_pool3d` |
 | `empty_values` | `shape` 为 `[1,10)`，非 int shape Tensor 按 legacy 改写为 `int32` | `paddle.empty` |
 | `repeat_interleave_values` | `repeats` 为 `[1,2048)`，`axis` Tensor 提前 fallback | `paddle.repeat_interleave`、`paddle.Tensor.repeat_interleave` |
@@ -443,7 +446,7 @@ schema 保留，值由 decorator 的主 API 自动派生。
 | `cumsum_values` | `axis` 为 `[-rank,rank)` no-cast | `paddle.cumsum`、`paddle.Tensor.cumsum` |
 | `reduction_axis_values` | `axis` 复刻 legacy `generate_random_axes()` | `paddle.mean/max/min/prod/sum/squeeze` |
 | `unsqueeze_values` | `axis` 范围来自 `len(x.shape)+1` | `paddle.unsqueeze` |
-| `unflatten_values` | `axis` 范围来自 `x.shape`，`shape` Tensor 仍早回退 | `paddle.unflatten`、`paddle.Tensor.unflatten` |
+| `unflatten_values` | `axis` 范围来自 `x.shape`，`shape` Tensor 生成 legacy ones | `paddle.unflatten`、`paddle.Tensor.unflatten` |
 | `topk_values` | `x` 按 dtype 专属值域，`k` 上界来自 `x.shape[axis]` | `paddle.topk`、`paddle.Tensor.topk` |
 | `index/gather/take family` | index 范围来自输入 shape/axis，保留 dtype 改写和边界值注入 | `index_sample/index_add/index_fill/take/gather/gather_nd/index_select/take_along_axis` 及 Tensor method |
 | `embedding_values` | ids 先消耗 legacy vocab 随机上界，再按 weight shape 取范围；weight 为 `[0,1)`/complex 双 RNG | `paddle.nn.functional.embedding` |
@@ -462,7 +465,8 @@ schema 保留，值由 decorator 的主 API 自动派生。
 | `expand_values` | `shape` Tensor 根据 `x.shape` 与 shape 参数位置生成 | `paddle.expand`、`paddle.Tensor.expand` |
 | `gather_tree_values` | `parents` 范围来自 beam size | `paddle.nn.functional.gather_tree` |
 
-这些规则仅在 v2、CPU、未开启 NumPy cache 时执行。默认 legacy 行为没有改变。
+这些规则是当前默认生产路径。GPU/cache 默认允许 v2 直通；只有规则显式禁用的模式才会在
+任何 RNG 调用前 fail fast。legacy 仅作为治理 oracle 暂留，不再承担生产回退。
 
 部分规则使用 `case.generate("参数名", "generator")` 选择参数值域；未命中特定参数的
 Tensor 可用 `case.generate_remaining("default")` 按 legacy 尾部分支补齐，并保持原遍历
@@ -487,13 +491,13 @@ Tensor 可用 `case.generate_remaining("default")` 按 legacy 尾部分支补齐
 |---|---|---|
 | `parser.py` | `APIConfig` 和配置解析 | 保留，后续单独治理 parser |
 | `tensor_config.py` | Tensor 配置、cache、框架物化 | 保留但继续拆分 |
-| `input_generator.py` | 原 legacy API 条件链 | 临时，fallback 归零后删除 |
+| `input_generator.py` | 原 legacy API 条件链归档 | 运行时不再调用；仅保留到旧源码与 inventory 物理清理完成 |
 | `model.py` | 不可变路径、绑定和上下文模型 | 保留 |
 | `payload.py` | `TensorPayload` 逻辑值容器和 `api_config` payload 存取 | 保留；作为 rule 输出真源，继续收窄 `TensorConfig.numpy_tensor` 回退面 |
 | `binding.py` | API 签名与参数路径绑定 | 保留并逐步成为唯一绑定实现 |
 | `strategies.py` | 旧工具兼容导出 shim | 仅兼容保留；新代码不应从此导入 |
 | `registry.py` | decorator rule、RuleCase、API 查找和冲突检测 | 保留 |
-| `dispatcher.py` | legacy/v2 选择和完整 case fallback | 迁移期保留；legacy 删除后简化 |
+| `dispatcher.py` | v2 选择、缺失规则和阻塞规则 fail-fast | 保留；legacy 删除后可继续简化参数 |
 | `telemetry.py` | context-local dispatch/legacy 事件 | 保留，接入 CI 报告后可扩展 |
 
 当前文件数量来自职责边界，而不是按 API 拆文件。现阶段不会为每个 value generator
@@ -509,9 +513,9 @@ Tensor 可用 `case.generate_remaining("default")` 按 legacy 尾部分支补齐
 |---|---|
 | `legacy_rule_inventory.json` | 枚举 legacy 分支、依赖和源码摘要 |
 | `baseline_cases.yaml` | 固定 seed 的代表性 case 清单 |
-| `legacy_cpu_baseline.json` | CPU dtype/shape/bytes 基线 |
-| `verify_strategies.py` | value generator 与 legacy 的 bytes/RNG 对照 |
-| `verify_registry.py` | registry、dispatch、fallback 和端到端 v2 对照 |
+| `legacy_cpu_baseline.json` | schema v2 冻结 v2 CPU dispatch fixture，文件名为历史遗留 |
+| `verify_strategies.py` | value generator 与 legacy value-domain shadow 的 bytes/RNG 对照，删除 legacy 前需改为 fixture |
+| `verify_registry.py` | registry、dispatch、fail-fast 和冻结 fixture 对照 |
 | `verify_bindings.py` | 新旧参数绑定 shadow 对照 |
 | `verify_input_generation.py` | inventory、CPU/GPU 基线入口 |
 
@@ -527,14 +531,14 @@ Tensor 可用 `case.generate_remaining("default")` 按 legacy 尾部分支补齐
 3. Tensor 遍历顺序与 legacy 一致。
 4. scalar、empty、normal shape 均有覆盖。
 5. 相关整数、浮点、复数、BF16/FP8 中间 dtype 均有覆盖。
-6. 未迁移 API 的 legacy telemetry 和生成结果不变。
-7. GPU/cache 未支持时，在任何新 RNG 调用前回退。
-8. default runtime 仍为 legacy，除非单独评审切换计划。
+6. 未迁移 API 不能静默运行，必须补 rule 或显式 fail fast。
+7. GPU/cache 未支持时，在任何新 RNG 调用前 fail fast。
+8. default runtime 为 v2；legacy 只作为治理 oracle 暂留。
 
 `CaseNumpyRNG` 当前是 case 级 RNG facade，记录 seed、config fingerprint 和 runtime mode。
-它的 backend 仍是 `legacy-global`，随机方法继续代理全局 `numpy.random`，因此没有改变
-随机算法、调用顺序或最终 RNG state。后续切换真正独立的 case-owned RNG state 时，必须
-单独验证固定 seed bytes 与最终 RNG state。
+它持有从全局 `numpy.random` 克隆出来的 legacy `RandomState`，规则成功后再 commit 回
+全局；失败规则不会污染全局 RNG。该实现没有切换随机算法，并由固定 seed bytes 与最终
+RNG state 回归验证。
 
 ## 11. API 迁移流程
 
@@ -545,9 +549,9 @@ Tensor 可用 `case.generate_remaining("default")` 按 legacy 尾部分支补齐
 3. 只有无关系的 dtype/shape/value domain 才先抽为 value generator。
 4. 使用 shadow verifier 对照数组 bytes 和最终 RNG state。
 5. 为经过确认的 API 建立显式 allowlist，不使用名称前缀猜测。
-6. 定义不支持模式的 `fallback_reason`，且 fallback 必须早于任何 RNG 调用。
-7. 执行真实 `APITestBase.gen_numpy_input()` 的 legacy/v2 固定 seed 对照。
-8. 检查迁移 case 的 legacy events 归零，未迁移 case 的 events 保持一致。
+6. 定义不支持模式的阻塞原因，且 fail fast 必须早于任何 RNG 调用。
+7. 执行 v2 固定 seed fixture 对照；fixture 由完整 case dispatcher 生成。
+8. 检查生产 dispatcher 只产生 v2 dispatch events；未注册或被阻塞的 case 明确报错。
 9. 执行 CPU baseline、binding、已有测试、GPU verifier 和 pre-commit。
 10. 更新计划、发现和进度文档。
 
@@ -581,10 +585,10 @@ GPU 不可用时，普通 GPU verifier 必须报告 `SKIP`，不能报告通过�
 Telemetry 当前使用 `ContextVar`，只有验证或调用方显式 capture 时收集事件。正常运行
 不会维护进程级累计列表，也不会消耗 RNG。事件至少能够区分：
 
-- legacy 默认执行。
 - v2 rule 命中。
-- v2 未注册回退。
-- v2 因 GPU/cache 等原因回退。
+- v2 未注册阻塞。
+- v2 因 GPU/cache 等原因阻塞。
+- 治理工具读取冻结 v2 fixture。
 
 ## 13. 后续演进顺序
 
@@ -595,7 +599,8 @@ Telemetry 当前使用 `ContextVar`，只有验证或调用方显式 capture 时
 5. 将 NumPy payload 与 Paddle/Torch/GPU materializer 完全拆分。
 6. 将全局 RNG 改为 case-owned RNG，将全局 cache 改为 session-owned cache。
 7. 单独治理 parser/serializer。
-8. 当核心语料和 CI 中 fallback 持续为零后，删除 `input_generator.py` 和双轨开关。
+8. 将剩余 legacy inventory/value-domain shadow 改为归档或 fixture 对照后，删除
+   `input_generator.py` 和旧生成入口。
 
 每个阶段只处理一类风险。规则迁移、随机分布调整、RNG 算法切换和 materializer
 改造不能合并在同一个变更中。
@@ -605,12 +610,13 @@ Telemetry 当前使用 `ContextVar`，只有验证或调用方显式 capture 时
 ### 为什么不直接重写 legacy 条件链？
 
 因为无法一次性证明数千行分支、跨参数副作用和全局 RNG 顺序完全一致。双轨允许每批
-只承担一类风险，并让任何未覆盖 API 明确回退。
+只承担一类风险，并让任何未覆盖 API 明确 fail fast。
 
-### 为什么保留 `input_generator.py`？
+### 为什么还保留 `input_generator.py`？
 
-它是当前未迁移 API 的行为真源和回退实现。过早删除会迫使高风险规则与基础设施一起
-迁移。只有 fallback 稳定归零后才删除。
+它现在只作为 legacy 条件链归档，供旧 inventory / 历史比对在物理清理完成前读取。
+生产 dispatcher 已不再调用它；`APITestBase._gen_numpy_input_legacy()` 与 package 级 legacy
+导出已经移除。
 
 ### 为什么 default value generator 只注册两个 API？
 
@@ -646,7 +652,7 @@ inventory、基线 JSON 和 verifier 只用于审查与 CI，不应增加生产 
 - Paddle/Torch/GPU 从同一逻辑 payload 物化。
 - 相同 case fingerprint 和 seed 可独立复现，不受执行顺序影响。
 - cache 不共享可写数组，容量和生命周期明确。
-- 删除 legacy generator、迁移期开关和回写兼容层。
+- 删除 legacy generator、迁移期开关和剩余归档读取路径。
 - CI 能报告 rule 命中、fallback、seed、ArgPath、dtype/shape 和 materializer。
 
 在达到这些条件前，当前双轨设计是风险控制机制，不是最终架构本身。

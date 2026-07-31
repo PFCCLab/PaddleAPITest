@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import numpy
 
@@ -39,12 +39,36 @@ LEGACY_NUMPY_RNG = LegacyNumpyRNG()
 
 @dataclass(frozen=True)
 class CaseNumpyRNG(LegacyNumpyRNG):
-    """Per-case RNG facade that currently preserves legacy global RNG behavior."""
+    """Per-case RNG facade backed by a cloned legacy NumPy RandomState."""
 
     seed: int
     config_fingerprint: str
     runtime_mode: str
-    backend: str = "legacy-global"
+    backend: str = "case-owned-legacy-state"
+    _state: numpy.random.RandomState = field(init=False, repr=False, compare=False)
+
+    def __post_init__(self):
+        state = numpy.random.RandomState()
+        state.set_state(numpy.random.get_state())
+        object.__setattr__(self, "_state", state)
+
+    def commit(self):
+        numpy.random.set_state(self._state.get_state())
+
+    def random(self, *args, **kwargs):
+        return self._state.random(*args, **kwargs)
+
+    def randint(self, *args, **kwargs):
+        return self._state.randint(*args, **kwargs)
+
+    def uniform(self, *args, **kwargs):
+        return self._state.uniform(*args, **kwargs)
+
+    def randn(self, *args, **kwargs):
+        return self._state.randn(*args, **kwargs)
+
+    def choice(self, *args, **kwargs):
+        return self._state.choice(*args, **kwargs)
 
 
 def create_case_rng(context) -> CaseNumpyRNG:

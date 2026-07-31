@@ -12,15 +12,16 @@ The detailed migration and architecture rationale is documented in
 APIConfig (tester.api_config.parser)
   -> APITestBase.gen_numpy_input
   -> dispatcher
-  -> decorator-registered rule, or legacy fallback
+  -> decorator-registered rule
   -> TensorConfig materialization
 ```
 
 ## Modules
 
 - `tensor_config.py`: tensor configuration, cache, and framework materialization.
-- `input_generator.py`: unchanged legacy per-op NumPy generation during migration.
-- `dispatcher.py`: legacy/v2 selection and complete-case fallback.
+- `input_generator.py`: legacy per-op NumPy generation archive; runtime no longer
+  dispatches through it.
+- `dispatcher.py`: v2 rule dispatch and fail-fast handling for missing or blocked rules.
 - `model.py` / `binding.py`: argument identity and signature binding for v2.
 - `value_generators.py`: pure API-independent NumPy value generation.
 - `registry.py`: `@rules.register` decorator rules, `RuleCase`, API lookup, and
@@ -49,8 +50,8 @@ only the current binding and use the enclosing `case` for everything else.
 traversal order, not as a place to hide one-off API logic behind module-level
 helpers.
 Current coverage is 114 decorator rules and 209 explicit APIs. Migrated rules
-use the case-local `CaseNumpyRNG` facade, which still proxies legacy global
-NumPy RNG state for now. GPU and cached generation are rule-gated with
-`allow_gpu` / `allow_cached`; unsupported rules still fall back before consuming
-value-generator RNG. Configuration tools should import `tester.api_config.parser` and
+use the case-local `CaseNumpyRNG` facade, which owns a legacy `RandomState`
+copy and commits it after successful rule generation. GPU and cached generation
+are rule-gated with `allow_gpu` / `allow_cached`; unsupported rules fail before
+consuming value-generator RNG. Configuration tools should import `tester.api_config.parser` and
 `tester.api_config.input_generation.tensor_config` directly.

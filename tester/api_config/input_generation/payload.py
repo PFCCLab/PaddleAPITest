@@ -57,10 +57,18 @@ def logical_value(api_config, tensor_config):
 def write_logical_value(api_config, tensor_config, value, update_metadata=True):
     payload = payload_for_tensor(api_config, tensor_config)
     if payload is not None:
-        payload = TensorPayload(payload.path, value, update_metadata=update_metadata)
+        old_payload = payload
+        payload = TensorPayload(old_payload.path, value, update_metadata=update_metadata)
         payload_by_tensor_id = getattr(api_config, _PAYLOAD_BY_TENSOR_ID_ATTR, None)
         if payload_by_tensor_id is not None:
             payload_by_tensor_id[id(tensor_config)] = payload
+        payloads = getattr(api_config, _PAYLOADS_ATTR, None)
+        if payloads is not None:
+            setattr(
+                api_config,
+                _PAYLOADS_ATTR,
+                tuple(payload if item.path == old_payload.path else item for item in payloads),
+            )
     tensor_config.numpy_tensor = value
     return payload
 

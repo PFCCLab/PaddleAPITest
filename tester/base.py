@@ -636,25 +636,10 @@ class APITestBase:
 
         return tuple(processed_indices) if is_tuple else processed_indices
 
-    def _gen_numpy_input_legacy(self):
-        for i, arg_config in enumerate(self.paddle_args_config):
-            if isinstance(arg_config, (list, tuple)):
-                is_tuple = isinstance(arg_config, tuple)
-                self._handle_list_or_tuple(arg_config, is_tuple=is_tuple, index=i)
-            elif isinstance(arg_config, TensorConfig):
-                arg_config.get_numpy_tensor(self.api_config, index=i)
-        for key, kwarg_config in self.paddle_kwargs_config.items():
-            if isinstance(kwarg_config, (list, tuple)):
-                is_tuple = isinstance(kwarg_config, tuple)
-                self._handle_list_or_tuple(kwarg_config, is_tuple=is_tuple, key=key)
-            elif isinstance(kwarg_config, TensorConfig):
-                kwarg_config.get_numpy_tensor(self.api_config, key=key)
-        return True
-
     def gen_numpy_input(self):
         from .api_config.input_generation.dispatcher import dispatch_input_generation
 
-        return dispatch_input_generation(self, self._gen_numpy_input_legacy)
+        return dispatch_input_generation(self)
 
     def _handle_list_or_tuple_paddle(self, config_items, is_tuple=False):
         """处理 list 或 tuple"""

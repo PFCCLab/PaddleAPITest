@@ -487,9 +487,10 @@ class TensorConfig:
             raise ValueError(f"Invalid axis config={cfg} in {api_config.api_name}")
 
     def get_numpy_tensor(self, api_config, index=None, key=None, **kwargs):
-        from .input_generator import generate_numpy_tensor
-
-        return generate_numpy_tensor(self, api_config, index, key, **kwargs)
+        raise RuntimeError(
+            "TensorConfig.get_numpy_tensor() has been retired; use APITestBase.gen_numpy_input() "
+            "and the v2 rule dispatcher instead."
+        )
 
     def get_paddle_tensor(self, api_config):
         if self.paddle_tensor is None:
@@ -503,7 +504,7 @@ class TensorConfig:
                 )
                 self.paddle_tensor.stop_gradient = not self._requires_autograd(api_config)
                 return self.paddle_tensor
-            if self.numpy_tensor is None and self._use_gpu(api_config):
+            if self._logical_numpy_tensor(api_config) is None and self._use_gpu(api_config):
                 return self.get_gpu_paddle_tensor(api_config)
             if not self.is_contiguous and self.strides is not None:
                 self.paddle_tensor = self._create_strided_paddle_tensor(api_config)
@@ -587,7 +588,7 @@ class TensorConfig:
                 if self._requires_autograd(api_config):
                     self.torch_tensor = self.torch_tensor.detach().requires_grad_(True)
                 return self.torch_tensor
-            if self.numpy_tensor is None and self._use_gpu(api_config):
+            if self._logical_numpy_tensor(api_config) is None and self._use_gpu(api_config):
                 return self.get_gpu_torch_tensor(api_config)
             if not self.is_contiguous and self.strides is not None:
                 self.torch_tensor = self._create_strided_torch_tensor(api_config)

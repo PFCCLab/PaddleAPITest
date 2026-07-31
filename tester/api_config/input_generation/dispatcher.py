@@ -3,14 +3,14 @@
 from __future__ import annotations
 
 import os
-from collections.abc import Callable, Mapping
+from collections.abc import Mapping
 
 from .registry import API_RULE_REGISTRY
 from .telemetry import record_dispatch
 
 INPUT_GENERATOR_ENV = "PADDLEAPITEST_INPUT_GENERATOR"
-INPUT_GENERATOR_MODES = frozenset({"legacy", "v2"})
-DEFAULT_INPUT_GENERATOR_MODE = "legacy"
+INPUT_GENERATOR_MODES = frozenset({"v2"})
+DEFAULT_INPUT_GENERATOR_MODE = "v2"
 LEGACY_RULE_ID = "legacy"
 
 
@@ -25,17 +25,12 @@ def resolve_input_generator_mode(value: str | None = None) -> str:
 
 def dispatch_input_generation(
     api_test,
-    generate_legacy: Callable[[], bool],
     rules_by_api: Mapping[str, object] | None = None,
 ) -> bool:
-    """Dispatch one APIConfig without changing the legacy fallback behavior."""
+    """Dispatch one APIConfig through the v2 rule registry."""
     mode = resolve_input_generator_mode()
     api_config = api_test.api_config
     api_name = api_config.api_name
-
-    if mode == "legacy":
-        record_dispatch(api_name, mode, "legacy", LEGACY_RULE_ID)
-        return generate_legacy()
 
     rules_by_api = API_RULE_REGISTRY if rules_by_api is None else rules_by_api
     rule = rules_by_api.get(api_name)
@@ -43,11 +38,11 @@ def dispatch_input_generation(
         record_dispatch(
             api_name,
             mode,
-            "fallback",
+            "blocked",
             LEGACY_RULE_ID,
             fallback_reason="no-registered-rule",
         )
-        return generate_legacy()
+        raise RuntimeError(f"no v2 input-generation rule registered for {api_name}")
 
     # Binding is intentionally lazy: default mode and v2 fallback do not add
     # imports, signature inspection, framework calls, or RNG consumption.
@@ -66,10 +61,10 @@ def dispatch_input_generation(
         record_dispatch(
             api_name,
             mode,
-            "fallback",
+            "blocked",
             rule.rule_id,
             fallback_reason=fallback_reason,
         )
-        return generate_legacy()
+        raise RuntimeError(f"v2 input-generation rule blocked for {api_name}: {fallback_reason}")
     record_dispatch(api_name, mode, "rule", rule.rule_id)
     return rule.generate(context, api_config)

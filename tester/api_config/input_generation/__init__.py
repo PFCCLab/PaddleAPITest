@@ -1,7 +1,6 @@
 """Test input generation, configuration, and materialization primitives."""
 
 from .payload import TensorPayload
-from .telemetry import LegacyGenerationEvent, capture_legacy_generation
 from .tensor_config import (
     USE_CACHED_NUMPY,
     TensorConfig,
@@ -15,6 +14,4 @@ __all__ = [
     "TensorPayload",
     "cached_numpy",
     "get_cached_numpy_array",
-    "LegacyGenerationEvent",
-    "capture_legacy_generation",
 ]
