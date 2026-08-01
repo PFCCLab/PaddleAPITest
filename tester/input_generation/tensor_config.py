@@ -10,6 +10,7 @@ import re
 import numpy
 import paddle
 import yaml
+from tester.dtype_utils import to_torch_dtype
 
 from .input_values import clear_input_value, input_value, write_input_value
 
@@ -209,36 +210,7 @@ class TensorConfig:
         return self.__str__()
 
     def to_torch_dtype(self, dtype):
-        if dtype in ["float32", numpy.float32]:
-            return torch.float32
-        elif dtype in ["float16", numpy.float16]:
-            return torch.float16
-        elif dtype in ["float64", numpy.float64]:
-            return torch.float64
-        elif dtype in ["int16", numpy.int16]:
-            return torch.int16
-        elif dtype in ["int8", numpy.int8]:
-            return torch.int8
-        elif dtype in ["bool", numpy.bool_]:
-            return torch.bool
-        elif dtype in ["bfloat16", numpy.uint16]:
-            return torch.bfloat16
-        elif dtype in ["uint8", numpy.uint8]:
-            return torch.uint8
-        elif dtype in ["int32", numpy.int32]:
-            return torch.int32
-        elif dtype in ["int64", numpy.int64]:
-            return torch.int64
-        elif dtype in ["complex64", numpy.complex64]:
-            return torch.complex64
-        elif dtype in ["complex128", numpy.complex128]:
-            return torch.complex128
-        elif dtype == "float8_e4m3fn":
-            return torch.float8_e4m3fn
-        elif dtype == "float8_e5m2":
-            return torch.float8_e5m2
-        else:
-            raise ValueError(f"Unsupported dtype: {dtype}")
+        return to_torch_dtype(dtype)
 
     def numel(self):
         return _numel(self.shape)

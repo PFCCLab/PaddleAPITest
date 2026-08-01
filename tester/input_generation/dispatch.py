@@ -5,7 +5,7 @@ from __future__ import annotations
 from collections.abc import Mapping
 
 from .input_bind import build_input_context
-from .registry import API_RULE_REGISTRY
+from .registry import API_RULE_REGISTRY, DEFAULT_INPUT_GENERATION_RULE
 
 
 def dispatch_input(
@@ -20,7 +20,7 @@ def dispatch_input(
     rules_by_api = API_RULE_REGISTRY if rules_by_api is None else rules_by_api
     rule = rules_by_api.get(api_name)
     if rule is None:
-        raise RuntimeError(f"no input-generation rule registered for {api_name}")
+        rule = DEFAULT_INPUT_GENERATION_RULE
 
     context = build_input_context(
         api_config,

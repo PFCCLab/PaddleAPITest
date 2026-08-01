@@ -2,7 +2,7 @@
 
 `tools/regression` 维护项目级固定回归配置集，用于在修改后验证 `paddle_only` 和 `accuracy` 两类门禁。
 
-当前固定集合为 `tools/regression/regression_configs.txt`，覆盖 114 个 API key、473 条配置。
+当前固定集合为 `tools/regression/regression_configs.txt`，覆盖 147 个 API key、609 条配置。
 
 ## 运行回归
 
@@ -32,7 +32,7 @@ GPU_IDS=0 REGRESSION_NUM_GPUS=1 REGRESSION_WORKERS_PER_GPU=2 \
 常用环境变量：
 
 - `REGRESSION_CONFIG_FILE`：配置集合路径，默认 `tools/regression/regression_configs.txt`
-- `REGRESSION_LOG_DIR`：日志输出目录，默认临时目录 `/tmp/paddleapitest_project_regression.XXXXXX`
+- `REGRESSION_LOG_DIR`：日志输出目录，默认 `tools/regression/logs/run.XXXXXX`
 - `PYTHON`：Python 解释器，默认 `python`
 - `GPU_IDS`：传给 `engineV4.py --gpu_ids`
 - `REGRESSION_NUM_GPUS`：传给 `engineV4.py --num_gpus`
@@ -75,14 +75,17 @@ python tools/regression/collect_configs.py \
   --summary tools/regression/regression_summary.txt
 ```
 
-`collect_configs.py` 会为每个 API key 保留最多 5 条不同配置。源配置不足 5 条时，按实际数量进入回归集合。
+`collect_configs.py` 扫描来源目录内所有文件名包含 `4096` 或 `1M` 的 `.txt` 文件，并
+为每个 API key 保留最多 5 条不同配置。源配置不足 5 条时，按实际数量进入回归集合，
+不生成或修改配置。
 
 收集策略：
 
-- 排除路径中包含 `needfix`、`need_fix`、`not_monitor`、`1m`、`0size` 的配置。
-- 排除配置文本中包含 `float8_` 的配置。
-- 排除 `paddle.empty` 与 `paddle.empty_like`，因为它们返回未初始化内存，不适合作为稳定门禁。
-- 仅保留项目当前支持输入生成和 accuracy 转换的 API。
+- 先收集 4096 配置，再用 1M 配置补充新 API 或不足 5 条的 API。
+- 1M 候选按 Tensor shape 的总元素量、最大 Tensor 元素量和最大维度从小到大选择。
+- 排除路径中包含 `needfix`、`need_fix` 或 `not_monitor` 的配置文件。
+- 不按 dtype 或 API 支持状态过滤配置。
+- 每条配置使用项目 `APIConfig` 解析并规范化，无法解析的行不进入集合。
 - `paddle._C_ops._run_custom_op` 按第一个参数 `op_name` 细分 API key，例如 `paddle._C_ops._run_custom_op:fused_swiglu_scale_clamp`。
 
 如候选集运行产生非允许分类，可根据 `error_stat` 结果剔除失败配置：

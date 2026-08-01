@@ -1,45 +1,43 @@
 from __future__ import annotations
 
 import argparse
+import math
+import numbers
 import os
-from collections import Counter, OrderedDict
+from collections import Counter, OrderedDict, defaultdict
 from pathlib import Path
 
 from tester.api_config.parser import APIConfig
-from tester.input_generation.registry import API_RULE_REGISTRY
-from tester.paddle_to_torch import get_converter
-from tester.paddle_to_torch.rules import ConversionKind
+from tester.input_generation.tensor_config import TensorConfig
 
 DEFAULT_OUTPUT = Path("tools/regression/regression_configs.txt")
 DEFAULT_SUMMARY = Path("tools/regression/regression_summary.txt")
 SOURCE_ENV_VAR = "REGRESSION_CONFIG_SOURCES"
-EXCLUDED_PATH_KEYWORDS = (
-    "needfix",
-    "need_fix",
-    "not_monitor",
-    "1m",
-    "0size",
-)
-EXCLUDED_CONFIG_KEYWORDS = ("float8_",)
-EXCLUDED_API_NAMES = (
-    "paddle.empty",
-    "paddle.empty_like",
-)
+EXCLUDED_PATH_KEYWORDS = ("needfix", "need_fix", "not_monitor")
+
+
+def source_spec(path: Path) -> str:
+    return "1M" if "1m" in path.name.lower() else "4096"
 
 
 def iter_source_files(sources):
+    paths = []
     for source in sources:
         if source.is_file():
-            if source.suffix == ".txt":
-                yield source
+            paths.append(source)
             continue
         if not source.exists():
             continue
-        for path in sorted(source.rglob("*.txt")):
-            path_text = str(path).lower()
-            if any(keyword in path_text for keyword in EXCLUDED_PATH_KEYWORDS):
-                continue
-            yield path
+        paths.extend(source.rglob("*.txt"))
+
+    selected = {
+        path
+        for path in paths
+        if path.suffix.lower() == ".txt"
+        and ("4096" in path.name.lower() or "1m" in path.name.lower())
+        and not any(keyword in str(path).lower() for keyword in EXCLUDED_PATH_KEYWORDS)
+    }
+    yield from sorted(selected, key=lambda path: (source_spec(path) == "1M", str(path)))
 
 
 def custom_op_name(api_config: APIConfig) -> str | None:
@@ -60,24 +58,56 @@ def api_key(api_config: APIConfig) -> str:
     return api_config.api_name
 
 
-def is_accuracy_supported(api_name: str, converter_cache: dict[str, bool]) -> bool:
-    if api_name not in converter_cache:
-        result = get_converter().convert(api_name)
-        converter_cache[api_name] = bool(
-            result.kind is not ConversionKind.UNSUPPORTED and result.code
-        )
-    return converter_cache[api_name]
+def iter_tensor_configs(value):
+    if isinstance(value, TensorConfig):
+        yield value
+    elif isinstance(value, (list, tuple)):
+        for item in value:
+            yield from iter_tensor_configs(item)
+    elif isinstance(value, dict):
+        for item in value.values():
+            yield from iter_tensor_configs(item)
 
 
-def should_skip_config(config_text: str) -> bool:
-    lowered = config_text.lower()
-    return any(keyword in lowered for keyword in EXCLUDED_CONFIG_KEYWORDS)
+def iter_shape_dimensions(value):
+    if (
+        isinstance(value, (list, tuple))
+        and value
+        and all(isinstance(item, numbers.Integral) and not isinstance(item, bool) for item in value)
+    ):
+        yield [abs(int(item)) for item in value]
+        return
+    if isinstance(value, (list, tuple)):
+        for item in value:
+            yield from iter_shape_dimensions(item)
+    elif isinstance(value, dict):
+        for item in value.values():
+            yield from iter_shape_dimensions(item)
+
+
+def config_shape_score(api_config: APIConfig):
+    tensors = [
+        *iter_tensor_configs(api_config.args),
+        *iter_tensor_configs(api_config.kwargs),
+    ]
+    shapes = [[abs(int(dim)) for dim in tensor.shape] for tensor in tensors]
+    if not shapes:
+        for value in (*api_config.args, *api_config.kwargs.values()):
+            shapes.extend(iter_shape_dimensions(value))
+    numels = [math.prod(shape) for shape in shapes]
+    dimensions = [dim for shape in shapes for dim in shape]
+    return (
+        sum(numels),
+        max(numels, default=0),
+        max(dimensions, default=0),
+        str(api_config),
+    )
 
 
 def collect_configs(sources, max_per_api):
     selected: OrderedDict[str, list[str]] = OrderedDict()
     seen_configs: set[str] = set()
-    converter_cache: dict[str, bool] = {}
+    one_m_candidates = defaultdict(dict)
     stats = Counter()
 
     for path in iter_source_files(sources):
@@ -88,35 +118,42 @@ def collect_configs(sources, max_per_api):
                 if not config_text or not config_text.startswith("paddle."):
                     continue
                 stats["lines"] += 1
-                if should_skip_config(config_text):
-                    stats["skip_config_keyword"] += 1
-                    continue
                 try:
                     api_config = APIConfig(config_text)
                 except Exception:
                     stats["parse_error"] += 1
                     continue
-                if api_config.api_name in EXCLUDED_API_NAMES:
-                    stats["skip_api_policy"] += 1
-                    continue
-                if api_config.api_name not in API_RULE_REGISTRY:
-                    stats["skip_no_input_rule"] += 1
-                    continue
-                if not is_accuracy_supported(api_config.api_name, converter_cache):
-                    stats["skip_no_accuracy_rule"] += 1
-                    continue
                 key = api_key(api_config)
+                normalized = str(api_config)
+                if source_spec(path) == "1M":
+                    one_m_candidates[key].setdefault(normalized, api_config)
+                    continue
                 bucket = selected.setdefault(key, [])
                 if len(bucket) >= max_per_api:
                     stats["skip_bucket_full"] += 1
                     continue
-                normalized = str(api_config)
                 if normalized in seen_configs:
                     stats["skip_duplicate"] += 1
                     continue
                 bucket.append(normalized)
                 seen_configs.add(normalized)
                 stats["selected"] += 1
+                stats["selected_4096"] += 1
+
+    for key, candidates in one_m_candidates.items():
+        bucket = selected.setdefault(key, [])
+        for normalized, _api_config in sorted(
+            candidates.items(), key=lambda item: config_shape_score(item[1])
+        ):
+            if len(bucket) >= max_per_api:
+                break
+            if normalized in seen_configs:
+                stats["skip_duplicate"] += 1
+                continue
+            bucket.append(normalized)
+            seen_configs.add(normalized)
+            stats["selected"] += 1
+            stats["selected_1M"] += 1
     return selected, stats
 
 
@@ -132,9 +169,10 @@ def write_outputs(selected, stats, output_path, summary_path, max_per_api):
         for name, value in sorted(stats.items()):
             summary.write(f"- {name}: {value}\n")
         summary.write(f"- max_per_api: {max_per_api}\n")
-        summary.write("- incomplete_api_keys_policy: included\n")
-        summary.write("- excluded_size_policies: 1M, 0size\n")
-        summary.write(f"- excluded_api_policies: {', '.join(EXCLUDED_API_NAMES)}\n")
+        summary.write("- source_file_policy: *4096*.txt, *1M*.txt\n")
+        summary.write("- config_filter_policy: exclude needfix, need_fix, not_monitor paths\n")
+        summary.write("- selection_policy: 4096 first, then smallest 1M shapes\n")
+        summary.write("- incomplete_api_keys_policy: keep available configs\n")
         summary.write(f"- regression_api_keys: {len(selected)}\n")
         summary.write(f"- regression_configs: {sum(len(items) for items in selected.values())}\n")
         summary.write(

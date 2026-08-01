@@ -8,8 +8,8 @@ from types import MappingProxyType
 from typing import Any
 
 import paddle
-import torch
 import yaml
+from tester.dtype_utils import to_torch_dtype
 
 with (Path(__file__).parent.parent / "base_config.yaml").open(encoding="utf-8") as stream:
     _BASE_CONFIG = yaml.safe_load(stream)
@@ -97,27 +97,6 @@ del _MANUAL_ARGUMENT_NAMES
 
 _SIGNATURE_CACHE: dict[str, inspect.Signature | None] = {}
 
-_TORCH_DTYPE_BY_NAME = MappingProxyType(
-    {
-        "bool": torch.bool,
-        "uint8": torch.uint8,
-        "int8": torch.int8,
-        "int16": torch.int16,
-        "int32": torch.int32,
-        "int64": torch.int64,
-        "float16": torch.float16,
-        "bfloat16": torch.bfloat16,
-        "float32": torch.float32,
-        "float64": torch.float64,
-        "complex64": torch.complex64,
-        "complex128": torch.complex128,
-        "fp16": torch.float16,
-        "fp32": torch.float32,
-        "fp64": torch.float64,
-        "bf16": torch.bfloat16,
-    }
-)
-
 
 def resolve_paddle_api(api_name: str) -> Callable[..., Any]:
     if not api_name.startswith("paddle."):
@@ -174,23 +153,7 @@ def _normalize_tensor_self_argument(
 
 
 def _normalize_torch_dtype(value: Any) -> Any:
-    if value is None or isinstance(value, torch.dtype):
-        return value
-    if isinstance(value, str):
-        dtype_name = value
-    elif isinstance(value, paddle.dtype):
-        dtype_name = str(value)
-    else:
-        try:
-            var_type = paddle.base.libpaddle.VarDesc.VarType
-        except AttributeError:
-            var_type = ()
-        if var_type and isinstance(value, var_type):
-            dtype_name = str(value)
-        else:
-            return value
-    dtype_key = dtype_name.split(".")[-1].lower()
-    return _TORCH_DTYPE_BY_NAME.get(dtype_key, value)
+    return to_torch_dtype(value, strict=False)
 
 
 def _normalize_dtype_arguments(bound: OrderedDict[str, Any]) -> OrderedDict[str, Any]:

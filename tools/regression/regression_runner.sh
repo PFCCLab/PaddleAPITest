@@ -3,10 +3,17 @@ set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 CONFIG_FILE="${REGRESSION_CONFIG_FILE:-tools/regression/regression_configs.txt}"
-LOG_ROOT="${REGRESSION_LOG_DIR:-$(mktemp -d /tmp/paddleapitest_project_regression.XXXXXX)}"
 PYTHON_BIN="${PYTHON:-python}"
 
 cd "${ROOT_DIR}"
+
+if [[ -n "${REGRESSION_LOG_DIR:-}" ]]; then
+  LOG_ROOT="${REGRESSION_LOG_DIR}"
+  mkdir -p "${LOG_ROOT}"
+else
+  mkdir -p tools/regression/logs
+  LOG_ROOT="$(mktemp -d tools/regression/logs/run.XXXXXX)"
+fi
 
 COMMON_ARGS=(
   --api_config_file="${CONFIG_FILE}"

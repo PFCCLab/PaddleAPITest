@@ -17,6 +17,7 @@ log.log
 
 # PaddleAPITest generated configs / logs
 test_*log*/
+tools/regression/logs/
 tester/api_config/**/test_log*
 tester/api_config/api_config*
 tester/api_config/output/

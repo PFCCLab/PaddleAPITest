@@ -515,7 +515,22 @@ def _is_tensor_config(value) -> bool:
 rules = RuleRegistry()
 
 
-@rules.register("paddle.add", "paddle.logical_not", "paddle.concat")
+@rules.register(
+    "paddle.add",
+    "paddle.logical_not",
+    "paddle.concat",
+    aliases=("paddle.Tensor.__add__", "paddle.Tensor.add", "paddle.Tensor.__radd__"),
+)
+@rules.register(
+    "paddle.subtract",
+    aliases=("paddle.Tensor.__sub__", "paddle.Tensor.sub", "paddle.Tensor.__rsub__"),
+)
+@rules.register("paddle.all", aliases=("paddle.Tensor.all",))
+@rules.register("paddle.transpose", aliases=("paddle.Tensor.transpose",))
+@rules.register("paddle.cast", aliases=("paddle.Tensor.cast",))
+@rules.register("paddle.assign")
+@rules.register("paddle.exp")
+@rules.register("paddle.nn.functional.sigmoid")
 def default_values(ctx: InputGenerationContext, case: RuleCase):
     case.generate_all("default")
 
@@ -1112,7 +1127,10 @@ def clip_values(ctx: InputGenerationContext, case: RuleCase):
     case.generate_remaining("default")
 
 
-@rules.register("paddle.multiply")
+@rules.register(
+    "paddle.multiply",
+    aliases=("paddle.Tensor.__mul__", "paddle.Tensor.multiply", "paddle.Tensor.__rmul__"),
+)
 def multiply_values(ctx: InputGenerationContext, case: RuleCase):
     case.generate_all("multiply")
 
@@ -3109,6 +3127,7 @@ def one_hot_values(ctx: InputGenerationContext, case: RuleCase):
 
 INPUT_GENERATION_RULES = rules.rules
 API_RULE_REGISTRY = rules.by_api
+DEFAULT_INPUT_GENERATION_RULE = API_RULE_REGISTRY["paddle.add"]
 
 
 def build_registry(rule_records=INPUT_GENERATION_RULES) -> dict[str, RegisteredRule]:

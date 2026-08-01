@@ -5,7 +5,7 @@ from collections import Counter
 from pathlib import Path
 
 from tester.api_config.parser import APIConfig
-from tools.regression.collect_configs import EXCLUDED_API_NAMES, api_key
+from tools.regression.collect_configs import api_key
 
 ALLOWED_TYPES = frozenset({"pass", "skip", "checkpoint", "paddle_bitwise"})
 DEFAULT_SUMMARY = Path("tools/regression/regression_summary.txt")
@@ -50,10 +50,6 @@ def selected_by_api(configs: list[str]) -> dict[str, int]:
     return dict(sorted(counts.items()))
 
 
-def is_excluded_api(config: str) -> bool:
-    return APIConfig(config).api_name in EXCLUDED_API_NAMES
-
-
 def write_summary(
     configs: list[str],
     summary_path: Path,
@@ -65,9 +61,10 @@ def write_summary(
     with summary_path.open("w", encoding="utf-8") as summary:
         summary.write("# Project regression config summary\n\n")
         summary.write(f"- max_per_api: {max_per_api}\n")
-        summary.write("- incomplete_api_keys_policy: included\n")
-        summary.write("- excluded_size_policies: 1M, 0size\n")
-        summary.write(f"- excluded_api_policies: {', '.join(EXCLUDED_API_NAMES)}\n")
+        summary.write("- source_file_policy: *4096*.txt, *1M*.txt\n")
+        summary.write("- config_filter_policy: exclude needfix, need_fix, not_monitor paths\n")
+        summary.write("- selection_policy: 4096 first, then smallest 1M shapes\n")
+        summary.write("- incomplete_api_keys_policy: keep available configs\n")
         summary.write(f"- regression_api_keys: {len(counts)}\n")
         summary.write(f"- regression_configs: {sum(counts.values())}\n")
         summary.write(
@@ -97,10 +94,7 @@ def main():
     original = [line.strip() for line in args.input.read_text().splitlines() if line.strip()]
     blocked_by_type = blocked_configs(args.log_dir)
     blocked_all = set().union(*blocked_by_type.values()) if blocked_by_type else set()
-    policy_excluded = {config for config in original if is_excluded_api(config)}
-    refined = [
-        config for config in original if config not in blocked_all and config not in policy_excluded
-    ]
+    refined = [config for config in original if config not in blocked_all]
 
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text("".join(f"{config}\n" for config in refined), encoding="utf-8")
@@ -108,7 +102,6 @@ def main():
 
     print(f"input configs: {len(original)}", flush=True)
     print(f"blocked configs: {len(blocked_all)}", flush=True)
-    print(f"policy excluded configs: {len(policy_excluded)}", flush=True)
     for result_type, configs in sorted(blocked_by_type.items()):
         print(f"  {result_type}: {len(configs)}", flush=True)
     print(f"output configs: {len(refined)}", flush=True)
