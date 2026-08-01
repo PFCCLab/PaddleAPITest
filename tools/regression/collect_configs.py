@@ -1,26 +1,18 @@
 from __future__ import annotations
 
 import argparse
+import os
 from collections import Counter, OrderedDict
 from pathlib import Path
 
 from tester.api_config.parser import APIConfig
 from tester.input_generation.registry import API_RULE_REGISTRY
 from tester.paddle_to_torch import get_converter
-
-DEFAULT_SOURCES = (
-    Path(
-        "/root/paddlejob/share-storage/gpfs/system-public/lihaoyang08/"
-        "PaddleAPITest-worktrees/opt/tester/api_config/monitor_config/accuracy/GPU"
-    ),
-    Path(
-        "/root/paddlejob/share-storage/gpfs/system-public/lihaoyang08/"
-        "baidu/paddle/jelly/case/scripts/api_test/apitest_config"
-    ),
-)
+from tester.paddle_to_torch.rules import ConversionKind
 
 DEFAULT_OUTPUT = Path("tools/regression/regression_configs.txt")
 DEFAULT_SUMMARY = Path("tools/regression/regression_summary.txt")
+SOURCE_ENV_VAR = "REGRESSION_CONFIG_SOURCES"
 EXCLUDED_PATH_KEYWORDS = (
     "needfix",
     "need_fix",
@@ -72,7 +64,7 @@ def is_accuracy_supported(api_name: str, converter_cache: dict[str, bool]) -> bo
     if api_name not in converter_cache:
         result = get_converter().convert(api_name)
         converter_cache[api_name] = bool(
-            result.is_supported and result.code and result.code.is_valid()
+            result.kind is not ConversionKind.UNSUPPORTED and result.code
         )
     return converter_cache[api_name]
 
@@ -168,9 +160,18 @@ def parse_args():
     return parser.parse_args()
 
 
+def resolve_sources(cli_sources):
+    if cli_sources:
+        return tuple(cli_sources)
+    env_value = os.environ.get(SOURCE_ENV_VAR)
+    if env_value:
+        return tuple(Path(value) for value in env_value.split(os.pathsep) if value)
+    raise SystemExit(f"no config sources provided; pass --source or set {SOURCE_ENV_VAR}")
+
+
 def main():
     args = parse_args()
-    sources = tuple(args.source or DEFAULT_SOURCES)
+    sources = resolve_sources(args.source)
     selected, stats = collect_configs(sources, args.max_per_api)
     write_outputs(selected, stats, args.output, args.summary, args.max_per_api)
     print(f"regression api keys: {len(selected)}", flush=True)

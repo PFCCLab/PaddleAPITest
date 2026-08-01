@@ -122,6 +122,7 @@ def process_grad_output(api_config, paddle_out_grads, torch_out_grads):
             is_upper = api_config.kwargs["is_upper"]
         else:
             is_upper = False
+        torch_out_grads = list(torch_out_grads)
         torch_out_grads[1] = (
             torch.triu(torch_out_grads[1]) if is_upper else torch.tril(torch_out_grads[1])
         )

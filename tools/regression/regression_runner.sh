@@ -3,7 +3,7 @@ set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 CONFIG_FILE="${REGRESSION_CONFIG_FILE:-tools/regression/regression_configs.txt}"
-LOG_ROOT="${REGRESSION_LOG_DIR:-/tmp/paddleapitest_project_regression_$(date +%s)}"
+LOG_ROOT="${REGRESSION_LOG_DIR:-$(mktemp -d /tmp/paddleapitest_project_regression.XXXXXX)}"
 PYTHON_BIN="${PYTHON:-python}"
 
 cd "${ROOT_DIR}"
@@ -16,7 +16,6 @@ COMMON_ARGS=(
   --num_workers_per_gpu="${REGRESSION_WORKERS_PER_GPU:-4}"
   --timeout="${REGRESSION_TIMEOUT:-180}"
   --show_runtime_status=False
-  --random_seed="${REGRESSION_SEED:-20260731}"
 )
 
 "${PYTHON_BIN}" engineV4.py \

@@ -10,16 +10,6 @@
 - last_refinement_blocked_configs: 1
 - last_refinement_paddle_accuracy: 1
 
-## Last validation
-
-- log_dir: /tmp/project_regression_1785489586
-- command: source /root/.venv-lihaoyang08/bin/activate && REGRESSION_LOG_DIR=/tmp/project_regression_1785489586 tools/regression/regression_runner.sh
-- compute: 8 GPUs, 4 workers per GPU
-- paddle_only: 473 pass, 0 fail
-- accuracy: 473 pass, 0 fail
-- error_stat_paddle_bitwise: 0
-- error_stat_non_bitwise: 0
-
 ## API key coverage
 
 - paddle.Tensor.__div__: 3

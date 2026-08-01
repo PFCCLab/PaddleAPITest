@@ -1,56 +1,91 @@
-# 项目回归测试流水线
+# 项目回归测试
 
-本目录用于维护项目级固定回归配置集，不归属于某个单独模块。
+`tools/regression` 维护项目级固定回归配置集，用于在修改后验证 `paddle_only` 和 `accuracy` 两类门禁。
+
 当前固定集合为 `tools/regression/regression_configs.txt`，覆盖 114 个 API key、473 条配置。
 
-## 配置来源
-
-- `/root/paddlejob/share-storage/gpfs/system-public/lihaoyang08/PaddleAPITest-worktrees/opt/tester/api_config/monitor_config/accuracy/GPU`
-- `/root/paddlejob/share-storage/gpfs/system-public/lihaoyang08/baidu/paddle/jelly/case/scripts/api_test/apitest_config`
-
-`collect_configs.py` 会从以上目录收集真实 APIConfig，并为每个 API key 保留最多 5 条不同配置。
-如果某个 API key 源配置不足 5 条，也会按实际数量进入回归集合。
-收集时会排除 `1M` 与 `0size` 配置目录，避免把大规模或零维专项集合混入常规回归。
-`paddle.empty` 与 `paddle.empty_like` 不进入固定回归集合，因为它们返回未初始化内存，
-不适合参与稳定的 paddle only 与 accuracy 门禁。
-`paddle._C_ops._run_custom_op` 按第一个参数 `op_name` 细分 API key，例如：
-
-```text
-paddle._C_ops._run_custom_op:fused_swiglu_scale_clamp
-```
-
-## 运行方式
+## 运行回归
 
 ```bash
-source /root/.venv-lihaoyang08/bin/activate
-python tools/regression/collect_configs.py
 tools/regression/regression_runner.sh
 ```
 
-流水线使用同一份 `regression_configs.txt` 分别运行：
+流水线会使用同一份 `regression_configs.txt` 依次运行：
 
 - `engineV4.py --paddle_only=True`
 - `engineV4.py --accuracy=True`
 
-默认执行参数为 `--gpu_ids=-1`、`--num_gpus=-1` 与 `--num_workers_per_gpu=4`，
-即使用可见 GPU 最大数量，并在每张 GPU 上启动 4 个 worker。可通过 `GPU_IDS`、
-`REGRESSION_NUM_GPUS` 和 `REGRESSION_WORKERS_PER_GPU` 临时覆盖。
+默认执行参数：
 
-执行结束后会调用 `tools/error_stat/error_stat.py --split-errors` 解析结果。门禁规则是：
+- `--gpu_ids=-1`
+- `--num_gpus=-1`
+- `--num_workers_per_gpu=4`
+- `--timeout=180`
 
-- 允许：`pass`、`skip`、`paddle_bitwise`
-- 不允许：`paddle_error`、`paddle_accuracy`、`paddle_cuda`、`paddle_crash`、`oom`、`timeout`、`torch_error`、`config_input`、`config_parse`、`config_convert`
+可通过环境变量覆盖：
 
-最近一次通过记录：
+```bash
+GPU_IDS=0 REGRESSION_NUM_GPUS=1 REGRESSION_WORKERS_PER_GPU=2 \
+  tools/regression/regression_runner.sh
+```
 
-- 日志目录：`/tmp/project_regression_1785489586`
-- 并发参数：8 张 GPU、每张 GPU 4 个 worker
-- `paddle_only`：473 pass，0 fail
-- `accuracy`：473 pass，0 fail
-- `error_stat`：无 `paddle_bitwise`，无其他错误分类
+常用环境变量：
 
-如候选集首次运行产生非允许分类，可用 `refine_configs.py` 基于 `error_stat` 结果剔除这些配置，
-再重新运行流水线：
+- `REGRESSION_CONFIG_FILE`：配置集合路径，默认 `tools/regression/regression_configs.txt`
+- `REGRESSION_LOG_DIR`：日志输出目录，默认临时目录 `/tmp/paddleapitest_project_regression.XXXXXX`
+- `PYTHON`：Python 解释器，默认 `python`
+- `GPU_IDS`：传给 `engineV4.py --gpu_ids`
+- `REGRESSION_NUM_GPUS`：传给 `engineV4.py --num_gpus`
+- `REGRESSION_WORKERS_PER_GPU`：传给 `engineV4.py --num_workers_per_gpu`
+- `REGRESSION_TIMEOUT`：单配置超时时间
+
+执行结束后，脚本会调用 `tools/error_stat/error_stat.py --split-errors` 解析结果，并用
+`tools/regression/check_error_stat.py` 检查门禁。
+
+## 门禁规则
+
+允许分类：
+
+- `pass`
+- `skip`
+- `paddle_bitwise`
+
+不允许分类：
+
+- `paddle_error`
+- `paddle_accuracy`
+- `paddle_cuda`
+- `paddle_crash`
+- `oom`
+- `timeout`
+- `torch_error`
+- `config_input`
+- `config_parse`
+- `config_convert`
+
+## 维护配置集合
+
+如需从外部 APIConfig 文件重新收集固定集合，显式传入来源目录或文件：
+
+```bash
+python tools/regression/collect_configs.py \
+  --source /path/to/api_config_dir \
+  --source /path/to/api_config_file.txt \
+  --output tools/regression/regression_configs.txt \
+  --summary tools/regression/regression_summary.txt
+```
+
+`collect_configs.py` 会为每个 API key 保留最多 5 条不同配置。源配置不足 5 条时，按实际数量进入回归集合。
+
+收集策略：
+
+- 排除路径中包含 `needfix`、`need_fix`、`not_monitor`、`1m`、`0size` 的配置。
+- 排除配置文本中包含 `float8_` 的配置。
+- 排除 `paddle.empty` 与 `paddle.empty_like`，因为它们返回未初始化内存，不适合作为稳定门禁。
+- 仅保留项目当前支持输入生成和 accuracy 转换的 API。
+- `paddle._C_ops._run_custom_op` 按第一个参数 `op_name` 细分 API key，例如 `paddle._C_ops._run_custom_op:fused_swiglu_scale_clamp`。
+
+如候选集运行产生非允许分类，可根据 `error_stat` 结果剔除失败配置：
 
 ```bash
 python tools/regression/refine_configs.py \

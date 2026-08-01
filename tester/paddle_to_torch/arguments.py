@@ -8,6 +8,7 @@ from types import MappingProxyType
 from typing import Any
 
 import paddle
+import torch
 import yaml
 
 with (Path(__file__).parent.parent / "base_config.yaml").open(encoding="utf-8") as stream:
@@ -96,6 +97,27 @@ del _MANUAL_ARGUMENT_NAMES
 
 _SIGNATURE_CACHE: dict[str, inspect.Signature | None] = {}
 
+_TORCH_DTYPE_BY_NAME = MappingProxyType(
+    {
+        "bool": torch.bool,
+        "uint8": torch.uint8,
+        "int8": torch.int8,
+        "int16": torch.int16,
+        "int32": torch.int32,
+        "int64": torch.int64,
+        "float16": torch.float16,
+        "bfloat16": torch.bfloat16,
+        "float32": torch.float32,
+        "float64": torch.float64,
+        "complex64": torch.complex64,
+        "complex128": torch.complex128,
+        "fp16": torch.float16,
+        "fp32": torch.float32,
+        "fp64": torch.float64,
+        "bf16": torch.bfloat16,
+    }
+)
+
 
 def resolve_paddle_api(api_name: str) -> Callable[..., Any]:
     if not api_name.startswith("paddle."):
@@ -134,6 +156,58 @@ def _bind_manual_arguments(
     )
 
 
+def _normalize_tensor_self_argument(
+    api_name: str, bound: OrderedDict[str, Any]
+) -> OrderedDict[str, Any]:
+    if not api_name.startswith("paddle.Tensor."):
+        return bound
+    if "self" in bound:
+        receiver_name = "self"
+    elif "x" not in bound and bound:
+        receiver_name = next(iter(bound))
+    else:
+        return bound
+    if receiver_name != "x":
+        bound["x"] = bound.pop(receiver_name)
+        bound.move_to_end("x", last=False)
+    return bound
+
+
+def _normalize_torch_dtype(value: Any) -> Any:
+    if value is None or isinstance(value, torch.dtype):
+        return value
+    if isinstance(value, str):
+        dtype_name = value
+    elif isinstance(value, paddle.dtype):
+        dtype_name = str(value)
+    else:
+        try:
+            var_type = paddle.base.libpaddle.VarDesc.VarType
+        except AttributeError:
+            var_type = ()
+        if var_type and isinstance(value, var_type):
+            dtype_name = str(value)
+        else:
+            return value
+    dtype_key = dtype_name.split(".")[-1].lower()
+    return _TORCH_DTYPE_BY_NAME.get(dtype_key, value)
+
+
+def _normalize_dtype_arguments(bound: OrderedDict[str, Any]) -> OrderedDict[str, Any]:
+    for name, value in tuple(bound.items()):
+        if "dtype" in name:
+            bound[name] = _normalize_torch_dtype(value)
+        elif isinstance(value, paddle.dtype):
+            bound[name] = _normalize_torch_dtype(value)
+    return bound
+
+
+def _finalize_bound_arguments(api_name: str, bound: OrderedDict[str, Any]) -> OrderedDict[str, Any]:
+    _normalize_tensor_self_argument(api_name, bound)
+    _normalize_dtype_arguments(bound)
+    return bound
+
+
 def bind_paddle_arguments(
     api_name: str,
     positional: Sequence[Any],
@@ -145,16 +219,25 @@ def bind_paddle_arguments(
     if api_name in ("paddle.Tensor.view", "paddle.view"):
         rest = positional[1:]
         if len(rest) > 1 and all(isinstance(value, int) for value in rest):
-            return OrderedDict(x=positional[0], shape_or_dtype=list(rest))
+            return _finalize_bound_arguments(
+                api_name,
+                OrderedDict(x=positional[0], shape_or_dtype=list(rest)),
+            )
 
     if api_name in ("paddle.Tensor.reshape", "paddle.reshape"):
         rest = positional[1:]
         if rest and all(isinstance(value, int) for value in rest):
-            return OrderedDict(x=positional[0], shape=list(rest))
+            return _finalize_bound_arguments(
+                api_name,
+                OrderedDict(x=positional[0], shape=list(rest)),
+            )
 
     manual_names = MANUAL_ARGUMENT_NAMES.get(api_name)
     if manual_names is not None:
-        return _bind_manual_arguments(manual_names, positional, keyword)
+        return _finalize_bound_arguments(
+            api_name,
+            _bind_manual_arguments(manual_names, positional, keyword),
+        )
 
     signature = _signature_for(api_name, api)
     if signature is None:
@@ -176,15 +259,16 @@ def bind_paddle_arguments(
     bound_arguments.apply_defaults()
     bound = OrderedDict(bound_arguments.arguments)
     bound.pop("name", None)
-    if api_name.startswith("paddle.Tensor.") and "self" in bound:
-        bound["x"] = bound.pop("self")
-        bound.move_to_end("x", last=False)
     if api_name == "paddle.Tensor.item":
         bound["indices"] = bound.pop("args")
     if api_name == "paddle.arange" and bound["end"] is None:
         bound["end"] = bound["start"]
         bound["start"] = 0
-    return bound
+    if api_name in ("paddle.topk", "paddle.Tensor.topk") and bound.get("axis") is None:
+        bound["axis"] = -1
+    if api_name in ("paddle.gather", "paddle.Tensor.gather") and bound.get("axis") is None:
+        bound["axis"] = 0
+    return _finalize_bound_arguments(api_name, bound)
 
 
 __all__ = ["MANUAL_ARGUMENT_NAMES", "bind_paddle_arguments", "resolve_paddle_api"]

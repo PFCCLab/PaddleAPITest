@@ -4392,6 +4392,7 @@
         "torch_api": "torch.Tensor.tolist"
     },
     "paddle.topk": {
+        "Rule": "TopkRule",
         "torch_api": "torch.topk",
         "paddle_torch_args_map": {
             "x": "input",
@@ -4402,6 +4403,7 @@
         }
     },
     "paddle.Tensor.topk": {
+        "Rule": "TopkRule",
         "torch_api": "torch.Tensor.topk",
         "paddle_torch_args_map": {
             "k": "k",

@@ -588,7 +588,7 @@ if keepdim == None:
 if not isinstance(axis, int) and axis != None:
     axis = int(axis)
 """
-        post = "result  = result.to(dtype)"
+        post = "result = result.to(dtype=dtype)"
         return self.build_result(
             paddle_api,
             kind=ConversionKind.DIRECT,
@@ -8063,10 +8063,31 @@ class TensorPowRule(BaseRule):
 
     def apply(self, paddle_api: str) -> ConvertResult:
         pre = """
-tensor = self
+tensor = x
 other = y
 """
         core = "result = tensor.__pow__(other)"
+        return self.build_result(
+            paddle_api,
+            kind=ConversionKind.DIRECT,
+            preprocess=pre.splitlines(),
+            core=core,
+        )
+
+
+class TopkRule(BaseRule):
+    PADDLE_APIS = ("paddle.topk", "paddle.Tensor.topk")
+
+    def apply(self, paddle_api: str) -> ConvertResult:
+        pre = """
+if axis is None:
+    axis = -1
+if largest is None:
+    largest = True
+if sorted is None:
+    sorted = True
+"""
+        core = "result = torch.topk(input=x, k=k, dim=axis, largest=largest, sorted=sorted)"
         return self.build_result(
             paddle_api,
             kind=ConversionKind.DIRECT,

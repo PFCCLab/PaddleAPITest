@@ -10,6 +10,7 @@ import yaml
 from .accuracy_common import process_grad_output, process_output
 from .base import APITestBase, gpu_mode_maybe_empty_cache
 from .paddle_to_torch import ConversionKind, get_converter
+from .paddle_to_torch.arguments import bind_paddle_arguments
 
 
 class APITestAccuracy(APITestBase):
@@ -282,6 +283,13 @@ class APITestAccuracy(APITestBase):
             if self.api_config.api_name == "paddle.nn.functional.rnnt_loss":
                 if paddle.device.get_device() == "cpu":
                     execution_locals["fused_log_softmax"] = False
+            bound_arguments = bind_paddle_arguments(
+                self.api_config.api_name,
+                self.torch_args,
+                self.torch_kwargs,
+            )
+            if bound_arguments is None:
+                raise RuntimeError(f"no argument binding contract for {self.api_config.api_name}")
 
             def execute_core(compiled, exec_globals, exec_locals):
                 if self.test_amp:
@@ -293,7 +301,7 @@ class APITestAccuracy(APITestBase):
             torch_output = self.converter.execute(
                 convert_result,
                 self.torch_args,
-                self.torch_kwargs,
+                bound_arguments,
                 execution_locals=execution_locals,
                 core_executor=execute_core,
             )

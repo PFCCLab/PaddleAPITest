@@ -33,7 +33,7 @@ BASE_DIR_32 = "/root/paddlejob/share-storage/gpfs/system-public/ningzhengsheng/n
 BASE_DIR_64 = "/root/paddlejob/share-storage/gpfs/system-public/ningzhengsheng/nzs_tmp_new/outputs/dpskv4_dist_seq64stp2"
 OUTPUT_SUFFIX = sys.argv[2] if len(sys.argv) > 2 else "1M_s32x64"
 OUTPUT_DIR = os.path.join(
-    "/root/paddlejob/share-storage/gpfs/system-public/lihaoyang08/workspace/0528_dsV4",
+    os.environ.get("API_DERIVE_OUTPUT_ROOT", "generated/api_traces"),
     OUTPUT_SUFFIX,
 )
 os.makedirs(OUTPUT_DIR, exist_ok=True)
