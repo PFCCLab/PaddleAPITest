@@ -74,7 +74,7 @@ def write_input_value(api_config, tensor_config, new_value, update_metadata=True
             update_metadata=update_metadata,
             backend=existing_value.backend,
             declared_dtype=existing_value.declared_dtype,
-            storage_dtype=existing_value.storage_dtype,
+            storage_dtype=str(getattr(new_value, "dtype", "")) or None,
         )
         value_by_tensor_id = getattr(api_config, _VALUE_BY_TENSOR_ID_ATTR, None)
         if value_by_tensor_id is not None:

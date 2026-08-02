@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import math
 import numbers
+import os
 from collections.abc import Callable
 from dataclasses import dataclass
 
@@ -101,12 +102,16 @@ class RegisteredRule:
     allow_cached: bool = True
 
     def block_reason(self, context: InputGenerationContext) -> str | None:
-        from .tensor_config import USE_CACHED_NUMPY
-
         if context.gpu_enabled and not self.allow_gpu:
             return f"{self.block_key}-gpu-blocked"
 
-        if USE_CACHED_NUMPY and not self.allow_cached:
+        use_cached_numpy = os.getenv("USE_CACHED_NUMPY", "False").lower() in {
+            "true",
+            "1",
+            "yes",
+            "y",
+        }
+        if use_cached_numpy and not self.allow_cached:
             return f"{self.block_key}-cache-blocked"
         if self.blocker is not None:
             return self.blocker(context)

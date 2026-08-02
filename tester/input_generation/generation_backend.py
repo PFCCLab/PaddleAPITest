@@ -109,25 +109,23 @@ class NumpyGenerationBackend:
     def random(self, shape=None, size=None, dtype=None):
         shape = shape if shape is not None else size
         value = self.rng.random(shape)
-        return value.astype(dtype) if dtype is not None else value
+        return numpy.asarray(value).astype(dtype) if dtype is not None else value
 
     def uniform(self, low=0.0, high=1.0, shape=None, size=None, dtype=None):
         shape = shape if shape is not None else size
         value = self.rng.uniform(low=low, high=high, size=shape)
-        return value.astype(dtype) if dtype is not None else value
+        return numpy.asarray(value).astype(dtype) if dtype is not None else value
 
     def randint(self, low, high=None, shape=None, size=None, dtype=None):
         shape = shape if shape is not None else size
-        kwargs = {"size": shape}
-        if dtype is not None:
-            kwargs["dtype"] = dtype
-        return self.rng.randint(low, high, **kwargs)
+        value = self.rng.randint(low, high, size=shape)
+        return numpy.asarray(value).astype(dtype) if dtype is not None else value
 
     def randn(self, *shape, size=None, dtype=None):
         if size is not None and not shape:
             shape = tuple(size) if isinstance(size, (list, tuple)) else (size,)
         value = self.rng.randn(*shape)
-        return value.astype(dtype) if dtype is not None else value
+        return numpy.asarray(value).astype(dtype) if dtype is not None else value
 
     def choice(self, values, shape=None, size=None, replace=True, p=None):
         shape = shape if shape is not None else size
@@ -361,6 +359,7 @@ class TorchGenerationBackend(NumpyGenerationBackend):
 
 
 INPUT_BACKEND_ENV_VAR = "PADDLEAPITEST_INPUT_BACKEND"
+# Only used when no case-local RNG is available, such as legacy TensorConfig helpers.
 _DEFAULT_BACKENDS = {}
 _WARNED_CACHED_TORCH_BACKEND = False
 

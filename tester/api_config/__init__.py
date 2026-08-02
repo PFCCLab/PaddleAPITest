@@ -1,3 +1,4 @@
+import os
 from typing import TYPE_CHECKING, Any
 
 __all__ = [
@@ -34,9 +35,7 @@ def __getattr__(name: str) -> Any:
 
         return analyse_configs
     elif name == "USE_CACHED_NUMPY":
-        from ..input_generation.tensor_config import USE_CACHED_NUMPY
-
-        return USE_CACHED_NUMPY
+        return os.getenv("USE_CACHED_NUMPY", "False").lower() in {"true", "1", "yes", "y"}
     elif name == "cached_numpy":
         from ..input_generation.tensor_config import cached_numpy
 

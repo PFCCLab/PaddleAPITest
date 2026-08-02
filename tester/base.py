@@ -18,7 +18,6 @@ from .input_generation.input_bind import (
 )
 from .input_generation.input_values import input_value
 from .input_generation.tensor_config import (
-    USE_CACHED_NUMPY,
     TensorConfig,
     get_cached_numpy_array,
 )
@@ -958,7 +957,7 @@ class APITestBase:
 
     def _make_numpy_output_grad(self, output):
         dtype = _dtype_name(output.dtype)
-        if USE_CACHED_NUMPY:
+        if os.getenv("USE_CACHED_NUMPY", "False").lower() in {"true", "1", "yes", "y"}:
             dtype = "float32" if dtype == "bfloat16" else dtype
             return self.get_cached_numpy(dtype, output.shape)
         if "int" in dtype:
