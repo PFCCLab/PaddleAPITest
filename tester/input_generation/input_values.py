@@ -10,6 +10,9 @@ class InputValue:
     path: InputPath
     value: object
     update_metadata: bool = True
+    backend: str = "numpy"
+    declared_dtype: str | None = None
+    storage_dtype: str | None = None
 
 
 _VALUES_ATTR = "_input_generation_values"
@@ -55,6 +58,13 @@ def input_value(api_config, tensor_config):
     return tensor_config.numpy_tensor
 
 
+def input_value_backend(api_config, tensor_config):
+    value = value_for_tensor(api_config, tensor_config)
+    if value is not None:
+        return value.backend
+    return "numpy"
+
+
 def write_input_value(api_config, tensor_config, new_value, update_metadata=True):
     existing_value = value_for_tensor(api_config, tensor_config)
     if existing_value is not None:
@@ -62,6 +72,9 @@ def write_input_value(api_config, tensor_config, new_value, update_metadata=True
             existing_value.path,
             new_value,
             update_metadata=update_metadata,
+            backend=existing_value.backend,
+            declared_dtype=existing_value.declared_dtype,
+            storage_dtype=existing_value.storage_dtype,
         )
         value_by_tensor_id = getattr(api_config, _VALUE_BY_TENSOR_ID_ATTR, None)
         if value_by_tensor_id is not None:

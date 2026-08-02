@@ -294,6 +294,7 @@ def _collect_relevant_env() -> dict[str, str]:
         "CPATH",
         "USE_GPU_MODE",
         "USE_CACHED_NUMPY",
+        "PADDLEAPITEST_INPUT_BACKEND",
         "USE_DUMP",
         "DUMP_DIR",
         "SKIP_GPU_CLEANUP",

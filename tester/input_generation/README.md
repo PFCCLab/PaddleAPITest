@@ -16,9 +16,14 @@ APIConfig -> APITestBase.gen_numpy_input -> dispatch.py -> input_bind.py -> regi
 - `input_bind.py`：签名解析、参数绑定、调用绑定和运行时上下文
 - `input_values.py`：逻辑值 `InputValue` 的读写、挂载和清理
 - `value_sample.py`：与 API 无关的纯 NumPy 值生成
-- `registry.py`：`@rules.register` 规则、`RuleCase` 和规则执行入口
+- `registry.py`：`@rules.register` 规则、`InputBuilder` 和规则执行入口
 - `dispatch.py`：输入生成调度、规则查找和阻断
 - `tensor_config.py`：张量配置、缓存和框架物化
+
+输入生成后端抽象和命名重构的设计与进度见：
+
+- `docs/superpowers/specs/2026-08-01-input-generation-backend-design.md`
+- `docs/superpowers/plans/2026-08-01-input-generation-backend-migration.md`
 
 ## 设计目标
 
@@ -60,15 +65,33 @@ Torch 开关和 GPU 开关。规则不应直接依赖全局状态。
 `RegisteredRule` 表示一条 decorator 注册规则，负责校验 GPU/cache 阻断、执行规则函数、
 检查完整性并提交 payload。
 
-### `RuleCase`
+### `InputBuilder`
 
-`RuleCase` 是规则编写时拿到的可变 case 视图。它负责：
+`InputBuilder` 是规则编写时拿到的输入构建器。它负责：
 
 - 按 `InputPath` 读取和写入 Tensor
 - 维护 case 级 RNG
 - 提供 `generate()`、`generate_all()`、`generate_remaining()`、`generate_by_parameter()`
 - 防止重复写入
 - 收集最终 payload
+
+规则函数中的变量名使用 `inputs`，并把值创建放在 `inputs.backend.*` 下，避免
+`case.zeros(...)` 这类调用混淆“API case”和“数组工厂”两个概念。
+
+### Backend Selection
+
+输入生成 backend 只通过环境变量选择：
+
+```bash
+PADDLEAPITEST_INPUT_BACKEND=numpy
+PADDLEAPITEST_INPUT_BACKEND=torch
+```
+
+未设置时默认 `numpy`。`torch` backend 使用 case-local Torch generator 作为随机源，
+并保持现有规则层的 NumPy-compatible value contract。
+
+`USE_CACHED_NUMPY=True` 时固定使用 `numpy` backend。如果同时设置
+`PADDLEAPITEST_INPUT_BACKEND=torch`，框架会打印 warning 并忽略 torch backend 请求。
 
 ## 规则编写方法
 
@@ -78,29 +101,29 @@ Torch 开关和 GPU 开关。规则不应直接依赖全局状态。
 
 ```python
 @rules.register("paddle.clip", aliases=("paddle.Tensor.clip",))
-def clip_values(ctx: InputGenerationContext, case: RuleCase):
-    case.generate("x", "default")
-    case.generate("min", "random_range", low=-1, high=0)
-    case.generate("max", "random_range", low=0, high=1)
+def clip_values(ctx: InputGenerationContext, inputs: InputBuilder):
+    inputs.generate("x", "default")
+    inputs.generate("min", "random_range", low=-1, high=0)
+    inputs.generate("max", "random_range", low=0, high=1)
 ```
 
 规则函数只描述 API 语义，不写绑定、物化或日志逻辑。
 
-### 2. 优先使用 `case` 的高层接口
+### 2. 优先使用 `inputs` 的高层接口
 
-- `case.generate_all("default")`：同类参数统一生成
-- `case.generate("x", "default")`：针对参数名生成
-- `case.generate_remaining("default")`：补齐未生成参数
-- `case.generate_by_parameter(...)`：按参数名映射不同生成策略
-- `case.arg()` / `case.kwarg()`：读取原始参数
-- `case.find()`：按参数名定位绑定
-- `case.value()`：读取逻辑值
+- `inputs.generate_all("default")`：同类参数统一生成
+- `inputs.generate("x", "default")`：针对参数名生成
+- `inputs.generate_remaining("default")`：补齐未生成参数
+- `inputs.generate_by_parameter(...)`：按参数名映射不同生成策略
+- `inputs.arg()` / `inputs.kwarg()`：读取原始参数
+- `inputs.find()`：按参数名定位绑定
+- `inputs.value()`：读取逻辑值
 
 ### 3. 只在必要时写低层值
 
-- `case.set_value()`：正常写入并同步元数据
-- `case.rewrite_value()`：重写已有值
-- `case.set_value_raw()`：仅在需要保留元数据时使用
+- `inputs.set_value()`：正常写入并同步元数据
+- `inputs.rewrite_value()`：重写已有值
+- `inputs.set_value_raw()`：仅在需要保留元数据时使用
 
 ### 4. 失败要显式
 
@@ -123,7 +146,7 @@ def clip_values(ctx: InputGenerationContext, case: RuleCase):
 ### 2. 从逐参数副作用改为完整 case 规则
 
 旧实现常在生成一个参数时顺手读写另一个参数，行为依赖遍历顺序。现在规则以完整 case 为单位
-描述，通过 `case.generate()`、`case.generate_all()`、`case.arg()` 和 `case.kwarg()`
+描述，通过 `inputs.generate()`、`inputs.generate_all()`、`inputs.arg()` 和 `inputs.kwarg()`
 显式表达参数关系。
 
 ### 3. 从生成逻辑与物化耦合改为分层处理
@@ -138,7 +161,7 @@ def clip_values(ctx: InputGenerationContext, case: RuleCase):
 
 ### 5. 从全局随机状态改为 case-owned RNG
 
-旧实现更接近共享全局随机状态。现在 `RuleCase` 持有 case 级 RNG，规则成功后才提交状态，
+旧实现更接近共享全局随机状态。现在 `InputBuilder` 持有 case 级 RNG，规则成功后才提交状态，
 失败不会污染其他 case。
 
 ## 运行时约束

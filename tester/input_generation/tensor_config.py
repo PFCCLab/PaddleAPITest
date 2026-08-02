@@ -12,7 +12,8 @@ import paddle
 import yaml
 from tester.dtype_utils import to_torch_dtype
 
-from .input_values import clear_input_value, input_value, write_input_value
+from .generation_backend import create_generation_backend
+from .input_values import clear_input_value, input_value, input_value_backend, write_input_value
 
 # 优化器的零填充位置属于物化层专用数据。
 OPTIMIZER_APIS = {
@@ -74,6 +75,10 @@ def _normalize_cache_dtype(dtype):
     if dtype == "bfloat16":
         return "float32"
     return str(dtype)
+
+
+def _generation_backend():
+    return create_generation_backend()
 
 
 def get_cached_numpy_array(
@@ -418,18 +423,19 @@ class TensorConfig:
         return self.torch_tensor
 
     def generate_random_axes(self, api_config):
+        backend = _generation_backend()
         x_shape = self.get_arg(api_config, 0, "x").shape
         max_dim = max(len(x_shape), 1)  # 标量时至少按 1 维处理。
 
         if len(self.shape) == 0:
-            dim = numpy.random.randint(0, max_dim)
-            if numpy.random.rand() > 0.5:
+            dim = backend.randint(0, max_dim)
+            if backend.random() > 0.5:
                 dim -= max_dim
             return numpy.array(dim, dtype=self.dtype)
 
         if len(self.shape) == 1:
-            dims = numpy.random.choice(max_dim, size=self.shape[0], replace=False)
-            mask = numpy.random.rand(self.shape[0]) > 0.5
+            dims = backend.choice(max_dim, size=self.shape[0], replace=False)
+            mask = backend.random(self.shape[0]) > 0.5
             dims = numpy.where(mask, dims - max_dim, dims)
             return numpy.array(dims, dtype=self.dtype)
 
@@ -439,6 +445,7 @@ class TensorConfig:
         )
 
     def generate_random_index(self, api_config, allow_none=False):
+        backend = _generation_backend()
         axis = self.get_arg(api_config, 2, "axis")
         if axis is None and not allow_none:
             raise ValueError("Axis is None")
@@ -448,7 +455,7 @@ class TensorConfig:
         if not (0 <= axis < len(x_shape)):
             raise ValueError(f"Invalid axis {axis} for shape {x_shape}")
         if len(self.shape) >= 1:
-            return numpy.random.randint(0, x_shape[axis], size=self.shape, dtype=self.dtype)
+            return backend.randint(0, x_shape[axis], size=self.shape, dtype=self.dtype)
 
         raise ValueError(
             f"Invalid shape for 'index' Tensor in {api_config.api_name}. "
@@ -572,9 +579,10 @@ class TensorConfig:
                 else:
                     intermediate_torch_dtype = self.to_torch_dtype(self.dtype)
                 requires_grad = self._requires_autograd(api_config)
-                self.torch_tensor = torch.tensor(
-                    self._logical_numpy_tensor(api_config),
+                self.torch_tensor = self._logical_torch_tensor(
+                    api_config,
                     dtype=intermediate_torch_dtype,
+                    device=device,
                     requires_grad=requires_grad and not needs_cast,
                 )
                 if needs_cast:
@@ -606,10 +614,10 @@ class TensorConfig:
         )
         tensor = torch.as_strided(flat_tensor, self.shape, self.strides)
         logical_tensor = self._logical_numpy_tensor(api_config)
-        if logical_tensor.size > 0:
+        if getattr(logical_tensor, "numel", lambda: getattr(logical_tensor, "size", 0))() > 0:
             tensor.copy_(
-                torch.tensor(
-                    logical_tensor,
+                self._logical_torch_tensor(
+                    api_config,
                     dtype=intermediate_torch_dtype,
                     device=device,
                 )
@@ -624,6 +632,15 @@ class TensorConfig:
 
     def _logical_numpy_tensor(self, api_config):
         return input_value(api_config, self)
+
+    def _logical_torch_tensor(self, api_config, dtype, device, requires_grad=False):
+        value = input_value(api_config, self)
+        if input_value_backend(api_config, self) == "torch" and isinstance(value, torch.Tensor):
+            tensor = value.to(device=device, dtype=dtype)
+            if requires_grad:
+                tensor = tensor.detach().requires_grad_(True)
+            return tensor
+        return torch.tensor(value, dtype=dtype, device=device, requires_grad=requires_grad)
 
     def clear_tensor(self, api_config=None):
         if api_config is not None:
@@ -760,20 +777,31 @@ class TensorConfig:
 
     def random_numpy(self, shape=None, data_type=None, min=None, max=None):
         """按 shape 和 dtype 生成位于 [min, max) 的随机 NumPy 数组。"""
+        backend = _generation_backend()
         if "int" in data_type:
             min = min if min is not None else -65535
             max = max if max is not None else 65535
-            numpy_tensor = (numpy.random.randint(min, max, size=shape)).astype(data_type)
+            numpy_tensor = backend.randint(min, max, size=shape).astype(data_type)
         elif data_type.startswith("complex"):
             real_dtype = "float32" if data_type == "complex64" else "float64"
             real_min = min if min is not None else numpy.finfo(real_dtype).min / 2
             real_max = max if max is not None else numpy.finfo(real_dtype).max / 2
-            real_part = numpy.random.uniform(real_min, real_max, size=shape).astype(real_dtype)
-            imag_part = numpy.random.uniform(real_min, real_max, size=shape).astype(real_dtype)
+            real_part = backend.uniform(
+                real_min,
+                real_max,
+                size=shape,
+                dtype=real_dtype,
+            ).astype(real_dtype)
+            imag_part = backend.uniform(
+                real_min,
+                real_max,
+                size=shape,
+                dtype=real_dtype,
+            ).astype(real_dtype)
             numpy_tensor = (real_part + 1j * imag_part).astype(data_type)
         else:
             dtype = "float32" if data_type == "bfloat16" else data_type
             min = min if min is not None else numpy.finfo(dtype).min / 2
             max = max if max is not None else numpy.finfo(dtype).max / 2
-            numpy_tensor = (numpy.random.uniform(min, max, size=shape)).astype(dtype)
+            numpy_tensor = backend.uniform(min, max, size=shape, dtype=dtype).astype(dtype)
         return numpy_tensor
