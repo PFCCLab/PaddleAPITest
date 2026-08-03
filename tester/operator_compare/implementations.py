@@ -226,8 +226,6 @@ def run_torch_case(case: CompareCase) -> torch.Tensor:
         torch_args,
         torch_keyword,
     )
-    if bound_arguments is None:
-        raise RuntimeError(f"no argument binding contract for {api_config.api_name}")
     output = Paddle2TorchConverter.execute(convert_result, torch_args, bound_arguments)
     return to_torch_tensor(output)
 

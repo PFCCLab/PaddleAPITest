@@ -50,6 +50,20 @@ class _LazyTorch:
 torch = _LazyTorch()
 
 
+def total_tensor_numel(api_config):
+    total = 0
+    values = (*api_config.args, *api_config.kwargs.values())
+    for value in values:
+        candidates = value if isinstance(value, (list, tuple)) else (value,)
+        for candidate in candidates:
+            if isinstance(candidate, TensorConfig):
+                numel = 1
+                for dimension in candidate.shape:
+                    numel *= dimension
+                total += numel
+    return total
+
+
 CUDA_ERROR = frozenset(
     [
         "CUDA error",
@@ -625,6 +639,14 @@ class APITestBase:
         from .input_generation.input_dispatch import dispatch_input
 
         return dispatch_input(self)
+
+    def _torch_execution_locals(self):
+        if (
+            self.api_config.api_name == "paddle.nn.functional.rnnt_loss"
+            and paddle.device.get_device() == "cpu"
+        ):
+            return {"fused_log_softmax": False}
+        return None
 
     def _materialize_paddle_config_value(self, config_value, *, clear_tensor=True):
         """Materialize a Paddle config tree into live values, optionally clearing cache."""
@@ -2070,9 +2092,7 @@ class APITestBase:
     def _reference_workspace_bytes(self, convert_result):
         if not self.gpu_mode_config.enabled:
             return 0
-        code = convert_result.code
-        source_lines = (*code.preprocess, *code.core, *code.postprocess)
-        if not any("_workspace_bytes =" in str(line) for line in source_lines):
+        if not convert_result.code.workspace_required:
             return 0
 
         from .paddle_to_torch import adaptive_workspace_bytes

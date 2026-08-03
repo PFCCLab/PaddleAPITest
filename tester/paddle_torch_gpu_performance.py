@@ -1,49 +1,15 @@
 from __future__ import annotations
 
 import time
+from contextlib import nullcontext
 
 import paddle
 import torch
 from func_timeout import func_set_timeout
 
-from .base import APITestBase
-from .input_generation.tensor_config import TensorConfig
-from .paddle_to_torch import ConversionKind, adaptive_workspace_bytes, get_converter
-
-
-def tensor_numel(tensor_config):
-    numel = 1
-    for i in tensor_config.shape:
-        numel = numel * i
-    return numel
-
-
-def get_tensor_configs(api_config):
-    tensor_configs = []
-    for arg_config in api_config.args:
-        if isinstance(arg_config, TensorConfig):
-            tensor_configs.append(arg_config)
-        elif isinstance(arg_config, (list, tuple)):
-            for j in range(len(arg_config)):
-                if isinstance(arg_config[j], TensorConfig):
-                    tensor_configs.append(arg_config[j])
-
-    for _key, arg_config in api_config.kwargs.items():
-        if isinstance(arg_config, TensorConfig):
-            tensor_configs.append(arg_config)
-        elif isinstance(arg_config, (list, tuple)):
-            for j in range(len(arg_config)):
-                if isinstance(arg_config[j], TensorConfig):
-                    tensor_configs.append(arg_config[j])
-    return tensor_configs
-
-
-def total_numel(api_config):
-    tensor_configs = get_tensor_configs(api_config)
-    numel = 0
-    for tensor_config in tensor_configs:
-        numel = numel + tensor_numel(tensor_config)
-    return numel
+from .base import APITestBase, total_tensor_numel
+from .paddle_to_torch import ConversionKind, get_converter
+from .paddle_to_torch.arguments import bind_paddle_arguments
 
 
 def print_performance(
@@ -684,7 +650,7 @@ class APITestPaddleTorchGPUPerformance(APITestBase):
             )
             return
 
-        numel = total_numel(self.api_config)
+        numel = total_tensor_numel(self.api_config)
         # test_loop = 1000
         test_loop = api_loop.get(self.api_config.api_name, 1000)
         # test_loop = 2147483647 * 20 // numel
@@ -816,67 +782,42 @@ class APITestPaddleTorchGPUPerformance(APITestBase):
                 self.report_case_result("torch_error", "build_torch_input failed")
                 return
 
-            # torch_args 与 torch_kwargs 是尚未映射的 torch 参数（即按 paddle 的参数顺序与关键字排列的 torch tensors）
-            # (弃用)以下代码等价于:
-            # torch_output = Paddle2TorchConverter.execute(convert_result, self.torch_args, self.torch_kwargs)
-            # 准备执行环境，将参数(torch tensors)直接映射至locals()
-            exec_globals = {"torch": torch, "_adaptive_workspace_bytes": adaptive_workspace_bytes}
-            exec_locals = {
-                "args": self.torch_args,
-                "kwargs": self.torch_kwargs,
-                "result": None,
-                **self.torch_kwargs,
-            }
-            if self.api_config.api_name == "paddle.nn.functional.rnnt_loss":
-                if paddle.device.get_device() == "cpu":
-                    exec_locals["fused_log_softmax"] = False
+            bound_arguments = bind_paddle_arguments(
+                self.api_config.api_name,
+                self.torch_args,
+                self.torch_kwargs,
+            )
+            context = self.converter.prepare_execution(
+                convert_result,
+                self.torch_args,
+                bound_arguments,
+                execution_locals=self._torch_execution_locals(),
+            )
+            self.converter.run_preprocess(context)
 
             # Only direct Torch mappings are eligible for performance comparison.
-            # 执行 *_compiled 编译好的代码速度更快，定位 compile error 时可删去 _compiled
-            code = convert_result.code
-            if code.preprocess_compiled:
-                exec(code.preprocess_compiled, exec_globals, exec_locals)
-
             if convert_result.kind is not ConversionKind.DIRECT:
                 combined = "combined"
 
-            if code.core_compiled:
-                if self.test_amp:
-                    with torch.autocast(device_type="cuda"):
-                        exec(code.core_compiled, exec_globals, exec_locals)
-                else:
-                    exec(code.core_compiled, exec_globals, exec_locals)
-
-            # if code.postprocess_compiled:
-            #     exec(code.postprocess_compiled, exec_globals, exec_locals)
-            output_var = convert_result.output_var or "result"
-            torch_output = exec_locals[output_var]
+            amp_context = torch.autocast(device_type="cuda") if self.test_amp else nullcontext()
+            with amp_context:
+                self.converter.run_core(context)
+            self.converter.run_postprocess(context)
+            torch_output = self.converter.get_output(context)
 
             with torch.no_grad():
-                if code.core_compiled:
-                    if self.test_amp:
-                        with torch.autocast(device_type="cuda"):
-                            torch.cuda.synchronize()
-                            start = time.time()
-                            for i in range(test_loop):
-                                exec(code.core_compiled, exec_globals, exec_locals)
-                            before_sync = time.time()
-                            torch.cuda.synchronize()
-                            end = time.time()
-                            torch_forward = end - start
-                            torch_forward_sync = end - before_sync
-                    else:
-                        torch.cuda.synchronize()
-                        start = time.time()
-                        for i in range(test_loop):
-                            exec(code.core_compiled, exec_globals, exec_locals)
-                        before_sync = time.time()
-                        torch.cuda.synchronize()
-                        end = time.time()
-                        torch_forward = end - start
-                        torch_forward_sync = end - before_sync
+                amp_context = torch.autocast(device_type="cuda") if self.test_amp else nullcontext()
+                with amp_context:
+                    torch.cuda.synchronize()
+                    start = time.time()
+                    self.converter.run_core(context, repeat=test_loop)
+                    before_sync = time.time()
+                    torch.cuda.synchronize()
+                    end = time.time()
+                torch_forward = end - start
+                torch_forward_sync = end - before_sync
 
-            del exec_globals, exec_locals, output_var, convert_result, code
+            del context, convert_result
         except Exception as err:
             print_performance(
                 False,

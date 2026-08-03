@@ -4,6 +4,7 @@ import json
 import os
 import threading
 from collections.abc import Callable, Mapping
+from dataclasses import dataclass
 from types import MappingProxyType
 from typing import Any
 
@@ -13,18 +14,6 @@ from . import rules
 from .config import ConversionEnvironment, read_conversion_environment
 from .rules import BaseRule, ConversionKind, ConvertResult, GenericRule, adaptive_workspace_bytes
 
-_MAPPING_FIELDS = frozenset(
-    {
-        "Rule",
-        "description",
-        "is_attribute",
-        "paddle_torch_args_map",
-        "set_defaults",
-        "torch_api",
-        "torch_args",
-        "torch_kwargs",
-    }
-)
 _MAPPING_FIELD_TYPES = {
     "Rule": str,
     "description": str,
@@ -35,7 +24,12 @@ _MAPPING_FIELD_TYPES = {
     "torch_args": (list, tuple),
     "torch_kwargs": Mapping,
 }
-_MAPPING_SCALAR_TYPES = (str, int, float, bool, type(None))
+
+
+@dataclass
+class ExecutionContext:
+    convert_result: ConvertResult
+    namespace: dict[str, Any]
 
 
 class Paddle2TorchConverter:
@@ -50,12 +44,12 @@ class Paddle2TorchConverter:
         api_rules = dict(rules.get_rule_registry())
         if extra_rules:
             for paddle_api, rule_class in extra_rules.items():
+                if not isinstance(rule_class, type) or not issubclass(rule_class, BaseRule):
+                    raise TypeError(f"Rule for {paddle_api!r} must inherit from BaseRule")
                 if paddle_api not in rule_class.PADDLE_APIS:
                     raise ValueError(
                         f"Extra Rule {rule_class.__name__} does not declare {paddle_api!r}"
                     )
-                if not issubclass(rule_class, BaseRule):
-                    raise TypeError(f"Rule for {paddle_api!r} must inherit from BaseRule")
                 if paddle_api in api_rules and api_rules[paddle_api] is not rule_class:
                     raise ValueError(f"Rule for {paddle_api!r} is already registered")
                 api_rules[paddle_api] = rule_class
@@ -99,9 +93,7 @@ class Paddle2TorchConverter:
             return MappingProxyType(
                 {key: cls._freeze_mapping(nested) for key, nested in value.items()}
             )
-        if isinstance(value, list):
-            return tuple(cls._freeze_mapping(item) for item in value)
-        if isinstance(value, tuple):
+        if isinstance(value, (list, tuple)):
             return tuple(cls._freeze_mapping(item) for item in value)
         return value
 
@@ -119,7 +111,7 @@ class Paddle2TorchConverter:
                 raise ValueError(f"Invalid Paddle API name {paddle_api!r}")
             if not isinstance(mapping, Mapping):
                 raise ValueError(f"Mapping for {paddle_api} must be an object")
-            unknown_fields = set(mapping) - _MAPPING_FIELDS
+            unknown_fields = set(mapping) - _MAPPING_FIELD_TYPES.keys()
             if unknown_fields:
                 fields = ", ".join(sorted(unknown_fields))
                 raise ValueError(f"Mapping for {paddle_api} has unknown fields: {fields}")
@@ -151,14 +143,10 @@ class Paddle2TorchConverter:
                     f"Mapping field {paddle_api}.torch_api is required for GenericRule"
                 )
             for field_name in ("set_defaults", "torch_kwargs"):
-                for key, value in mapping.get(field_name, {}).items():
+                for key in mapping.get(field_name, {}):
                     if not isinstance(key, str) or not key:
                         raise ValueError(
                             f"Mapping field {paddle_api}.{field_name} requires non-empty string keys"
-                        )
-                    if not isinstance(value, _MAPPING_SCALAR_TYPES):
-                        raise ValueError(
-                            f"Mapping field {paddle_api}.{field_name} requires scalar values"
                         )
             for paddle_name, torch_name in mapping.get("paddle_torch_args_map", {}).items():
                 if not isinstance(paddle_name, str) or not paddle_name:
@@ -171,8 +159,11 @@ class Paddle2TorchConverter:
                         f"Mapping field {paddle_api}.paddle_torch_args_map "
                         "requires non-empty string values"
                     )
-            if any(not isinstance(arg, str) for arg in mapping.get("torch_args", [])):
-                raise ValueError(f"Mapping field {paddle_api}.torch_args requires string values")
+            for arg in mapping.get("torch_args", []):
+                if not isinstance(arg, str):
+                    raise ValueError(
+                        f"Mapping field {paddle_api}.torch_args requires string values"
+                    )
         if require_complete_registry:
             missing_apis = set(api_rules) - set(paddle2torch_mapping)
             if missing_apis:
@@ -230,7 +221,82 @@ class Paddle2TorchConverter:
             return result
 
     @staticmethod
+    def prepare_execution(
+        convert_result: ConvertResult,
+        torch_args: list,
+        bound_arguments: Mapping[str, Any],
+        *,
+        execution_locals: Mapping[str, Any] | None = None,
+    ) -> ExecutionContext:
+        if convert_result.kind is ConversionKind.UNSUPPORTED:
+            raise ValueError(
+                f"Cannot execute unsupported conversion for {convert_result.paddle_api}: "
+                f"{convert_result.error_message}"
+            )
+        namespace = {
+            "torch": torch,
+            "_adaptive_workspace_bytes": adaptive_workspace_bytes,
+            "positional_arguments": torch_args,
+            "bound_arguments": bound_arguments,
+            "result": None,
+            **bound_arguments,
+            **(execution_locals or {}),
+        }
+        return ExecutionContext(convert_result=convert_result, namespace=namespace)
+
+    @staticmethod
+    def _execute_stage(
+        context: ExecutionContext,
+        stage: str,
+        *,
+        core_executor: Callable[[Any, dict[str, Any], dict[str, Any]], None] | None = None,
+        repeat: int = 1,
+    ) -> None:
+        compiled = getattr(context.convert_result.code, f"{stage}_compiled")
+        if compiled is None:
+            return
+        namespace = context.namespace
+        executor = core_executor or exec
+        try:
+            for _ in range(repeat):
+                executor(compiled, namespace, namespace)
+        except Exception as exc:
+            raise RuntimeError(
+                f"Failed to execute {context.convert_result.paddle_api} during {stage}: {exc!s}"
+            ) from exc
+
+    @classmethod
+    def run_preprocess(cls, context: ExecutionContext) -> None:
+        cls._execute_stage(context, "preprocess")
+
+    @classmethod
+    def run_core(
+        cls,
+        context: ExecutionContext,
+        *,
+        core_executor: Callable[[Any, dict[str, Any], dict[str, Any]], None] | None = None,
+        repeat: int = 1,
+    ) -> None:
+        cls._execute_stage(context, "core", core_executor=core_executor, repeat=repeat)
+
+    @classmethod
+    def run_postprocess(cls, context: ExecutionContext) -> None:
+        cls._execute_stage(context, "postprocess")
+
+    @staticmethod
+    def get_output(context: ExecutionContext) -> Any:
+        output_var = context.convert_result.output_var or "result"
+        try:
+            return context.namespace[output_var]
+        except KeyError:
+            raise ValueError(
+                f"Output variable {output_var!r} for {context.convert_result.paddle_api} "
+                "was not found in the execution context"
+            )
+
+    @classmethod
     def execute(
+        cls,
         convert_result: ConvertResult,
         torch_args: list,
         bound_arguments: Mapping[str, Any],
@@ -238,66 +304,17 @@ class Paddle2TorchConverter:
         execution_locals: Mapping[str, Any] | None = None,
         core_executor: Callable[[Any, dict[str, Any], dict[str, Any]], None] | None = None,
     ) -> Any:
-        """执行转换后的代码。
-
-        Args:
-            convert_result (ConvertResult): 转换结果对象
-            torch_args (List): 传递给 Paddle API 的含有 Torch Tensors 的位置参数列表
-            bound_arguments (Mapping): 按 Paddle 参数名绑定的 Torch 输入
-            execution_locals (Mapping): 额外注入生成代码执行环境的局部变量
-            core_executor (Callable): 可选的 core 阶段执行器，用于包裹 AMP 等调用方上下文
-
-        Returns:
-            Any: 执行结果
-
-        Raises:
-            RuntimeError: 执行转换后的代码时发生异常
-            ValueError: 转换结果中指定的输出变量在执行上下文中不存在
-        """
-        if convert_result.kind is ConversionKind.UNSUPPORTED:
-            raise ValueError(
-                f"Cannot execute unsupported conversion for {convert_result.paddle_api}: "
-                f"{convert_result.error_message}"
-            )
-
-        # 准备执行环境，将参数(torch tensors)直接映射至locals
-        exec_globals = {"torch": torch, "_adaptive_workspace_bytes": adaptive_workspace_bytes}
-        exec_locals = {
-            "positional_arguments": torch_args,
-            "bound_arguments": bound_arguments,
-            "result": None,
-            **bound_arguments,
-        }
-        if execution_locals:
-            exec_locals.update(execution_locals)
-
-        code = convert_result.code
-        stage = "preprocess"
-        try:
-            if code.preprocess_compiled:
-                exec(code.preprocess_compiled, exec_globals, exec_locals)
-            stage = "core"
-            if code.core_compiled:
-                if core_executor is None:
-                    exec(code.core_compiled, exec_globals, exec_locals)
-                else:
-                    core_executor(code.core_compiled, exec_globals, exec_locals)
-            stage = "postprocess"
-            if code.postprocess_compiled:
-                exec(code.postprocess_compiled, exec_globals, exec_locals)
-        except Exception as e:
-            raise RuntimeError(
-                f"Failed to execute {convert_result.paddle_api} during {stage}: {e!s}"
-            ) from e
-
-        output_var = convert_result.output_var or "result"
-        try:
-            return exec_locals[output_var]
-        except KeyError:
-            raise ValueError(
-                f"Output variable {output_var!r} for {convert_result.paddle_api} "
-                "was not found in the execution context"
-            )
+        """Prepare and execute all stages of one converted Paddle invocation."""
+        context = cls.prepare_execution(
+            convert_result,
+            torch_args,
+            bound_arguments,
+            execution_locals=execution_locals,
+        )
+        cls.run_preprocess(context)
+        cls.run_core(context, core_executor=core_executor)
+        cls.run_postprocess(context)
+        return cls.get_output(context)
 
 
 # 模块级变量与实例管理
