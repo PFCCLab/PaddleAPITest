@@ -5,7 +5,6 @@ from __future__ import annotations
 import csv
 import io
 import os
-import shutil
 
 from . import log_runtime as runtime
 from .log_schema import (
@@ -257,7 +256,7 @@ def _sort_csv(file_path, columns):
 
 
 def _count_result_logs():
-    """统计结果分类并写出未完成配置列表。"""
+    """统计结果分类并写出未归类配置列表。"""
     log_counts = {}
     errors = []
     checkpoint_file = runtime.TEST_LOG_PATH / "checkpoint.txt"
@@ -282,15 +281,17 @@ def _count_result_logs():
             print(f"Error reading {log_file}: {err}", flush=True)
             errors.append(f"read {log_file}: {err}")
 
-    incomplete_file = runtime.TEST_LOG_PATH / "api_config_incomplete.txt"
+    unclassified_file = runtime.TEST_LOG_PATH / "api_config_unclassified.txt"
+    legacy_unclassified_file = runtime.TEST_LOG_PATH / "api_config_incomplete.txt"
     if not errors:
         try:
-            runtime.write_sorted_lines(incomplete_file, api_configs)
+            runtime.write_sorted_lines(unclassified_file, api_configs)
+            legacy_unclassified_file.unlink(missing_ok=True)
             if api_configs:
-                log_counts["incomplete"] = len(api_configs)
+                log_counts["unclassified"] = len(api_configs)
         except Exception as err:
-            print(f"Error writing to {incomplete_file}: {err}", flush=True)
-            errors.append(f"write {incomplete_file}: {err}")
+            print(f"Error writing to {unclassified_file}: {err}", flush=True)
+            errors.append(f"write {unclassified_file}: {err}")
     if errors:
         log_counts["_aggregation_errors"] = errors
     return log_counts
@@ -398,7 +399,7 @@ def _check_log_integrity(log_counts):
 
 def _remove_empty_tmp_dir():
     if runtime.TMP_LOG_PATH.exists() and not any(runtime.TMP_LOG_PATH.iterdir()):
-        shutil.rmtree(runtime.TMP_LOG_PATH)
+        runtime.TMP_LOG_PATH.rmdir()
 
 
 def aggregate_logs():

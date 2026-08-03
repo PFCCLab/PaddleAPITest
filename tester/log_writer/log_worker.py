@@ -98,14 +98,15 @@ def write_to_log(log_type: LogType, line):
 
 def write_to_comp_log(comp, log_type: LogType, line):
     """向一个 comp 维度写入配置并更新分类状态。"""
+    line = line.strip()
+    if not line:
+        return
+
     dimension = COMP_TO_DIMENSION[comp]
     prefix = LOG_PREFIXES[log_type]
     comp_dir = runtime.RESULT_LOG_PATH / "comp" / dimension
     comp_dir.mkdir(parents=True, exist_ok=True)
     file_path = runtime.result_file(prefix, comp_dir)
-    line = line.strip()
-    if not line:
-        return
 
     dim_configs = _comp_terminal_configs.setdefault(dimension, {})
     existing = dim_configs.get(line)

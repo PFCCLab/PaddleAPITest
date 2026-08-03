@@ -57,10 +57,6 @@ def _filter_text_file(file_path, keep_line):
         temp_file.unlink(missing_ok=True)
 
 
-def _rewrite_text_excluding(file_path, excluded_lines):
-    return _filter_text_file(file_path, lambda line: line not in excluded_lines)
-
-
 def _filter_csv_file(file_path, keep_config):
     if not file_path.exists():
         return 0
@@ -87,10 +83,6 @@ def _filter_csv_file(file_path, keep_config):
         return removed
     finally:
         temp_file.unlink(missing_ok=True)
-
-
-def _rewrite_csv_excluding(file_path, excluded_configs):
-    return _filter_csv_file(file_path, lambda config: config not in excluded_configs)
 
 
 def _restore_truncated_retest_configs(configs, checkpoints):
@@ -164,8 +156,15 @@ def prepare_retest(retest_types):
         return set()
 
     runtime.close_process_files()
-    for prefix in LOG_PREFIXES.values():
-        _rewrite_text_excluding(runtime.TEST_LOG_PATH / f"{prefix}.txt", cleanup_configs)
+    # A selected result must not stay checkpointed, or the batch loader will skip it.
+    _filter_text_file(
+        runtime.TEST_LOG_PATH / f"{LOG_PREFIXES['checkpoint']}.txt",
+        lambda line: line not in cleanup_configs,
+    )
+    for prefix in RESULT_LOG_PREFIXES.values():
+        _filter_text_file(
+            runtime.TEST_LOG_PATH / f"{prefix}.txt", lambda line: line not in cleanup_configs
+        )
 
     comp_dir = runtime.TEST_LOG_PATH / "comp"
     if comp_dir.exists():
@@ -173,15 +172,18 @@ def prepare_retest(retest_types):
             if not dimension_dir.is_dir():
                 continue
             for prefix in LOG_PREFIXES.values():
-                _rewrite_text_excluding(
+                _filter_text_file(
                     dimension_dir / f"{prefix}.txt",
-                    cleanup_configs,
+                    lambda line: line not in cleanup_configs,
                 )
 
-    _rewrite_text_excluding(runtime.TEST_LOG_PATH / "api_config_incomplete.txt", cleanup_configs)
+    _filter_text_file(
+        runtime.TEST_LOG_PATH / "api_config_unclassified.txt",
+        lambda line: line not in cleanup_configs,
+    )
     csv_configs = cleanup_configs | {config[:MAX_CSV_CONFIG_LENGTH] for config in cleanup_configs}
-    _rewrite_csv_excluding(runtime.TEST_LOG_PATH / "tol.csv", csv_configs)
-    _rewrite_csv_excluding(runtime.TEST_LOG_PATH / "stable.csv", csv_configs)
+    _filter_csv_file(runtime.TEST_LOG_PATH / "tol.csv", lambda config: config not in csv_configs)
+    _filter_csv_file(runtime.TEST_LOG_PATH / "stable.csv", lambda config: config not in csv_configs)
     return retest_configs
 
 

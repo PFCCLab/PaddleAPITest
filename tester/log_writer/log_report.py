@@ -245,7 +245,7 @@ def print_run_footer(total_case, tested_case, remaining_case, log_counts, elapse
     )
     print(f"Issues: {paddle_issues} Paddle | {test_issues} test | {retest} retest")
     print("Classification")
-    ordered_types = [*LOG_PREFIXES, "incomplete"]
+    ordered_types = [*LOG_PREFIXES, "unclassified"]
     for log_type in ordered_types:
         if log_type in counts:
             print(f"  {log_type}: {counts[log_type]}")
