@@ -295,7 +295,7 @@ def classify_runtime_error(error_msg):
     )
     if any(marker in error_msg_lower for marker in cuda_markers):
         return "paddle_cuda", True
-    # (Unimplemented): Paddle 已知不支持的功能，当前 case 无法有效验证
+    # (Unimplemented): Paddle 已知不支持的功能，当前 config 无法有效验证
     if "(unimplemented)" in error_msg_lower:
         return "skip", False
     # Paddle 输出数值检查失败
@@ -427,7 +427,7 @@ class APITestBase:
         affected_comps=None,
         write_main_log=True,
     ):
-        """Emit one standardized case-level result and write the matching logs."""
+        """Emit one standardized config-level result and write the matching logs."""
         log_worker.emit_case_result(
             log_type,
             self.api_config.config,

@@ -16,7 +16,7 @@ APIConfig -> APITestBase.gen_input_data -> input_dispatch.py -> input_binding.py
 - `input_binding.py`：签名解析、参数绑定、调用绑定和运行时上下文
 - `input_data.py`：输入数据 `InputData` 的读写、挂载和清理
 - `value_gen.py`：与 API 无关的通用值生成，具体数组/tensor 由 backend 决定
-- `input_registry.py`：`@rules.register` 规则、`InputDataBuilder` 和规则执行入口
+- `input_registry.py`：`@rules.register` 规则、`ConfigView` / `ValueFactory` / `InputWriter` 和规则执行入口
 - `input_dispatch.py`：输入生成调度、规则查找和阻断
 - `input_backend.py`：输入生成 backend 选择和 numpy/torch/paddle 实现
 - `tensor_config.py`：张量配置、缓存和框架物化
@@ -33,7 +33,7 @@ APIConfig -> APITestBase.gen_input_data -> input_dispatch.py -> input_binding.py
 - 同一 seed 下保持 dtype、shape、bytes 和最终 RNG 状态一致
 - GPU 或缓存未准备好时，在生成前直接阻断
 - 输入数据与框架输入构造分离，便于单独验证
-- case 级 RNG 只在规则成功后提交，失败不污染后续 case
+- config 级 RNG 只在规则成功后提交，失败不污染后续 config
 
 ## 核心模型
 
@@ -68,18 +68,16 @@ Tensor 绑定和未解析原因。规则只应该读取它，不应该自己再�
 `RegisteredRule` 表示一条 decorator 注册规则，负责校验 GPU/cache 阻断、执行规则函数、
 检查完整性并提交输入数据。
 
-### `InputDataBuilder`
+### 规则参数
 
-`InputDataBuilder` 是规则编写时拿到的输入构建器。它负责：
+规则函数接收三个职责明确的参数：
 
-- 按 `TensorPath` 读取和写入 Tensor
-- 维护 case 级 RNG
-- 提供 `generate()`、`generate_all()`、`generate_remaining()`、`generate_by_parameter()`
-- 防止重复写入
-- 收集最终输入数据
+- `ConfigView`：只读 config 视图，负责原始参数读取、Tensor 绑定查询和 API 名称
+- `ValueFactory`：数值生成入口，负责 value domain 和 backend-native 数组/tensor 操作
+- `InputWriter`：输入写入入口，负责写入、重写、去重、读取已生成值和完整性检查
 
-规则函数中的变量名使用 `inputs`，并把值创建放在 `inputs.backend.*` 下，避免
-`case.zeros(...)` 这类调用混淆“API case”和“数组工厂”两个概念。
+常见批量生成流程由 `generate_all()`、`generate_one()`、`generate_remaining()` 和
+`generate_by_parameter()` 这些 registry helper 承担，避免把参数读取、数值生成和写入状态混在一个对象里。
 
 ### Backend Selection
 
@@ -113,29 +111,29 @@ Paddle logical value 经 DLPack 生成，并在 Torch 侧 clone 为 Torch 自有
 
 ```python
 @rules.register("paddle.clip", aliases=("paddle.Tensor.clip",))
-def clip_values(ctx: InputContext, inputs: InputDataBuilder):
-    inputs.generate("x", "default")
-    inputs.generate("min", "random_range", low=-1, high=0)
-    inputs.generate("max", "random_range", low=0, high=1)
+def clip_values(config: ConfigView, values: ValueFactory, writer: InputWriter):
+    generate_one(config, values, writer, "x", "default")
+    generate_one(config, values, writer, "min", "random_range", low=-1, high=0)
+    generate_one(config, values, writer, "max", "random_range", low=0, high=1)
 ```
 
 规则函数只描述 API 语义，不写绑定、物化或日志逻辑。
 
-### 2. 优先使用 `inputs` 的高层接口
+### 2. 优先使用 registry helper
 
-- `inputs.generate_all("default")`：同类参数统一生成
-- `inputs.generate("x", "default")`：针对参数名生成
-- `inputs.generate_remaining("default")`：补齐未生成参数
-- `inputs.generate_by_parameter(...)`：按参数名映射不同生成策略
-- `inputs.arg()` / `inputs.kwarg()`：读取原始参数
-- `inputs.find()`：按参数名定位绑定
-- `inputs.value()`：读取逻辑值
+- `generate_all(config, values, writer, "default")`：同类参数统一生成
+- `generate_one(config, values, writer, "x", "default")`：针对参数名生成
+- `generate_remaining(config, values, writer, "default")`：补齐未生成参数
+- `generate_by_parameter(config, values, writer, ...)`：按参数名映射不同生成策略
+- `config.arg()` / `config.kwarg()`：读取原始参数
+- `config.find()`：按参数名定位绑定
+- `writer.value()`：读取逻辑值
 
 ### 3. 只在必要时写低层值
 
-- `inputs.set_value()`：正常写入并同步元数据
-- `inputs.rewrite_value()`：重写已有值
-- `inputs.set_value_raw()`：仅在需要保留元数据时使用
+- `writer.set_value()`：正常写入并同步元数据
+- `writer.rewrite_value()`：重写已有值
+- `writer.set_value_raw()`：仅在需要保留元数据时使用
 
 ### 4. 失败要显式
 
@@ -155,10 +153,10 @@ def clip_values(ctx: InputContext, inputs: InputDataBuilder):
 `if/elif api_name` 条件链分派。现在这些职责拆成 `input_binding.py`、`input_registry.py`、
 `input_dispatch.py`、`value_gen.py`、`input_data.py` 和 `tensor_config.py`，边界更清楚。
 
-### 2. 从逐参数副作用改为完整 case 规则
+### 2. 从逐参数副作用改为完整 config 规则
 
-旧实现常在生成一个参数时顺手读写另一个参数，行为依赖遍历顺序。现在规则以完整 case 为单位
-描述，通过 `inputs.generate()`、`inputs.generate_all()`、`inputs.arg()` 和 `inputs.kwarg()`
+旧实现常在生成一个参数时顺手读写另一个参数，行为依赖遍历顺序。现在规则以完整 config 为单位
+描述，通过 `generate_one()`、`generate_all()`、`config.arg()` 和 `config.kwarg()`
 显式表达参数关系。
 
 ### 3. 从生成逻辑与物化耦合改为分层处理
@@ -171,20 +169,20 @@ def clip_values(ctx: InputContext, inputs: InputDataBuilder):
 纯输入生成且不依赖参数关系的 API 走默认规则；需要特殊语义的 API 必须显式注册。
 已注册规则被阻断、重复写入或遗漏 Tensor 时直接失败，避免静默产出错误输入。
 
-### 5. 从全局随机状态改为 case-owned RNG
+### 5. 从全局随机状态改为 config-owned RNG
 
-旧实现更接近共享全局随机状态。现在 `InputDataBuilder` 持有 case 级 RNG，规则成功后才提交状态，
-失败不会污染其他 case。
+旧实现更接近共享全局随机状态。现在输入生成持有 config 级 RNG，规则成功后才提交状态，
+失败不会污染其他 config。
 
 ## 运行时约束
 
-- `CaseNumpyRNG` 使用独立 `RandomState` 副本
+- `ConfigNumpyRNG` 使用独立 `RandomState` 副本
 - `input_dispatch.py` 只做规则查找和阻断
 - `input_data.py` 只管理输入数据，不承担框架创建
 - `tensor_config.py` 只承担 Tensor 物化和读写
 
 ## 当前状态
 
-- `CaseNumpyRNG` 使用独立 `RandomState` 副本，并在规则成功后提交到全局
+- `ConfigNumpyRNG` 使用独立 `RandomState` 副本，并在规则成功后提交到全局
 - GPU 和 cached 阻断通过 `allow_gpu` / `allow_cached` 控制
 - 运行时目录只保留当前实现代码

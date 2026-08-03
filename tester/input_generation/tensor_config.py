@@ -39,6 +39,7 @@ AUTOGRAD_DTYPES = frozenset(
 )
 FLOAT8_DTYPES = frozenset(["float8_e5m2", "float8_e4m3fn"])
 CAST_THROUGH_INTERMEDIATE_DTYPES = frozenset(["bfloat16"]) | FLOAT8_DTYPES
+_TRUE_VALUES = {"true", "1", "yes", "y"}
 
 
 def _load_forward_only_apis():
@@ -52,7 +53,11 @@ optimizer_apis = OPTIMIZER_APIS
 
 
 def is_gpu_mode():
-    return os.getenv("USE_GPU_MODE", str(USE_GPU_MODE)).lower() in ("true", "1", "yes", "y")
+    return os.getenv("USE_GPU_MODE", str(USE_GPU_MODE)).lower() in _TRUE_VALUES
+
+
+def _torch_compute_device():
+    return torch.device("cuda:0") if torch.cuda.is_available() else torch.device("cpu")
 
 
 def _shape_tuple(shape):
@@ -194,8 +199,36 @@ class TensorConfig:
             return torch.device("cpu")
         paddle_device = paddle.device.get_device()
         if "gpu" in paddle_device or "cuda" in paddle_device or self._use_gpu():
-            return torch.device("cuda:0") if torch.cuda.is_available() else torch.device("cpu")
+            return _torch_compute_device()
         return torch.device("cpu")
+
+    def _missing_input_error(self, api_config, framework):
+        return ValueError(
+            f"TensorConfig has no generated input value before {framework} materialization: "
+            f"api={getattr(api_config, 'api_name', '<unknown>')}, "
+            f"shape={self.shape}, dtype={self.dtype}, "
+            f"backend={create_input_backend().name}"
+        )
+
+    def _cast_intermediate_dtype(self):
+        if self.dtype == "bfloat16":
+            return "float32"
+        if self.dtype in FLOAT8_DTYPES:
+            return "float16"
+        return self.dtype
+
+    def _torch_cast_dtype(self):
+        if self.dtype == "bfloat16":
+            return torch.float32
+        if self.dtype in FLOAT8_DTYPES:
+            return torch.float16
+        return to_torch_dtype(self.dtype)
+
+    def _float8_intermediate_dtype(self):
+        return "float16" if self.dtype in FLOAT8_DTYPES else self.dtype
+
+    def _torch_float8_intermediate_dtype(self):
+        return torch.float16 if self.dtype in FLOAT8_DTYPES else to_torch_dtype(self.dtype)
 
     def _logical_numel(self, value):
         if hasattr(value, "numel"):
@@ -238,12 +271,7 @@ class TensorConfig:
                 self.paddle_tensor.stop_gradient = not self._requires_autograd(api_config)
                 return self.paddle_tensor
             if input_value(api_config, self) is None:
-                raise ValueError(
-                    "TensorConfig has no generated input value before Paddle materialization: "
-                    f"api={getattr(api_config, 'api_name', '<unknown>')}, "
-                    f"shape={self.shape}, dtype={self.dtype}, "
-                    f"backend={create_input_backend().name}"
-                )
+                raise self._missing_input_error(api_config, "Paddle")
             if not self.is_contiguous and self.strides is not None:
                 self.paddle_tensor = self._create_paddle_strided(api_config)
                 print(
@@ -255,11 +283,7 @@ class TensorConfig:
                 )
             else:
                 requires_autograd = self._requires_autograd(api_config)
-                intermediate_dtype = (
-                    "float32"
-                    if self.dtype == "bfloat16"
-                    else ("float16" if self.dtype in FLOAT8_DTYPES else self.dtype)
-                )
+                intermediate_dtype = self._cast_intermediate_dtype()
                 self.paddle_tensor = self._logical_paddle_tensor(
                     api_config,
                     dtype=intermediate_dtype,
@@ -293,7 +317,7 @@ class TensorConfig:
         original_flag = paddle.get_flags([flag_name])
         paddle.set_flags({flag_name: False})
         try:
-            intermediate_dtype = "float16" if self.dtype in FLOAT8_DTYPES else self.dtype
+            intermediate_dtype = self._float8_intermediate_dtype()
             storage_size = self._strided_storage_size()
             flat_tensor = paddle.zeros(
                 [storage_size],
@@ -318,11 +342,7 @@ class TensorConfig:
             paddle.set_flags(original_flag)
 
     def get_torch_tensor(self, api_config):
-        device = (
-            torch.device("cuda:0")
-            if self._use_gpu() and torch.cuda.is_available()
-            else torch.device("cpu")
-        )
+        device = _torch_compute_device() if self._use_gpu() else torch.device("cpu")
         torch.set_default_device(device)
         if self.torch_tensor is None:
             if self.cpu_tensor is not None:
@@ -331,22 +351,12 @@ class TensorConfig:
                     self.torch_tensor = self.torch_tensor.detach().requires_grad_(True)
                 return self.torch_tensor
             if input_value(api_config, self) is None:
-                raise ValueError(
-                    "TensorConfig has no generated input value before Torch materialization: "
-                    f"api={getattr(api_config, 'api_name', '<unknown>')}, "
-                    f"shape={self.shape}, dtype={self.dtype}, "
-                    f"backend={create_input_backend().name}"
-                )
+                raise self._missing_input_error(api_config, "Torch")
             if not self.is_contiguous and self.strides is not None:
                 self.torch_tensor = self._create_torch_strided(api_config)
             else:
                 needs_cast = self.dtype in CAST_THROUGH_INTERMEDIATE_DTYPES
-                if needs_cast:
-                    intermediate_torch_dtype = (
-                        torch.float32 if self.dtype == "bfloat16" else torch.float16
-                    )
-                else:
-                    intermediate_torch_dtype = to_torch_dtype(self.dtype)
+                intermediate_torch_dtype = self._torch_cast_dtype()
                 requires_grad = self._requires_autograd(api_config)
                 self.torch_tensor = self._logical_torch_tensor(
                     api_config,
@@ -369,16 +379,8 @@ class TensorConfig:
 
     def _create_torch_strided(self, api_config):
         """基于共享逻辑输入创建非连续 Torch Tensor。"""
-        device = (
-            torch.device("cuda:0")
-            if self._use_gpu() and torch.cuda.is_available()
-            else torch.device("cpu")
-        )
-        needs_intermediate = self.dtype in FLOAT8_DTYPES
-        if needs_intermediate:
-            intermediate_torch_dtype = torch.float16
-        else:
-            intermediate_torch_dtype = to_torch_dtype(self.dtype)
+        device = _torch_compute_device() if self._use_gpu() else torch.device("cpu")
+        intermediate_torch_dtype = self._torch_float8_intermediate_dtype()
 
         flat_tensor = torch.empty(
             self._strided_storage_size(),

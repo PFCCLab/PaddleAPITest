@@ -164,7 +164,7 @@ class InputBinding:
 
 @dataclass(frozen=True)
 class InputContext:
-    """一次生成 case 的运行时上下文。"""
+    """一次生成 config 的运行时上下文。"""
 
     call: InputBinding
     config_fingerprint: str
@@ -317,22 +317,21 @@ def _contains_identity(value, target):
     return False
 
 
+def _top_level_values(api_config):
+    yield from (
+        (TensorPath.positional(index), value, None) for index, value in enumerate(api_config.args)
+    )
+    yield from ((TensorPath.keyword(key), value, key) for key, value in api_config.kwargs.items())
+
+
 def _path_parameters(api_config, arguments):
     bindings = []
-    for index, value in enumerate(api_config.args):
+    for path, value, fallback_name in _top_level_values(api_config):
         names = [name for name, bound in arguments.items() if _contains_identity(bound, value)]
         bindings.append(
             ParameterBinding(
-                path=TensorPath.positional(index),
-                parameter_name=names[0] if len(names) == 1 else None,
-            )
-        )
-    for key, value in api_config.kwargs.items():
-        names = [name for name, bound in arguments.items() if _contains_identity(bound, value)]
-        bindings.append(
-            ParameterBinding(
-                path=TensorPath.keyword(key),
-                parameter_name=names[0] if len(names) == 1 else key,
+                path=path,
+                parameter_name=names[0] if len(names) == 1 else fallback_name,
             )
         )
     return tuple(bindings)
@@ -368,11 +367,7 @@ def bind_input(api_config):
     path_parameters = _path_parameters(api_config, arguments)
     parameter_by_path = {binding.path: binding.parameter_name for binding in path_parameters}
     tensors = []
-    for index, value in enumerate(api_config.args):
-        path = TensorPath.positional(index)
-        _walk_tensors(value, path, parameter_by_path.get(path), tensors)
-    for key, value in api_config.kwargs.items():
-        path = TensorPath.keyword(key)
+    for path, value, _fallback_name in _top_level_values(api_config):
         _walk_tensors(value, path, parameter_by_path.get(path), tensors)
     return InputBinding(
         api_name=api_config.api_name,

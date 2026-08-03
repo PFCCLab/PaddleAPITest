@@ -71,23 +71,16 @@ def write_input_value(api_config, tensor_config, new_value):
         existing_value.backend if existing_value is not None else _backend_for_value(new_value)
     )
     if existing_value is not None:
-        updated_value = InputData(
-            existing_value.path,
-            new_value,
-            backend=backend,
-        )
+        updated_value = InputData(existing_value.path, new_value, backend=backend)
         value_by_tensor_id = getattr(api_config, _VALUE_BY_TENSOR_ID_ATTR, None)
         if value_by_tensor_id is not None:
             value_by_tensor_id[id(tensor_config)] = updated_value
         values = getattr(api_config, _VALUES_ATTR, None)
         if values is not None:
-            setattr(
-                api_config,
-                _VALUES_ATTR,
-                tuple(
-                    updated_value if item.path == existing_value.path else item for item in values
-                ),
+            updated_values = (
+                updated_value if item.path == existing_value.path else item for item in values
             )
+            setattr(api_config, _VALUES_ATTR, tuple(updated_values))
     tensor_config.input_value = new_value
     tensor_config.input_value_backend = backend
     return new_value

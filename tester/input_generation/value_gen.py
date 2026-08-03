@@ -56,8 +56,8 @@ NUMPY_RNG = NumPyRNG()
 
 
 @dataclass(frozen=True)
-class CaseNumpyRNG(NumPyRNG):
-    """基于独立 RandomState 副本的单 case RNG。"""
+class ConfigNumpyRNG(NumPyRNG):
+    """基于独立 RandomState 副本的单 config RNG。"""
 
     seed: int
     config_fingerprint: str
@@ -89,12 +89,28 @@ class CaseNumpyRNG(NumPyRNG):
         return self._state.choice(values, size=shape, replace=replace, p=p)
 
 
-def create_case_rng(context) -> CaseNumpyRNG:
-    return CaseNumpyRNG(seed=context.seed, config_fingerprint=context.config_fingerprint)
+def create_config_rng(context) -> ConfigNumpyRNG:
+    return ConfigNumpyRNG(seed=context.seed, config_fingerprint=context.config_fingerprint)
 
 
 def generation_dtype(dtype: str) -> str:
     return _INTERMEDIATE_DTYPES.get(dtype, dtype)
+
+
+def _complex_parts(dtype, shape, rng, *, low=None, high=None, offset=0.0, scale=1.0):
+    real_dtype = "float32" if dtype == "complex64" else "float64"
+    if low is None and high is None:
+        real = rng.random(shape) * scale + offset
+        imag = rng.random(shape) * scale + offset
+    else:
+        real = rng.uniform(low, high, shape=shape)
+        imag = rng.uniform(low, high, shape=shape)
+    return rng.cast(real, real_dtype), rng.cast(imag, real_dtype)
+
+
+def _complex_value(dtype, shape, rng, **kwargs):
+    real, imag = _complex_parts(dtype, shape, rng, **kwargs)
+    return rng.cast(real + 1j * imag, dtype)
 
 
 def generate_default(spec: TensorSpec, rng=NUMPY_RNG) -> object:
@@ -113,10 +129,7 @@ def generate_default(spec: TensorSpec, rng=NUMPY_RNG) -> object:
     if "int" in dtype:
         return rng.cast(rng.randint(-65535, 65535, shape=shape), dtype)
     if dtype.startswith("complex"):
-        real_dtype = "float32" if dtype == "complex64" else "float64"
-        real = rng.cast((rng.random(shape) - 0.5) * 1.2, real_dtype)
-        imag = rng.cast((rng.random(shape) - 0.5) * 1.2, real_dtype)
-        return rng.cast(real + 1j * imag, dtype)
+        return _complex_value(dtype, shape, rng, offset=-0.6, scale=1.2)
     return rng.cast((rng.random(shape) - 0.5) * 1.2, dtype)
 
 
@@ -133,10 +146,7 @@ def generate_nonzero(spec: TensorSpec, rng=NUMPY_RNG) -> object:
             return rng.cast(rng.randint(1, 256, shape=shape), dtype)
         return rng.cast(rng.randint(1, 65535, shape=shape), dtype)
     if dtype.startswith("complex"):
-        real_dtype = "float32" if dtype == "complex64" else "float64"
-        real = rng.cast(rng.random(shape) + 0.5, real_dtype)
-        imag = rng.cast(rng.random(shape) + 0.5, real_dtype)
-        return rng.cast(real + 1j * imag, dtype)
+        return _complex_value(dtype, shape, rng, offset=0.5)
     return rng.cast(rng.random(shape) + 0.5, dtype)
 
 
@@ -157,10 +167,7 @@ def generate_multiply(spec: TensorSpec, rng=NUMPY_RNG) -> object:
     """生成 `paddle.multiply` 值。"""
     dtype = generation_dtype(spec.dtype)
     if dtype.startswith("complex"):
-        real_dtype = "float32" if dtype == "complex64" else "float64"
-        real = rng.cast(rng.random(spec.shape), real_dtype)
-        imag = rng.cast(rng.random(spec.shape), real_dtype)
-        return rng.cast(real + 1j * imag, dtype)
+        return _complex_value(dtype, spec.shape, rng)
     return rng.cast(rng.random(spec.shape), dtype)
 
 
@@ -298,9 +305,7 @@ def generate_random_range(
         real_dtype = "float32" if dtype == "complex64" else "float64"
         real_low = low if low is not None else numpy.finfo(real_dtype).min / 2
         real_high = high if high is not None else numpy.finfo(real_dtype).max / 2
-        real = rng.cast(rng.uniform(real_low, real_high, shape=spec.shape), real_dtype)
-        imag = rng.cast(rng.uniform(real_low, real_high, shape=spec.shape), real_dtype)
-        return rng.cast(real + 1j * imag, dtype)
+        return _complex_value(dtype, spec.shape, rng, low=real_low, high=real_high)
     low = low if low is not None else numpy.finfo(dtype).min / 2
     high = high if high is not None else numpy.finfo(dtype).max / 2
     return rng.cast(rng.uniform(low, high, shape=spec.shape), dtype)
@@ -317,8 +322,5 @@ def generate_uniform(
     if "int" in dtype:
         return rng.cast(rng.randint(low, high, shape=spec.shape), dtype)
     if dtype.startswith("complex"):
-        real_dtype = "float32" if dtype == "complex64" else "float64"
-        real = rng.cast(rng.uniform(low, high, shape=spec.shape), real_dtype)
-        imag = rng.cast(rng.uniform(low, high, shape=spec.shape), real_dtype)
-        return rng.cast(real + 1j * imag, dtype)
+        return _complex_value(dtype, spec.shape, rng, low=low, high=high)
     return rng.cast(rng.uniform(low, high, shape=spec.shape), dtype)

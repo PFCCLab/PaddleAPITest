@@ -17,7 +17,7 @@ from .input_data import input_value as read_input_value
 from .tensor_config import CAST_THROUGH_INTERMEDIATE_DTYPES, TensorConfig, not_zero_apis
 from .tensor_spec import TensorSpec
 from .value_gen import (
-    create_case_rng,
+    create_config_rng,
     generate_abs_plus_one,
     generate_binary01,
     generate_default,
@@ -47,8 +47,8 @@ from .value_gen import (
 )
 
 ValueGenerator = Callable[..., object]
-CaseValueGenerator = Callable[[object], object]
-RuleFunction = Callable[[InputContext, "InputDataBuilder"], None]
+ConfigValueGenerator = Callable[[object], object]
+RuleFunction = Callable[["ConfigView", "ValueFactory", "InputWriter"], None]
 BlockerFunction = Callable[[InputContext], str | None]
 _RAW_WRITE = object()
 
@@ -88,7 +88,7 @@ _VALUE_GENERATORS: dict[str, ValueGenerator] = {
 
 @dataclass(frozen=True)
 class RegisteredRule:
-    """一条通过装饰器注册的 inputs 级规则。
+    """一条通过装饰器注册的输入生成规则。
 
     这里保存的是规则的元信息和执行入口，不保存 API 约束逻辑本身。
     规则函数负责描述参数关系，`RegisteredRule` 负责门控、完整性检查和提交。
@@ -118,195 +118,241 @@ class RegisteredRule:
         return None
 
     def generate(self, context: InputContext, api_config: object) -> bool:
-        input_builder = InputDataBuilder(context, api_config)
-        self.function(context, input_builder)
-        input_builder.require_complete()
-        attach_values(api_config, input_builder.input_data_items())
-        input_builder.backend.commit()
+        rng = create_config_rng(context)
+        backend = create_input_backend(rng)
+        config = ConfigView(context.call, api_config)
+        values = ValueFactory(backend)
+        writer = InputWriter(api_config, backend)
+        self.function(config, values, writer)
+        writer.require_complete(config)
+        attach_values(api_config, writer.input_data_items())
+        backend.commit()
         return True
 
 
-class InputDataBuilder:
-    """规则编写时可操作的 inputs 视图。
+class ConfigView:
+    """规则侧只读 config 视图。"""
 
-    `InputDataBuilder` 负责把一次 API 调用中的所有 TensorConfig、随机状态和输入数据操作串起来。
-    它让规则作者只关心“生成什么值”，而不需要关心数据存储、去重和提交时机。
-    """
-
-    def __init__(self, context: InputContext, raw_case: object):
-        self.context = context
-        self.raw_case = raw_case
-        self.rng = create_case_rng(context)
-        self.backend = create_input_backend(self.rng)
-        # 用路径去重，避免同一个 Tensor 被重复写入。
-        self._generated_paths = set()
-        # input data 以 TensorPath 为键，后续框架输入构造只消费这里的值。
-        self._input_data_by_path: dict[object, InputData] = {}
-
-    def generate_all(self, generator: str, low=None, high=None):
-        for binding in self.context.call.tensors:
-            self._generate_binding(binding, generator, low, high)
-
-    def generate(
-        self,
-        parameter_name: str | tuple[str, ...],
-        generator: str | CaseValueGenerator,
-        low=None,
-        high=None,
-    ):
-        names = (parameter_name,) if isinstance(parameter_name, str) else tuple(parameter_name)
-        matched = False
-        for binding in self.context.call.tensors:
-            if binding.parameter_name in names:
-                self._generate_binding(binding, generator, low, high)
-                matched = True
-        if not matched:
-            raise ValueError(
-                f"rule {self.context.call.api_name} did not find parameter {parameter_name!r}"
-            )
-
-    def generate_remaining(self, generator: str | CaseValueGenerator):
-        for binding in self.context.call.tensors:
-            if binding.path not in self._generated_paths:
-                self._generate_binding(binding, generator)
-
-    def generate_by_parameter(
-        self, parameter_generators, default: str | CaseValueGenerator | None = None
-    ):
-        normalized = []
-        for parameter_name, generator in parameter_generators:
-            names = (parameter_name,) if isinstance(parameter_name, str) else tuple(parameter_name)
-            normalized.append((names, generator))
-        for binding in self.context.call.tensors:
-            generator = None
-            for names, candidate in normalized:
-                if binding.parameter_name in names:
-                    generator = candidate
-                    break
-            if generator is None:
-                generator = default
-            if generator is not None:
-                self._generate_binding(binding, generator)
-
-    def require_complete(self):
-        missing = [
-            str(binding.path)
-            for binding in self.context.call.tensors
-            if binding.path not in self._generated_paths
-        ]
-        if missing:
-            raise ValueError(
-                f"rule {self.context.call.api_name} left tensors ungenerated: {missing}"
-            )
-
-    def is_generated(self, binding):
-        return binding.path in self._generated_paths
-
-    def _generate_binding(self, binding, generator: str | CaseValueGenerator, low=None, high=None):
-        if binding.path in self._generated_paths:
-            raise ValueError(f"rule generated tensor twice: {binding.path}")
-        if callable(generator):
-            value = generator(binding)
-            if value is _RAW_WRITE:
-                return
-        else:
-            generate_value = _VALUE_GENERATORS[generator]
-            value = generate_value(binding.spec, low, high, self.backend)
-        self.set_value(binding, value)
-
-    def set_value(self, binding, value):
-        if binding.path in self._generated_paths:
-            raise ValueError(f"rule generated tensor twice: {binding.path}")
-        storage_value = _apply_value_raw(
-            self.raw_case,
-            binding.path,
-            value,
-            self.backend,
-            True,
-        )
-        self._input_data_by_path[binding.path] = InputData(
-            binding.path,
-            storage_value,
-            self.backend.name,
-        )
-        self._generated_paths.add(binding.path)
-
-    def rewrite_value(self, binding, value):
-        storage_value = _apply_value_raw(
-            self.raw_case,
-            binding.path,
-            value,
-            self.backend,
-            True,
-        )
-        self._input_data_by_path[binding.path] = InputData(
-            binding.path,
-            storage_value,
-            self.backend.name,
-        )
-        self._generated_paths.add(binding.path)
-
-    def set_value_raw(self, binding, value):
-        if binding.path in self._generated_paths:
-            raise ValueError(f"rule generated tensor twice: {binding.path}")
-        storage_value = _apply_value_raw(
-            self.raw_case,
-            binding.path,
-            value,
-            self.backend,
-            False,
-        )
-        self._input_data_by_path[binding.path] = InputData(
-            binding.path,
-            storage_value,
-            self.backend.name,
-        )
-        self._generated_paths.add(binding.path)
-        return _RAW_WRITE
+    def __init__(self, call, raw_config: object):
+        self.call = call
+        self.raw_config = raw_config
 
     def find(self, parameter_name: str):
-        for binding in self.context.call.tensors:
+        for binding in self.call.tensors:
             if binding.parameter_name == parameter_name:
                 return binding
         return None
 
     def binding_for_config(self, tensor_config):
-        for binding in self.context.call.tensors:
-            if _tensor_config_at(self.raw_case, binding.path) is tensor_config:
+        for binding in self.call.tensors:
+            if _tensor_config_at(self.raw_config, binding.path) is tensor_config:
                 return binding
         return None
+
+    @property
+    def api_name(self):
+        return self.call.api_name
+
+    @property
+    def tensors(self):
+        return self.call.tensors
+
+    def arg(self, position, name, default=None):
+        return _api_arg(self.raw_config, position, name, default)
+
+    def has_kwarg(self, name):
+        return name in self.raw_config.kwargs
+
+    def kwarg(self, name, default=None):
+        return self.raw_config.kwargs.get(name, default)
+
+    def argument_values(self):
+        return (*self.raw_config.args, *self.raw_config.kwargs.values())
+
+    def is_tensor_config(self, value):
+        return _is_tensor_config(value)
+
+
+class ValueFactory:
+    """规则侧数值生成入口。"""
+
+    def __init__(self, backend):
+        self.backend = backend
+
+    def domain(self, generator: str, binding, low=None, high=None):
+        return _VALUE_GENERATORS[generator](binding.spec, low, high, self.backend)
+
+    def dtype_eps(self, dtype):
+        dtype = self._numeric_dtype(dtype)
+        if dtype == "bool" or "int" in dtype:
+            return 0
+        return numpy.finfo(self._real_dtype(dtype)).eps
+
+    def dtype_max(self, dtype):
+        dtype = self._numeric_dtype(dtype)
+        if dtype == "bool":
+            return 1
+        if "int" in dtype:
+            return numpy.iinfo(dtype).max
+        return numpy.finfo(self._real_dtype(dtype)).max
+
+    def dtype_min(self, dtype):
+        dtype = self._numeric_dtype(dtype)
+        if dtype == "bool":
+            return 0
+        if "int" in dtype:
+            return numpy.iinfo(dtype).min
+        return numpy.finfo(self._real_dtype(dtype)).min
+
+    def _numeric_dtype(self, dtype):
+        return self.backend.generation_dtype(str(dtype).replace("paddle.", ""))
+
+    def _real_dtype(self, dtype):
+        if dtype == "complex64":
+            return "float32"
+        if dtype == "complex128":
+            return "float64"
+        return dtype
+
+
+class InputWriter:
+    """规则侧输入写入与完整性状态。"""
+
+    def __init__(self, raw_config: object, backend):
+        self.raw_config = raw_config
+        self.backend = backend
+        self._generated_paths = set()
+        self._input_data_by_path: dict[object, InputData] = {}
+
+    def require_complete(self, config: ConfigView):
+        missing = [
+            str(binding.path)
+            for binding in config.tensors
+            if binding.path not in self._generated_paths
+        ]
+        if missing:
+            raise ValueError(f"rule {config.api_name} left tensors ungenerated: {missing}")
+
+    def is_generated(self, binding):
+        return binding.path in self._generated_paths
+
+    def set_value(self, binding, value):
+        if binding.path in self._generated_paths:
+            raise ValueError(f"rule generated tensor twice: {binding.path}")
+        self._write_value(binding, value, update_config=True)
+
+    def rewrite_value(self, binding, value):
+        self._write_value(binding, value, update_config=True)
+
+    def set_value_raw(self, binding, value):
+        if binding.path in self._generated_paths:
+            raise ValueError(f"rule generated tensor twice: {binding.path}")
+        self._write_value(binding, value, update_config=False)
+        return _RAW_WRITE
 
     def value(self, binding):
         data = self._input_data_by_path.get(binding.path)
         if data is not None:
             return data.value
-        config = _tensor_config_at(self.raw_case, binding.path)
-        return read_input_value(self.raw_case, config)
+        config = _tensor_config_at(self.raw_config, binding.path)
+        return read_input_value(self.raw_config, config)
 
     def input_data_items(self):
         return tuple(self._input_data_by_path.values())
 
-    @property
-    def api_name(self):
-        return self.context.call.api_name
+    def _write_value(self, binding, value, update_config):
+        storage_value = _apply_value_raw(
+            self.raw_config,
+            binding.path,
+            value,
+            self.backend,
+            update_config,
+        )
+        self._input_data_by_path[binding.path] = InputData(
+            binding.path,
+            storage_value,
+            self.backend.name,
+        )
+        self._generated_paths.add(binding.path)
 
-    def arg(self, position, name, default=None):
-        return _api_arg(self.raw_case, position, name, default)
 
-    def has_kwarg(self, name):
-        return name in self.raw_case.kwargs
+def generate_all(
+    config: ConfigView,
+    values: ValueFactory,
+    writer: InputWriter,
+    generator,
+    low=None,
+    high=None,
+):
+    for binding in config.tensors:
+        _generate_binding(values, writer, binding, generator, low, high)
 
-    def kwarg(self, name, default=None):
-        return self.raw_case.kwargs.get(name, default)
 
-    def argument_values(self):
-        return (*self.raw_case.args, *self.raw_case.kwargs.values())
+def generate_one(
+    config: ConfigView,
+    values: ValueFactory,
+    writer: InputWriter,
+    parameter_name: str | tuple[str, ...],
+    generator,
+    low=None,
+    high=None,
+):
+    names = (parameter_name,) if isinstance(parameter_name, str) else tuple(parameter_name)
+    matched = False
+    for binding in config.tensors:
+        if binding.parameter_name in names:
+            _generate_binding(values, writer, binding, generator, low, high)
+            matched = True
+    if not matched:
+        raise ValueError(f"rule {config.api_name} did not find parameter {parameter_name!r}")
 
-    def is_tensor_config(self, value):
-        return _is_tensor_config(value)
 
-    def value_domain(self, generator: str, binding, low=None, high=None):
-        return _VALUE_GENERATORS[generator](binding.spec, low, high, self.backend)
+def generate_remaining(config: ConfigView, values: ValueFactory, writer: InputWriter, generator):
+    for binding in config.tensors:
+        if not writer.is_generated(binding):
+            _generate_binding(values, writer, binding, generator)
+
+
+def generate_by_parameter(
+    config: ConfigView,
+    values: ValueFactory,
+    writer: InputWriter,
+    parameter_generators,
+    default: str | ConfigValueGenerator | None = None,
+):
+    normalized = []
+    for parameter_name, generator in parameter_generators:
+        names = (parameter_name,) if isinstance(parameter_name, str) else tuple(parameter_name)
+        normalized.append((names, generator))
+    for binding in config.tensors:
+        generator = None
+        for names, candidate in normalized:
+            if binding.parameter_name in names:
+                generator = candidate
+                break
+        if generator is None:
+            generator = default
+        if generator is not None:
+            _generate_binding(values, writer, binding, generator)
+
+
+def _generate_binding(
+    values: ValueFactory,
+    writer: InputWriter,
+    binding,
+    generator,
+    low=None,
+    high=None,
+):
+    if writer.is_generated(binding):
+        raise ValueError(f"rule generated tensor twice: {binding.path}")
+    if callable(generator):
+        value = generator(binding)
+        if value is _RAW_WRITE:
+            return
+    else:
+        value = values.domain(generator, binding, low, high)
+    writer.set_value(binding, value)
 
 
 class RuleRegistry:
@@ -422,7 +468,7 @@ def _max_unpool_input_size(
     return kernel_size, stride, padding, pool_input_size
 
 
-def _optimizer_beta_pow(inputs: InputDataBuilder, binding, beta, step):
+def _optimizer_beta_pow(values: ValueFactory, binding, beta, step):
     import paddle
 
     use_accuracy_compatible = paddle.get_flags("FLAGS_use_accuracy_compatible_kernel")[
@@ -431,8 +477,8 @@ def _optimizer_beta_pow(inputs: InputDataBuilder, binding, beta, step):
     if use_accuracy_compatible:
         beta_pow_value = beta**step
     else:
-        beta_pow_value = inputs.backend.power(numpy.float32(beta), numpy.float32(step)).item()
-    return inputs.backend.full(binding.spec.shape, beta_pow_value, dtype=binding.spec.dtype)
+        beta_pow_value = values.backend.power(numpy.float32(beta), numpy.float32(step)).item()
+    return values.backend.full(binding.spec.shape, beta_pow_value, dtype=binding.spec.dtype)
 
 
 def _is_tensor_config(value) -> bool:
@@ -458,41 +504,46 @@ rules = RuleRegistry()
 @rules.register("paddle.assign")
 @rules.register("paddle.exp")
 @rules.register("paddle.nn.functional.sigmoid")
-def default_values(ctx: InputContext, inputs: InputDataBuilder):
-    inputs.generate_all("default")
+def default_values(config: ConfigView, values: ValueFactory, writer: InputWriter):
+    generate_all(config, values, writer, "default")
 
 
 @rules.register("paddle.incubate.nn.functional.fused_act_dequant")
-def fused_act_dequant_values(ctx: InputContext, inputs: InputDataBuilder):
+def fused_act_dequant_values(config: ConfigView, values: ValueFactory, writer: InputWriter):
     def x_scale_value(binding):
         if binding.spec.dtype == "int32":
-            exponent = inputs.backend.randint(120, 128, shape=binding.spec.shape, dtype="int32")
-            return exponent * inputs.backend.asarray(0x01010101, dtype="int32")
-        return inputs.value_domain("default", binding)
+            exponent = values.backend.randint(120, 128, shape=binding.spec.shape, dtype="int32")
+            return exponent * values.backend.asarray(0x01010101, dtype="int32")
+        return values.domain("default", binding)
 
-    inputs.generate_by_parameter((("x_scale", x_scale_value),), default="default")
+    generate_by_parameter(config, values, writer, (("x_scale", x_scale_value),), default="default")
 
 
 @rules.register("paddle.incubate.nn.functional.variable_length_memory_efficient_attention")
-def variable_length_memory_efficient_attention_values(ctx: InputContext, inputs: InputDataBuilder):
+def variable_length_memory_efficient_attention_values(
+    config: ConfigView, values: ValueFactory, writer: InputWriter
+):
     def seq_lens_value(binding):
-        query = inputs.arg(0, "query")
+        query = config.arg(0, "query")
         q_seq_len = query.shape[2]
-        return inputs.value_domain("random_range", binding, 1, q_seq_len)
+        return values.domain("random_range", binding, 1, q_seq_len)
 
     def kv_seq_lens_value(binding):
-        key = inputs.arg(1, "key")
-        value = inputs.arg(2, "value")
+        key = config.arg(1, "key")
+        value = config.arg(2, "value")
         max_seq_len = min(key.shape[2], value.shape[2])
-        return inputs.value_domain("random_range", binding, 1, max_seq_len)
+        return values.domain("random_range", binding, 1, max_seq_len)
 
     def mask_value(binding):
-        return inputs.backend.cast(
-            inputs.backend.randint(0, 2, shape=binding.spec.shape),
+        return values.backend.cast(
+            values.backend.randint(0, 2, shape=binding.spec.shape),
             binding.spec.dtype,
-        ) * inputs.dtype_min(binding.spec.dtype)
+        ) * values.dtype_min(binding.spec.dtype)
 
-    inputs.generate_by_parameter(
+    generate_by_parameter(
+        config,
+        values,
+        writer,
         (
             ("seq_lens", seq_lens_value),
             ("kv_seq_lens", kv_seq_lens_value),
@@ -505,9 +556,9 @@ def variable_length_memory_efficient_attention_values(ctx: InputContext, inputs:
 @rules.register(
     "paddle.incubate.nn.functional.block_multihead_attention",
 )
-def block_multihead_attention_values(ctx: InputContext, inputs: InputDataBuilder):
-    qkv = inputs.arg(0, "qkv")
-    seq_lens_encoder = inputs.arg(3, "seq_lens_encoder")
+def block_multihead_attention_values(config: ConfigView, values: ValueFactory, writer: InputWriter):
+    qkv = config.arg(0, "qkv")
+    seq_lens_encoder = config.arg(3, "seq_lens_encoder")
     batch_size = seq_lens_encoder.shape[0]
     seq_len = qkv.shape[0] // batch_size
 
@@ -528,22 +579,22 @@ def block_multihead_attention_values(ctx: InputContext, inputs: InputDataBuilder
     }
 
     def seq_len_array(binding):
-        return inputs.backend.asarray([seq_len] * batch_size, dtype=binding.spec.dtype)
+        return values.backend.asarray([seq_len] * batch_size, dtype=binding.spec.dtype)
 
     def set_padding_offsets(binding):
-        seq_lens_this_time = inputs.value(inputs.find("seq_lens_this_time"))
-        cum_offsets_now = inputs.backend.cumsum(seq_len - seq_lens_this_time)
-        cum_offsets_binding = inputs.find("cum_offsets")
-        cu_seqlens_q_binding = inputs.find("cu_seqlens_q")
-        cu_seqlens_k_binding = inputs.find("cu_seqlens_k")
-        cum_offsets = inputs.backend.zeros((batch_size + 1,), dtype=cum_offsets_binding.spec.dtype)
+        seq_lens_this_time = writer.value(config.find("seq_lens_this_time"))
+        cum_offsets_now = values.backend.cumsum(seq_len - seq_lens_this_time)
+        cum_offsets_binding = config.find("cum_offsets")
+        cu_seqlens_q_binding = config.find("cu_seqlens_q")
+        cu_seqlens_k_binding = config.find("cu_seqlens_k")
+        cum_offsets = values.backend.zeros((batch_size + 1,), dtype=cum_offsets_binding.spec.dtype)
         cum_offsets[1:] = cum_offsets_now
-        token_num = inputs.backend.sum(seq_lens_this_time)
-        padding_offsets = inputs.backend.zeros((token_num,), dtype=binding.spec.dtype)
-        cu_seqlens_q = inputs.backend.zeros(
+        token_num = values.backend.sum(seq_lens_this_time)
+        padding_offsets = values.backend.zeros((token_num,), dtype=binding.spec.dtype)
+        cu_seqlens_q = values.backend.zeros(
             (batch_size + 1,), dtype=cu_seqlens_q_binding.spec.dtype
         )
-        cu_seqlens_k = inputs.backend.zeros(
+        cu_seqlens_k = values.backend.zeros(
             (batch_size + 1,), dtype=cu_seqlens_k_binding.spec.dtype
         )
         for batch_index in range(batch_size):
@@ -554,37 +605,35 @@ def block_multihead_attention_values(ctx: InputContext, inputs: InputDataBuilder
             cum_seq_len = (batch_index + 1) * seq_len - cum_offsets[batch_index + 1]
             cu_seqlens_q[batch_index + 1] = cum_seq_len
             cu_seqlens_k[batch_index + 1] = cum_seq_len
-        inputs.set_value(cum_offsets_binding, cum_offsets[:-1])
-        inputs.set_value(cu_seqlens_q_binding, cu_seqlens_q)
-        inputs.set_value(cu_seqlens_k_binding, cu_seqlens_k)
-        inputs.set_value(binding, padding_offsets)
+        writer.set_value(cum_offsets_binding, cum_offsets[:-1])
+        writer.set_value(cu_seqlens_q_binding, cu_seqlens_q)
+        writer.set_value(cu_seqlens_k_binding, cu_seqlens_k)
+        writer.set_value(binding, padding_offsets)
 
-    for binding in ctx.call.tensors:
-        if inputs.is_generated(binding):
+    for binding in config.tensors:
+        if writer.is_generated(binding):
             continue
         if binding.parameter_name in zero_parameters:
-            inputs.set_value(
-                binding, inputs.backend.zeros(binding.spec.shape, dtype=binding.spec.dtype)
+            writer.set_value(
+                binding, values.backend.zeros(binding.spec.shape, dtype=binding.spec.dtype)
             )
         elif binding.parameter_name == "seq_lens_encoder":
-            inputs.set_value(binding, seq_len_array(binding))
+            writer.set_value(binding, seq_len_array(binding))
         elif binding.parameter_name == "seq_lens_this_time":
-            inputs.set_value(binding, inputs.value(inputs.find("seq_lens_encoder")))
+            writer.set_value(binding, writer.value(config.find("seq_lens_encoder")))
         elif binding.parameter_name == "padding_offsets":
             set_padding_offsets(binding)
         elif binding.parameter_name in positive_range_parameters:
-            inputs.set_value(binding, inputs.value_domain("random_range", binding, low=0))
+            writer.set_value(binding, values.domain("random_range", binding, low=0))
         elif binding.parameter_name == "max_enc_len_this_time":
-            inputs.set_value(binding, seq_len_array(binding))
+            writer.set_value(binding, seq_len_array(binding))
         elif binding.parameter_name in {"mask", "tgt_mask"}:
-            inputs.set_value(
+            writer.set_value(
                 binding,
-                inputs.value_domain(
-                    "random_range", binding, high=inputs.dtype_eps(binding.spec.dtype)
-                ),
+                values.domain("random_range", binding, high=values.dtype_eps(binding.spec.dtype)),
             )
         else:
-            inputs.set_value(binding, inputs.value_domain("default", binding))
+            writer.set_value(binding, values.domain("default", binding))
 
 
 @rules.register(
@@ -593,27 +642,27 @@ def block_multihead_attention_values(ctx: InputContext, inputs: InputDataBuilder
     "paddle._C_ops.merged_adam_",
     block_key="optimizer",
 )
-def optimizer_values(ctx: InputContext, inputs: InputDataBuilder):
+def optimizer_values(config: ConfigView, values: ValueFactory, writer: InputWriter):
     zero_parameters = {"moment1", "moment2", "moment2_max"}
     optimizer_step = None
 
     def generate_value(binding):
         nonlocal optimizer_step
         if binding.parameter_name in zero_parameters:
-            return inputs.backend.zeros(binding.spec.shape, dtype=binding.spec.dtype)
-        if inputs.api_name == "paddle._C_ops.adamw_" and binding.parameter_name in {
+            return values.backend.zeros(binding.spec.shape, dtype=binding.spec.dtype)
+        if config.api_name == "paddle._C_ops.adamw_" and binding.parameter_name in {
             "beta1_pow",
             "beta2_pow",
         }:
             if optimizer_step is None:
-                optimizer_step = inputs.backend.randint(1, 101)
-            beta = inputs.arg(10, "beta1")
+                optimizer_step = values.backend.randint(1, 101)
+            beta = config.arg(10, "beta1")
             if binding.parameter_name == "beta2_pow":
-                beta = inputs.arg(11, "beta2")
-            return _optimizer_beta_pow(inputs, binding, beta, optimizer_step)
-        return inputs.value_domain("default", binding)
+                beta = config.arg(11, "beta2")
+            return _optimizer_beta_pow(values, binding, beta, optimizer_step)
+        return values.domain("default", binding)
 
-    inputs.generate_all(generate_value)
+    generate_all(config, values, writer, generate_value)
 
 
 @rules.register(
@@ -621,18 +670,18 @@ def optimizer_values(ctx: InputContext, inputs: InputDataBuilder):
     "paddle.nn.functional.max_unpool2d",
     "paddle.nn.functional.max_unpool3d",
 )
-def max_unpool_values(ctx: InputContext, inputs: InputDataBuilder):
-    x_binding = inputs.find("x")
-    indices_binding = inputs.find("indices")
+def max_unpool_values(config: ConfigView, values: ValueFactory, writer: InputWriter):
+    x_binding = config.find("x")
+    indices_binding = config.find("indices")
     if x_binding is None or indices_binding is None:
-        raise ValueError(f"rule {inputs.api_name} requires x and indices tensors")
+        raise ValueError(f"rule {config.api_name} requires x and indices tensors")
 
-    kernel_size = inputs.arg(2, "kernel_size")
-    stride = inputs.arg(3, "stride")
-    padding = inputs.arg(4, "padding")
-    output_size = inputs.arg(5, "output_size")
+    kernel_size = config.arg(2, "kernel_size")
+    stride = config.arg(3, "stride")
+    padding = config.arg(4, "padding")
+    output_size = config.arg(5, "output_size")
     kernel_size, stride, padding, pool_input_size = _max_unpool_input_size(
-        inputs.api_name,
+        config.api_name,
         x_binding.spec.shape,
         output_size,
         kernel_size,
@@ -647,9 +696,9 @@ def max_unpool_values(ctx: InputContext, inputs: InputDataBuilder):
         is_contiguous=x_binding.spec.is_contiguous,
         strides=x_binding.spec.strides,
     )
-    pool_input = generate_random_range(pool_input_spec, low=-5, high=5, rng=inputs.backend)
-    pool_name = inputs.api_name.rsplit(".", 1)[-1].replace("max_unpool", "max_pool")
-    if inputs.backend.name == "torch":
+    pool_input = generate_random_range(pool_input_spec, low=-5, high=5, rng=values.backend)
+    pool_name = config.api_name.rsplit(".", 1)[-1].replace("max_unpool", "max_pool")
+    if values.backend.name == "torch":
         import torch.nn.functional as torch_functional
 
         max_poolxd_func = getattr(torch_functional, pool_name)
@@ -660,8 +709,8 @@ def max_unpool_values(ctx: InputContext, inputs: InputDataBuilder):
             padding,
             return_indices=True,
         )
-        inputs.set_value(x_binding, x)
-        inputs.set_value(indices_binding, indices)
+        writer.set_value(x_binding, x)
+        writer.set_value(indices_binding, indices)
         return
 
     import paddle
@@ -674,42 +723,42 @@ def max_unpool_values(ctx: InputContext, inputs: InputDataBuilder):
         padding,
         return_mask=True,
     )
-    if inputs.backend.name == "paddle":
-        inputs.set_value(x_binding, x)
-        inputs.set_value(indices_binding, indices)
+    if values.backend.name == "paddle":
+        writer.set_value(x_binding, x)
+        writer.set_value(indices_binding, indices)
         return
-    inputs.set_value(x_binding, x.numpy())
-    inputs.set_value(indices_binding, indices.numpy())
+    writer.set_value(x_binding, x.numpy())
+    writer.set_value(indices_binding, indices.numpy())
 
 
 @rules.register("paddle.arange")
-def arange_values(ctx: InputContext, inputs: InputDataBuilder):
+def arange_values(config: ConfigView, values: ValueFactory, writer: InputWriter):
     def tensor_binding(value):
-        return inputs.binding_for_config(value) if inputs.is_tensor_config(value) else None
+        return config.binding_for_config(value) if config.is_tensor_config(value) else None
 
     def rewrite_tensor(value, tensor_value):
         binding = tensor_binding(value)
         if binding is not None:
-            inputs.rewrite_value(binding, tensor_value)
+            writer.rewrite_value(binding, tensor_value)
 
     def generate_step_tensor(step_config, is_positive):
         if "int" in step_config.dtype:
             if is_positive:
-                return inputs.backend.cast(
-                    inputs.backend.randint(1, 10, shape=step_config.shape),
+                return values.backend.cast(
+                    values.backend.randint(1, 10, shape=step_config.shape),
                     step_config.dtype,
                 )
-            return inputs.backend.cast(
-                inputs.backend.randint(-10, -1, shape=step_config.shape),
+            return values.backend.cast(
+                values.backend.randint(-10, -1, shape=step_config.shape),
                 step_config.dtype,
             )
         if is_positive:
-            return inputs.backend.cast(
-                inputs.backend.uniform(0.1, 5.0, shape=step_config.shape),
+            return values.backend.cast(
+                values.backend.uniform(0.1, 5.0, shape=step_config.shape),
                 step_config.dtype,
             )
-        return inputs.backend.cast(
-            inputs.backend.uniform(-5.0, -0.1, shape=step_config.shape),
+        return values.backend.cast(
+            values.backend.uniform(-5.0, -0.1, shape=step_config.shape),
             step_config.dtype,
         )
 
@@ -726,65 +775,65 @@ def arange_values(ctx: InputContext, inputs: InputDataBuilder):
 
     def random_range(tensor_config, low, high):
         if "int" in tensor_config.dtype:
-            return inputs.backend.cast(
-                inputs.backend.randint(low, high, shape=tensor_config.shape),
+            return values.backend.cast(
+                values.backend.randint(low, high, shape=tensor_config.shape),
                 tensor_config.dtype,
             )
-        return inputs.backend.cast(
-            inputs.backend.uniform(low, high, shape=tensor_config.shape),
+        return values.backend.cast(
+            values.backend.uniform(low, high, shape=tensor_config.shape),
             tensor_config.dtype,
         )
 
     def handle_arange_relation():
-        start_val = inputs.arg(0, "start", 0)
-        end_val = inputs.arg(1, "end", None)
-        step_val = inputs.arg(2, "step", 1)
+        start_val = config.arg(0, "start", 0)
+        end_val = config.arg(1, "end", None)
+        step_val = config.arg(2, "step", 1)
 
-        if inputs.is_tensor_config(start_val):
-            if inputs.is_tensor_config(end_val):
-                if inputs.is_tensor_config(step_val):
-                    flag = inputs.backend.choice([True, False])
+        if config.is_tensor_config(start_val):
+            if config.is_tensor_config(end_val):
+                if config.is_tensor_config(step_val):
+                    flag = values.backend.choice([True, False])
                     rewrite_tensor(step_val, generate_step_tensor(step_val, flag))
                 else:
                     flag = step_val > 0
                 rewrite_tensor(start_val, random_range(start_val, -50, 50))
-                start = inputs.value(inputs.find("start")).item()
+                start = writer.value(config.find("start")).item()
                 if flag:
                     low, high = safe_range(start + 1, start + 50)
                 else:
                     low, high = safe_range(start - 50, start - 1)
                 rewrite_tensor(end_val, random_range(end_val, low, high))
             elif end_val is None:
-                if inputs.is_tensor_config(step_val):
-                    flag = inputs.backend.choice([True, False])
+                if config.is_tensor_config(step_val):
+                    flag = values.backend.choice([True, False])
                     rewrite_tensor(step_val, generate_step_tensor(step_val, flag))
                 else:
                     flag = step_val > 0
                 if flag:
                     if "int" in start_val.dtype:
-                        value = inputs.backend.cast(
-                            inputs.backend.randint(1, 50, shape=start_val.shape),
+                        value = values.backend.cast(
+                            values.backend.randint(1, 50, shape=start_val.shape),
                             start_val.dtype,
                         )
                     else:
-                        value = inputs.backend.cast(
-                            inputs.backend.uniform(0.1, 50.0, shape=start_val.shape),
+                        value = values.backend.cast(
+                            values.backend.uniform(0.1, 50.0, shape=start_val.shape),
                             start_val.dtype,
                         )
                 elif "int" in start_val.dtype:
-                    value = inputs.backend.cast(
-                        inputs.backend.randint(-50, -1, shape=start_val.shape),
+                    value = values.backend.cast(
+                        values.backend.randint(-50, -1, shape=start_val.shape),
                         start_val.dtype,
                     )
                 else:
-                    value = inputs.backend.cast(
-                        inputs.backend.uniform(-50.0, -0.1, shape=start_val.shape),
+                    value = values.backend.cast(
+                        values.backend.uniform(-50.0, -0.1, shape=start_val.shape),
                         start_val.dtype,
                     )
                 rewrite_tensor(start_val, value)
             else:
-                if inputs.is_tensor_config(step_val):
-                    flag = inputs.backend.choice([True, False])
+                if config.is_tensor_config(step_val):
+                    flag = values.backend.choice([True, False])
                     rewrite_tensor(step_val, generate_step_tensor(step_val, flag))
                 else:
                     flag = step_val > 0
@@ -793,9 +842,9 @@ def arange_values(ctx: InputContext, inputs: InputDataBuilder):
                 else:
                     low, high = safe_range(end_val + 1, end_val + 50)
                 rewrite_tensor(start_val, random_range(start_val, low, high))
-        elif inputs.is_tensor_config(end_val):
-            if inputs.is_tensor_config(step_val):
-                flag = inputs.backend.choice([True, False])
+        elif config.is_tensor_config(end_val):
+            if config.is_tensor_config(step_val):
+                flag = values.backend.choice([True, False])
                 rewrite_tensor(step_val, generate_step_tensor(step_val, flag))
             else:
                 flag = step_val > 0
@@ -805,28 +854,28 @@ def arange_values(ctx: InputContext, inputs: InputDataBuilder):
                 low, high = safe_range(start_val - 50, start_val - 1)
             rewrite_tensor(end_val, random_range(end_val, low, high))
         elif end_val is None:
-            if inputs.is_tensor_config(step_val):
+            if config.is_tensor_config(step_val):
                 flag = start_val > 0
                 rewrite_tensor(step_val, generate_step_tensor(step_val, flag))
-        elif inputs.is_tensor_config(step_val):
+        elif config.is_tensor_config(step_val):
             flag = start_val < end_val
             rewrite_tensor(step_val, generate_step_tensor(step_val, flag))
 
-    for binding in ctx.call.tensors:
-        if inputs.value(binding) is None:
+    for binding in config.tensors:
+        if writer.value(binding) is None:
             handle_arange_relation()
 
 
 @rules.register("paddle.nn.functional.moe_permute")
-def moe_permute_values(ctx: InputContext, inputs: InputDataBuilder):
+def moe_permute_values(config: ConfigView, values: ValueFactory, writer: InputWriter):
     def expert_routemap_value(binding):
-        num_experts = inputs.arg(4, "num_experts", 32)
-        hidden_states = inputs.arg(0, "hidden_states")
-        scale = inputs.arg(1, "scale")
-        expert_prob = inputs.arg(3, "expert_prob_topk")
-        tokens_per_expert = inputs.arg(5, "tokens_per_expert")
-        padding_alignment = inputs.arg(6, "padding_alignment")
-        using_ue8m0_scale = inputs.arg(8, "using_ue8m0_scale", False)
+        num_experts = config.arg(4, "num_experts", 32)
+        hidden_states = config.arg(0, "hidden_states")
+        scale = config.arg(1, "scale")
+        expert_prob = config.arg(3, "expert_prob_topk")
+        tokens_per_expert = config.arg(5, "tokens_per_expert")
+        padding_alignment = config.arg(6, "padding_alignment")
+        using_ue8m0_scale = config.arg(8, "using_ue8m0_scale", False)
         if (
             not isinstance(num_experts, int)
             or isinstance(num_experts, bool)
@@ -840,14 +889,14 @@ def moe_permute_values(ctx: InputContext, inputs: InputDataBuilder):
             or padding_alignment & (padding_alignment - 1)
         ):
             raise ValueError("padding_alignment must be a positive power of 2")
-        if not inputs.is_tensor_config(hidden_states) or (
+        if not config.is_tensor_config(hidden_states) or (
             len(hidden_states.shape) != 2
             or hidden_states.dtype not in {"bfloat16", "float32", "float8_e4m3fn"}
         ):
             raise ValueError("hidden_states must be a rank-2 bfloat16 or float8_e4m3fn tensor")
         if binding.spec.dtype != "int32":
             raise ValueError("expert_routemap_topk dtype must be int32")
-        if not inputs.is_tensor_config(expert_prob) or (
+        if not config.is_tensor_config(expert_prob) or (
             len(expert_prob.shape) != 2 or expert_prob.dtype != "float32"
         ):
             raise ValueError("expert_prob_topk must be a rank-2 float32 tensor")
@@ -864,7 +913,7 @@ def moe_permute_values(ctx: InputContext, inputs: InputDataBuilder):
                 expected_scale_width = (expected_scale_width + 3) // 4
                 expected_scale_dtype = "int32"
             if not (
-                inputs.is_tensor_config(scale)
+                config.is_tensor_config(scale)
                 and tuple(scale.shape) == (seqlen, expected_scale_width)
                 and scale.dtype == expected_scale_dtype
             ):
@@ -874,7 +923,7 @@ def moe_permute_values(ctx: InputContext, inputs: InputDataBuilder):
                 )
         elif scale is not None:
             raise ValueError("scale must be None when hidden_states dtype is bfloat16")
-        routemap = inputs.backend.full((seqlen, topk), -1, dtype="int32")
+        routemap = values.backend.full((seqlen, topk), -1, dtype="int32")
         if topk == 0:
             raise ValueError("topk should be greater than 0")
         if not isinstance(tokens_per_expert, list):
@@ -895,7 +944,7 @@ def moe_permute_values(ctx: InputContext, inputs: InputDataBuilder):
             )
         cursor = 0
         for expert, count in enumerate(tokens_per_expert):
-            positions = inputs.backend.arange(cursor, cursor + count, dtype="int64")
+            positions = values.backend.arange(cursor, cursor + count, dtype="int64")
             rows = positions % seqlen
             columns = (positions // seqlen) % topk
             routemap[rows, columns] = expert
@@ -903,22 +952,25 @@ def moe_permute_values(ctx: InputContext, inputs: InputDataBuilder):
         return routemap
 
     def expert_prob_value(binding):
-        routemap_binding = inputs.find("expert_routemap_topk")
-        probs = inputs.backend.zeros(binding.spec.shape, dtype="float32")
-        if routemap_binding is not None and inputs.value(routemap_binding) is not None:
-            mask = inputs.value(routemap_binding) >= 0
-            raw = inputs.backend.cast(inputs.backend.random(binding.spec.shape), "float32") * mask
-            row_sums = inputs.backend.sum(raw, axis=1, keepdims=True)
+        routemap_binding = config.find("expert_routemap_topk")
+        probs = values.backend.zeros(binding.spec.shape, dtype="float32")
+        if routemap_binding is not None and writer.value(routemap_binding) is not None:
+            mask = writer.value(routemap_binding) >= 0
+            raw = values.backend.cast(values.backend.random(binding.spec.shape), "float32") * mask
+            row_sums = values.backend.sum(raw, axis=1, keepdims=True)
             row_sums[row_sums == 0] = 1.0
             probs = raw / row_sums
         else:
-            probs = inputs.backend.cast(inputs.backend.random(binding.spec.shape), "float32")
-            row_sums = inputs.backend.sum(probs, axis=1, keepdims=True)
+            probs = values.backend.cast(values.backend.random(binding.spec.shape), "float32")
+            row_sums = values.backend.sum(probs, axis=1, keepdims=True)
             row_sums[row_sums == 0] = 1.0
             probs = probs / row_sums
         return probs
 
-    inputs.generate_by_parameter(
+    generate_by_parameter(
+        config,
+        values,
+        writer,
         (
             ("expert_routemap_topk", expert_routemap_value),
             ("expert_prob_topk", expert_prob_value),
@@ -928,13 +980,13 @@ def moe_permute_values(ctx: InputContext, inputs: InputDataBuilder):
 
 
 @rules.register("paddle.nn.functional.moe_unpermute")
-def moe_unpermute_values(ctx: InputContext, inputs: InputDataBuilder):
+def moe_unpermute_values(config: ConfigView, values: ValueFactory, writer: InputWriter):
     def expert_routemap_value(binding):
-        num_experts = inputs.arg(5, "num_experts", 32)
-        total_zipped_tokens = inputs.arg(4, "total_zipped_tokens")
-        hidden_config = inputs.arg(0, "hidden_states_unzipped")
-        rowmap_config = inputs.arg(1, "zipped_expertwise_rowmap")
-        prob_config = inputs.arg(3, "token_prob_unzipped")
+        num_experts = config.arg(5, "num_experts", 32)
+        total_zipped_tokens = config.arg(4, "total_zipped_tokens")
+        hidden_config = config.arg(0, "hidden_states_unzipped")
+        rowmap_config = config.arg(1, "zipped_expertwise_rowmap")
+        prob_config = config.arg(3, "token_prob_unzipped")
         if not isinstance(num_experts, int) or isinstance(num_experts, bool) or num_experts <= 0:
             raise ValueError("num_experts must be a positive integer")
         if (
@@ -944,13 +996,13 @@ def moe_unpermute_values(ctx: InputContext, inputs: InputDataBuilder):
         ):
             raise ValueError("total_zipped_tokens must be a non-negative integer")
         if not (
-            inputs.is_tensor_config(hidden_config)
+            config.is_tensor_config(hidden_config)
             and len(hidden_config.shape) == 2
             and hidden_config.dtype in {"bfloat16", "float32"}
         ):
             raise ValueError("hidden_states_unzipped must be a rank-2 bfloat16 tensor")
         if not (
-            inputs.is_tensor_config(rowmap_config)
+            config.is_tensor_config(rowmap_config)
             and len(rowmap_config.shape) == 2
             and rowmap_config.dtype == "int32"
             and tuple(rowmap_config.shape) == (total_zipped_tokens, num_experts)
@@ -960,7 +1012,7 @@ def moe_unpermute_values(ctx: InputContext, inputs: InputDataBuilder):
                 "[total_zipped_tokens, num_experts] and dtype int32"
             )
         if not (
-            inputs.is_tensor_config(prob_config)
+            config.is_tensor_config(prob_config)
             and len(prob_config.shape) in (1, 2)
             and prob_config.shape[0] == hidden_config.shape[0]
             and (len(prob_config.shape) == 1 or prob_config.shape[1] == 1)
@@ -977,59 +1029,59 @@ def moe_unpermute_values(ctx: InputContext, inputs: InputDataBuilder):
             raise ValueError("expert_routemap_topk sequence length must equal total_zipped_tokens")
         if topk <= 0:
             raise ValueError("topk should be greater than 0")
-        routemap = inputs.backend.full(binding.spec.shape, -1, dtype="int32")
+        routemap = values.backend.full(binding.spec.shape, -1, dtype="int32")
         max_assign = min(topk, num_experts)
         route_count = min(hidden_config.shape[0], seqlen * max_assign)
-        positions = inputs.backend.arange(route_count, dtype="int64")
+        positions = values.backend.arange(route_count, dtype="int64")
         rows = positions % seqlen
         columns = positions // seqlen
         routemap[rows, columns] = (rows + columns) % num_experts
         return routemap
 
     def rowmap_value(binding):
-        routemap_binding = inputs.find("expert_routemap_topk")
-        if routemap_binding is not None and not inputs.is_generated(routemap_binding):
-            inputs.set_value(routemap_binding, expert_routemap_value(routemap_binding))
-        routemap_config = inputs.arg(2, "expert_routemap_topk")
-        num_experts = inputs.arg(5, "num_experts", 32)
-        total_zipped_tokens = inputs.arg(4, "total_zipped_tokens")
-        hidden_config = inputs.arg(0, "hidden_states_unzipped")
+        routemap_binding = config.find("expert_routemap_topk")
+        if routemap_binding is not None and not writer.is_generated(routemap_binding):
+            writer.set_value(routemap_binding, expert_routemap_value(routemap_binding))
+        routemap_config = config.arg(2, "expert_routemap_topk")
+        num_experts = config.arg(5, "num_experts", 32)
+        total_zipped_tokens = config.arg(4, "total_zipped_tokens")
+        hidden_config = config.arg(0, "hidden_states_unzipped")
         seqlen = total_zipped_tokens
         unzipped_seqlen = (
-            hidden_config.shape[0] if inputs.is_tensor_config(hidden_config) else seqlen
+            hidden_config.shape[0] if config.is_tensor_config(hidden_config) else seqlen
         )
         if binding.spec.dtype != "int32" or tuple(binding.spec.shape) != (seqlen, num_experts):
             raise ValueError(
                 "zipped_expertwise_rowmap must have shape "
                 "[total_zipped_tokens, num_experts] and dtype int32"
             )
-        rowmap = inputs.backend.full(binding.spec.shape, -1, dtype="int32")
-        if inputs.is_tensor_config(routemap_config) and routemap_binding is not None:
-            routemap = inputs.value(routemap_binding)
-            expert_counts = inputs.backend.asarray(
-                [inputs.backend.count_nonzero(routemap == expert) for expert in range(num_experts)],
+        rowmap = values.backend.full(binding.spec.shape, -1, dtype="int32")
+        if config.is_tensor_config(routemap_config) and routemap_binding is not None:
+            routemap = writer.value(routemap_binding)
+            expert_counts = values.backend.asarray(
+                [values.backend.count_nonzero(routemap == expert) for expert in range(num_experts)],
                 dtype="int64",
             )
-            if int(inputs.backend.sum(expert_counts)) > unzipped_seqlen:
+            if int(values.backend.sum(expert_counts)) > unzipped_seqlen:
                 raise ValueError("routemap assignments exceed hidden_states_unzipped capacity")
-            expert_offsets = inputs.backend.zeros(num_experts, dtype="int64")
-            expert_offsets[1:] = inputs.backend.cumsum(expert_counts[:-1])
-            expert_counters = inputs.backend.zeros(num_experts, dtype="int64")
+            expert_offsets = values.backend.zeros(num_experts, dtype="int64")
+            expert_offsets[1:] = values.backend.cumsum(expert_counts[:-1])
+            expert_counters = values.backend.zeros(num_experts, dtype="int64")
             for row_index in range(seqlen):
                 for expert in range(num_experts):
-                    positions = inputs.backend.nonzero(routemap[row_index] == expert)[0]
-                    if inputs.backend.prod(positions.shape) == 0:
+                    positions = values.backend.nonzero(routemap[row_index] == expert)[0]
+                    if values.backend.prod(positions.shape) == 0:
                         continue
                     rowmap[row_index, expert] = expert_offsets[expert] + expert_counters[expert]
                     expert_counters[expert] += 1
         return rowmap
 
     def token_prob_value(binding):
-        hidden_config = inputs.arg(0, "hidden_states_unzipped")
+        hidden_config = config.arg(0, "hidden_states_unzipped")
         if not (
             binding.spec.dtype == "float32"
             and len(binding.spec.shape) in (1, 2)
-            and inputs.is_tensor_config(hidden_config)
+            and config.is_tensor_config(hidden_config)
             and binding.spec.shape[0] == hidden_config.shape[0]
             and (len(binding.spec.shape) == 1 or binding.spec.shape[1] == 1)
         ):
@@ -1037,150 +1089,153 @@ def moe_unpermute_values(ctx: InputContext, inputs: InputDataBuilder):
                 "token_prob_unzipped must match the broadcasted sequence "
                 "length and have dtype float32"
             )
-        return inputs.backend.cast(inputs.backend.random(binding.spec.shape), "float32")
+        return values.backend.cast(values.backend.random(binding.spec.shape), "float32")
 
-    for binding in ctx.call.tensors:
-        if inputs.is_generated(binding):
+    for binding in config.tensors:
+        if writer.is_generated(binding):
             continue
         if binding.parameter_name == "expert_routemap_topk":
-            inputs.set_value(binding, expert_routemap_value(binding))
+            writer.set_value(binding, expert_routemap_value(binding))
         elif binding.parameter_name == "zipped_expertwise_rowmap":
-            inputs.set_value(binding, rowmap_value(binding))
+            writer.set_value(binding, rowmap_value(binding))
         elif binding.parameter_name == "token_prob_unzipped":
-            inputs.set_value(binding, token_prob_value(binding))
+            writer.set_value(binding, token_prob_value(binding))
         else:
-            inputs.set_value(binding, inputs.value_domain("default", binding))
+            writer.set_value(binding, values.domain("default", binding))
 
 
 @rules.register(*tuple(sorted(not_zero_apis)))
-def nonzero_values(ctx: InputContext, inputs: InputDataBuilder):
-    inputs.generate_all("nonzero")
+def nonzero_values(config: ConfigView, values: ValueFactory, writer: InputWriter):
+    generate_all(config, values, writer, "nonzero")
 
 
 @rules.register("paddle.bernoulli")
-def bernoulli_probability(ctx: InputContext, inputs: InputDataBuilder):
-    inputs.generate_all("unit_interval")
+def bernoulli_probability(config: ConfigView, values: ValueFactory, writer: InputWriter):
+    generate_all(config, values, writer, "unit_interval")
 
 
 @rules.register("paddle.standard_gamma")
-def standard_gamma_unit_interval(ctx: InputContext, inputs: InputDataBuilder):
-    inputs.generate_all("unit_interval")
+def standard_gamma_unit_interval(config: ConfigView, values: ValueFactory, writer: InputWriter):
+    generate_all(config, values, writer, "unit_interval")
 
 
 @rules.register("paddle.poisson")
-def poisson_unit_interval(ctx: InputContext, inputs: InputDataBuilder):
-    inputs.generate_all("unit_interval")
+def poisson_unit_interval(config: ConfigView, values: ValueFactory, writer: InputWriter):
+    generate_all(config, values, writer, "unit_interval")
 
 
 @rules.register(
     "paddle.sqrt",
     aliases=("paddle.Tensor.sqrt",),
 )
-def sqrt_nonnegative(ctx: InputContext, inputs: InputDataBuilder):
-    inputs.generate_all("uniform", low=0, high=1000)
+def sqrt_nonnegative(config: ConfigView, values: ValueFactory, writer: InputWriter):
+    generate_all(config, values, writer, "uniform", low=0, high=1000)
 
 
 @rules.register(
     "paddle.rsqrt",
     aliases=("paddle.Tensor.rsqrt",),
 )
-def rsqrt_positive(ctx: InputContext, inputs: InputDataBuilder):
-    inputs.generate_all("uniform", low=1e-7, high=1000)
+def rsqrt_positive(config: ConfigView, values: ValueFactory, writer: InputWriter):
+    generate_all(config, values, writer, "uniform", low=1e-7, high=1000)
 
 
 @rules.register("paddle.clip", aliases=("paddle.Tensor.clip",))
-def clip_values(ctx: InputContext, inputs: InputDataBuilder):
-    x_binding = inputs.find("x")
-    min_binding = inputs.find("min")
-    max_binding = inputs.find("max")
-    min_config = inputs.arg(1, "min")
-    max_config = inputs.arg(2, "max")
+def clip_values(config: ConfigView, values: ValueFactory, writer: InputWriter):
+    x_binding = config.find("x")
+    min_binding = config.find("min")
+    max_binding = config.find("max")
+    min_config = config.arg(1, "min")
+    max_config = config.arg(2, "max")
 
-    if inputs.is_tensor_config(min_config) and inputs.is_tensor_config(max_config):
-        min_value = inputs.value_domain("random_range", min_binding)
-        max_value = inputs.value_domain("random_range", max_binding, low=min_value)
-        inputs.set_value(min_binding, min_value)
-        inputs.set_value(max_binding, max_value)
+    if config.is_tensor_config(min_config) and config.is_tensor_config(max_config):
+        min_value = values.domain("random_range", min_binding)
+        max_value = values.domain("random_range", max_binding, low=min_value)
+        writer.set_value(min_binding, min_value)
+        writer.set_value(max_binding, max_value)
     elif min_config is not None and max_config is not None:
-        if inputs.is_tensor_config(min_config) and isinstance(max_config, (int, float)):
-            min_value = inputs.value_domain("random_range", min_binding, high=max_config)
-            inputs.set_value(min_binding, min_value)
-        elif inputs.is_tensor_config(max_config) and isinstance(min_config, (int, float)):
-            max_value = inputs.value_domain("random_range", max_binding, low=min_config)
-            inputs.set_value(max_binding, max_value)
+        if config.is_tensor_config(min_config) and isinstance(max_config, (int, float)):
+            min_value = values.domain("random_range", min_binding, high=max_config)
+            writer.set_value(min_binding, min_value)
+        elif config.is_tensor_config(max_config) and isinstance(min_config, (int, float)):
+            max_value = values.domain("random_range", max_binding, low=min_config)
+            writer.set_value(max_binding, max_value)
 
     if x_binding is not None:
-        inputs.set_value(
+        writer.set_value(
             x_binding,
-            inputs.value_domain("random_range", x_binding),
+            values.domain("random_range", x_binding),
         )
-    inputs.generate_remaining("default")
+    generate_remaining(config, values, writer, "default")
 
 
 @rules.register(
     "paddle.multiply",
     aliases=("paddle.Tensor.__mul__", "paddle.Tensor.multiply", "paddle.Tensor.__rmul__"),
 )
-def multiply_values(ctx: InputContext, inputs: InputDataBuilder):
-    inputs.generate_all("multiply")
+def multiply_values(config: ConfigView, values: ValueFactory, writer: InputWriter):
+    generate_all(config, values, writer, "multiply")
 
 
 @rules.register(
     "paddle.nn.functional.binary_cross_entropy",
 )
-def binary_cross_entropy_values(ctx: InputContext, inputs: InputDataBuilder):
-    inputs.generate_all("unit_interval")
+def binary_cross_entropy_values(config: ConfigView, values: ValueFactory, writer: InputWriter):
+    generate_all(config, values, writer, "unit_interval")
 
 
 @rules.register("paddle.nn.functional.alpha_dropout")
-def alpha_dropout_values(ctx: InputContext, inputs: InputDataBuilder):
-    inputs.generate_by_parameter((("x", "unit_interval"),), default="default")
+def alpha_dropout_values(config: ConfigView, values: ValueFactory, writer: InputWriter):
+    generate_by_parameter(config, values, writer, (("x", "unit_interval"),), default="default")
 
 
 @rules.register("paddle.nn.functional.conv2d_transpose")
-def conv2d_transpose_values(ctx: InputContext, inputs: InputDataBuilder):
+def conv2d_transpose_values(config: ConfigView, values: ValueFactory, writer: InputWriter):
     def tensor_value(binding):
         if "int" in binding.spec.dtype:
-            return inputs.backend.cast(
-                inputs.backend.randint(-65535, 65535, shape=binding.spec.shape),
+            return values.backend.cast(
+                values.backend.randint(-65535, 65535, shape=binding.spec.shape),
                 binding.spec.dtype,
             )
-        return inputs.backend.cast(
-            inputs.backend.random(binding.spec.shape) - 0.5,
+        return values.backend.cast(
+            values.backend.random(binding.spec.shape) - 0.5,
             binding.spec.dtype,
         )
 
-    inputs.generate_by_parameter(
+    generate_by_parameter(
+        config,
+        values,
+        writer,
         ((("x", "weight", "bias"), tensor_value),),
         default="default",
     )
 
 
 @rules.register("paddle.vision.ops.distribute_fpn_proposals")
-def distribute_fpn_proposals_values(ctx: InputContext, inputs: InputDataBuilder):
+def distribute_fpn_proposals_values(config: ConfigView, values: ValueFactory, writer: InputWriter):
     state = {"num": None}
 
     def fpn_rois_value(binding):
         num = binding.spec.shape[0]
         state["num"] = num
-        rois = inputs.backend.randint(1, 1024, shape=[num, 4])
-        rois[:, 0] = rois[:, 0] + inputs.backend.random([num])
-        rois[:, 1] = rois[:, 1] + inputs.backend.random([num])
+        rois = values.backend.randint(1, 1024, shape=[num, 4])
+        rois[:, 0] = rois[:, 0] + values.backend.random([num])
+        rois[:, 1] = rois[:, 1] + values.backend.random([num])
         rois[:, 2] = (
-            rois[:, 0] + inputs.backend.randint(1, 1024, shape=[num]) + inputs.backend.random([num])
+            rois[:, 0] + values.backend.randint(1, 1024, shape=[num]) + values.backend.random([num])
         )
         rois[:, 3] = (
-            rois[:, 1] + inputs.backend.randint(1, 1024, shape=[num]) + inputs.backend.random([num])
+            rois[:, 1] + values.backend.randint(1, 1024, shape=[num]) + values.backend.random([num])
         )
         return rois
 
     def rois_num_value(binding):
         if state["num"] is None:
-            fpn_rois = inputs.arg(0, "fpn_rois")
+            fpn_rois = config.arg(0, "fpn_rois")
             state["num"] = fpn_rois.shape[0]
         num = state["num"]
         remaining = binding.spec.shape[0]
-        result = inputs.backend.zeros(binding.spec.shape)
+        result = values.backend.zeros(binding.spec.shape)
         if num > 4096 or remaining > 4096:
             if num < remaining:
                 result[:num] = 1
@@ -1188,86 +1243,92 @@ def distribute_fpn_proposals_values(ctx: InputContext, inputs: InputDataBuilder)
                 result += num // remaining
                 result[: num % remaining] += 1
         elif num < remaining:
-            indices = inputs.backend.choice(remaining, num, replace=False)
+            indices = values.backend.choice(remaining, num, replace=False)
             result[indices] = 1
         else:
             for index in range(binding.spec.shape[0] - 1):
-                result[index] = inputs.backend.randint(1, num - remaining + 2)
+                result[index] = values.backend.randint(1, num - remaining + 2)
                 num -= result[index]
                 remaining -= 1
             result[binding.spec.shape[0] - 1] = num
         return result
 
-    inputs.generate_by_parameter(
+    generate_by_parameter(
+        config,
+        values,
+        writer,
         (
             ("fpn_rois", fpn_rois_value),
             ("rois_num", rois_num_value),
-        )
+        ),
     )
 
 
 @rules.register("paddle.vision.ops.generate_proposals")
-def generate_proposals_values(ctx: InputContext, inputs: InputDataBuilder):
+def generate_proposals_values(config: ConfigView, values: ValueFactory, writer: InputWriter):
     def random_value(binding):
-        return inputs.backend.random(binding.spec.shape, dtype=binding.spec.dtype)
+        return values.backend.random(binding.spec.shape, dtype=binding.spec.dtype)
 
     def img_size_value(binding):
-        return inputs.backend.cast(
-            inputs.backend.randint(0, 1024, shape=binding.spec.shape),
+        return values.backend.cast(
+            values.backend.randint(0, 1024, shape=binding.spec.shape),
             binding.spec.dtype,
         )
 
     def anchors_value(binding):
-        anchors = inputs.backend.zeros(binding.spec.shape, dtype=binding.spec.dtype)
+        anchors = values.backend.zeros(binding.spec.shape, dtype=binding.spec.dtype)
         width = binding.spec.shape[0]
         height = binding.spec.shape[1]
         for index in range(binding.spec.shape[0]):
-            anchors[index][0] = inputs.backend.random() * width
-            anchors[index][1] = inputs.backend.random() * height
+            anchors[index][0] = values.backend.random() * width
+            anchors[index][1] = values.backend.random() * height
             anchors[index][2] = (
-                inputs.backend.random() * (width - anchors[index][0] + 1) + anchors[index][0] + 1
+                values.backend.random() * (width - anchors[index][0] + 1) + anchors[index][0] + 1
             )
             anchors[index][3] = (
-                inputs.backend.random() * (height - anchors[index][1] + 1) + anchors[index][1] + 1
+                values.backend.random() * (height - anchors[index][1] + 1) + anchors[index][1] + 1
             )
         return anchors
 
-    for binding in ctx.call.tensors:
+    for binding in config.tensors:
         if binding.parameter_name in {"scores", "bbox_deltas"}:
-            inputs.set_value(binding, random_value(binding))
+            writer.set_value(binding, random_value(binding))
         elif binding.parameter_name == "img_size":
-            inputs.set_value(binding, img_size_value(binding))
+            writer.set_value(binding, img_size_value(binding))
         elif binding.parameter_name == "anchors":
-            inputs.set_value(binding, anchors_value(binding))
+            writer.set_value(binding, anchors_value(binding))
         else:
-            inputs.set_value(binding, inputs.value_domain("default", binding))
+            writer.set_value(binding, values.domain("default", binding))
 
 
 @rules.register("paddle.vision.ops.nms")
-def nms_values(ctx: InputContext, inputs: InputDataBuilder):
+def nms_values(config: ConfigView, values: ValueFactory, writer: InputWriter):
     def boxes_value(binding):
-        boxes = inputs.backend.zeros(binding.spec.shape, dtype=binding.spec.dtype)
+        boxes = values.backend.zeros(binding.spec.shape, dtype=binding.spec.dtype)
         for index in range(binding.spec.shape[0]):
-            boxes[index][0] = inputs.backend.random() * 1023
-            boxes[index][1] = inputs.backend.random() * 1023
+            boxes[index][0] = values.backend.random() * 1023
+            boxes[index][1] = values.backend.random() * 1023
             boxes[index][2] = (
-                inputs.backend.random() * (1024 - boxes[index][0] + 1) + boxes[index][0] + 1
+                values.backend.random() * (1024 - boxes[index][0] + 1) + boxes[index][0] + 1
             )
             boxes[index][3] = (
-                inputs.backend.random() * (1024 - boxes[index][1] + 1) + boxes[index][1] + 1
+                values.backend.random() * (1024 - boxes[index][1] + 1) + boxes[index][1] + 1
             )
         return boxes
 
     def scores_value(binding):
-        return inputs.backend.random(binding.spec.shape, dtype=binding.spec.dtype)
+        return values.backend.random(binding.spec.shape, dtype=binding.spec.dtype)
 
     def default_vision_value(binding):
-        return inputs.backend.cast(
-            inputs.backend.randint(0, 1024, shape=binding.spec.shape),
+        return values.backend.cast(
+            values.backend.randint(0, 1024, shape=binding.spec.shape),
             binding.spec.dtype,
         )
 
-    inputs.generate_by_parameter(
+    generate_by_parameter(
+        config,
+        values,
+        writer,
         (
             ("boxes", boxes_value),
             ("scores", scores_value),
@@ -1281,32 +1342,32 @@ def nms_values(ctx: InputContext, inputs: InputDataBuilder):
     "paddle.vision.ops.roi_pool",
     "paddle.vision.ops.psroi_pool",
 )
-def roi_pool_values(ctx: InputContext, inputs: InputDataBuilder):
+def roi_pool_values(config: ConfigView, values: ValueFactory, writer: InputWriter):
     state = {"x_shape": None, "boxes_shape": None}
 
     def x_value(binding):
         state["x_shape"] = binding.spec.shape
-        return inputs.backend.cast(
-            inputs.backend.random(binding.spec.shape) * 255,
+        return values.backend.cast(
+            values.backend.random(binding.spec.shape) * 255,
             binding.spec.dtype,
         )
 
     def boxes_value(binding):
         if state["x_shape"] is None:
-            x = inputs.arg(0, "x")
+            x = config.arg(0, "x")
             state["x_shape"] = x.shape
         state["boxes_shape"] = binding.spec.shape
-        boxes = inputs.backend.zeros(binding.spec.shape, dtype=binding.spec.dtype)
+        boxes = values.backend.zeros(binding.spec.shape, dtype=binding.spec.dtype)
         for index in range(binding.spec.shape[0]):
-            boxes[index][0] = inputs.backend.random() * (state["x_shape"][2] - 2)
-            boxes[index][1] = inputs.backend.random() * (state["x_shape"][3] - 2)
+            boxes[index][0] = values.backend.random() * (state["x_shape"][2] - 2)
+            boxes[index][1] = values.backend.random() * (state["x_shape"][3] - 2)
             boxes[index][2] = (
-                inputs.backend.random() * (state["x_shape"][2] - 1 - boxes[index][0] + 1)
+                values.backend.random() * (state["x_shape"][2] - 1 - boxes[index][0] + 1)
                 + boxes[index][0]
                 + 1
             )
             boxes[index][3] = (
-                inputs.backend.random() * (state["x_shape"][3] - 1 - boxes[index][1] + 1)
+                values.backend.random() * (state["x_shape"][3] - 1 - boxes[index][1] + 1)
                 + boxes[index][1]
                 + 1
             )
@@ -1314,21 +1375,24 @@ def roi_pool_values(ctx: InputContext, inputs: InputDataBuilder):
 
     def boxes_num_value(binding):
         if state["boxes_shape"] is None:
-            boxes = inputs.arg(1, "boxes")
+            boxes = config.arg(1, "boxes")
             state["boxes_shape"] = boxes.shape
         boxes_remaining = state["boxes_shape"][0]
-        result = inputs.backend.zeros(binding.spec.shape, dtype=binding.spec.dtype)
+        result = values.backend.zeros(binding.spec.shape, dtype=binding.spec.dtype)
         numel = math.prod(binding.spec.shape)
         for index in range(numel - 1):
             if boxes_remaining < numel:
                 result[index] = 0
             else:
-                result[index] = inputs.backend.randint(1, boxes_remaining - (numel - 1 - index) + 1)
+                result[index] = values.backend.randint(1, boxes_remaining - (numel - 1 - index) + 1)
                 boxes_remaining -= result[index]
         result[numel - 1] = boxes_remaining
         return result
 
-    inputs.generate_by_parameter(
+    generate_by_parameter(
+        config,
+        values,
+        writer,
         (
             ("x", x_value),
             ("boxes", boxes_value),
@@ -1343,18 +1407,21 @@ def roi_pool_values(ctx: InputContext, inputs: InputDataBuilder):
     "paddle.gammaincc",
     "paddle.linspace",
 )
-def zero_65535_or_unit_values(ctx: InputContext, inputs: InputDataBuilder):
-    inputs.generate_all("int_zero_65535_else_unit")
+def zero_65535_or_unit_values(config: ConfigView, values: ValueFactory, writer: InputWriter):
+    generate_all(config, values, writer, "int_zero_65535_else_unit")
 
 
 @rules.register("paddle.dot")
-def dot_values(ctx: InputContext, inputs: InputDataBuilder):
-    inputs.generate_all("int_minus127_127_else_default")
+def dot_values(config: ConfigView, values: ValueFactory, writer: InputWriter):
+    generate_all(config, values, writer, "int_minus127_127_else_default")
 
 
 @rules.register("paddle.normal")
-def normal_values(ctx: InputContext, inputs: InputDataBuilder):
-    inputs.generate_by_parameter(
+def normal_values(config: ConfigView, values: ValueFactory, writer: InputWriter):
+    generate_by_parameter(
+        config,
+        values,
+        writer,
         (
             ("mean", "signed_half_interval"),
             ("std", "normal_std"),
@@ -1364,18 +1431,18 @@ def normal_values(ctx: InputContext, inputs: InputDataBuilder):
 
 
 @rules.register("paddle.ones")
-def ones_shape(ctx: InputContext, inputs: InputDataBuilder):
-    inputs.generate_all("ones_shape")
+def ones_shape(config: ConfigView, values: ValueFactory, writer: InputWriter):
+    generate_all(config, values, writer, "ones_shape")
 
 
 @rules.register("paddle.zeros")
-def zeros_shape(ctx: InputContext, inputs: InputDataBuilder):
-    inputs.generate_all("int_zero_2048_no_cast")
+def zeros_shape(config: ConfigView, values: ValueFactory, writer: InputWriter):
+    generate_all(config, values, writer, "int_zero_2048_no_cast")
 
 
 @rules.register("paddle.eye")
-def eye_shape(ctx: InputContext, inputs: InputDataBuilder):
-    inputs.generate_all("int_zero_2048_no_cast")
+def eye_shape(config: ConfigView, values: ValueFactory, writer: InputWriter):
+    generate_all(config, values, writer, "int_zero_2048_no_cast")
 
 
 @rules.register(
@@ -1383,16 +1450,22 @@ def eye_shape(ctx: InputContext, inputs: InputDataBuilder):
     "paddle.Tensor.tile",
     "paddle.tile",
 )
-def shape_parameter_values(ctx: InputContext, inputs: InputDataBuilder):
-    inputs.generate_by_parameter(
+def shape_parameter_values(config: ConfigView, values: ValueFactory, writer: InputWriter):
+    generate_by_parameter(
+        config,
+        values,
+        writer,
         ((("size", "scale_factor", "repeat_times"), "int_one_128"),),
         default="default",
     )
 
 
 @rules.register("paddle.nn.functional.upsample")
-def upsample_values(ctx: InputContext, inputs: InputDataBuilder):
-    inputs.generate_by_parameter(
+def upsample_values(config: ConfigView, values: ValueFactory, writer: InputWriter):
+    generate_by_parameter(
+        config,
+        values,
+        writer,
         (
             ("size", "int_one_128"),
             ("scale_factor", "abs_unit_plus_one"),
@@ -1404,8 +1477,11 @@ def upsample_values(ctx: InputContext, inputs: InputDataBuilder):
 @rules.register(
     "paddle.nn.functional.gaussian_nll_loss",
 )
-def gaussian_nll_loss_values(ctx: InputContext, inputs: InputDataBuilder):
-    inputs.generate_by_parameter(
+def gaussian_nll_loss_values(config: ConfigView, values: ValueFactory, writer: InputWriter):
+    generate_by_parameter(
+        config,
+        values,
+        writer,
         ((("var", "variance"), "unit_interval_plus_one"),),
         default="default",
     )
@@ -1414,20 +1490,23 @@ def gaussian_nll_loss_values(ctx: InputContext, inputs: InputDataBuilder):
 @rules.register(
     "paddle.nn.functional.hinge_embedding_loss",
 )
-def hinge_embedding_loss_values(ctx: InputContext, inputs: InputDataBuilder):
-    inputs.generate_by_parameter((("label", "hinge_labels"),), default="default")
+def hinge_embedding_loss_values(config: ConfigView, values: ValueFactory, writer: InputWriter):
+    generate_by_parameter(config, values, writer, (("label", "hinge_labels"),), default="default")
 
 
 @rules.register(
     "paddle.nn.functional.sigmoid_focal_loss",
 )
-def sigmoid_focal_loss_values(ctx: InputContext, inputs: InputDataBuilder):
-    inputs.generate_by_parameter((("label", "binary_0_1"),), default="default")
+def sigmoid_focal_loss_values(config: ConfigView, values: ValueFactory, writer: InputWriter):
+    generate_by_parameter(config, values, writer, (("label", "binary_0_1"),), default="default")
 
 
 @rules.register("paddle.full")
-def full_values(ctx: InputContext, inputs: InputDataBuilder):
-    inputs.generate_by_parameter(
+def full_values(config: ConfigView, values: ValueFactory, writer: InputWriter):
+    generate_by_parameter(
+        config,
+        values,
+        writer,
         (
             ("shape", "int_zero_64"),
             ("fill_value", "full_fill_value"),
@@ -1437,26 +1516,28 @@ def full_values(ctx: InputContext, inputs: InputDataBuilder):
 
 
 @rules.register("paddle.standard_normal")
-def standard_normal_shape(ctx: InputContext, inputs: InputDataBuilder):
-    inputs.generate_by_parameter((("shape", "int_one_128"),), default="default")
+def standard_normal_shape(config: ConfigView, values: ValueFactory, writer: InputWriter):
+    generate_by_parameter(config, values, writer, (("shape", "int_one_128"),), default="default")
 
 
 @rules.register("paddle.logspace")
-def logspace_values(ctx: InputContext, inputs: InputDataBuilder):
-    inputs.generate_by_parameter((("num", "int_one_65535_no_cast"),), default="default")
+def logspace_values(config: ConfigView, values: ValueFactory, writer: InputWriter):
+    generate_by_parameter(
+        config, values, writer, (("num", "int_one_65535_no_cast"),), default="default"
+    )
 
 
 @rules.register("paddle.quantile")
-def quantile_values(ctx: InputContext, inputs: InputDataBuilder):
-    inputs.generate_by_parameter((("q", "quantile_q"),), default="default")
+def quantile_values(config: ConfigView, values: ValueFactory, writer: InputWriter):
+    generate_by_parameter(config, values, writer, (("q", "quantile_q"),), default="default")
 
 
 @rules.register(
     "paddle.remainder",
     aliases=("paddle.Tensor.remainder",),
 )
-def remainder_values(ctx: InputContext, inputs: InputDataBuilder):
-    inputs.generate_by_parameter((("y", "remainder_rhs"),), default="default")
+def remainder_values(config: ConfigView, values: ValueFactory, writer: InputWriter):
+    generate_by_parameter(config, values, writer, (("y", "remainder_rhs"),), default="default")
 
 
 @rules.register(
@@ -1464,24 +1545,29 @@ def remainder_values(ctx: InputContext, inputs: InputDataBuilder):
     "paddle.nn.functional.dropout2d",
     "paddle.nn.functional.dropout3d",
 )
-def dropout_values(ctx: InputContext, inputs: InputDataBuilder):
-    inputs.generate_by_parameter((("p", "dropout_probability"),), default="default")
+def dropout_values(config: ConfigView, values: ValueFactory, writer: InputWriter):
+    generate_by_parameter(
+        config, values, writer, (("p", "dropout_probability"),), default="default"
+    )
 
 
 @rules.register("paddle.atan2")
-def atan2_values(ctx: InputContext, inputs: InputDataBuilder):
-    inputs.generate_all("unit_interval_plus_one")
+def atan2_values(config: ConfigView, values: ValueFactory, writer: InputWriter):
+    generate_all(config, values, writer, "unit_interval_plus_one")
 
 
 @rules.register("paddle.bincount")
-def bincount_values(ctx: InputContext, inputs: InputDataBuilder):
+def bincount_values(config: ConfigView, values: ValueFactory, writer: InputWriter):
     def integer_value(binding):
-        return inputs.backend.cast(
-            inputs.backend.randint(0, 65535, shape=binding.spec.shape),
+        return values.backend.cast(
+            values.backend.randint(0, 65535, shape=binding.spec.shape),
             binding.spec.dtype,
         )
 
-    inputs.generate_by_parameter(
+    generate_by_parameter(
+        config,
+        values,
+        writer,
         (
             ("x", integer_value),
             ("minlength", integer_value),
@@ -1493,43 +1579,49 @@ def bincount_values(ctx: InputContext, inputs: InputDataBuilder):
 @rules.register(
     "paddle.nn.functional.adaptive_avg_pool2d", "paddle.nn.functional.adaptive_avg_pool3d"
 )
-def adaptive_avg_pool_values(ctx: InputContext, inputs: InputDataBuilder):
+def adaptive_avg_pool_values(config: ConfigView, values: ValueFactory, writer: InputWriter):
     def output_size(binding):
-        x_shape = inputs.arg(0, "x").shape
-        return inputs.backend.cast(
-            inputs.backend.randint(1, 2 * max(x_shape), shape=binding.spec.shape),
+        x_shape = config.arg(0, "x").shape
+        return values.backend.cast(
+            values.backend.randint(1, 2 * max(x_shape), shape=binding.spec.shape),
             binding.spec.dtype,
         )
 
-    inputs.generate_by_parameter(
+    generate_by_parameter(
+        config,
+        values,
+        writer,
         (("output_size", output_size),),
         default="default",
     )
 
 
 @rules.register("paddle.empty")
-def empty_values(ctx: InputContext, inputs: InputDataBuilder):
-    inputs.generate_by_parameter((("shape", "empty_shape"),), default="default")
+def empty_values(config: ConfigView, values: ValueFactory, writer: InputWriter):
+    generate_by_parameter(config, values, writer, (("shape", "empty_shape"),), default="default")
 
 
 @rules.register(
     "paddle.repeat_interleave",
     aliases=("paddle.Tensor.repeat_interleave",),
 )
-def repeat_interleave_values(ctx: InputContext, inputs: InputDataBuilder):
+def repeat_interleave_values(config: ConfigView, values: ValueFactory, writer: InputWriter):
     def axis_value(binding):
-        x = inputs.arg(0, "x")
+        x = config.arg(0, "x")
         input_dims = len(x.shape)
         if len(binding.spec.shape) == 0:
-            return inputs.backend.asarray(
-                inputs.backend.randint(-input_dims, input_dims), dtype=binding.spec.dtype
+            return values.backend.asarray(
+                values.backend.randint(-input_dims, input_dims), dtype=binding.spec.dtype
             )
-        return inputs.backend.cast(
-            inputs.backend.randint(-input_dims, input_dims, shape=binding.spec.shape),
+        return values.backend.cast(
+            values.backend.randint(-input_dims, input_dims, shape=binding.spec.shape),
             binding.spec.dtype,
         )
 
-    inputs.generate_by_parameter(
+    generate_by_parameter(
+        config,
+        values,
+        writer,
         (
             ("repeats", "int_one_2048"),
             ("axis", axis_value),
@@ -1550,7 +1642,7 @@ def repeat_interleave_values(ctx: InputContext, inputs: InputDataBuilder):
         "paddle._C_ops.Tensor.put_along_axis_",
     ),
 )
-def put_along_axis_values(ctx: InputContext, inputs: InputDataBuilder):
+def put_along_axis_values(config: ConfigView, values: ValueFactory, writer: InputWriter):
     def random_tensor_value(binding, shape):
         scalar_spec = TensorSpec(
             shape=tuple(shape),
@@ -1559,88 +1651,95 @@ def put_along_axis_values(ctx: InputContext, inputs: InputDataBuilder):
             is_contiguous=binding.spec.is_contiguous,
             strides=binding.spec.strides,
         )
-        return generate_random_range(scalar_spec, rng=inputs.backend)
+        return generate_random_range(scalar_spec, rng=values.backend)
 
     def indices_value(binding):
-        x_tensor = inputs.arg(0, "arr", inputs.arg(0, "x"))
+        x_tensor = config.arg(0, "arr", config.arg(0, "x"))
         x_shape = tuple(x_tensor.shape) if x_tensor is not None else ()
         x_dims = len(x_shape)
         current_shape = tuple(binding.spec.shape)
         if len(current_shape) != x_dims:
             new_shape = [current_shape[i] if i < len(current_shape) else 1 for i in range(x_dims)]
-            indices = inputs.backend.zeros(new_shape, dtype="int64")
+            indices = values.backend.zeros(new_shape, dtype="int64")
             for axis in range(x_dims):
                 if axis < len(current_shape):
                     dim_size = x_shape[axis]
                     if dim_size > 0:
-                        axis_indices = inputs.backend.choice(
+                        axis_indices = values.backend.choice(
                             dim_size, shape=new_shape[axis], replace=False
                         )
-                        axis_indices = inputs.backend.cast(axis_indices, "int64")
+                        axis_indices = values.backend.cast(axis_indices, "int64")
                         idx_tuple = tuple(
                             [slice(None)] * axis
                             + [slice(None, new_shape[axis])]
                             + [slice(None)] * (x_dims - axis - 1)
                         )
-                        indices[idx_tuple] = inputs.backend.reshape(
+                        indices[idx_tuple] = values.backend.reshape(
                             axis_indices,
                             [-1] + [1] * (x_dims - axis - 1),
                         )
             return indices
-        axis = inputs.arg(3, "axis", 0)
+        axis = config.arg(3, "axis", 0)
         axis = axis if isinstance(axis, int) else 0
         axis = axis if axis >= 0 else axis + x_dims
-        indices = inputs.backend.zeros(current_shape, dtype="int64")
+        indices = values.backend.zeros(current_shape, dtype="int64")
         if 0 <= axis < x_dims:
             dim_size = x_shape[axis]
-            for idx in inputs.backend.ndindex(tuple(current_shape[:-1])):
-                indices[idx] = inputs.backend.choice(
+            for idx in values.backend.ndindex(tuple(current_shape[:-1])):
+                indices[idx] = values.backend.choice(
                     dim_size, shape=current_shape[-1], replace=False
                 )
         return indices
 
     def values_value(binding):
-        indices_binding = inputs.find("indices")
+        indices_binding = config.find("indices")
         if indices_binding is not None:
-            indices = inputs.value(indices_binding)
+            indices = writer.value(indices_binding)
             if tuple(indices.shape) != tuple(binding.spec.shape):
-                if inputs.backend.prod(binding.spec.shape) == 1:
-                    return inputs.set_value_raw(
+                if values.backend.prod(binding.spec.shape) == 1:
+                    return writer.set_value_raw(
                         binding,
-                        inputs.backend.full(
+                        values.backend.full(
                             indices.shape,
                             random_tensor_value(binding, ())[()],
                             dtype=binding.spec.dtype,
                         ),
                     )
-                return inputs.set_value_raw(binding, random_tensor_value(binding, indices.shape))
+                return writer.set_value_raw(binding, random_tensor_value(binding, indices.shape))
             return random_tensor_value(binding, binding.spec.shape)
-        return inputs.value_domain("default", binding)
+        return values.domain("default", binding)
 
-    inputs.generate_by_parameter(
-        (("indices", indices_value), ("values", values_value)), default="default"
+    generate_by_parameter(
+        config,
+        values,
+        writer,
+        (("indices", indices_value), ("values", values_value)),
+        default="default",
     )
 
 
 @rules.register("paddle.matrix_transpose")
-def matrix_transpose_values(ctx: InputContext, inputs: InputDataBuilder):
+def matrix_transpose_values(config: ConfigView, values: ValueFactory, writer: InputWriter):
     def x_value(binding):
         shape = binding.spec.shape if len(binding.spec.shape) >= 2 else (2, 2)
         dtype = binding.spec.dtype
         if "int" in dtype:
-            return inputs.backend.cast(inputs.backend.randint(-65535, 65535, shape=shape), dtype)
-        return inputs.backend.cast(inputs.backend.random(shape) - 0.5, dtype)
+            return values.backend.cast(values.backend.randint(-65535, 65535, shape=shape), dtype)
+        return values.backend.cast(values.backend.random(shape) - 0.5, dtype)
 
-    inputs.generate_by_parameter((("x", x_value),), default="default")
+    generate_by_parameter(config, values, writer, (("x", x_value),), default="default")
 
 
 @rules.register("paddle.nn.functional.softmax")
-def softmax_values(ctx: InputContext, inputs: InputDataBuilder):
+def softmax_values(config: ConfigView, values: ValueFactory, writer: InputWriter):
     def axis_value(binding):
-        x_shape = inputs.arg(0, "x").shape
-        return inputs.value_domain("uniform", binding, low=-len(x_shape), high=len(x_shape))
+        x_shape = config.arg(0, "x").shape
+        return values.domain("uniform", binding, low=-len(x_shape), high=len(x_shape))
 
-    inputs.generate_by_parameter(
+    generate_by_parameter(
+        config,
+        values,
+        writer,
         (
             ("x", "random_range"),
             ("axis", axis_value),
@@ -1650,11 +1749,14 @@ def softmax_values(ctx: InputContext, inputs: InputDataBuilder):
 
 
 @rules.register("paddle.nn.functional.zeropad2d")
-def zeropad2d_values(ctx: InputContext, inputs: InputDataBuilder):
+def zeropad2d_values(config: ConfigView, values: ValueFactory, writer: InputWriter):
     def padding_value(binding):
-        return inputs.value_domain("uniform", binding, low=0, high=10)
+        return values.domain("uniform", binding, low=0, high=10)
 
-    inputs.generate_by_parameter(
+    generate_by_parameter(
+        config,
+        values,
+        writer,
         (
             ("x", "random_range"),
             ("padding", padding_value),
@@ -1664,49 +1766,54 @@ def zeropad2d_values(ctx: InputContext, inputs: InputDataBuilder):
 
 
 @rules.register("paddle.nn.functional.pad")
-def pad_values(ctx: InputContext, inputs: InputDataBuilder):
+def pad_values(config: ConfigView, values: ValueFactory, writer: InputWriter):
     def pad_value(binding):
-        x_shape = inputs.arg(0, "x").shape
-        return inputs.value_domain("uniform", binding, low=0, high=min(x_shape))
+        x_shape = config.arg(0, "x").shape
+        return values.domain("uniform", binding, low=0, high=min(x_shape))
 
-    inputs.generate_by_parameter((("pad", pad_value),), default="default")
+    generate_by_parameter(config, values, writer, (("pad", pad_value),), default="default")
 
 
 @rules.register("paddle.nn.functional.class_center_sample")
-def class_center_sample_values(ctx: InputContext, inputs: InputDataBuilder):
+def class_center_sample_values(config: ConfigView, values: ValueFactory, writer: InputWriter):
     def label_value(binding):
-        num_classes = inputs.arg(1, "num_classes")
-        return inputs.backend.cast(
-            inputs.backend.randint(0, num_classes, shape=binding.spec.shape),
+        num_classes = config.arg(1, "num_classes")
+        return values.backend.cast(
+            values.backend.randint(0, num_classes, shape=binding.spec.shape),
             binding.spec.dtype,
         )
 
-    inputs.generate_by_parameter((("label", label_value),), default="default")
+    generate_by_parameter(config, values, writer, (("label", label_value),), default="default")
 
 
 @rules.register("paddle.shard_index")
-def shard_index_values(ctx: InputContext, inputs: InputDataBuilder):
+def shard_index_values(config: ConfigView, values: ValueFactory, writer: InputWriter):
     def input_binding(binding):
-        index_num = inputs.arg(1, "index_num")
+        index_num = config.arg(1, "index_num")
         if index_num is None:
-            index_num = inputs.backend.randint(1, 1000)
-        return inputs.backend.cast(
-            inputs.backend.randint(0, index_num, shape=binding.spec.shape),
+            index_num = values.backend.randint(1, 1000)
+        return values.backend.cast(
+            values.backend.randint(0, index_num, shape=binding.spec.shape),
             binding.spec.dtype,
         )
 
-    inputs.generate_by_parameter((("input", input_binding),), default="default")
+    generate_by_parameter(config, values, writer, (("input", input_binding),), default="default")
 
 
 @rules.register("paddle.incubate.nn.functional.masked_multihead_attention")
-def masked_multihead_attention_values(ctx: InputContext, inputs: InputDataBuilder):
+def masked_multihead_attention_values(
+    config: ConfigView, values: ValueFactory, writer: InputWriter
+):
     def sequence_lengths(binding):
-        return inputs.value_domain("random_range", binding, low=1)
+        return values.domain("random_range", binding, low=1)
 
     def rotary_tensor(binding):
-        return inputs.value_domain("uniform", binding, low=0, high=1000)
+        return values.domain("uniform", binding, low=0, high=1000)
 
-    inputs.generate_by_parameter(
+    generate_by_parameter(
+        config,
+        values,
+        writer,
         (
             ("sequence_lengths", sequence_lengths),
             ("rotary_tensor", rotary_tensor),
@@ -1720,31 +1827,31 @@ def masked_multihead_attention_values(ctx: InputContext, inputs: InputDataBuilde
     "paddle.argmin",
     aliases=("paddle.Tensor.argmax", "paddle.Tensor.argmin"),
 )
-def argminmax_values(ctx: InputContext, inputs: InputDataBuilder):
+def argminmax_values(config: ConfigView, values: ValueFactory, writer: InputWriter):
     def axis_value(binding):
-        x_shape = inputs.arg(0, "x").shape
+        x_shape = config.arg(0, "x").shape
         min_dim = len(x_shape)
-        return inputs.backend.cast(
-            inputs.backend.randint(-min_dim, min_dim - 1, shape=binding.spec.shape),
+        return values.backend.cast(
+            values.backend.randint(-min_dim, min_dim - 1, shape=binding.spec.shape),
             "int64",
         )
 
-    inputs.generate_by_parameter((("axis", axis_value),), default="default")
+    generate_by_parameter(config, values, writer, (("axis", axis_value),), default="default")
 
 
 @rules.register("paddle.cumsum", aliases=("paddle.Tensor.cumsum",))
-def cumsum_values(ctx: InputContext, inputs: InputDataBuilder):
+def cumsum_values(config: ConfigView, values: ValueFactory, writer: InputWriter):
     def axis_value(binding):
-        x_shape = inputs.arg(0, "x").shape
-        return inputs.backend.randint(-len(x_shape), len(x_shape), shape=binding.spec.shape)
+        x_shape = config.arg(0, "x").shape
+        return values.backend.randint(-len(x_shape), len(x_shape), shape=binding.spec.shape)
 
-    inputs.generate_by_parameter((("axis", axis_value),), default="default")
+    generate_by_parameter(config, values, writer, (("axis", axis_value),), default="default")
 
 
 @rules.register(
     "paddle.mean", "paddle.max", "paddle.min", "paddle.prod", "paddle.sum", "paddle.squeeze"
 )
-def reduction_axis_values(ctx: InputContext, inputs: InputDataBuilder):
+def reduction_axis_values(config: ConfigView, values: ValueFactory, writer: InputWriter):
     used_list_axes = None
 
     def init_used_list_axes(x_shape, axis_arg):
@@ -1752,7 +1859,7 @@ def reduction_axis_values(ctx: InputContext, inputs: InputDataBuilder):
         max_dim = max(len(x_shape), 1)
         if isinstance(axis_arg, (list, tuple)):
             for item in axis_arg:
-                if inputs.is_tensor_config(item):
+                if config.is_tensor_config(item):
                     continue
                 if not isinstance(item, int):
                     raise ValueError(f"Invalid item type for axis: {type(item)}")
@@ -1766,9 +1873,9 @@ def reduction_axis_values(ctx: InputContext, inputs: InputDataBuilder):
 
     def axis_value(binding):
         nonlocal used_list_axes
-        x_shape = inputs.arg(0, "x").shape
+        x_shape = config.arg(0, "x").shape
         max_dim = max(len(x_shape), 1)
-        axis_arg = inputs.arg(1, "axis", None)
+        axis_arg = config.arg(1, "axis", None)
         if isinstance(axis_arg, (list, tuple)) and binding.path.indices:
             if binding.spec.shape not in [(), (1,)]:
                 raise ValueError(
@@ -1785,84 +1892,84 @@ def reduction_axis_values(ctx: InputContext, inputs: InputDataBuilder):
             available_dims = sorted(set(range(max_dim)) - used_list_axes)
             if not available_dims:
                 raise ValueError("Not enough available dimensions for axis TensorConfig items")
-            dim = inputs.backend.choice(available_dims, replace=False)
+            dim = values.backend.choice(available_dims, replace=False)
             dim = int(dim)
             used_list_axes.add(dim)
-            if inputs.backend.random() > 0.5:
+            if values.backend.random() > 0.5:
                 dim -= max_dim
-            return inputs.backend.asarray(dim, dtype=binding.spec.dtype)
+            return values.backend.asarray(dim, dtype=binding.spec.dtype)
         if len(binding.spec.shape) == 0:
-            dim = inputs.backend.randint(0, max_dim)
-            if inputs.backend.random() > 0.5:
+            dim = values.backend.randint(0, max_dim)
+            if values.backend.random() > 0.5:
                 dim -= max_dim
-            return inputs.backend.asarray(dim, dtype=binding.spec.dtype)
+            return values.backend.asarray(dim, dtype=binding.spec.dtype)
         if len(binding.spec.shape) == 1:
-            dims = inputs.backend.choice(max_dim, shape=binding.spec.shape[0], replace=False)
-            mask = inputs.backend.random(binding.spec.shape[0]) > 0.5
-            dims = inputs.backend.where(mask, dims - max_dim, dims)
-            return inputs.backend.asarray(dims, dtype=binding.spec.dtype)
+            dims = values.backend.choice(max_dim, shape=binding.spec.shape[0], replace=False)
+            mask = values.backend.random(binding.spec.shape[0]) > 0.5
+            dims = values.backend.where(mask, dims - max_dim, dims)
+            return values.backend.asarray(dims, dtype=binding.spec.dtype)
         raise ValueError(
-            f"Invalid shape for 'axis' Tensor in {inputs.api_name}. "
+            f"Invalid shape for 'axis' Tensor in {config.api_name}. "
             f"Expected a 0-D or 1-D Tensor, but got shape {binding.spec.shape}."
         )
 
-    inputs.generate_by_parameter((("axis", axis_value),), default="default")
+    generate_by_parameter(config, values, writer, (("axis", axis_value),), default="default")
 
 
 @rules.register("paddle.unsqueeze")
-def unsqueeze_values(ctx: InputContext, inputs: InputDataBuilder):
+def unsqueeze_values(config: ConfigView, values: ValueFactory, writer: InputWriter):
     def axis_value(binding):
-        x_shape = inputs.arg(0, "x").shape
+        x_shape = config.arg(0, "x").shape
         max_dim = len(x_shape) + 1
         if len(binding.spec.shape) == 0:
-            dim = inputs.backend.randint(0, max_dim)
-            if inputs.backend.random() > 0.5:
+            dim = values.backend.randint(0, max_dim)
+            if values.backend.random() > 0.5:
                 dim -= max_dim
-            return inputs.backend.asarray(dim, dtype=binding.spec.dtype)
+            return values.backend.asarray(dim, dtype=binding.spec.dtype)
         if len(binding.spec.shape) == 1:
-            dims = inputs.backend.choice(max_dim, shape=binding.spec.shape[0], replace=False)
-            mask = inputs.backend.random(binding.spec.shape[0]) > 0.5
-            dims = inputs.backend.where(mask, dims - max_dim, dims)
-            return inputs.backend.asarray(dims, dtype=binding.spec.dtype)
+            dims = values.backend.choice(max_dim, shape=binding.spec.shape[0], replace=False)
+            mask = values.backend.random(binding.spec.shape[0]) > 0.5
+            dims = values.backend.where(mask, dims - max_dim, dims)
+            return values.backend.asarray(dims, dtype=binding.spec.dtype)
         raise ValueError(
             f"Invalid shape for 'axis' Tensor in paddle.unsqueeze. "
             f"Expected a 0-D or 1-D Tensor, but got shape {binding.spec.shape}."
         )
 
-    inputs.generate_by_parameter((("axis", axis_value),), default="default")
+    generate_by_parameter(config, values, writer, (("axis", axis_value),), default="default")
 
 
 @rules.register("paddle.unflatten", aliases=("paddle.Tensor.unflatten",))
-def unflatten_values(ctx: InputContext, inputs: InputDataBuilder):
+def unflatten_values(config: ConfigView, values: ValueFactory, writer: InputWriter):
     def axis_value(binding):
-        x_shape = inputs.arg(0, "x").shape
-        return inputs.backend.cast(
-            inputs.backend.randint(0, len(x_shape), shape=binding.spec.shape),
+        x_shape = config.arg(0, "x").shape
+        return values.backend.cast(
+            values.backend.randint(0, len(x_shape), shape=binding.spec.shape),
             binding.spec.dtype,
         )
 
-    inputs.generate_by_parameter((("axis", axis_value),), default="default")
+    generate_by_parameter(config, values, writer, (("axis", axis_value),), default="default")
 
 
 @rules.register("paddle.topk", aliases=("paddle.Tensor.topk",))
-def topk_values(ctx: InputContext, inputs: InputDataBuilder):
+def topk_values(config: ConfigView, values: ValueFactory, writer: InputWriter):
     def x_value(binding):
         dtype = binding.spec.dtype
         if dtype == "bfloat16" or dtype in {"float8_e4m3fn", "float8_e5m2"}:
             dtype = "float32" if dtype == "bfloat16" else "float16"
         if dtype in {"float32", "float64"}:
-            return inputs.backend.cast(
-                (inputs.backend.random(binding.spec.shape) - 0.5) * 1.2,
+            return values.backend.cast(
+                (values.backend.random(binding.spec.shape) - 0.5) * 1.2,
                 dtype,
             )
         if dtype == "float16":
-            return inputs.backend.cast(
-                inputs.backend.cast(inputs.backend.randn(*binding.spec.shape), dtype) * 1e-3,
+            return values.backend.cast(
+                values.backend.cast(values.backend.randn(*binding.spec.shape), dtype) * 1e-3,
                 dtype,
             )
         if dtype in {"int32", "int64"}:
-            return inputs.backend.cast(
-                inputs.backend.randint(-10, 10, shape=binding.spec.shape),
+            return values.backend.cast(
+                values.backend.randint(-10, 10, shape=binding.spec.shape),
                 dtype,
             )
         raise ValueError(
@@ -1870,21 +1977,24 @@ def topk_values(ctx: InputContext, inputs: InputDataBuilder):
         )
 
     def k_value(binding):
-        x_config = inputs.arg(0, "x")
-        axis = inputs.arg(2, "axis", -1)
+        x_config = config.arg(0, "x")
+        axis = config.arg(2, "axis", -1)
         max_k_value = 1
         if x_config is not None and x_config.shape:
             max_k_value = x_config.shape[axis] if len(x_config.shape) > 0 else 1
         if not binding.spec.shape:
-            return inputs.backend.asarray(
-                inputs.backend.randint(1, max_k_value + 1), dtype=binding.spec.dtype
+            return values.backend.asarray(
+                values.backend.randint(1, max_k_value + 1), dtype=binding.spec.dtype
             )
-        return inputs.backend.cast(
-            inputs.backend.randint(1, max_k_value + 1, shape=binding.spec.shape),
+        return values.backend.cast(
+            values.backend.randint(1, max_k_value + 1, shape=binding.spec.shape),
             binding.spec.dtype,
         )
 
-    inputs.generate_by_parameter(
+    generate_by_parameter(
+        config,
+        values,
+        writer,
         (
             ("x", x_value),
             ("k", k_value),
@@ -1894,18 +2004,18 @@ def topk_values(ctx: InputContext, inputs: InputDataBuilder):
 
 
 @rules.register("paddle.index_sample")
-def index_sample_values(ctx: InputContext, inputs: InputDataBuilder):
+def index_sample_values(config: ConfigView, values: ValueFactory, writer: InputWriter):
     def index_value(binding):
-        x_dim = inputs.arg(0, "x").shape[1]
-        return inputs.backend.randint(0, x_dim, shape=binding.spec.shape)
+        x_dim = config.arg(0, "x").shape[1]
+        return values.backend.randint(0, x_dim, shape=binding.spec.shape)
 
-    inputs.generate_by_parameter((("index", index_value),), default="default")
+    generate_by_parameter(config, values, writer, (("index", index_value),), default="default")
 
 
 @rules.register("paddle.Tensor.__getitem__")
-def tensor_getitem_values(ctx: InputContext, inputs: InputDataBuilder):
+def tensor_getitem_values(config: ConfigView, values: ValueFactory, writer: InputWriter):
     def source_binding():
-        binding = inputs.find("arr") or inputs.find("x") or inputs.find("self")
+        binding = config.find("arr") or config.find("x") or config.find("self")
         if binding is None:
             raise ValueError("Tensor.__getitem__ rule could not find source tensor")
         return binding
@@ -1914,21 +2024,21 @@ def tensor_getitem_values(ctx: InputContext, inputs: InputDataBuilder):
         min_dim = min(source_binding().spec.shape)
         numel = math.prod(binding.spec.shape)
         if binding.spec.dtype == "bool":
-            indices = inputs.backend.choice([0, 1], shape=numel)
+            indices = values.backend.choice([0, 1], shape=numel)
         else:
-            indices = inputs.backend.randint(0, min_dim, shape=numel)
-        return inputs.backend.cast(
-            inputs.backend.reshape(indices, binding.spec.shape),
+            indices = values.backend.randint(0, min_dim, shape=numel)
+        return values.backend.cast(
+            values.backend.reshape(indices, binding.spec.shape),
             binding.spec.dtype,
         )
 
-    inputs.generate_by_parameter((("item", item_value),), default="default")
+    generate_by_parameter(config, values, writer, (("item", item_value),), default="default")
 
 
 @rules.register("paddle.Tensor.__setitem__")
-def tensor_setitem_values(ctx: InputContext, inputs: InputDataBuilder):
+def tensor_setitem_values(config: ConfigView, values: ValueFactory, writer: InputWriter):
     def source_binding():
-        binding = inputs.find("arr") or inputs.find("x") or inputs.find("self")
+        binding = config.find("arr") or config.find("x") or config.find("self")
         if binding is None:
             raise ValueError("Tensor.__setitem__ rule could not find source tensor")
         return binding
@@ -1937,82 +2047,85 @@ def tensor_setitem_values(ctx: InputContext, inputs: InputDataBuilder):
         min_dim = min(source_binding().spec.shape)
         numel = math.prod(binding.spec.shape)
         if binding.spec.dtype == "bool":
-            value = inputs.arg(2, "value")
+            value = config.arg(2, "value")
             if value is not None and hasattr(value, "shape"):
-                indices = inputs.backend.zeros(numel, dtype="int64")
+                indices = values.backend.zeros(numel, dtype="int64")
                 num_true = min(value.shape[0], numel)
-                true_indices = inputs.backend.choice(numel, shape=num_true, replace=False)
+                true_indices = values.backend.choice(numel, shape=num_true, replace=False)
                 indices[true_indices] = 1
             else:
-                indices = inputs.backend.choice([0, 1], shape=numel)
+                indices = values.backend.choice([0, 1], shape=numel)
         else:
-            indices = inputs.backend.randint(0, min_dim, shape=numel)
-        return inputs.backend.cast(
-            inputs.backend.reshape(indices, binding.spec.shape),
+            indices = values.backend.randint(0, min_dim, shape=numel)
+        return values.backend.cast(
+            values.backend.reshape(indices, binding.spec.shape),
             binding.spec.dtype,
         )
 
-    inputs.generate_by_parameter((("item", item_value),), default="default")
+    generate_by_parameter(config, values, writer, (("item", item_value),), default="default")
 
 
 @rules.register("paddle.index_add", "paddle.index_fill")
-def index_update_values(ctx: InputContext, inputs: InputDataBuilder):
+def index_update_values(config: ConfigView, values: ValueFactory, writer: InputWriter):
     def index_value(binding):
-        axis = inputs.arg(2, "axis")
+        axis = config.arg(2, "axis")
         if axis is None:
             raise ValueError("Axis is None")
-        x_shape = inputs.arg(0, "x").shape
+        x_shape = config.arg(0, "x").shape
         axis = axis if axis >= 0 else axis + len(x_shape)
         if not (0 <= axis < len(x_shape)):
             raise ValueError(f"Invalid axis {axis} for shape {x_shape}")
         if len(binding.spec.shape) >= 1:
-            return inputs.backend.cast(
-                inputs.backend.randint(0, x_shape[axis], shape=binding.spec.shape),
+            return values.backend.cast(
+                values.backend.randint(0, x_shape[axis], shape=binding.spec.shape),
                 binding.spec.dtype,
             )
         raise ValueError(
-            f"Invalid shape for 'index' Tensor in {inputs.api_name}. "
+            f"Invalid shape for 'index' Tensor in {config.api_name}. "
             f"Expected a 0-D or 1-D Tensor, but got shape {binding.spec.shape}."
         )
 
-    inputs.generate_by_parameter((("index", index_value),), default="default")
+    generate_by_parameter(config, values, writer, (("index", index_value),), default="default")
 
 
 @rules.register("paddle.take")
-def take_values(ctx: InputContext, inputs: InputDataBuilder):
+def take_values(config: ConfigView, values: ValueFactory, writer: InputWriter):
     def index_value(binding):
-        x = inputs.arg(0, "x")
+        x = config.arg(0, "x")
         dim_size = math.prod(x.shape)
-        return inputs.backend.cast(
-            inputs.backend.randint(0, dim_size, shape=binding.spec.shape),
+        return values.backend.cast(
+            values.backend.randint(0, dim_size, shape=binding.spec.shape),
             binding.spec.dtype,
         )
 
-    inputs.generate_by_parameter((("index", index_value),), default="default")
+    generate_by_parameter(config, values, writer, (("index", index_value),), default="default")
 
 
 @rules.register("paddle.gather", aliases=("paddle.Tensor.gather",))
-def gather_values(ctx: InputContext, inputs: InputDataBuilder):
+def gather_values(config: ConfigView, values: ValueFactory, writer: InputWriter):
     def index_value(binding):
-        x = inputs.arg(0, "x")
-        if inputs.has_kwarg("axis"):
-            axis = inputs.arg(2, "axis")
+        x = config.arg(0, "x")
+        if config.has_kwarg("axis"):
+            axis = config.arg(2, "axis")
             if hasattr(axis, "shape"):
                 axis = axis.shape[0]
         else:
             axis = 0
-        return inputs.backend.cast(
-            inputs.backend.randint(0, x.shape[axis], shape=binding.spec.shape),
+        return values.backend.cast(
+            values.backend.randint(0, x.shape[axis], shape=binding.spec.shape),
             binding.spec.dtype,
         )
 
     def axis_value(binding):
-        return inputs.backend.cast(
-            inputs.backend.randint(0, 2, shape=binding.spec.shape),
+        return values.backend.cast(
+            values.backend.randint(0, 2, shape=binding.spec.shape),
             binding.spec.dtype,
         )
 
-    inputs.generate_by_parameter(
+    generate_by_parameter(
+        config,
+        values,
+        writer,
         (
             ("index", index_value),
             ("axis", axis_value),
@@ -2022,74 +2135,74 @@ def gather_values(ctx: InputContext, inputs: InputDataBuilder):
 
 
 @rules.register("paddle.gather_nd", aliases=("paddle.Tensor.gather_nd",))
-def gather_nd_values(ctx: InputContext, inputs: InputDataBuilder):
+def gather_nd_values(config: ConfigView, values: ValueFactory, writer: InputWriter):
     def index_value(binding):
-        x_shape = inputs.arg(0, "x").shape
-        index_shape = inputs.arg(1, "index").shape
-        result = inputs.backend.zeros(index_shape, dtype=binding.spec.dtype)
+        x_shape = config.arg(0, "x").shape
+        index_shape = config.arg(1, "index").shape
+        result = values.backend.zeros(index_shape, dtype=binding.spec.dtype)
         for index in range(index_shape[-1]):
-            result[..., index] = inputs.backend.randint(
+            result[..., index] = values.backend.randint(
                 0, x_shape[index], shape=result[..., index].shape
             )
         return result
 
-    inputs.generate_by_parameter((("index", index_value),), default="default")
+    generate_by_parameter(config, values, writer, (("index", index_value),), default="default")
 
 
 @rules.register("paddle.index_select", aliases=("paddle.Tensor.index_select",))
-def index_select_values(ctx: InputContext, inputs: InputDataBuilder):
+def index_select_values(config: ConfigView, values: ValueFactory, writer: InputWriter):
     def index_value(binding):
-        axis = inputs.arg(2, "axis")
+        axis = config.arg(2, "axis")
         if axis is None:
             axis = 0
-        x = inputs.arg(0, "x")
+        x = config.arg(0, "x")
         if x.shape[axis] == 0:
-            return inputs.backend.zeros(binding.spec.shape, dtype=binding.spec.dtype)
-        return inputs.backend.cast(
-            inputs.backend.randint(0, x.shape[axis], shape=binding.spec.shape),
+            return values.backend.zeros(binding.spec.shape, dtype=binding.spec.dtype)
+        return values.backend.cast(
+            values.backend.randint(0, x.shape[axis], shape=binding.spec.shape),
             binding.spec.dtype,
         )
 
-    inputs.generate_by_parameter((("index", index_value),), default="default")
+    generate_by_parameter(config, values, writer, (("index", index_value),), default="default")
 
 
 @rules.register("paddle.take_along_axis", aliases=("paddle.Tensor.take_along_axis",))
-def take_along_axis_values(ctx: InputContext, inputs: InputDataBuilder):
+def take_along_axis_values(config: ConfigView, values: ValueFactory, writer: InputWriter):
     def indices_value(binding):
-        arr_shape = inputs.arg(0, "arr").shape
-        axis = inputs.arg(2, "axis")
+        arr_shape = config.arg(0, "arr").shape
+        axis = config.arg(2, "axis")
         axis_value = axis if axis >= 0 else axis + len(arr_shape)
         dim_size = arr_shape[axis_value]
         dtype = binding.spec.dtype if binding.spec.dtype in {"int32", "int64"} else "int64"
         num_elements = math.prod(binding.spec.shape)
         if num_elements == 0:
-            indices = inputs.backend.asarray([], dtype=dtype)
+            indices = values.backend.asarray([], dtype=dtype)
         elif dim_size == 1:
-            indices = inputs.backend.zeros(num_elements, dtype=dtype)
+            indices = values.backend.zeros(num_elements, dtype=dtype)
         elif num_elements == 1:
-            indices = inputs.backend.asarray([0], dtype=dtype)
+            indices = values.backend.asarray([0], dtype=dtype)
         else:
-            indices = inputs.backend.cast(
-                inputs.backend.randint(0, dim_size, shape=num_elements), dtype
+            indices = values.backend.cast(
+                values.backend.randint(0, dim_size, shape=num_elements), dtype
             )
-            positions_to_replace = inputs.backend.choice(num_elements, shape=2, replace=False)
-            flat_indices = inputs.backend.flatten(indices)
+            positions_to_replace = values.backend.choice(num_elements, shape=2, replace=False)
+            flat_indices = values.backend.flatten(indices)
             flat_indices[positions_to_replace[0]] = 0
             flat_indices[positions_to_replace[1]] = dim_size - 1
             indices = flat_indices
-        return inputs.backend.reshape(indices, binding.spec.shape)
+        return values.backend.reshape(indices, binding.spec.shape)
 
-    inputs.generate_by_parameter((("indices", indices_value),), default="default")
+    generate_by_parameter(config, values, writer, (("indices", indices_value),), default="default")
 
 
 @rules.register("paddle.index_put", aliases=("paddle.Tensor.index_put",))
-def index_put_values(ctx: InputContext, inputs: InputDataBuilder):
+def index_put_values(config: ConfigView, values: ValueFactory, writer: InputWriter):
     state = {}
 
     def prepare_indices_state():
-        x = inputs.arg(0, "x")
-        value = inputs.arg(2, "value")
-        indices = inputs.arg(1, "indices")
+        x = config.arg(0, "x")
+        value = config.arg(2, "value")
+        indices = config.arg(1, "indices")
         if not isinstance(indices, (list, tuple)):
             return None
 
@@ -2099,7 +2212,7 @@ def index_put_values(ctx: InputContext, inputs: InputDataBuilder):
         has_bool_index = False
         dims_consumed = 0
         for item in indices:
-            if not inputs.is_tensor_config(item):
+            if not config.is_tensor_config(item):
                 continue
             if item.dtype == "bool":
                 has_bool_index = True
@@ -2158,29 +2271,29 @@ def index_put_values(ctx: InputContext, inputs: InputDataBuilder):
         }
 
     def int_indices(shape, dim_size):
-        num_elements = inputs.backend.prod(shape)
+        num_elements = values.backend.prod(shape)
         if num_elements > dim_size:
-            indices_flat = inputs.backend.randint(-dim_size, dim_size, shape=num_elements)
+            indices_flat = values.backend.randint(-dim_size, dim_size, shape=num_elements)
         else:
-            indices_flat = inputs.backend.choice(dim_size, shape=num_elements, replace=False)
-        return inputs.backend.reshape(indices_flat, shape)
+            indices_flat = values.backend.choice(dim_size, shape=num_elements, replace=False)
+        return values.backend.reshape(indices_flat, shape)
 
     def bool_mask(shape, num_true):
-        mask_size = inputs.backend.prod(shape)
+        mask_size = values.backend.prod(shape)
         if mask_size < num_true:
             raise ValueError(
                 f"Cannot generate a mask with {num_true} true values in a {mask_size} element mask"
             )
-        mask_flat = inputs.backend.zeros(mask_size, dtype="bool")
-        true_indices = inputs.backend.choice(mask_size, shape=num_true, replace=False)
+        mask_flat = values.backend.zeros(mask_size, dtype="bool")
+        true_indices = values.backend.choice(mask_size, shape=num_true, replace=False)
         mask_flat[true_indices] = True
-        return inputs.backend.reshape(mask_flat, shape)
+        return values.backend.reshape(mask_flat, shape)
 
     def index_value(binding):
         if not state:
             prepared = prepare_indices_state()
             if prepared is None:
-                return inputs.value_domain("default", binding)
+                return values.domain("default", binding)
             state.update(prepared)
 
         if binding.spec.dtype == "bool":
@@ -2193,24 +2306,24 @@ def index_put_values(ctx: InputContext, inputs: InputDataBuilder):
 
         x_dim_to_index = state["x_shape"][state["x_dim_cursor"]]
         state["x_dim_cursor"] += 1
-        return inputs.backend.cast(
+        return values.backend.cast(
             int_indices(binding.spec.shape, x_dim_to_index),
             binding.spec.dtype,
         )
 
-    inputs.generate_by_parameter((("indices", index_value),), default="default")
+    generate_by_parameter(config, values, writer, (("indices", index_value),), default="default")
 
 
 @rules.register("paddle.multiplex")
-def multiplex_values(ctx: InputContext, inputs: InputDataBuilder):
+def multiplex_values(config: ConfigView, values: ValueFactory, writer: InputWriter):
     def index_value(binding):
-        axis_values = inputs.arg(0, "inputs")
-        return inputs.backend.cast(
-            inputs.backend.randint(0, len(axis_values), shape=binding.spec.shape),
+        axis_values = config.arg(0, "inputs")
+        return values.backend.cast(
+            values.backend.randint(0, len(axis_values), shape=binding.spec.shape),
             binding.spec.dtype,
         )
 
-    inputs.generate_by_parameter((("index", index_value),), default="default")
+    generate_by_parameter(config, values, writer, (("index", index_value),), default="default")
 
 
 @rules.register(
@@ -2223,17 +2336,19 @@ def multiplex_values(ctx: InputContext, inputs: InputDataBuilder):
     "paddle.incubate.segment_mean",
     "paddle.incubate.segment_min",
 )
-def segment_values(ctx: InputContext, inputs: InputDataBuilder):
+def segment_values(config: ConfigView, values: ValueFactory, writer: InputWriter):
     def segment_ids_value(binding):
-        batch_size = inputs.arg(0, "x").shape[0]
-        max_segments = inputs.backend.randint(1, batch_size + 1)
-        values = inputs.backend.cast(
-            inputs.backend.randint(0, max_segments, shape=binding.spec.shape),
+        batch_size = config.arg(0, "x").shape[0]
+        max_segments = values.backend.randint(1, batch_size + 1)
+        segment_ids = values.backend.cast(
+            values.backend.randint(0, max_segments, shape=binding.spec.shape),
             binding.spec.dtype,
         )
-        return inputs.backend.sort(values)
+        return values.backend.sort(segment_ids)
 
-    inputs.generate_by_parameter((("segment_ids", segment_ids_value),), default="default")
+    generate_by_parameter(
+        config, values, writer, (("segment_ids", segment_ids_value),), default="default"
+    )
 
 
 @rules.register(
@@ -2241,59 +2356,65 @@ def segment_values(ctx: InputContext, inputs: InputDataBuilder):
     "paddle.geometric.send_uv",
     "paddle.geometric.send_ue_recv",
 )
-def geometric_send_values(ctx: InputContext, inputs: InputDataBuilder):
+def geometric_send_values(config: ConfigView, values: ValueFactory, writer: InputWriter):
     def index_value(binding):
-        num_nodes = inputs.arg(0, "x").shape[0]
-        return inputs.backend.cast(
-            inputs.backend.randint(0, num_nodes, shape=binding.spec.shape),
+        num_nodes = config.arg(0, "x").shape[0]
+        return values.backend.cast(
+            values.backend.randint(0, num_nodes, shape=binding.spec.shape),
             binding.spec.dtype,
         )
 
-    inputs.generate_by_parameter(
+    generate_by_parameter(
+        config,
+        values,
+        writer,
         ((("src_index", "dst_index"), index_value),),
         default="default",
     )
 
 
 @rules.register("paddle.geometric.sample_neighbors")
-def sample_neighbors_values(ctx: InputContext, inputs: InputDataBuilder):
+def sample_neighbors_values(config: ConfigView, values: ValueFactory, writer: InputWriter):
     def row_value(binding):
-        colptr_shape = inputs.arg(1, "colptr").shape
+        colptr_shape = config.arg(1, "colptr").shape
         num_nodes = colptr_shape[0] - 1
-        return inputs.backend.randint(
+        return values.backend.randint(
             0, num_nodes, shape=binding.spec.shape, dtype=binding.spec.dtype
         )
 
     def colptr_value(binding):
-        row = inputs.arg(0, "row")
+        row = config.arg(0, "row")
         num_edges = row.shape[0]
         num_nodes = binding.spec.shape[0] - 1
-        colptr = inputs.backend.zeros(binding.spec.shape, dtype=binding.spec.dtype)
+        colptr = values.backend.zeros(binding.spec.shape, dtype=binding.spec.dtype)
         if num_nodes > 0 and num_edges > 0:
-            splits = inputs.backend.choice(
-                inputs.backend.arange(num_edges + 1),
+            splits = values.backend.choice(
+                values.backend.arange(num_edges + 1),
                 shape=num_nodes - 1,
                 replace=True,
             )
-            splits = inputs.backend.sort(splits)
+            splits = values.backend.sort(splits)
             colptr[1:num_nodes] = splits
             colptr[num_nodes] = num_edges
         return colptr
 
     def input_nodes_value(binding):
         num_nodes = binding.spec.shape[0] - 1
-        return inputs.backend.randint(
+        return values.backend.randint(
             0, num_nodes, shape=binding.spec.shape, dtype=binding.spec.dtype
         )
 
     def edge_order_value(binding):
-        num_edges = inputs.arg(0, "row").shape[0]
-        return inputs.backend.reshape(
-            inputs.backend.arange(num_edges, dtype=binding.spec.dtype),
+        num_edges = config.arg(0, "row").shape[0]
+        return values.backend.reshape(
+            values.backend.arange(num_edges, dtype=binding.spec.dtype),
             binding.spec.shape,
         )
 
-    inputs.generate_by_parameter(
+    generate_by_parameter(
+        config,
+        values,
+        writer,
         (
             ("row", row_value),
             ("colptr", colptr_value),
@@ -2305,7 +2426,7 @@ def sample_neighbors_values(ctx: InputContext, inputs: InputDataBuilder):
 
 
 @rules.register("paddle.reshape", aliases=("paddle.Tensor.reshape",))
-def reshape_values(ctx: InputContext, inputs: InputDataBuilder):
+def reshape_values(config: ConfigView, values: ValueFactory, writer: InputWriter):
     state = {
         "shape": None,
         "maxvalue": None,
@@ -2318,7 +2439,7 @@ def reshape_values(ctx: InputContext, inputs: InputDataBuilder):
             state["shape"] = shape
             state["maxvalue"] = math.prod(shape)
             state["tensornum"] = 0
-            for candidate in inputs.argument_values():
+            for candidate in config.argument_values():
                 if isinstance(candidate, (list, tuple)):
                     for index, item in enumerate(candidate):
                         if isinstance(item, numbers.Integral):
@@ -2326,9 +2447,9 @@ def reshape_values(ctx: InputContext, inputs: InputDataBuilder):
                                 state["maxvalue"] //= shape[index]
                             elif item != -1:
                                 state["maxvalue"] //= int(item)
-                        elif inputs.is_tensor_config(item):
+                        elif config.is_tensor_config(item):
                             state["tensornum"] += 1
-        return inputs.value_domain("default", binding)
+        return values.domain("default", binding)
 
     def shape_value(binding):
         if state["tensornum"] == 0:
@@ -2337,33 +2458,36 @@ def reshape_values(ctx: InputContext, inputs: InputDataBuilder):
         shape = binding.spec.shape
         maxvalue = state["maxvalue"]
         if shape not in ((), (1,)):
-            result = inputs.backend.zeros(shape, dtype=dtype)
+            result = values.backend.zeros(shape, dtype=dtype)
             for index in range(shape[0]):
                 if index < shape[0] - 1:
-                    result[index] = inputs.backend.randint(1, maxvalue + 1)
+                    result[index] = values.backend.randint(1, maxvalue + 1)
                     while maxvalue % result[index]:
-                        result[index] = inputs.backend.randint(1, maxvalue + 1)
+                        result[index] = values.backend.randint(1, maxvalue + 1)
                     maxvalue //= result[index]
                 else:
                     result[index] = maxvalue
             state["maxvalue"] = maxvalue
             return result
         if state["tensornum"] == 1:
-            return inputs.backend.cast(
-                inputs.backend.randint(maxvalue, maxvalue + 1, shape=shape),
+            return values.backend.cast(
+                values.backend.randint(maxvalue, maxvalue + 1, shape=shape),
                 dtype,
             )
         state["tensornum"] -= 1
-        result = inputs.backend.cast(inputs.backend.randint(1, maxvalue + 1, shape=shape), dtype)
+        result = values.backend.cast(values.backend.randint(1, maxvalue + 1, shape=shape), dtype)
         while maxvalue % result:
-            result = inputs.backend.cast(
-                inputs.backend.randint(1, maxvalue + 1, shape=shape),
+            result = values.backend.cast(
+                values.backend.randint(1, maxvalue + 1, shape=shape),
                 dtype,
             )
         state["maxvalue"] = maxvalue // result
         return result
 
-    inputs.generate_by_parameter(
+    generate_by_parameter(
+        config,
+        values,
+        writer,
         (
             ("x", initialize_from_x),
             ("shape", shape_value),
@@ -2373,7 +2497,7 @@ def reshape_values(ctx: InputContext, inputs: InputDataBuilder):
 
 
 @rules.register("paddle.slice")
-def slice_values(ctx: InputContext, inputs: InputDataBuilder):
+def slice_values(config: ConfigView, values: ValueFactory, writer: InputWriter):
     state = {
         "shape": None,
         "indice": 0,
@@ -2382,40 +2506,40 @@ def slice_values(ctx: InputContext, inputs: InputDataBuilder):
     }
 
     def axes():
-        return inputs.arg(1, "axes")
+        return config.arg(1, "axes")
 
     def input_binding(binding):
         if state["shape"] is None:
             state["shape"] = binding.spec.shape
-        return inputs.value_domain("default", binding)
+        return values.domain("default", binding)
 
     def starts_value(binding):
         dim_sizes = [state["shape"][axis] for axis in axes()]
         if binding.spec.shape == ():
-            coin = inputs.backend.randint(0, 2)
+            coin = values.backend.randint(0, 2)
             if coin == 0:
-                value = inputs.backend.randint(
+                value = values.backend.randint(
                     0, dim_sizes[state["indice"]] - 1, binding.spec.shape
                 )
             else:
-                value = inputs.backend.randint(-65535, -1, binding.spec.shape)
+                value = values.backend.randint(-65535, -1, binding.spec.shape)
             state["start"].append(value)
             state["indice"] += 1
-            return inputs.backend.asarray(value, dtype=binding.spec.dtype)
-        result = inputs.backend.zeros(binding.spec.shape, dtype=binding.spec.dtype)
+            return values.backend.asarray(value, dtype=binding.spec.dtype)
+        result = values.backend.zeros(binding.spec.shape, dtype=binding.spec.dtype)
         for index in range(math.prod(binding.spec.shape)):
-            coin = inputs.backend.randint(0, 2)
+            coin = values.backend.randint(0, 2)
             if coin == 0:
-                result[index] = inputs.backend.randint(0, dim_sizes[state["indice"]] - 1)
+                result[index] = values.backend.randint(0, dim_sizes[state["indice"]] - 1)
             else:
-                result[index] = inputs.backend.randint(-65535, -1)
+                result[index] = values.backend.randint(-65535, -1)
             state["start"].append(result[index])
             state["indice"] += 1
         return result
 
     def ends_value(binding):
         if not state["start"]:
-            start_arg = inputs.arg(2, "starts")
+            start_arg = config.arg(2, "starts")
             state["start"] = list(
                 start_arg if isinstance(start_arg, (list, tuple)) else [start_arg]
             )
@@ -2426,34 +2550,37 @@ def slice_values(ctx: InputContext, inputs: InputDataBuilder):
                 item = item if item > -dim_sizes[index] else -dim_sizes[index]
                 start[index] = item + dim_sizes[index]
         if binding.spec.shape == ():
-            coin = inputs.backend.randint(0, 2)
+            coin = values.backend.randint(0, 2)
             current = start[state["index"]]
             if coin == 0:
-                value = inputs.backend.randint(current + 1, 65535, binding.spec.shape)
+                value = values.backend.randint(current + 1, 65535, binding.spec.shape)
             else:
                 if current - dim_sizes[index] == 0:
                     current -= 1
                     start[state["index"]] = current
-                value = inputs.backend.randint(
+                value = values.backend.randint(
                     min(current - dim_sizes[index] + 1, -1), 0, binding.spec.shape
                 )
             state["index"] += 1
-            return inputs.backend.asarray(value, dtype=binding.spec.dtype)
-        result = inputs.backend.zeros(binding.spec.shape, dtype=binding.spec.dtype)
+            return values.backend.asarray(value, dtype=binding.spec.dtype)
+        result = values.backend.zeros(binding.spec.shape, dtype=binding.spec.dtype)
         for index in range(math.prod(binding.spec.shape)):
-            coin = inputs.backend.randint(0, 2)
+            coin = values.backend.randint(0, 2)
             current = start[state["index"]]
             if coin == 0:
-                result[index] = inputs.backend.randint(current + 1, 65535)
+                result[index] = values.backend.randint(current + 1, 65535)
             else:
                 if current - dim_sizes[index] == 0:
                     current -= 1
                     start[state["index"]] = current
-                result[index] = inputs.backend.randint(current - dim_sizes[state["index"]] + 1, 0)
+                result[index] = values.backend.randint(current - dim_sizes[state["index"]] + 1, 0)
             state["index"] += 1
         return result
 
-    inputs.generate_by_parameter(
+    generate_by_parameter(
+        config,
+        values,
+        writer,
         (
             ("input", input_binding),
             ("starts", starts_value),
@@ -2464,105 +2591,108 @@ def slice_values(ctx: InputContext, inputs: InputDataBuilder):
 
 
 @rules.register("paddle.scatter")
-def scatter_values(ctx: InputContext, inputs: InputDataBuilder):
+def scatter_values(config: ConfigView, values: ValueFactory, writer: InputWriter):
     def index_value(binding):
-        x = inputs.arg(0, "x")
+        x = config.arg(0, "x")
         first_dim = x.shape[0]
-        overwrite = inputs.arg(3, "overwrite")
+        overwrite = config.arg(3, "overwrite")
         if (overwrite is None or overwrite is True) and (
             binding.spec.shape == () or binding.spec.shape[0]
         ) <= first_dim:
-            return inputs.backend.cast(
-                inputs.backend.choice(first_dim, shape=binding.spec.shape, replace=False),
+            return values.backend.cast(
+                values.backend.choice(first_dim, shape=binding.spec.shape, replace=False),
                 binding.spec.dtype,
             )
-        return inputs.backend.cast(
-            inputs.backend.randint(0, first_dim, shape=binding.spec.shape),
+        return values.backend.cast(
+            values.backend.randint(0, first_dim, shape=binding.spec.shape),
             binding.spec.dtype,
         )
 
-    inputs.generate_by_parameter((("index", index_value),), default="default")
+    generate_by_parameter(config, values, writer, (("index", index_value),), default="default")
 
 
 @rules.register("paddle.scatter_nd")
-def scatter_nd_values(ctx: InputContext, inputs: InputDataBuilder):
+def scatter_nd_values(config: ConfigView, values: ValueFactory, writer: InputWriter):
     def index_value(binding):
-        output_shape = inputs.arg(2, "shape")
+        output_shape = config.arg(2, "shape")
         if output_shape and len(output_shape):
-            result = inputs.backend.zeros(binding.spec.shape, dtype=binding.spec.dtype)
+            result = values.backend.zeros(binding.spec.shape, dtype=binding.spec.dtype)
             for axis in range(len(output_shape)):
                 if axis >= binding.spec.shape[-1]:
                     break
-                result[..., axis] = inputs.backend.randint(
+                result[..., axis] = values.backend.randint(
                     -output_shape[axis],
                     output_shape[axis],
                     shape=result[..., axis].shape,
                 )
-                result[..., axis] = inputs.backend.cast(result[..., axis], binding.spec.dtype)
+                result[..., axis] = values.backend.cast(result[..., axis], binding.spec.dtype)
             return result
-        return inputs.value_domain("default", binding)
+        return values.domain("default", binding)
 
-    inputs.generate_by_parameter((("index", index_value),), default="default")
+    generate_by_parameter(config, values, writer, (("index", index_value),), default="default")
 
 
 @rules.register("paddle.scatter_nd_add")
-def scatter_nd_add_values(ctx: InputContext, inputs: InputDataBuilder):
+def scatter_nd_add_values(config: ConfigView, values: ValueFactory, writer: InputWriter):
     def index_value(binding):
-        x_shape = inputs.arg(0, "x").shape
-        result = inputs.backend.zeros(binding.spec.shape, dtype=binding.spec.dtype)
+        x_shape = config.arg(0, "x").shape
+        result = values.backend.zeros(binding.spec.shape, dtype=binding.spec.dtype)
         for axis in range(binding.spec.shape[-1]):
-            result[..., axis] = inputs.backend.randint(
+            result[..., axis] = values.backend.randint(
                 -x_shape[axis],
                 x_shape[axis],
                 shape=result[..., axis].shape,
             )
-            result[..., axis] = inputs.backend.cast(result[..., axis], binding.spec.dtype)
+            result[..., axis] = values.backend.cast(result[..., axis], binding.spec.dtype)
         return result
 
-    inputs.generate_by_parameter((("index", index_value),), default="default")
+    generate_by_parameter(config, values, writer, (("index", index_value),), default="default")
 
 
 @rules.register("paddle.strided_slice")
-def strided_slice_values(ctx: InputContext, inputs: InputDataBuilder):
+def strided_slice_values(config: ConfigView, values: ValueFactory, writer: InputWriter):
     def axes_value(binding):
-        x = inputs.arg(0, "x")
-        return inputs.backend.cast(
-            inputs.backend.randint(0, len(x.shape), shape=binding.spec.shape),
+        x = config.arg(0, "x")
+        return values.backend.cast(
+            values.backend.randint(0, len(x.shape), shape=binding.spec.shape),
             binding.spec.dtype,
         )
 
     def list_value(binding):
-        x = inputs.arg(0, "x")
-        axes_arg = inputs.arg(1, "axes")
+        x = config.arg(0, "x")
+        axes_arg = config.arg(1, "axes")
         axes = axes_arg
         if not isinstance(axes, list):
-            axes = inputs.value(inputs.find("axes"))
+            axes = writer.value(config.find("axes"))
         if not binding.path.indices:
-            return inputs.value_domain("default", binding)
+            return values.domain("default", binding)
         list_index = binding.path.indices[0]
         parameter = binding.parameter_name
         if parameter == "starts":
-            return inputs.backend.cast(
-                inputs.backend.randint(0, x.shape[axes[list_index]] - 1, shape=binding.spec.shape),
+            return values.backend.cast(
+                values.backend.randint(0, x.shape[axes[list_index]] - 1, shape=binding.spec.shape),
                 binding.spec.dtype,
             )
         if parameter == "ends":
-            return inputs.backend.cast(
-                inputs.backend.randint(
-                    inputs.value(inputs.find("starts"))[list_index] + 1,
+            return values.backend.cast(
+                values.backend.randint(
+                    writer.value(config.find("starts"))[list_index] + 1,
                     x.shape[axes[list_index]],
                     shape=binding.spec.shape,
                 ),
                 binding.spec.dtype,
             )
         if parameter == "strides":
-            return inputs.backend.cast(
-                inputs.backend.randint(1, x.shape[axes[list_index]], shape=binding.spec.shape),
+            return values.backend.cast(
+                values.backend.randint(1, x.shape[axes[list_index]], shape=binding.spec.shape),
                 binding.spec.dtype,
             )
-        return inputs.value_domain("default", binding)
+        return values.domain("default", binding)
 
-    inputs.generate_by_parameter(
+    generate_by_parameter(
+        config,
+        values,
+        writer,
         (
             ("axes", axes_value),
             (("starts", "ends", "strides"), list_value),
@@ -2572,45 +2702,45 @@ def strided_slice_values(ctx: InputContext, inputs: InputDataBuilder):
 
 
 @rules.register("paddle.tensordot")
-def tensordot_values(ctx: InputContext, inputs: InputDataBuilder):
+def tensordot_values(config: ConfigView, values: ValueFactory, writer: InputWriter):
     state = {"shape1": None, "shape2": None, "tensor1": None}
 
     def x_value(binding):
         if state["shape1"] is None:
             state["shape1"] = binding.spec.shape
-        return inputs.value_domain("default", binding)
+        return values.domain("default", binding)
 
     def y_value(binding):
         if state["shape2"] is None:
             state["shape2"] = binding.spec.shape
-        return inputs.value_domain("default", binding)
+        return values.domain("default", binding)
 
     def axes_value(binding):
-        axes_arg = inputs.arg(2, "axes")
+        axes_arg = config.arg(2, "axes")
         rank = len(state["shape1"])
         if isinstance(axes_arg, (list, tuple)):
             if state["tensor1"] is None:
-                result = inputs.backend.zeros(binding.spec.shape, dtype=binding.spec.dtype)
+                result = values.backend.zeros(binding.spec.shape, dtype=binding.spec.dtype)
                 used = []
                 for index in range(math.prod(binding.spec.shape)):
-                    result[index] = inputs.backend.randint(0, rank)
+                    result[index] = values.backend.randint(0, rank)
                     while (
                         state["shape1"][result[index]] not in state["shape2"]
                         or result[index] in used
                     ):
-                        result[index] = inputs.backend.randint(0, rank)
+                        result[index] = values.backend.randint(0, rank)
                     used.append(result[index])
                 state["tensor1"] = result
                 return result
-            result = inputs.backend.zeros(binding.spec.shape, dtype=binding.spec.dtype)
+            result = values.backend.zeros(binding.spec.shape, dtype=binding.spec.dtype)
             used = []
             for index in range(math.prod(binding.spec.shape)):
-                result[index] = inputs.backend.randint(0, rank)
+                result[index] = values.backend.randint(0, rank)
                 while (
                     state["shape2"][result[index]] != state["shape1"][state["tensor1"][index]]
                     or result[index] in used
                 ):
-                    result[index] = inputs.backend.randint(0, rank)
+                    result[index] = values.backend.randint(0, rank)
                 used.append(result[index])
             return result
         if binding.spec.shape == () or math.prod(binding.spec.shape) == 1:
@@ -2624,27 +2754,30 @@ def tensordot_values(ctx: InputContext, inputs: InputDataBuilder):
                     f"No valid axis found for tensordot,x shape {state['shape1']}, "
                     f"y shape {state['shape2']},axes {axes_arg}"
                 )
-            return inputs.backend.asarray(
-                [inputs.backend.choice(candidates)], dtype=binding.spec.dtype
+            return values.backend.asarray(
+                [values.backend.choice(candidates)], dtype=binding.spec.dtype
             )
-        result = inputs.backend.zeros(binding.spec.shape, dtype=binding.spec.dtype)
+        result = values.backend.zeros(binding.spec.shape, dtype=binding.spec.dtype)
         used1 = []
         used2 = []
         for index in range(binding.spec.shape[0]):
-            result[0][index] = inputs.backend.randint(0, rank)
-            result[1][index] = inputs.backend.randint(0, rank)
+            result[0][index] = values.backend.randint(0, rank)
+            result[1][index] = values.backend.randint(0, rank)
             while (
                 state["shape1"][result[0][index]] != state["shape2"][result[1][index]]
                 or result[0][index] in used1
                 or result[1][index] in used2
             ):
-                result[0][index] = inputs.backend.randint(0, rank)
-                result[1][index] = inputs.backend.randint(0, rank)
+                result[0][index] = values.backend.randint(0, rank)
+                result[1][index] = values.backend.randint(0, rank)
             used1.append(result[0][index])
             used2.append(result[1][index])
         return result
 
-    inputs.generate_by_parameter(
+    generate_by_parameter(
+        config,
+        values,
+        writer,
         (
             ("x", x_value),
             ("y", y_value),
@@ -2655,20 +2788,23 @@ def tensordot_values(ctx: InputContext, inputs: InputDataBuilder):
 
 
 @rules.register("paddle.nn.functional.embedding")
-def embedding_values(ctx: InputContext, inputs: InputDataBuilder):
+def embedding_values(config: ConfigView, values: ValueFactory, writer: InputWriter):
     def ids_value(binding):
-        weight_config = inputs.arg(1, "weight")
-        vocab_size = inputs.backend.randint(10, 1000)
+        weight_config = config.arg(1, "weight")
+        vocab_size = values.backend.randint(10, 1000)
         if weight_config is not None and weight_config.shape:
             vocab_size = weight_config.shape[0]
         if vocab_size == 0:
-            return inputs.backend.zeros(binding.spec.shape, dtype=binding.spec.dtype)
-        return inputs.backend.cast(
-            inputs.backend.randint(0, vocab_size, shape=binding.spec.shape),
+            return values.backend.zeros(binding.spec.shape, dtype=binding.spec.dtype)
+        return values.backend.cast(
+            values.backend.randint(0, vocab_size, shape=binding.spec.shape),
             binding.spec.dtype,
         )
 
-    inputs.generate_by_parameter(
+    generate_by_parameter(
+        config,
+        values,
+        writer,
         (
             ("x", ids_value),
             ("ids", ids_value),
@@ -2679,36 +2815,41 @@ def embedding_values(ctx: InputContext, inputs: InputDataBuilder):
 
 
 @rules.register("paddle.nn.functional.affine_grid")
-def affine_grid_values(ctx: InputContext, inputs: InputDataBuilder):
+def affine_grid_values(config: ConfigView, values: ValueFactory, writer: InputWriter):
     def out_shape_value(binding):
-        theta_shape = inputs.arg(0, "theta").shape
-        values = inputs.backend.cast(
-            inputs.backend.randint(1, 128, shape=binding.spec.shape),
+        theta_shape = config.arg(0, "theta").shape
+        out_shape = values.backend.cast(
+            values.backend.randint(1, 128, shape=binding.spec.shape),
             binding.spec.dtype,
         )
-        values[0] = theta_shape[0]
-        return values
+        out_shape[0] = theta_shape[0]
+        return out_shape
 
-    inputs.generate_by_parameter((("out_shape", out_shape_value),), default="default")
+    generate_by_parameter(
+        config, values, writer, (("out_shape", out_shape_value),), default="default"
+    )
 
 
 @rules.register("paddle.nn.functional.hsigmoid_loss")
-def hsigmoid_loss_values(ctx: InputContext, inputs: InputDataBuilder):
+def hsigmoid_loss_values(config: ConfigView, values: ValueFactory, writer: InputWriter):
     def label_value(binding):
-        num_classes = inputs.arg(2, "num_classes")
-        return inputs.backend.cast(
-            inputs.backend.randint(0, num_classes, shape=binding.spec.shape),
+        num_classes = config.arg(2, "num_classes")
+        return values.backend.cast(
+            values.backend.randint(0, num_classes, shape=binding.spec.shape),
             binding.spec.dtype,
         )
 
     def path_table_value(binding):
-        weight = inputs.arg(3, "weight")
-        return inputs.backend.cast(
-            inputs.backend.randint(0, weight.shape[0], shape=binding.spec.shape),
+        weight = config.arg(3, "weight")
+        return values.backend.cast(
+            values.backend.randint(0, weight.shape[0], shape=binding.spec.shape),
             binding.spec.dtype,
         )
 
-    inputs.generate_by_parameter(
+    generate_by_parameter(
+        config,
+        values,
+        writer,
         (
             ("label", label_value),
             ("path_table", path_table_value),
@@ -2719,104 +2860,109 @@ def hsigmoid_loss_values(ctx: InputContext, inputs: InputDataBuilder):
 
 
 @rules.register("paddle.nn.functional.margin_cross_entropy")
-def margin_cross_entropy_values(ctx: InputContext, inputs: InputDataBuilder):
+def margin_cross_entropy_values(config: ConfigView, values: ValueFactory, writer: InputWriter):
     def label_value(binding):
-        logits = inputs.arg(0, "logits")
-        return inputs.backend.cast(
-            inputs.backend.randint(0, logits.shape[1], shape=binding.spec.shape),
+        logits = config.arg(0, "logits")
+        return values.backend.cast(
+            values.backend.randint(0, logits.shape[1], shape=binding.spec.shape),
             binding.spec.dtype,
         )
 
-    inputs.generate_by_parameter((("label", label_value),), default="default")
+    generate_by_parameter(config, values, writer, (("label", label_value),), default="default")
 
 
 @rules.register("paddle.nn.functional.multi_margin_loss")
-def multi_margin_loss_values(ctx: InputContext, inputs: InputDataBuilder):
+def multi_margin_loss_values(config: ConfigView, values: ValueFactory, writer: InputWriter):
     def label_value(binding):
-        logits = inputs.arg(0, "input")
-        return inputs.backend.cast(
-            inputs.backend.randint(0, logits.shape[1], shape=binding.spec.shape),
+        logits = config.arg(0, "input")
+        return values.backend.cast(
+            values.backend.randint(0, logits.shape[1], shape=binding.spec.shape),
             binding.spec.dtype,
         )
 
-    inputs.generate_by_parameter((("label", label_value),), default="default")
+    generate_by_parameter(config, values, writer, (("label", label_value),), default="default")
 
 
 @rules.register("paddle.nn.functional.dice_loss")
-def dice_loss_values(ctx: InputContext, inputs: InputDataBuilder):
+def dice_loss_values(config: ConfigView, values: ValueFactory, writer: InputWriter):
     def label_value(binding):
-        tensor = inputs.arg(0, "input")
-        return inputs.backend.cast(
-            inputs.backend.randint(0, tensor.shape[-1], shape=binding.spec.shape),
+        tensor = config.arg(0, "input")
+        return values.backend.cast(
+            values.backend.randint(0, tensor.shape[-1], shape=binding.spec.shape),
             binding.spec.dtype,
         )
 
-    inputs.generate_by_parameter((("label", label_value),), default="default")
+    generate_by_parameter(config, values, writer, (("label", label_value),), default="default")
 
 
 @rules.register("paddle.nn.functional.nll_loss")
-def nll_loss_values(ctx: InputContext, inputs: InputDataBuilder):
+def nll_loss_values(config: ConfigView, values: ValueFactory, writer: InputWriter):
     def label_value(binding):
-        input_config = inputs.arg(0, "input")
-        n_classes = inputs.backend.randint(5, 50) if input_config is None else input_config.shape[1]
-        return inputs.backend.cast(
-            inputs.backend.randint(0, n_classes, shape=binding.spec.shape),
+        input_config = config.arg(0, "input")
+        n_classes = values.backend.randint(5, 50) if input_config is None else input_config.shape[1]
+        return values.backend.cast(
+            values.backend.randint(0, n_classes, shape=binding.spec.shape),
             binding.spec.dtype,
         )
 
-    inputs.generate_by_parameter((("label", label_value),), default="default")
+    generate_by_parameter(config, values, writer, (("label", label_value),), default="default")
 
 
 @rules.register("paddle.nn.functional.adaptive_log_softmax_with_loss")
-def adaptive_log_softmax_with_loss_values(ctx: InputContext, inputs: InputDataBuilder):
+def adaptive_log_softmax_with_loss_values(
+    config: ConfigView, values: ValueFactory, writer: InputWriter
+):
     def label_value(binding):
-        cutoffs = inputs.arg(4, "cutoffs")
+        cutoffs = config.arg(4, "cutoffs")
         n_classes = cutoffs[-1]
         generation_size = binding.spec.shape
         if len(binding.spec.shape) == 0:
             generation_size = 1
         if n_classes == 1:
-            return inputs.backend.zeros(generation_size, dtype=binding.spec.dtype)
-        return inputs.backend.randint(0, n_classes, shape=generation_size, dtype=binding.spec.dtype)
+            return values.backend.zeros(generation_size, dtype=binding.spec.dtype)
+        return values.backend.randint(0, n_classes, shape=generation_size, dtype=binding.spec.dtype)
 
-    inputs.generate_by_parameter((("label", label_value),), default="default")
+    generate_by_parameter(config, values, writer, (("label", label_value),), default="default")
 
 
 @rules.register("paddle.nn.functional.cross_entropy")
-def cross_entropy_values(ctx: InputContext, inputs: InputDataBuilder):
+def cross_entropy_values(config: ConfigView, values: ValueFactory, writer: InputWriter):
     def input_value(binding):
-        use_softmax = inputs.arg(8, "use_softmax", True)
+        use_softmax = config.arg(8, "use_softmax", True)
         if use_softmax:
-            return inputs.value_domain("default", binding)
-        axis = inputs.arg(7, "axis", -1)
-        values = inputs.backend.random(binding.spec.shape)
-        probabilities = values / inputs.backend.sum(values, axis=axis, keepdims=True)
-        return inputs.backend.cast(probabilities, binding.spec.dtype)
+            return values.domain("default", binding)
+        axis = config.arg(7, "axis", -1)
+        logits = values.backend.random(binding.spec.shape)
+        probabilities = logits / values.backend.sum(logits, axis=axis, keepdims=True)
+        return values.backend.cast(probabilities, binding.spec.dtype)
 
     def label_value(binding):
-        input_shape = inputs.arg(0, "input").shape
-        axis = inputs.arg(7, "axis", -1)
+        input_shape = config.arg(0, "input").shape
+        axis = config.arg(7, "axis", -1)
         num_classes = input_shape[axis]
-        soft_label = inputs.arg(5, "soft_label", False)
-        label_smoothing = inputs.arg(6, "label_smoothing", 0.0)
+        soft_label = config.arg(5, "soft_label", False)
+        label_smoothing = config.arg(6, "label_smoothing", 0.0)
         if (label_smoothing > 0 and list(binding.spec.shape) == list(input_shape)) or (
             label_smoothing == 0 and soft_label
         ):
-            soft_labels = inputs.backend.random(binding.spec.shape)
-            soft_labels = soft_labels / inputs.backend.sum(soft_labels, axis=axis, keepdims=True)
-            return inputs.backend.cast(soft_labels, binding.spec.dtype)
+            soft_labels = values.backend.random(binding.spec.shape)
+            soft_labels = soft_labels / values.backend.sum(soft_labels, axis=axis, keepdims=True)
+            return values.backend.cast(soft_labels, binding.spec.dtype)
         if num_classes == 0:
-            return inputs.backend.zeros(binding.spec.shape, dtype=binding.spec.dtype)
-        return inputs.backend.cast(
-            inputs.backend.randint(0, num_classes, shape=binding.spec.shape),
+            return values.backend.zeros(binding.spec.shape, dtype=binding.spec.dtype)
+        return values.backend.cast(
+            values.backend.randint(0, num_classes, shape=binding.spec.shape),
             binding.spec.dtype,
         )
 
     def weight_value(binding):
-        values = inputs.backend.random(binding.spec.shape)
-        return values / inputs.backend.sum(values)
+        weights = values.backend.random(binding.spec.shape)
+        return weights / values.backend.sum(weights)
 
-    inputs.generate_by_parameter(
+    generate_by_parameter(
+        config,
+        values,
+        writer,
         (
             ("input", input_value),
             ("label", label_value),
@@ -2827,21 +2973,21 @@ def cross_entropy_values(ctx: InputContext, inputs: InputDataBuilder):
 
 
 @rules.register("paddle.nn.functional.ctc_loss")
-def ctc_loss_values(ctx: InputContext, inputs: InputDataBuilder):
+def ctc_loss_values(config: ConfigView, values: ValueFactory, writer: InputWriter):
     def labels_value(binding):
-        num_classes = inputs.arg(0, "log_probs").shape[2] - 1
-        blank = inputs.arg(4, "blank", 0)
+        num_classes = config.arg(0, "log_probs").shape[2] - 1
+        blank = config.arg(4, "blank", 0)
         valid_label_indices = [index for index in range(num_classes + 1) if index != blank]
         if not valid_label_indices:
-            return inputs.backend.zeros(binding.spec.shape, dtype=binding.spec.dtype)
-        return inputs.backend.cast(
-            inputs.backend.choice(valid_label_indices, shape=binding.spec.shape, replace=True),
+            return values.backend.zeros(binding.spec.shape, dtype=binding.spec.dtype)
+        return values.backend.cast(
+            values.backend.choice(valid_label_indices, shape=binding.spec.shape, replace=True),
             binding.spec.dtype,
         )
 
     def input_lengths_value(binding):
-        max_logit_length = inputs.arg(0, "log_probs").shape[0]
-        return inputs.backend.randint(
+        max_logit_length = config.arg(0, "log_probs").shape[0]
+        return values.backend.randint(
             1,
             max_logit_length + 1,
             shape=binding.spec.shape,
@@ -2849,24 +2995,27 @@ def ctc_loss_values(ctx: InputContext, inputs: InputDataBuilder):
         )
 
     def label_lengths_value(binding):
-        max_label_length = inputs.arg(1, "labels").shape[1]
-        max_logit_length = inputs.arg(0, "log_probs").shape[0]
-        cand_label_lengths = inputs.backend.randint(
+        max_label_length = config.arg(1, "labels").shape[1]
+        max_logit_length = config.arg(0, "log_probs").shape[0]
+        cand_label_lengths = values.backend.randint(
             1,
             max_label_length + 1,
             shape=binding.spec.shape,
             dtype=binding.spec.dtype,
         )
-        compatible_input_lengths = inputs.backend.randint(
+        compatible_input_lengths = values.backend.randint(
             1,
             max_logit_length + 1,
             shape=binding.spec.shape,
             dtype=binding.spec.dtype,
         )
-        final_label_lengths = inputs.backend.minimum(cand_label_lengths, compatible_input_lengths)
-        return inputs.backend.maximum(final_label_lengths, 1)
+        final_label_lengths = values.backend.minimum(cand_label_lengths, compatible_input_lengths)
+        return values.backend.maximum(final_label_lengths, 1)
 
-    inputs.generate_by_parameter(
+    generate_by_parameter(
+        config,
+        values,
+        writer,
         (
             ("labels", labels_value),
             ("input_lengths", input_lengths_value),
@@ -2877,54 +3026,56 @@ def ctc_loss_values(ctx: InputContext, inputs: InputDataBuilder):
 
 
 @rules.register("paddle.nn.functional.sequence_mask")
-def sequence_mask_values(ctx: InputContext, inputs: InputDataBuilder):
+def sequence_mask_values(config: ConfigView, values: ValueFactory, writer: InputWriter):
     def x_value(binding):
-        maxlen_config = inputs.arg(1, "maxlen")
+        maxlen_config = config.arg(1, "maxlen")
         provided_maxlen = None
         if isinstance(maxlen_config, int):
             provided_maxlen = max(1, maxlen_config)
         if provided_maxlen is not None:
-            return inputs.backend.cast(
-                inputs.backend.randint(0, provided_maxlen + 1, shape=binding.spec.shape),
+            return values.backend.cast(
+                values.backend.randint(0, provided_maxlen + 1, shape=binding.spec.shape),
                 binding.spec.dtype,
             )
-        high_value = inputs.backend.randint(1, 2048)
-        values = inputs.backend.cast(
-            inputs.backend.randint(0, high_value, shape=binding.spec.shape),
+        high_value = values.backend.randint(1, 2048)
+        lengths = values.backend.cast(
+            values.backend.randint(0, high_value, shape=binding.spec.shape),
             binding.spec.dtype,
         )
-        if inputs.backend.prod(values.shape) > 0 and inputs.backend.count_nonzero(values) == 0:
-            fix_value = inputs.backend.randint(1, max(2, high_value))
-            inputs.backend.flatten(values)[0] = fix_value
-        return values
+        if values.backend.prod(lengths.shape) > 0 and values.backend.count_nonzero(lengths) == 0:
+            fix_value = values.backend.randint(1, max(2, high_value))
+            values.backend.flatten(lengths)[0] = fix_value
+        return lengths
 
-    inputs.generate_by_parameter((("x", x_value),), default="default")
+    generate_by_parameter(config, values, writer, (("x", x_value),), default="default")
 
 
 @rules.register("paddle.nn.functional.softmax_with_cross_entropy")
-def softmax_with_cross_entropy_values(ctx: InputContext, inputs: InputDataBuilder):
+def softmax_with_cross_entropy_values(
+    config: ConfigView, values: ValueFactory, writer: InputWriter
+):
     def label_value(binding):
-        logits = inputs.arg(0, "logits")
+        logits = config.arg(0, "logits")
         if not hasattr(logits, "shape"):
-            logits = inputs.kwarg("logits")
+            logits = config.kwarg("logits")
         num_classes = 10
         if logits is not None:
-            axis = inputs.kwarg("axis", -1)
+            axis = config.kwarg("axis", -1)
             axis = axis if axis >= 0 else len(logits.shape) + axis
             if 0 <= axis < len(logits.shape):
                 num_classes = logits.shape[axis]
         else:
-            num_classes = inputs.backend.randint(5, 20)
-        return inputs.backend.cast(
-            inputs.backend.randint(0, num_classes, shape=binding.spec.shape),
+            num_classes = values.backend.randint(5, 20)
+        return values.backend.cast(
+            values.backend.randint(0, num_classes, shape=binding.spec.shape),
             binding.spec.dtype,
         )
 
-    inputs.generate_by_parameter((("label", label_value),), default="default")
+    generate_by_parameter(config, values, writer, (("label", label_value),), default="default")
 
 
 @rules.register("paddle.linalg.cholesky")
-def cholesky_values(ctx: InputContext, inputs: InputDataBuilder):
+def cholesky_values(config: ConfigView, values: ValueFactory, writer: InputWriter):
     def x_value(binding):
         if len(binding.spec.shape) < 2 or binding.spec.shape[-1] != binding.spec.shape[-2]:
             raise ValueError(
@@ -2932,25 +3083,25 @@ def cholesky_values(ctx: InputContext, inputs: InputDataBuilder):
             )
         batch_dims = binding.spec.shape[:-2]
         matrix_dim = binding.spec.shape[-1]
-        matrix = inputs.backend.random(
+        matrix = values.backend.random(
             [*batch_dims, matrix_dim, matrix_dim], dtype=binding.spec.dtype
         )
         if len(batch_dims) > 0:
-            tensor = inputs.backend.einsum("...ij,...kj->...ik", matrix, matrix)
+            tensor = values.backend.einsum("...ij,...kj->...ik", matrix, matrix)
         else:
-            tensor = inputs.backend.dot(matrix, inputs.backend.swapaxes(matrix, -1, -2))
-        tensor += inputs.backend.eye(matrix_dim, dtype=binding.spec.dtype) * 10000
+            tensor = values.backend.dot(matrix, values.backend.swapaxes(matrix, -1, -2))
+        tensor += values.backend.eye(matrix_dim, dtype=binding.spec.dtype) * 10000
         print("cholesky tensor", tensor)
         return tensor
 
-    inputs.generate_by_parameter((("x", x_value),), default="default")
+    generate_by_parameter(config, values, writer, (("x", x_value),), default="default")
 
 
 @rules.register("paddle.linalg.cov")
-def covariance_values(ctx: InputContext, inputs: InputDataBuilder):
+def covariance_values(config: ConfigView, values: ValueFactory, writer: InputWriter):
     def observation_count():
-        x_shape = inputs.arg(0, "x").shape
-        rowvar = inputs.arg(1, "rowvar")
+        x_shape = config.arg(0, "x").shape
+        rowvar = config.arg(1, "rowvar")
         if rowvar is None:
             rowvar = True
         return (x_shape[1] if rowvar else x_shape[0]) if len(x_shape) > 1 else x_shape[0]
@@ -2958,27 +3109,30 @@ def covariance_values(ctx: InputContext, inputs: InputDataBuilder):
     def x_value(binding):
         if len(binding.spec.shape) < 1 or len(binding.spec.shape) > 2:
             raise ValueError("Shape must have 1 or 2 dimensions for covariance input")
-        tensor = inputs.backend.random(binding.spec.shape, dtype=binding.spec.dtype)
-        tensor += inputs.backend.random(binding.spec.shape, dtype=binding.spec.dtype) * 1e-6
+        tensor = values.backend.random(binding.spec.shape, dtype=binding.spec.dtype)
+        tensor += values.backend.random(binding.spec.shape, dtype=binding.spec.dtype) * 1e-6
         return tensor
 
     def fweights_value(binding):
-        return inputs.backend.cast(
-            inputs.backend.randint(1, 11, shape=(observation_count(),)),
+        return values.backend.cast(
+            values.backend.randint(1, 11, shape=(observation_count(),)),
             binding.spec.dtype,
         )
 
     def aweights_value(binding):
         if binding.spec.dtype in ["float32", "float64"]:
-            return inputs.backend.uniform(
+            return values.backend.uniform(
                 0.1, 1.0, shape=(observation_count(),), dtype=binding.spec.dtype
             )
-        return inputs.backend.cast(
-            inputs.backend.randint(1, 11, shape=(observation_count(),)),
+        return values.backend.cast(
+            values.backend.randint(1, 11, shape=(observation_count(),)),
             binding.spec.dtype,
         )
 
-    inputs.generate_by_parameter(
+    generate_by_parameter(
+        config,
+        values,
+        writer,
         (
             ("x", x_value),
             ("fweights", fweights_value),
@@ -2989,7 +3143,7 @@ def covariance_values(ctx: InputContext, inputs: InputDataBuilder):
 
 
 @rules.register("paddle.linalg.eigh", "paddle.linalg.eigvalsh")
-def eigen_symmetric_values(ctx: InputContext, inputs: InputDataBuilder):
+def eigen_symmetric_values(config: ConfigView, values: ValueFactory, writer: InputWriter):
     def x_value(binding):
         if len(binding.spec.shape) < 2 or binding.spec.shape[-1] != binding.spec.shape[-2]:
             raise ValueError(
@@ -2997,55 +3151,58 @@ def eigen_symmetric_values(ctx: InputContext, inputs: InputDataBuilder):
             )
         batch_dims = binding.spec.shape[:-2]
         matrix_dim = binding.spec.shape[-1]
-        matrix = inputs.backend.random(
+        matrix = values.backend.random(
             [*batch_dims, matrix_dim, matrix_dim], dtype=binding.spec.dtype
         )
         if binding.spec.dtype in ["complex64", "complex128"]:
-            matrix = matrix + 1j * inputs.backend.random(
+            matrix = matrix + 1j * values.backend.random(
                 [*batch_dims, matrix_dim, matrix_dim],
                 dtype=binding.spec.dtype,
             )
-            tensor = matrix + inputs.backend.conj(inputs.backend.swapaxes(matrix, -1, -2))
+            tensor = matrix + values.backend.conj(values.backend.swapaxes(matrix, -1, -2))
         elif len(batch_dims) > 0:
-            tensor = inputs.backend.einsum("...ij,...kj->...ik", matrix, matrix)
+            tensor = values.backend.einsum("...ij,...kj->...ik", matrix, matrix)
         else:
-            tensor = inputs.backend.dot(matrix, inputs.backend.swapaxes(matrix, -1, -2))
-        tensor += inputs.backend.eye(matrix_dim, dtype=binding.spec.dtype) * 1e-6
+            tensor = values.backend.dot(matrix, values.backend.swapaxes(matrix, -1, -2))
+        tensor += values.backend.eye(matrix_dim, dtype=binding.spec.dtype) * 1e-6
         return tensor
 
-    inputs.generate_by_parameter((("x", x_value),), default="default")
+    generate_by_parameter(config, values, writer, (("x", x_value),), default="default")
 
 
 @rules.register("paddle.linalg.lstsq")
-def lstsq_values(ctx: InputContext, inputs: InputDataBuilder):
+def lstsq_values(config: ConfigView, values: ValueFactory, writer: InputWriter):
     def matrix_value(binding):
         if len(binding.spec.shape) < 2:
             raise ValueError("Shape must have at least 2 dimensions for lstsq x")
         batch_dims = binding.spec.shape[:-2]
         rows, cols = binding.spec.shape[-2], binding.spec.shape[-1]
-        return inputs.backend.random([*batch_dims, rows, cols], dtype=binding.spec.dtype)
+        return values.backend.random([*batch_dims, rows, cols], dtype=binding.spec.dtype)
 
-    inputs.generate_by_parameter(((("x", "y"), matrix_value),), default="default")
+    generate_by_parameter(config, values, writer, ((("x", "y"), matrix_value),), default="default")
 
 
 @rules.register("paddle.linalg.lu_unpack")
-def lu_unpack_values(ctx: InputContext, inputs: InputDataBuilder):
+def lu_unpack_values(config: ConfigView, values: ValueFactory, writer: InputWriter):
     def x_value(binding):
         if len(binding.spec.shape) < 2:
             raise ValueError("Shape must have at least 2 dimensions for LU matrix")
-        tensor = inputs.backend.random(binding.spec.shape, dtype=binding.spec.dtype)
+        tensor = values.backend.random(binding.spec.shape, dtype=binding.spec.dtype)
         diagonal_size = min(binding.spec.shape[-2], binding.spec.shape[-1])
         tensor[..., range(diagonal_size), range(diagonal_size)] += 1e-6
         return tensor
 
     def pivot_value(binding):
-        row_count = inputs.arg(0, "x").shape[-2]
-        return inputs.backend.cast(
-            inputs.backend.randint(1, row_count + 1, shape=binding.spec.shape),
+        row_count = config.arg(0, "x").shape[-2]
+        return values.backend.cast(
+            values.backend.randint(1, row_count + 1, shape=binding.spec.shape),
             binding.spec.dtype,
         )
 
-    inputs.generate_by_parameter(
+    generate_by_parameter(
+        config,
+        values,
+        writer,
         (
             ("x", x_value),
             (("pivot", "y"), pivot_value),
@@ -3055,18 +3212,18 @@ def lu_unpack_values(ctx: InputContext, inputs: InputDataBuilder):
 
 
 @rules.register("paddle.linalg.cond")
-def condition_values(ctx: InputContext, inputs: InputDataBuilder):
+def condition_values(config: ConfigView, values: ValueFactory, writer: InputWriter):
     def x_value(binding):
         matrix_size = binding.spec.shape[-1]
-        tensor = inputs.backend.random(binding.spec.shape, dtype=binding.spec.dtype)
-        tensor += matrix_size * inputs.backend.eye(matrix_size, dtype=binding.spec.dtype)
+        tensor = values.backend.random(binding.spec.shape, dtype=binding.spec.dtype)
+        tensor += matrix_size * values.backend.eye(matrix_size, dtype=binding.spec.dtype)
         return tensor
 
-    inputs.generate_by_parameter((("x", x_value),), default="default")
+    generate_by_parameter(config, values, writer, (("x", x_value),), default="default")
 
 
 @rules.register("paddle.linalg.det", "paddle.linalg.slogdet")
-def determinant_values(ctx: InputContext, inputs: InputDataBuilder):
+def determinant_values(config: ConfigView, values: ValueFactory, writer: InputWriter):
     def x_value(binding):
         if len(binding.spec.shape) < 2:
             raise AssertionError("Input must be at least 2D.")
@@ -3076,44 +3233,44 @@ def determinant_values(ctx: InputContext, inputs: InputDataBuilder):
         is_complex = binding.spec.dtype.startswith("complex")
         if is_complex:
             real_dtype = "float32" if binding.spec.dtype == "complex64" else "float64"
-            real = inputs.backend.uniform(0.5, 1.0, shape=binding.spec.shape, dtype=real_dtype)
-            imag = inputs.backend.uniform(0.5, 1.0, shape=binding.spec.shape, dtype=real_dtype)
-            matrix = inputs.backend.cast(real + 1j * imag, binding.spec.dtype)
-            matrix_h = inputs.backend.swapaxes(inputs.backend.conj(matrix), -1, -2)
+            real = values.backend.uniform(0.5, 1.0, shape=binding.spec.shape, dtype=real_dtype)
+            imag = values.backend.uniform(0.5, 1.0, shape=binding.spec.shape, dtype=real_dtype)
+            matrix = values.backend.cast(real + 1j * imag, binding.spec.dtype)
+            matrix_h = values.backend.swapaxes(values.backend.conj(matrix), -1, -2)
         else:
-            matrix = inputs.backend.uniform(
+            matrix = values.backend.uniform(
                 0.5, 1.0, shape=binding.spec.shape, dtype=binding.spec.dtype
             )
-            matrix_h = inputs.backend.swapaxes(matrix, -1, -2)
-        return inputs.backend.matmul(matrix, matrix_h) + inputs.backend.eye(
+            matrix_h = values.backend.swapaxes(matrix, -1, -2)
+        return values.backend.matmul(matrix, matrix_h) + values.backend.eye(
             matrix_size, dtype=binding.spec.dtype
         )
 
-    inputs.generate_by_parameter((("x", x_value),), default="default")
+    generate_by_parameter(config, values, writer, (("x", x_value),), default="default")
 
 
 @rules.register("paddle.linalg.pca_lowrank")
-def pca_lowrank_values(ctx: InputContext, inputs: InputDataBuilder):
+def pca_lowrank_values(config: ConfigView, values: ValueFactory, writer: InputWriter):
     def x_value(binding):
-        return inputs.backend.cast(inputs.backend.randn(*binding.spec.shape), binding.spec.dtype)
+        return values.backend.cast(values.backend.randn(*binding.spec.shape), binding.spec.dtype)
 
-    inputs.generate_by_parameter((("x", x_value),), default="default")
+    generate_by_parameter(config, values, writer, (("x", x_value),), default="default")
 
 
 @rules.register("paddle.linalg.corrcoef")
-def corrcoef_values(ctx: InputContext, inputs: InputDataBuilder):
+def corrcoef_values(config: ConfigView, values: ValueFactory, writer: InputWriter):
     def x_value(binding):
         if binding.spec.dtype == "float16":
             return (
-                inputs.backend.cast(
-                    inputs.backend.randn(*binding.spec.shape),
+                values.backend.cast(
+                    values.backend.randn(*binding.spec.shape),
                     binding.spec.dtype,
                 )
                 * 1e-3
             )
-        return inputs.value_domain("default", binding)
+        return values.domain("default", binding)
 
-    inputs.generate_by_parameter((("x", x_value),), default="default")
+    generate_by_parameter(config, values, writer, (("x", x_value),), default="default")
 
 
 @rules.register(
@@ -3135,15 +3292,15 @@ def corrcoef_values(ctx: InputContext, inputs: InputDataBuilder):
     "paddle.linalg.qr",
     "paddle.linalg.vector_norm",
 )
-def linalg_default_values(ctx: InputContext, inputs: InputDataBuilder):
-    inputs.generate_all("default")
+def linalg_default_values(config: ConfigView, values: ValueFactory, writer: InputWriter):
+    generate_all(config, values, writer, "default")
 
 
 @rules.register("paddle.linalg.pinv")
-def pinv_values(ctx: InputContext, inputs: InputDataBuilder):
-    hermitian = bool(inputs.arg(2, " hermitian", False))
+def pinv_values(config: ConfigView, values: ValueFactory, writer: InputWriter):
+    hermitian = bool(config.arg(2, " hermitian", False))
     if not hermitian:
-        inputs.generate_all("default")
+        generate_all(config, values, writer, "default")
         return
 
     def x_value(binding):
@@ -3151,51 +3308,51 @@ def pinv_values(ctx: InputContext, inputs: InputDataBuilder):
             raise ValueError("pinv only supports 2D or 3D tensors")
         if binding.spec.dtype.startswith("complex"):
             real_dtype = "float32" if binding.spec.dtype == "complex64" else "float64"
-            real = inputs.backend.cast(inputs.backend.randn(*binding.spec.shape), real_dtype)
-            imag = inputs.backend.cast(inputs.backend.randn(*binding.spec.shape), real_dtype)
-            matrix = inputs.backend.cast(real + 1j * imag, binding.spec.dtype)
+            real = values.backend.cast(values.backend.randn(*binding.spec.shape), real_dtype)
+            imag = values.backend.cast(values.backend.randn(*binding.spec.shape), real_dtype)
+            matrix = values.backend.cast(real + 1j * imag, binding.spec.dtype)
         else:
-            matrix = inputs.backend.cast(
-                inputs.backend.randn(*binding.spec.shape),
+            matrix = values.backend.cast(
+                values.backend.randn(*binding.spec.shape),
                 binding.spec.dtype,
             )
         if len(binding.spec.shape) == 2:
             matrix_t = (
-                inputs.backend.swapaxes(inputs.backend.conj(matrix), -1, -2)
+                values.backend.swapaxes(values.backend.conj(matrix), -1, -2)
                 if binding.spec.dtype.startswith("complex")
-                else inputs.backend.swapaxes(matrix, -1, -2)
+                else values.backend.swapaxes(matrix, -1, -2)
             )
         else:
             matrix_t = (
-                inputs.backend.swapaxes(inputs.backend.conj(matrix), -2, -1)
+                values.backend.swapaxes(values.backend.conj(matrix), -2, -1)
                 if binding.spec.dtype.startswith("complex")
-                else inputs.backend.swapaxes(matrix, -2, -1)
+                else values.backend.swapaxes(matrix, -2, -1)
             )
         return (matrix + matrix_t) / 2
 
-    inputs.generate_by_parameter((("x", x_value),), default="default")
+    generate_by_parameter(config, values, writer, (("x", x_value),), default="default")
 
 
 @rules.register("paddle.linalg.cholesky_solve", aliases=("paddle.Tensor.cholesky_solve",))
-def cholesky_solve_values(ctx: InputContext, inputs: InputDataBuilder):
-    if inputs.api_name == "paddle.linalg.cholesky_solve":
-        inputs.generate_all("default")
+def cholesky_solve_values(config: ConfigView, values: ValueFactory, writer: InputWriter):
+    if config.api_name == "paddle.linalg.cholesky_solve":
+        generate_all(config, values, writer, "default")
         return
 
     def y_value(binding):
-        value = inputs.value_domain("random_range", binding)
-        if inputs.arg(2, "upper"):
-            return inputs.backend.triu(value)
-        return inputs.backend.tril(value)
+        value = values.domain("random_range", binding)
+        if config.arg(2, "upper"):
+            return values.backend.triu(value)
+        return values.backend.tril(value)
 
-    inputs.generate_by_parameter((("y", y_value),), default="default")
+    generate_by_parameter(config, values, writer, (("y", y_value),), default="default")
 
 
 @rules.register("paddle.view", aliases=("paddle.Tensor.view",))
-def view_values(ctx: InputContext, inputs: InputDataBuilder):
+def view_values(config: ConfigView, values: ValueFactory, writer: InputWriter):
     def x_value(binding):
         if binding.spec.dtype == "uint8":
-            target = str(inputs.arg(1, "shape_or_dtype", ""))
+            target = str(config.arg(1, "shape_or_dtype", ""))
             nbytes = math.prod(binding.spec.shape)
             itemsize = {
                 "paddle.bfloat16": 2,
@@ -3206,30 +3363,30 @@ def view_values(ctx: InputContext, inputs: InputDataBuilder):
             if itemsize is not None and nbytes % itemsize == 0:
                 numel = nbytes // itemsize
                 if target == "paddle.bfloat16":
-                    finite_f32 = inputs.backend.cast(
-                        (inputs.backend.random(numel) - 0.5) * 1.2,
+                    finite_f32 = values.backend.cast(
+                        (values.backend.random(numel) - 0.5) * 1.2,
                         "float32",
                     )
-                    uint32_value = inputs.backend.view_dtype(finite_f32, "uint32")
-                    return inputs.backend.view_dtype(
-                        inputs.backend.cast(uint32_value >> 16, "uint16"),
+                    uint32_value = values.backend.view_dtype(finite_f32, "uint32")
+                    return values.backend.view_dtype(
+                        values.backend.cast(uint32_value >> 16, "uint16"),
                         "uint8",
                     )
-                finite = inputs.backend.cast(
-                    (inputs.backend.random(numel) - 0.5) * 1.2,
+                finite = values.backend.cast(
+                    (values.backend.random(numel) - 0.5) * 1.2,
                     target.replace("paddle.", ""),
                 )
-                return inputs.backend.view_dtype(inputs.backend.ascontiguousarray(finite), "uint8")
-        return inputs.value_domain("default", binding)
+                return values.backend.view_dtype(values.backend.ascontiguousarray(finite), "uint8")
+        return values.domain("default", binding)
 
-    inputs.generate_by_parameter((("x", x_value),), default="default")
+    generate_by_parameter(config, values, writer, (("x", x_value),), default="default")
 
 
 @rules.register(
     "paddle.pow",
     aliases=("paddle.Tensor.pow", "paddle.Tensor.__rpow__", "paddle.Tensor.__pow__"),
 )
-def pow_values(ctx: InputContext, inputs: InputDataBuilder):
+def pow_values(config: ConfigView, values: ValueFactory, writer: InputWriter):
     def get_base_max(value, dtype_max, default_max=5):
         value_max = default_max
         if value <= 0:
@@ -3254,58 +3411,61 @@ def pow_values(ctx: InputContext, inputs: InputDataBuilder):
         return value_max
 
     def value(binding):
-        api_name = inputs.api_name
+        api_name = config.api_name
         dtype = binding.spec.dtype
         if api_name == "paddle.Tensor.__rpow__":
             is_base_arg = binding.parameter_name in {"other", "y"} or str(binding.path) == "args[1]"
             if is_base_arg:
-                const = inputs.arg(0, "self")
+                const = config.arg(0, "self")
                 get_max = get_base_max
                 default_max = 10
             else:
-                const = inputs.arg(1, "other")
+                const = config.arg(1, "other")
                 get_max = get_exponent_max
                 default_max = 5
         else:
             is_base_arg = binding.parameter_name in {"self", "x"}
             if is_base_arg:
-                const = inputs.arg(1, "other", inputs.arg(1, "y"))
+                const = config.arg(1, "other", config.arg(1, "y"))
                 get_max = get_base_max
                 default_max = 10
             else:
-                const = inputs.arg(0, "self", inputs.arg(0, "x"))
+                const = config.arg(0, "self", config.arg(0, "x"))
                 get_max = get_exponent_max
                 default_max = 5
         if isinstance(const, numbers.Number):
-            value_max = get_max(const, inputs.dtype_max(dtype), default_max)
+            value_max = get_max(const, values.dtype_max(dtype), default_max)
             if is_base_arg and int(const) != const:
-                return inputs.value_domain("random_range", binding, low=0, high=value_max)
-            return inputs.value_domain("random_range", binding, low=-value_max, high=value_max)
+                return values.domain("random_range", binding, low=0, high=value_max)
+            return values.domain("random_range", binding, low=-value_max, high=value_max)
         if is_base_arg:
-            return inputs.value_domain("random_range", binding, low=0, high=default_max)
-        return inputs.value_domain("random_range", binding, low=-default_max, high=default_max)
+            return values.domain("random_range", binding, low=0, high=default_max)
+        return values.domain("random_range", binding, low=-default_max, high=default_max)
 
-    inputs.generate_all(value)
+    generate_all(config, values, writer, value)
 
 
 @rules.register("paddle.nn.functional.rnnt_loss")
-def rnnt_loss_values(ctx: InputContext, inputs: InputDataBuilder):
+def rnnt_loss_values(config: ConfigView, values: ValueFactory, writer: InputWriter):
     def logits(binding):
         shape = binding.spec.shape if len(binding.spec.shape) == 4 else (3, 4, 3, 5)
-        return inputs.backend.random(shape, dtype=binding.spec.dtype)
+        return values.backend.random(shape, dtype=binding.spec.dtype)
 
     def labels(binding):
         shape = binding.spec.shape if len(binding.spec.shape) == 2 else (3, 2)
-        return inputs.backend.cast(inputs.backend.randint(1, 4, shape=shape), binding.spec.dtype)
+        return values.backend.cast(values.backend.randint(1, 4, shape=shape), binding.spec.dtype)
 
     def lengths(max_possible_length):
         def generate(binding):
             shape = binding.spec.shape if len(binding.spec.shape) == 1 else (3,)
-            return inputs.backend.ones(shape, dtype=binding.spec.dtype) * max_possible_length
+            return values.backend.ones(shape, dtype=binding.spec.dtype) * max_possible_length
 
         return generate
 
-    inputs.generate_by_parameter(
+    generate_by_parameter(
+        config,
+        values,
+        writer,
         (
             (("input", "logits"), logits),
             (("label", "labels"), labels),
@@ -3317,10 +3477,10 @@ def rnnt_loss_values(ctx: InputContext, inputs: InputDataBuilder):
 
 
 @rules.register("paddle.chunk")
-def chunk_values(ctx: InputContext, inputs: InputDataBuilder):
+def chunk_values(config: ConfigView, values: ValueFactory, writer: InputWriter):
     def axis_value(binding):
-        x_tensor = inputs.arg(0, "x")
-        chunks = inputs.arg(1, "chunks")
+        x_tensor = config.arg(0, "x")
+        chunks = config.arg(1, "chunks")
         valid_axes = [
             index for index, dim_size in enumerate(x_tensor.shape) if dim_size % chunks == 0
         ]
@@ -3329,24 +3489,24 @@ def chunk_values(ctx: InputContext, inputs: InputDataBuilder):
                 f"No valid axis found in x.shape = {x_tensor.shape} for chunks = {chunks}. "
                 f"Each dim must be divisible by chunks."
             )
-        chosen_axis = inputs.backend.choice(valid_axes)
+        chosen_axis = values.backend.choice(valid_axes)
         if len(binding.spec.shape) == 0:
-            return inputs.backend.asarray(chosen_axis, dtype=binding.spec.dtype)
+            return values.backend.asarray(chosen_axis, dtype=binding.spec.dtype)
         if len(binding.spec.shape) == 1 and binding.spec.shape[0] == 1:
-            return inputs.backend.asarray([chosen_axis], dtype=binding.spec.dtype)
+            return values.backend.asarray([chosen_axis], dtype=binding.spec.dtype)
         raise ValueError(
             f"Invalid shape for 'axis' Tensor in paddle.chunk. "
             f"Expected a 0-D or 1-D Tensor, but got shape {binding.spec.shape}."
         )
 
-    inputs.generate_by_parameter((("axis", axis_value),), default="default")
+    generate_by_parameter(config, values, writer, (("axis", axis_value),), default="default")
 
 
 @rules.register("paddle.split")
-def split_values(ctx: InputContext, inputs: InputDataBuilder):
+def split_values(config: ConfigView, values: ValueFactory, writer: InputWriter):
     def axis_value(binding):
-        x_shape = inputs.arg(0, "x").shape
-        num_or_sections = inputs.arg(1, "num_or_sections")
+        x_shape = config.arg(0, "x").shape
+        num_or_sections = config.arg(1, "num_or_sections")
         if isinstance(num_or_sections, (list, tuple)):
             neg_one_count = sum(1 for item in num_or_sections if item == -1)
             if neg_one_count > 1:
@@ -3365,7 +3525,7 @@ def split_values(ctx: InputContext, inputs: InputDataBuilder):
 
         target_dim = None
         if len(x_shape) == 0:
-            target_dim = inputs.backend.randint(-1, 0)
+            target_dim = values.backend.randint(-1, 0)
         else:
             for dim, dim_size in enumerate(x_shape):
                 if isinstance(num_or_sections, int) and dim_size % num_splits == 0:
@@ -3381,84 +3541,84 @@ def split_values(ctx: InputContext, inputs: InputDataBuilder):
                 f"and num_or_sections={num_or_sections}"
             )
         if len(binding.spec.shape) == 0:
-            return inputs.backend.asarray(target_dim, dtype=binding.spec.dtype)
+            return values.backend.asarray(target_dim, dtype=binding.spec.dtype)
         if len(binding.spec.shape) == 1 and binding.spec.shape[0] == 1:
-            return inputs.backend.asarray([target_dim], dtype=binding.spec.dtype)
+            return values.backend.asarray([target_dim], dtype=binding.spec.dtype)
         raise ValueError(
             f"Invalid shape for 'axis' Tensor in paddle.split. "
             f"Expected a 0-D or 1-D Tensor, but got shape {binding.spec.shape}."
         )
 
-    inputs.generate_by_parameter((("axis", axis_value),), default="default")
+    generate_by_parameter(config, values, writer, (("axis", axis_value),), default="default")
 
 
 @rules.register("paddle.expand", aliases=("paddle.Tensor.expand",))
-def expand_values(ctx: InputContext, inputs: InputDataBuilder):
+def expand_values(config: ConfigView, values: ValueFactory, writer: InputWriter):
     def shape_value(binding):
-        x_shape = inputs.arg(0, "x").shape
+        x_shape = config.arg(0, "x").shape
         shape_index = binding.path.indices[0] if binding.path.indices else 0
         if len(x_shape) == 0 or shape_index > len(x_shape) - 1 or x_shape[shape_index] == 1:
-            return inputs.backend.cast(
-                inputs.backend.randint(1, 127, shape=binding.spec.shape),
+            return values.backend.cast(
+                values.backend.randint(1, 127, shape=binding.spec.shape),
                 binding.spec.dtype,
             )
         if len(binding.spec.shape) == 0 or binding.spec.shape[0] == 1:
-            return inputs.backend.asarray(x_shape[shape_index])
-        values = inputs.backend.cast(
-            inputs.backend.randint(1, 127, shape=binding.spec.shape),
+            return values.backend.asarray(x_shape[shape_index])
+        shape_values = values.backend.cast(
+            values.backend.randint(1, 127, shape=binding.spec.shape),
             binding.spec.dtype,
         )
         offset = binding.spec.shape[0] - len(x_shape)
         for index in range(binding.spec.shape[0]):
             if index >= offset and x_shape[index - offset] != 1:
-                values[index] = x_shape[index - offset]
-        return values
+                shape_values[index] = x_shape[index - offset]
+        return shape_values
 
-    inputs.generate_by_parameter((("shape", shape_value),), default="default")
+    generate_by_parameter(config, values, writer, (("shape", shape_value),), default="default")
 
 
 @rules.register("paddle.nn.functional.gather_tree")
-def gather_tree_values(ctx: InputContext, inputs: InputDataBuilder):
+def gather_tree_values(config: ConfigView, values: ValueFactory, writer: InputWriter):
     def parents_value(binding):
-        sequences = inputs.arg(0, "sequences")
+        sequences = config.arg(0, "sequences")
         if hasattr(sequences, "shape") and len(sequences.shape) >= 3:
             beam_size = sequences.shape[2]
         else:
             beam_size = binding.spec.shape[2] if len(binding.spec.shape) >= 3 else 4
         beam_size = 1 if beam_size < 1 else beam_size
-        parents = inputs.backend.zeros(binding.spec.shape, dtype=binding.spec.dtype)
+        parents = values.backend.zeros(binding.spec.shape, dtype=binding.spec.dtype)
         for time_index in range(binding.spec.shape[0]):
             for batch_index in range(binding.spec.shape[1]):
                 for beam_index in range(binding.spec.shape[2]):
-                    parents[time_index, batch_index, beam_index] = inputs.backend.randint(
+                    parents[time_index, batch_index, beam_index] = values.backend.randint(
                         0, beam_size
                     )
         return parents
 
-    inputs.generate_by_parameter((("parents", parents_value),), default="default")
+    generate_by_parameter(config, values, writer, (("parents", parents_value),), default="default")
 
 
 @rules.register("paddle.multinomial")
-def multinomial_values(ctx: InputContext, inputs: InputDataBuilder):
-    x_binding = inputs.find("x")
-    num_samples_binding = inputs.find("num_samples")
+def multinomial_values(config: ConfigView, values: ValueFactory, writer: InputWriter):
+    x_binding = config.find("x")
+    num_samples_binding = config.find("num_samples")
     if x_binding is not None:
-        values = inputs.backend.cast(
-            inputs.backend.abs(inputs.backend.random(x_binding.spec.shape)),
+        x_values = values.backend.cast(
+            values.backend.abs(values.backend.random(x_binding.spec.shape)),
             x_binding.spec.dtype,
         )
-        inputs.set_value(x_binding, values)
+        writer.set_value(x_binding, x_values)
     if num_samples_binding is not None:
-        replacement = inputs.arg(2, "replacement")
-        if inputs.has_kwarg("replacement") and replacement is True:
+        replacement = config.arg(2, "replacement")
+        if config.has_kwarg("replacement") and replacement is True:
             max_allow = 1024
         else:
-            x_values = inputs.value(x_binding)
-            max_allow = inputs.backend.count_nonzero(x_values > 0)
-        inputs.set_value(
+            x_values = writer.value(x_binding)
+            max_allow = values.backend.count_nonzero(x_values > 0)
+        writer.set_value(
             num_samples_binding,
-            inputs.backend.cast(
-                inputs.backend.randint(
+            values.backend.cast(
+                values.backend.randint(
                     1,
                     max_allow + 1,
                     shape=num_samples_binding.spec.shape,
@@ -3466,37 +3626,37 @@ def multinomial_values(ctx: InputContext, inputs: InputDataBuilder):
                 num_samples_binding.spec.dtype,
             ),
         )
-    inputs.generate_remaining("default")
+    generate_remaining(config, values, writer, "default")
 
 
 @rules.register("paddle.nn.functional.one_hot")
-def one_hot_values(ctx: InputContext, inputs: InputDataBuilder):
-    x_binding = inputs.find("x")
-    num_classes_binding = inputs.find("num_classes")
-    num_classes_config = inputs.arg(1, "num_classes")
-    default_random_num_classes = inputs.backend.randint(1, 65535)
+def one_hot_values(config: ConfigView, values: ValueFactory, writer: InputWriter):
+    x_binding = config.find("x")
+    num_classes_binding = config.find("num_classes")
+    num_classes_config = config.arg(1, "num_classes")
+    default_random_num_classes = values.backend.randint(1, 65535)
     if isinstance(num_classes_config, int):
         determined_num_classes = num_classes_config
-    elif inputs.is_tensor_config(num_classes_config):
+    elif config.is_tensor_config(num_classes_config):
         if num_classes_binding is not None and num_classes_config.numel() in {0, 1}:
-            inputs.set_value(
+            writer.set_value(
                 num_classes_binding,
-                inputs.backend.asarray([default_random_num_classes], dtype="int64"),
+                values.backend.asarray([default_random_num_classes], dtype="int64"),
             )
-        determined_num_classes = inputs.value(num_classes_binding).item()
+        determined_num_classes = writer.value(num_classes_binding).item()
     else:
         determined_num_classes = default_random_num_classes
     if x_binding is not None:
-        inputs.set_value(
+        writer.set_value(
             x_binding,
-            inputs.backend.randint(
+            values.backend.randint(
                 0,
                 determined_num_classes,
                 shape=x_binding.spec.shape,
                 dtype=x_binding.spec.dtype,
             ),
         )
-    inputs.generate_remaining("default")
+    generate_remaining(config, values, writer, "default")
 
 
 INPUT_GENERATION_RULES = rules.rules
@@ -3504,21 +3664,21 @@ API_RULE_REGISTRY = rules.by_api
 DEFAULT_INPUT_GENERATION_RULE = API_RULE_REGISTRY["paddle.add"]
 
 
-def _tensor_config_at(inputs, path):
-    value = inputs.args[path.key] if path.root == "args" else inputs.kwargs[path.key]
+def _tensor_config_at(api_config, path):
+    value = api_config.args[path.key] if path.root == "args" else api_config.kwargs[path.key]
     for index in path.indices:
         value = value[index]
     return value
 
 
-def _api_arg(inputs, position, name, default=None):
-    if 0 <= position < len(inputs.args):
-        return inputs.args[position]
-    return inputs.kwargs.get(name, default)
+def _api_arg(api_config, position, name, default=None):
+    if 0 <= position < len(api_config.args):
+        return api_config.args[position]
+    return api_config.kwargs.get(name, default)
 
 
-def _apply_value_raw(inputs, path, value, backend, update_config):
-    config = _tensor_config_at(inputs, path)
+def _apply_value_raw(api_config, path, value, backend, update_config):
+    config = _tensor_config_at(api_config, path)
     storage_value = backend.asarray(value, copy=True)
     config.input_value = storage_value
     config.input_value_backend = backend.name

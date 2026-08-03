@@ -263,11 +263,7 @@ class TorchInputBackend(NumpyInputBackend):
         return torch
 
     def _torch_shape(self, shape):
-        if shape is None:
-            return ()
-        if isinstance(shape, numbers.Integral):
-            return (int(shape),)
-        return tuple(shape)
+        return _normalize_shape(shape, scalar_empty=False)
 
     def _torch_dtype(self, dtype):
         if isinstance(dtype, str):
@@ -343,11 +339,7 @@ class TorchInputBackend(NumpyInputBackend):
 
     def choice(self, values, shape=None, replace=True, p=None):
         torch = self._torch()
-        scalar = shape is None
-        torch_shape = (
-            () if scalar else tuple(shape) if isinstance(shape, (list, tuple)) else (shape,)
-        )
-        num_samples = 1 if scalar else int(numpy.prod(torch_shape))
+        scalar, torch_shape, num_samples = _choice_shape(shape, scalar_empty=False)
 
         if isinstance(values, numbers.Integral):
             population = torch.arange(int(values), device=self._device)
@@ -556,11 +548,7 @@ class PaddleInputBackend(NumpyInputBackend):
         return paddle
 
     def _paddle_shape(self, shape):
-        if shape is None:
-            return []
-        if isinstance(shape, numbers.Integral):
-            return [int(shape)]
-        return list(shape)
+        return _normalize_shape(shape, scalar_empty=True)
 
     def _paddle_dtype(self, dtype):
         storage_dtype = self._storage_dtype(dtype)
@@ -618,11 +606,7 @@ class PaddleInputBackend(NumpyInputBackend):
 
     def choice(self, values, shape=None, replace=True, p=None):
         paddle = self._paddle()
-        scalar = shape is None
-        paddle_shape = (
-            [] if scalar else list(shape) if isinstance(shape, (list, tuple)) else [shape]
-        )
-        num_samples = 1 if scalar else int(numpy.prod(paddle_shape))
+        scalar, paddle_shape, num_samples = _choice_shape(shape, scalar_empty=True)
 
         if isinstance(values, numbers.Integral):
             population = paddle.arange(int(values), dtype="int64", device=self.device)
@@ -814,17 +798,28 @@ class PaddleInputBackend(NumpyInputBackend):
 
 
 INPUT_BACKEND_ENV_VAR = "PADDLEAPITEST_INPUT_BACKEND"
-# Only used when no case-local RNG is available, such as legacy TensorConfig helpers.
+# Only used when no config-local RNG is available, such as legacy TensorConfig helpers.
 _DEFAULT_BACKENDS = {}
 _WARNED_CACHED_NON_NUMPY_BACKEND = False
+_TRUE_VALUES = {"true", "1", "yes", "y"}
 
 
-def _use_cached_numpy() -> bool:
-    return os.getenv("USE_CACHED_NUMPY", "False").lower() in {"true", "1", "yes", "y"}
+def _env_flag(name, default="False") -> bool:
+    return os.getenv(name, default).lower() in _TRUE_VALUES
 
 
-def _use_gpu_mode() -> bool:
-    return os.getenv("USE_GPU_MODE", "False").lower() in {"true", "1", "yes", "y"}
+def _normalize_shape(shape, *, scalar_empty):
+    if shape is None:
+        return [] if scalar_empty else ()
+    if isinstance(shape, numbers.Integral):
+        return [int(shape)] if scalar_empty else (int(shape),)
+    return list(shape) if scalar_empty else tuple(shape)
+
+
+def _choice_shape(shape, *, scalar_empty):
+    scalar = shape is None
+    normalized = _normalize_shape(shape, scalar_empty=scalar_empty)
+    return scalar, normalized, 1 if scalar else int(numpy.prod(normalized))
 
 
 def create_input_backend(rng=NUMPY_RNG) -> InputBackend:
@@ -832,8 +827,8 @@ def create_input_backend(rng=NUMPY_RNG) -> InputBackend:
 
     requested = os.environ.get(INPUT_BACKEND_ENV_VAR)
     normalized_requested = (requested or "numpy").strip().lower()
-    use_cached_numpy = _use_cached_numpy()
-    use_gpu_mode = _use_gpu_mode()
+    use_cached_numpy = _env_flag("USE_CACHED_NUMPY")
+    use_gpu_mode = _env_flag("USE_GPU_MODE")
 
     if use_cached_numpy:
         if normalized_requested in {"torch", "paddle"} and not _WARNED_CACHED_NON_NUMPY_BACKEND:
