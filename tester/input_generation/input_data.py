@@ -2,12 +2,12 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from .input_path import InputPath
+from .tensor_path import TensorPath
 
 
 @dataclass(frozen=True)
-class InputValue:
-    path: InputPath
+class InputData:
+    path: TensorPath
     value: object
     update_metadata: bool = True
     backend: str = "numpy"
@@ -19,7 +19,7 @@ _VALUES_ATTR = "_input_generation_values"
 _VALUE_BY_TENSOR_ID_ATTR = "_input_generation_value_by_tensor_id"
 
 
-def _tensor_value_at_path(api_config, path: InputPath):
+def _tensor_value_at_path(api_config, path: TensorPath):
     if path.root == "args":
         value = api_config.args[path.key]
     else:
@@ -55,24 +55,34 @@ def input_value(api_config, tensor_config):
     value = value_for_tensor(api_config, tensor_config)
     if value is not None:
         return value.value
-    return tensor_config.numpy_tensor
+    return tensor_config.input_value
 
 
 def input_value_backend(api_config, tensor_config):
     value = value_for_tensor(api_config, tensor_config)
     if value is not None:
         return value.backend
+    return tensor_config.input_value_backend or "numpy"
+
+
+def _backend_for_value(value):
+    module = value.__class__.__module__.split(".", 1)[0]
+    if module in {"torch", "paddle"}:
+        return module
     return "numpy"
 
 
 def write_input_value(api_config, tensor_config, new_value, update_metadata=True):
     existing_value = value_for_tensor(api_config, tensor_config)
+    backend = (
+        existing_value.backend if existing_value is not None else _backend_for_value(new_value)
+    )
     if existing_value is not None:
-        updated_value = InputValue(
+        updated_value = InputData(
             existing_value.path,
             new_value,
             update_metadata=update_metadata,
-            backend=existing_value.backend,
+            backend=backend,
             declared_dtype=existing_value.declared_dtype,
             storage_dtype=str(getattr(new_value, "dtype", "")) or None,
         )
@@ -88,7 +98,8 @@ def write_input_value(api_config, tensor_config, new_value, update_metadata=True
                     updated_value if item.path == existing_value.path else item for item in values
                 ),
             )
-    tensor_config.numpy_tensor = new_value
+    tensor_config.input_value = new_value
+    tensor_config.input_value_backend = backend
     return new_value
 
 
@@ -105,3 +116,5 @@ def clear_input_value(api_config, tensor_config):
                 _VALUES_ATTR,
                 tuple(item for item in values if item.path != value.path),
             )
+    tensor_config.input_value = None
+    tensor_config.input_value_backend = None

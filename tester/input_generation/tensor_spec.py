@@ -6,7 +6,7 @@ from dataclasses import dataclass
 
 
 @dataclass(frozen=True)
-class TensorView:
+class TensorSpec:
     """供值生成器消费的 TensorConfig 只读视图。"""
 
     # 这里只保留值域生成需要的字段，避免规则直接触碰可变 TensorConfig。

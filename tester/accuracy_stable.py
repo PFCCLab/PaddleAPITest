@@ -732,8 +732,8 @@ class APITestAccuracyStable(APITestBase):
             return
 
         try:
-            if not self.gen_numpy_input():
-                self.report_case_result("config_input", "gen_numpy_input failed")
+            if not self.gen_input_data():
+                self.report_case_result("config_input", "gen_input_data failed")
                 return
         except Exception as err:
             _, fatal = self.report_runtime_error(err, "config_input", "input")
@@ -793,10 +793,10 @@ class APITestAccuracyStable(APITestBase):
     def get_torch_output(self, convert_result, iter_idx=0):
         torch_output = None
         try:
-            if not self.gen_torch_input():
+            if not self.build_torch_input():
                 self.report_case_result(
                     "torch_error",
-                    "gen_torch_input failed",
+                    "build_torch_input failed",
                     affected_comps=self._TORCH_AFFECTED_COMPS[iter_idx],
                 )
                 return None, None, None
@@ -914,10 +914,10 @@ class APITestAccuracyStable(APITestBase):
     def get_paddle_output(self, torch_grad_success, iter_idx=0):
         paddle_output = None
         try:
-            if not self.gen_paddle_input():
+            if not self.build_paddle_input():
                 self.report_case_result(
                     "paddle_error",
-                    "gen_paddle_input failed",
+                    "build_paddle_input failed",
                     affected_comps=self._PADDLE_AFFECTED_COMPS[iter_idx],
                 )
                 return None, None

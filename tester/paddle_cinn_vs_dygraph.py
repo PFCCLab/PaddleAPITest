@@ -22,8 +22,8 @@ class APITestCINNVSDygraph(APITestBase):
             return
 
         try:
-            if not self.gen_numpy_input():
-                self.report_case_result("config_input", "gen_numpy_input failed")
+            if not self.gen_input_data():
+                self.report_case_result("config_input", "gen_input_data failed")
                 return
         except Exception as err:
             log_type, fatal = self.report_runtime_error(err, "config_input", "input")
@@ -31,8 +31,8 @@ class APITestCINNVSDygraph(APITestBase):
                 raise
             return
 
-        if not self.gen_paddle_input():
-            self.report_case_result("paddle_error", "gen_paddle_input failed")
+        if not self.build_paddle_input():
+            self.report_case_result("paddle_error", "build_paddle_input failed")
             return
 
         try:

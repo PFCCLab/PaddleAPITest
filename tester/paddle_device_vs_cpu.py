@@ -49,8 +49,8 @@ class APITestCustomDeviceVSCPU(APITestBase):
             else:
                 paddle.set_device(f"{device_type}:{device_id}")
 
-            if not self.gen_paddle_input():
-                print(f"gen_paddle_input failed on {device_type}", flush=True)
+            if not self.build_paddle_input():
+                print(f"build_paddle_input failed on {device_type}", flush=True)
                 return None, None
 
             # Forward
@@ -244,8 +244,8 @@ class APITestCustomDeviceVSCPU(APITestBase):
 
         # 4. Generate Numpy input data
         try:
-            if not self.gen_numpy_input():
-                self.report_case_result("config_input", "gen_numpy_input failed")
+            if not self.gen_input_data():
+                self.report_case_result("config_input", "gen_input_data failed")
                 return
         except Exception as err:
             log_type, fatal = self.report_runtime_error(err, "config_input", "input")

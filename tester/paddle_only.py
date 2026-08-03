@@ -109,8 +109,8 @@ class APITestPaddleOnly(APITestBase):
 
         try:
             self.dump_event("numpy_input_start")
-            if not self.gen_numpy_input():
-                self.report_case_result("config_input", "gen_numpy_input failed")
+            if not self.gen_input_data():
+                self.report_case_result("config_input", "gen_input_data failed")
                 self._finalize_paddle_only("config_input")
                 return
             self.dump_event("numpy_input_done")
@@ -122,8 +122,8 @@ class APITestPaddleOnly(APITestBase):
 
         try:
             self.dump_event("paddle_input_start")
-            if not self.gen_paddle_input():
-                self.report_case_result("paddle_error", "gen_paddle_input failed")
+            if not self.build_paddle_input():
+                self.report_case_result("paddle_error", "build_paddle_input failed")
                 self._finalize_paddle_only("paddle_error")
                 return
             self.dump_save(

@@ -4,8 +4,8 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 
-from .input_bind import build_input_context
-from .registry import API_RULE_REGISTRY, DEFAULT_INPUT_GENERATION_RULE
+from .input_binding import build_input_context
+from .input_registry import API_RULE_REGISTRY, DEFAULT_INPUT_GENERATION_RULE
 
 
 def dispatch_input(

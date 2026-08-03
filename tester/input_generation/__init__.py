@@ -1,12 +1,13 @@
 """输入生成、配置与物化的基础原语。"""
 
-from .generation_backend import (
-    GenerationBackend,
-    NumpyGenerationBackend,
-    TorchGenerationBackend,
-    create_generation_backend,
+from .input_backend import (
+    InputBackend,
+    NumpyInputBackend,
+    PaddleInputBackend,
+    TorchInputBackend,
+    create_input_backend,
 )
-from .input_values import InputValue
+from .input_data import InputData
 from .tensor_config import (
     USE_CACHED_NUMPY,
     TensorConfig,
@@ -17,11 +18,12 @@ from .tensor_config import (
 __all__ = [
     "USE_CACHED_NUMPY",
     "TensorConfig",
-    "InputValue",
-    "GenerationBackend",
-    "NumpyGenerationBackend",
-    "TorchGenerationBackend",
-    "create_generation_backend",
+    "InputData",
+    "InputBackend",
+    "NumpyInputBackend",
+    "PaddleInputBackend",
+    "TorchInputBackend",
+    "create_input_backend",
     "cached_numpy",
     "get_cached_numpy_array",
 ]

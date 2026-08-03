@@ -12,11 +12,12 @@ import yaml
 
 from .dtype_utils import to_torch_dtype
 from .dump_writer import DEFAULT_DUMP_DIR, DumpContext, dump_enabled
-from .input_generation.input_bind import (
+from .input_generation.input_backend import create_input_backend
+from .input_generation.input_binding import (
     bind_parameters,
     get_arg,
 )
-from .input_generation.input_values import input_value
+from .input_generation.input_data import input_value, write_input_value
 from .input_generation.tensor_config import (
     TensorConfig,
     get_cached_numpy_array,
@@ -691,42 +692,45 @@ class APITestBase:
                 raise ValueError(f"Invalid item type for axis: {type(item)}")
 
         if tensor_configs:
+            backend = create_input_backend()
             available_dims = list(set(range(max_dim)) - used_axes)
             if len(available_dims) < len(tensor_configs):
                 raise ValueError(
                     f"Not enough available dimensions ({len(available_dims)}) for {len(tensor_configs)} TensorConfig items"
                 )
-            selected_dims = numpy.random.choice(
-                available_dims, size=len(tensor_configs), replace=False
-            )
-            mask = numpy.random.randint(0, 2, size=len(tensor_configs)).astype(bool)
-            final_dims = numpy.where(mask, selected_dims - max_dim, selected_dims)
+            selected_dims = backend.choice(available_dims, size=len(tensor_configs), replace=False)
+            mask = backend.cast(backend.randint(0, 2, size=len(tensor_configs)), "bool")
+            final_dims = backend.where(mask, selected_dims - max_dim, selected_dims)
             tensor_idx = 0
             for i, item in enumerate(config_items):
                 if isinstance(item, TensorConfig):
-                    item.fill_numpy_tensor(final_dims[tensor_idx])
+                    write_input_value(
+                        self.api_config,
+                        item,
+                        backend.full(item.shape, final_dims[tensor_idx], dtype=item.dtype),
+                    )
                     tmp[i] = input_value(self.api_config, item)
                     tensor_idx += 1
         return tuple(tmp) if is_tuple else tmp
 
-    def _generate_int_indices(self, item_shape, dim_size):
-        num_elements = numpy.prod(item_shape).item()
+    def _generate_int_indices(self, item_shape, dim_size, backend):
+        num_elements = backend.prod(item_shape)
         if num_elements > dim_size:
-            indices_flat = numpy.random.randint(-dim_size, dim_size, size=num_elements)
+            indices_flat = backend.randint(-dim_size, dim_size, size=num_elements)
         else:
-            indices_flat = numpy.random.choice(dim_size, size=num_elements, replace=False)
-        return indices_flat.reshape(item_shape)
+            indices_flat = backend.choice(dim_size, size=num_elements, replace=False)
+        return backend.reshape(indices_flat, item_shape)
 
-    def _generate_constrained_bool_mask(self, shape, num_true):
-        mask_size = numpy.prod(shape).item()
+    def _generate_constrained_bool_mask(self, shape, num_true, backend):
+        mask_size = backend.prod(shape)
         if mask_size < num_true:
             raise ValueError(
                 f"Cannot generate a mask with {num_true} true values in a {mask_size} element mask"
             )
-        mask_flat = numpy.zeros(mask_size, dtype="bool")
-        true_indices = numpy.random.choice(mask_size, num_true, replace=False)
+        mask_flat = backend.zeros(mask_size, dtype="bool")
+        true_indices = backend.choice(mask_size, num_true, replace=False)
         mask_flat[true_indices] = True
-        return mask_flat.reshape(shape)
+        return backend.reshape(mask_flat, shape)
 
     def _broadcast_or_raise(self, shapes):
         return numpy.broadcast_shapes(*[tuple(s) for s in shapes])
@@ -800,28 +804,32 @@ class APITestBase:
             )
         processed_indices = []
         x_dim_cursor = 0
+        backend = create_input_backend()
         for item in config_items:
             if item.dtype == "bool":
                 if num_true_needed < 0:
                     raise ValueError(
                         "Cannot determine the number of True elements for the boolean mask."
                     )
-                item.numpy_tensor = self._generate_constrained_bool_mask(
-                    item.shape, num_true_needed
+                index_value = self._generate_constrained_bool_mask(
+                    item.shape,
+                    num_true_needed,
+                    backend,
                 )
                 x_dim_cursor += len(item.shape)
             else:
                 x_dim_to_index = x_shape[x_dim_cursor]
-                indices = self._generate_int_indices(item.shape, x_dim_to_index)
-                item.numpy_tensor = indices.astype(item.dtype)
+                indices = self._generate_int_indices(item.shape, x_dim_to_index, backend)
+                index_value = backend.cast(indices, item.dtype)
                 x_dim_cursor += 1
 
-            processed_indices.append(item.numpy_tensor)
+            write_input_value(self.api_config, item, index_value)
+            processed_indices.append(input_value(self.api_config, item))
 
         return tuple(processed_indices) if is_tuple else processed_indices
 
-    def gen_numpy_input(self):
-        from .input_generation.dispatch import dispatch_input
+    def gen_input_data(self):
+        from .input_generation.input_dispatch import dispatch_input
 
         return dispatch_input(self)
 
@@ -844,11 +852,11 @@ class APITestBase:
             )
         return config_value
 
-    def gen_paddle_input(self):
+    def build_paddle_input(self):
         """Generate Paddle inputs from config and materialize TensorConfig leaves.
 
-        Call gen_numpy_input() first because gen_paddle_input() does not pass
-        index or key to get_paddle_tensor() or get_numpy_tensor().
+        Call gen_input_data() first because build_paddle_input() only materializes
+        TensorConfig leaves and does not generate logical input values.
         """
         self.paddle_args = []
         self.paddle_kwargs = collections.OrderedDict()
@@ -1261,11 +1269,11 @@ class APITestBase:
             return self.to_torch_dtype(config_value)
         return config_value
 
-    def gen_torch_input(self):
+    def build_torch_input(self):
         """Generate Torch inputs from config and materialize TensorConfig leaves.
 
-        Call gen_numpy_input() first because gen_torch_input() does not pass
-        index or key to get_torch_tensor() or get_numpy_tensor().
+        Call gen_input_data() first because build_torch_input() only materializes
+        TensorConfig leaves and does not generate logical input values.
         """
         self.torch_args = []
         self.torch_kwargs = collections.OrderedDict()

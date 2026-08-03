@@ -701,8 +701,8 @@ class APITestPaddleTorchGPUPerformance(APITestBase):
         torch_backward_sync = None
 
         try:
-            if not self.gen_numpy_input():
-                self.report_case_result("config_input", "gen_numpy_input failed")
+            if not self.gen_input_data():
+                self.report_case_result("config_input", "gen_input_data failed")
                 return
         except Exception as err:
             log_type, fatal = self.report_runtime_error(err, "config_input", "input")
@@ -711,8 +711,8 @@ class APITestPaddleTorchGPUPerformance(APITestBase):
             return
 
         try:
-            if not self.gen_paddle_input():
-                self.report_case_result("paddle_error", "gen_paddle_input failed")
+            if not self.build_paddle_input():
+                self.report_case_result("paddle_error", "build_paddle_input failed")
                 return
 
             if self.test_amp:
@@ -812,8 +812,8 @@ class APITestPaddleTorchGPUPerformance(APITestBase):
         try:
             device = torch.device("cuda:0")
             torch.set_default_device(device)
-            if not self.gen_torch_input():
-                self.report_case_result("torch_error", "gen_torch_input failed")
+            if not self.build_torch_input():
+                self.report_case_result("torch_error", "build_torch_input failed")
                 return
 
             # torch_args 与 torch_kwargs 是尚未映射的 torch 参数（即按 paddle 的参数顺序与关键字排列的 torch tensors）

@@ -10,9 +10,9 @@ from pathlib import Path
 
 import yaml
 
-from .input_path import InputPath
 from .tensor_config import TensorConfig
-from .tensor_view import TensorView
+from .tensor_path import TensorPath
+from .tensor_spec import TensorSpec
 
 BASE_CONFIG = Path(__file__).resolve().parents[1] / "base_config.yaml"
 
@@ -140,19 +140,19 @@ def get_arg(api_config, position, name, default=None):
 
 @dataclass(frozen=True)
 class ParameterBinding:
-    path: InputPath
+    path: TensorPath
     parameter_name: str | None
 
 
 @dataclass(frozen=True)
 class TensorBinding:
-    path: InputPath
+    path: TensorPath
     parameter_name: str | None
-    spec: TensorView
+    spec: TensorSpec
 
 
 @dataclass(frozen=True)
-class BoundInput:
+class InputBinding:
     """规则侧看到的一次 APIConfig 绑定结果。"""
 
     api_name: str
@@ -176,10 +176,10 @@ class BoundInput:
 
 
 @dataclass(frozen=True)
-class InputGenerationContext:
+class InputContext:
     """一次生成 case 的运行时上下文。"""
 
-    call: BoundInput
+    call: InputBinding
     config_fingerprint: str
     seed: int
     use_torch: bool
@@ -385,7 +385,7 @@ def _path_parameters(api_config, arguments):
         names = [name for name, bound in arguments.items() if _contains_identity(bound, value)]
         bindings.append(
             ParameterBinding(
-                path=InputPath.positional(index),
+                path=TensorPath.positional(index),
                 parameter_name=names[0] if len(names) == 1 else None,
             )
         )
@@ -393,7 +393,7 @@ def _path_parameters(api_config, arguments):
         names = [name for name, bound in arguments.items() if _contains_identity(bound, value)]
         bindings.append(
             ParameterBinding(
-                path=InputPath.keyword(key),
+                path=TensorPath.keyword(key),
                 parameter_name=names[0] if len(names) == 1 else key,
             )
         )
@@ -444,13 +444,13 @@ class SignatureResolver:
 
 
 def _walk_tensors(value, path, parameter_name, output):
-    # 嵌套 TensorConfig 列表保留顶层参数名，但会扩展 InputPath。
+    # 嵌套 TensorConfig 列表保留顶层参数名，但会扩展 TensorPath。
     if isinstance(value, TensorConfig):
         output.append(
             TensorBinding(
                 path=path,
                 parameter_name=parameter_name,
-                spec=TensorView.from_tensor_config(value),
+                spec=TensorSpec.from_tensor_config(value),
             )
         )
         return
@@ -460,7 +460,7 @@ def _walk_tensors(value, path, parameter_name, output):
 
 
 def bind_input(api_config, resolver=None):
-    # `BoundInput` 是规则层唯一应该直接读取的绑定对象。
+    # `InputBinding` 是规则层唯一应该直接读取的绑定对象。
     resolver = resolver or SignatureResolver()
     resolution = resolver.resolve(api_config)
     parameter_by_path = {
@@ -468,12 +468,12 @@ def bind_input(api_config, resolver=None):
     }
     tensors = []
     for index, value in enumerate(api_config.args):
-        path = InputPath.positional(index)
+        path = TensorPath.positional(index)
         _walk_tensors(value, path, parameter_by_path.get(path), tensors)
     for key, value in api_config.kwargs.items():
-        path = InputPath.keyword(key)
+        path = TensorPath.keyword(key)
         _walk_tensors(value, path, parameter_by_path.get(path), tensors)
-    return BoundInput(
+    return InputBinding(
         api_name=api_config.api_name,
         binding_source=resolution.source,
         parameter_bindings=resolution.path_parameters,
@@ -490,7 +490,7 @@ def build_input_context(
     gpu_enabled=False,
 ):
     call = bind_input(api_config, resolver=resolver)
-    return InputGenerationContext.create(
+    return InputContext.create(
         call=call,
         config_text=api_config.config,
         seed=seed,

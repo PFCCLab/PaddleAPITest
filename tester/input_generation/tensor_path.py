@@ -6,10 +6,10 @@ from dataclasses import dataclass
 
 
 @dataclass(frozen=True)
-class InputPath:
+class TensorPath:
     """一次 API 调用中 Tensor 的稳定路径。"""
 
-    # 这个路径不受 TensorConfig 可变字段影响，规则和 payload 都依赖它。
+    # 这个路径不受 TensorConfig 可变字段影响，规则和输入数据都依赖它。
     root: str
     key: int | str
     indices: tuple[int, ...] = ()
@@ -35,10 +35,10 @@ class InputPath:
         return cls("kwargs", name, tuple(indices))
 
     def child(self, index):
-        return InputPath(self.root, self.key, (*self.indices, index))
+        return TensorPath(self.root, self.key, (*self.indices, index))
 
     def top_level(self):
-        return InputPath(self.root, self.key)
+        return TensorPath(self.root, self.key)
 
     def __str__(self):
         value = f"args[{self.key}]" if self.root == "args" else f"kwargs.{self.key}"

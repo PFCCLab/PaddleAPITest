@@ -241,11 +241,11 @@ class APITestAccuracy(APITestBase):
         self.dump_event("config_convert_done")
         return convert_result
 
-    def _generate_numpy_inputs(self):
+    def _gen_input_data(self):
         try:
             self.dump_event("numpy_input_start")
-            if not self.gen_numpy_input():
-                self.report_case_result("config_input", "gen_numpy_input failed")
+            if not self.gen_input_data():
+                self.report_case_result("config_input", "gen_input_data failed")
                 self.dump_finalize("config_input")
                 return False
             self.dump_event("numpy_input_done")
@@ -262,8 +262,8 @@ class APITestAccuracy(APITestBase):
             device = torch.device("cuda:0")
             torch.set_default_device(device)
             self.dump_event("torch_input_start")
-            if not self.gen_torch_input():
-                self.report_case_result("torch_error", "gen_torch_input failed")
+            if not self.build_torch_input():
+                self.report_case_result("torch_error", "build_torch_input failed")
                 self.dump_finalize("torch_error")
                 return False, None, None, False
             self.dump_save(
@@ -425,8 +425,8 @@ class APITestAccuracy(APITestBase):
 
     def get_paddle_output(self):
         try:
-            if not self.gen_paddle_input():
-                self.report_case_result("paddle_error", "gen_paddle_input failed")
+            if not self.build_paddle_input():
+                self.report_case_result("paddle_error", "build_paddle_input failed")
                 self.dump_finalize("paddle_error")
                 return False, None
 
@@ -533,7 +533,7 @@ class APITestAccuracy(APITestBase):
         convert_result = self._convert_api()
         if convert_result is None:
             return
-        if not self._generate_numpy_inputs():
+        if not self._gen_input_data():
             return
         probe_bytes = self.estimate_input_bytes()
 

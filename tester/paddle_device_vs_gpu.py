@@ -157,12 +157,12 @@ class APITestPaddleDeviceVSGPU(APITestCustomDeviceVSCPU):
                 self.report_case_result("config_parse", "ana_paddle_api_info failed")
                 return None, None
 
-            if not self.gen_numpy_input():
-                self.report_case_result("config_input", "gen_numpy_input failed")
+            if not self.gen_input_data():
+                self.report_case_result("config_input", "gen_input_data failed")
                 return None, None
 
-            if not self.gen_paddle_input():
-                self.report_case_result("paddle_error", "gen_paddle_input failed")
+            if not self.build_paddle_input():
+                self.report_case_result("paddle_error", "build_paddle_input failed")
                 return None, None
 
             paddle_output = self.paddle_api(*tuple(self.paddle_args), **self.paddle_kwargs)
