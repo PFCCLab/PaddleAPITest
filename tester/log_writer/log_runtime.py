@@ -13,7 +13,6 @@ from .log_schema import LOG_PREFIXES, LogType
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 TEST_LOG_PATH = PROJECT_ROOT / "tester/api_config/test_log"
-TEST_LOG_PATH.mkdir(parents=True, exist_ok=True)
 TMP_LOG_PATH = TEST_LOG_PATH / ".tmp"
 RESULT_LOG_PATH = TEST_LOG_PATH
 RESULT_LOG_SUFFIX = ""
@@ -70,6 +69,7 @@ def default_log_dir(*, single=False):
 def configure_direct_results(log_id):
     """配置历史单进程引擎使用的主结果文件后缀。"""
     global RESULT_LOG_PATH, RESULT_LOG_SUFFIX, MAIN_LOG_SUFFIX
+    TEST_LOG_PATH.mkdir(parents=True, exist_ok=True)
     suffix = f"_{log_id}" if log_id and not log_id.startswith("_") else log_id
     RESULT_LOG_PATH = TEST_LOG_PATH
     RESULT_LOG_SUFFIX = suffix

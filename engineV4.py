@@ -180,6 +180,10 @@ MAX_EXTERNAL_KILL_RETRIES_PER_CASE = 1
 MAX_TOTAL_EXTERNAL_KILL_EVENTS = 3
 # 初始 warmup 与单个 slot 复活共用的启动超时预算。
 WORKER_STARTUP_TIMEOUT = 180
+FORECAST_MIN_INTERVAL_SECONDS = 60
+FORECAST_MAX_INTERVAL_SECONDS = 30 * 60
+FORECAST_TARGET_CASES = 100
+FORECAST_INITIAL_MAX_WAIT_SECONDS = 5 * 60
 
 
 @dataclass
@@ -196,6 +200,9 @@ class BatchRunState:
     shutdown_force: bool = False
     abort_run: bool = False
     active_tasks: int = 0
+    test_started_at: float | None = None
+    last_forecast_at: float | None = None
+    last_forecast_case: int = 0
 
 
 @dataclass
@@ -1561,6 +1568,7 @@ def _handle_batch_result(
     pool,
     options,
     all_case,
+    checkpointed_case,
     batch_state,
     retry_state,
     pending_dispatch,
@@ -1654,12 +1662,44 @@ def _handle_batch_result(
         or progress_status != "DONE"
     ):
         log_report.print_case_progress(
-            batch_state.tested_case,
-            all_case,
+            checkpointed_case + batch_state.tested_case,
+            checkpointed_case + all_case,
             progress_status,
             config,
             progress_detail,
         )
+
+    if (
+        options.show_runtime_status
+        and batch_state.tested_case < all_case
+        and batch_state.test_started_at is not None
+        and batch_state.last_forecast_at is not None
+    ):
+        now = time.monotonic()
+        elapsed = now - batch_state.test_started_at
+        rate = batch_state.tested_case / elapsed
+        if batch_state.last_forecast_case == 0:
+            forecast_due = elapsed >= FORECAST_MIN_INTERVAL_SECONDS and (
+                batch_state.tested_case >= FORECAST_TARGET_CASES
+                or elapsed >= FORECAST_INITIAL_MAX_WAIT_SECONDS
+            )
+        else:
+            forecast_interval = max(
+                FORECAST_MIN_INTERVAL_SECONDS,
+                min(FORECAST_MAX_INTERVAL_SECONDS, FORECAST_TARGET_CASES / rate),
+            )
+            forecast_due = now - batch_state.last_forecast_at >= forecast_interval
+        if forecast_due:
+            eta = (all_case - batch_state.tested_case) / rate
+            log_report.print_batch_forecast(
+                checkpointed_case + batch_state.tested_case,
+                checkpointed_case + all_case,
+                rate,
+                elapsed,
+                eta,
+            )
+            batch_state.last_forecast_at = now
+            batch_state.last_forecast_case = batch_state.tested_case
 
     log_worker.write_to_log("checkpoint", config)
 
@@ -1684,6 +1724,7 @@ def _run_batch_mode(
     options,
     api_configs,
     all_case,
+    checkpointed_case,
     available_gpus,
     max_workers_per_gpu,
     start_time,
@@ -1753,6 +1794,9 @@ def _run_batch_mode(
         # 先把当前已经空闲的 worker 填满，让首轮尽快开始。
         if not batch_state.abort_run:
             refill_idle_workers()
+            if batch_state.active_tasks:
+                batch_state.test_started_at = time.monotonic()
+                batch_state.last_forecast_at = batch_state.test_started_at
 
         # 主循环只负责收消息、补空闲 worker、以及把结果交给专门的处理逻辑。
         while (batch_state.active_tasks > 0 or pending_dispatch) and not batch_state.abort_run:
@@ -1768,6 +1812,7 @@ def _run_batch_mode(
                         pool=pool,
                         options=options,
                         all_case=all_case,
+                        checkpointed_case=checkpointed_case,
                         batch_state=batch_state,
                         retry_state=retry_state,
                         pending_dispatch=pending_dispatch,
@@ -2280,6 +2325,7 @@ def _run_batch_case_mode(options, start_time):
         options=options,
         api_configs=api_configs,
         all_case=all_case,
+        checkpointed_case=batch_configs.finish_case,
         available_gpus=available_gpus,
         max_workers_per_gpu=max_workers_per_gpu,
         start_time=start_time,

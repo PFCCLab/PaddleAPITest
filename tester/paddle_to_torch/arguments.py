@@ -17,24 +17,21 @@ with (Path(__file__).parent.parent / "base_config.yaml").open(encoding="utf-8") 
 _TENSOR_BINARY_METHODS = tuple(_BASE_CONFIG.get("single_op_no_signature_apis", ()))
 del _BASE_CONFIG
 
-_COPS_PUBLIC_ALIASES = MappingProxyType(
-    {
-        "paddle._C_ops.add_": "paddle.add",
-        "paddle._C_ops.bitwise_not": "paddle.bitwise_not",
-        "paddle._C_ops.clip": "paddle.clip",
-        "paddle._C_ops.concat": "paddle.concat",
-        "paddle._C_ops.flatten_": "paddle.flatten",
-        "paddle._C_ops.matmul": "paddle.matmul",
-        "paddle._C_ops.multiply_": "paddle.multiply",
-        "paddle._C_ops.numel": "paddle.numel",
-        "paddle._C_ops.put_along_axis_": "paddle.put_along_axis",
-        "paddle._C_ops.reshape_": "paddle.reshape",
-        "paddle._C_ops.scale_": "paddle.scale",
-        "paddle._C_ops.subtract_": "paddle.subtract",
-        "paddle._C_ops.transpose": "paddle.transpose",
-        "paddle._C_ops.uniform": "paddle.uniform",
-    }
-)
+_COPS_PUBLIC_ALIASES = {
+    "paddle._C_ops.add_": "paddle.add",
+    "paddle._C_ops.bitwise_not": "paddle.bitwise_not",
+    "paddle._C_ops.clip": "paddle.clip",
+    "paddle._C_ops.concat": "paddle.concat",
+    "paddle._C_ops.flatten_": "paddle.flatten",
+    "paddle._C_ops.matmul": "paddle.matmul",
+    "paddle._C_ops.multiply_": "paddle.multiply",
+    "paddle._C_ops.numel": "paddle.numel",
+    "paddle._C_ops.put_along_axis_": "paddle.put_along_axis",
+    "paddle._C_ops.reshape_": "paddle.reshape",
+    "paddle._C_ops.scale_": "paddle.scale",
+    "paddle._C_ops.subtract_": "paddle.subtract",
+    "paddle._C_ops.transpose": "paddle.transpose",
+}
 
 _MANUAL_ARGUMENT_NAMES = {
     f"paddle.Tensor.{method}": ("self", "y") for method in _TENSOR_BINARY_METHODS
@@ -66,7 +63,7 @@ _MANUAL_ARGUMENT_NAMES.update(
             "use_global_beta_pow",
             "amsgrad",
         ),
-        "paddle._C_ops.full_": ("x", "shape", "value", "dtype"),
+        "paddle._C_ops.full_": ("x", "shape", "value", "dtype", "place"),
         "paddle._C_ops.fused_linear_param_grad_add": (
             "x",
             "dout",
@@ -75,7 +72,7 @@ _MANUAL_ARGUMENT_NAMES.update(
             "multi_precision",
             "has_bias",
         ),
-        "paddle._C_ops.gaussian": ("shape", "mean", "std", "seed", "dtype"),
+        "paddle._C_ops.gaussian": ("shape", "mean", "std", "seed", "dtype", "place"),
         "paddle._C_ops.matmul_grad": (
             "x",
             "y",
@@ -92,10 +89,29 @@ _MANUAL_ARGUMENT_NAMES.update(
             "arg3",
             "arg4",
         ),
+        "paddle._C_ops.uniform": ("shape", "dtype", "min", "max", "seed", "place"),
     }
 )
 MANUAL_ARGUMENT_NAMES = MappingProxyType(_MANUAL_ARGUMENT_NAMES)
 del _MANUAL_ARGUMENT_NAMES
+
+_MANUAL_ARGUMENT_DEFAULTS = {
+    "paddle._C_ops._run_custom_op": {
+        "arg1": None,
+        "arg2": None,
+        "arg3": None,
+        "arg4": None,
+    },
+    "paddle._C_ops.full_": {"place": None},
+    "paddle._C_ops.gaussian": {"place": None},
+    "paddle._C_ops.uniform": {
+        "dtype": None,
+        "min": 0,
+        "max": 1.0,
+        "seed": 0,
+        "place": None,
+    },
+}
 
 _SIGNATURE_CACHE: dict[str, inspect.Signature | None] = {}
 
@@ -124,47 +140,45 @@ def _signature_for(api_name: str, api: Callable[..., Any] | Any | None) -> inspe
 
 
 def _bind_manual_arguments(
+    api_name: str,
     names: Sequence[str],
     positional: Sequence[Any],
     keyword: Mapping[str, Any],
 ) -> OrderedDict[str, Any]:
-    return OrderedDict(
-        (
-            name,
-            positional[index] if index < len(positional) else keyword.get(name),
-        )
-        for index, name in enumerate(names)
+    defaults = _MANUAL_ARGUMENT_DEFAULTS.get(api_name, {})
+    signature = inspect.Signature(
+        parameters=[
+            inspect.Parameter(
+                name,
+                inspect.Parameter.POSITIONAL_OR_KEYWORD,
+                default=defaults.get(name, inspect.Parameter.empty),
+            )
+            for name in names
+        ]
     )
+    bound = signature.bind(*positional, **keyword)
+    bound.apply_defaults()
+    return OrderedDict(bound.arguments)
 
 
-def _normalize_tensor_self_argument(
-    api_name: str, bound: OrderedDict[str, Any]
-) -> OrderedDict[str, Any]:
+def _normalize_tensor_self_argument(api_name: str, bound: OrderedDict[str, Any]) -> None:
     if not api_name.startswith("paddle.Tensor."):
-        return bound
+        return
     if "self" in bound:
         receiver_name = "self"
     elif "x" not in bound and bound:
         receiver_name = next(iter(bound))
     else:
-        return bound
+        return
     if receiver_name != "x":
         bound["x"] = bound.pop(receiver_name)
         bound.move_to_end("x", last=False)
-    return bound
 
 
-def _normalize_torch_dtype(value: Any) -> Any:
-    return to_torch_dtype(value, strict=False)
-
-
-def _normalize_dtype_arguments(bound: OrderedDict[str, Any]) -> OrderedDict[str, Any]:
+def _normalize_dtype_arguments(bound: OrderedDict[str, Any]) -> None:
     for name, value in tuple(bound.items()):
-        if "dtype" in name:
-            bound[name] = _normalize_torch_dtype(value)
-        elif isinstance(value, paddle.dtype):
-            bound[name] = _normalize_torch_dtype(value)
-    return bound
+        if "dtype" in name or isinstance(value, paddle.dtype):
+            bound[name] = to_torch_dtype(value, strict=False)
 
 
 def _finalize_bound_arguments(api_name: str, bound: OrderedDict[str, Any]) -> OrderedDict[str, Any]:
@@ -179,11 +193,15 @@ def bind_paddle_arguments(
     keyword: Mapping[str, Any],
     *,
     api: Callable[..., Any] | Any | None = None,
-) -> OrderedDict[str, Any] | None:
+) -> OrderedDict[str, Any]:
     """Bind one Paddle invocation to the named inputs used by generated Torch code."""
     if api_name in ("paddle.Tensor.view", "paddle.view"):
         rest = positional[1:]
         if len(rest) > 1 and all(isinstance(value, int) for value in rest):
+            unexpected = set(keyword) - {"name"}
+            if unexpected:
+                names = ", ".join(sorted(unexpected))
+                raise TypeError(f"got unexpected keyword arguments: {names}")
             return _finalize_bound_arguments(
                 api_name,
                 OrderedDict(x=positional[0], shape_or_dtype=list(rest)),
@@ -192,6 +210,10 @@ def bind_paddle_arguments(
     if api_name in ("paddle.Tensor.reshape", "paddle.reshape"):
         rest = positional[1:]
         if rest and all(isinstance(value, int) for value in rest):
+            unexpected = set(keyword) - {"name"}
+            if unexpected:
+                names = ", ".join(sorted(unexpected))
+                raise TypeError(f"got unexpected keyword arguments: {names}")
             return _finalize_bound_arguments(
                 api_name,
                 OrderedDict(x=positional[0], shape=list(rest)),
@@ -201,25 +223,22 @@ def bind_paddle_arguments(
     if manual_names is not None:
         return _finalize_bound_arguments(
             api_name,
-            _bind_manual_arguments(manual_names, positional, keyword),
+            _bind_manual_arguments(api_name, manual_names, positional, keyword),
         )
 
     signature = _signature_for(api_name, api)
     if signature is None:
         alias_name = _COPS_PUBLIC_ALIASES.get(api_name)
         if alias_name is None:
-            return None
+            raise ValueError(f"API {api_name} has no argument binding contract")
         signature = _signature_for(alias_name, None)
         if signature is None:
             raise ValueError(f"API {alias_name} has no inspectable signature")
-        positional_count = sum(
-            parameter.kind in (parameter.POSITIONAL_ONLY, parameter.POSITIONAL_OR_KEYWORD)
-            for parameter in signature.parameters.values()
+        signature = signature.replace(
+            parameters=[
+                parameter for parameter in signature.parameters.values() if parameter.name != "name"
+            ]
         )
-        valid_names = set(signature.parameters)
-        keyword = {name: value for name, value in keyword.items() if name in valid_names}
-        positional = positional[:positional_count]
-
     bound_arguments = signature.bind(*positional, **keyword)
     bound_arguments.apply_defaults()
     bound = OrderedDict(bound_arguments.arguments)

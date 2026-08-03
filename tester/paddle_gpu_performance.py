@@ -4,43 +4,7 @@ import time
 
 import paddle
 
-from .base import APITestBase
-from .input_generation.tensor_config import TensorConfig
-
-
-def tensor_numel(tensor_config):
-    numel = 1
-    for i in tensor_config.shape:
-        numel = numel * i
-    return numel
-
-
-def get_tensor_configs(api_config):
-    tensor_configs = []
-    for arg_config in api_config.args:
-        if isinstance(arg_config, TensorConfig):
-            tensor_configs.append(arg_config)
-        elif isinstance(arg_config, (list, tuple)):
-            for j in range(len(arg_config)):
-                if isinstance(arg_config[j], TensorConfig):
-                    tensor_configs.append(arg_config[j])
-
-    for _key, arg_config in api_config.kwargs.items():
-        if isinstance(arg_config, TensorConfig):
-            tensor_configs.append(arg_config)
-        elif isinstance(arg_config, (list, tuple)):
-            for j in range(len(arg_config)):
-                if isinstance(arg_config[j], TensorConfig):
-                    tensor_configs.append(arg_config[j])
-    return tensor_configs
-
-
-def total_numel(api_config):
-    tensor_configs = get_tensor_configs(api_config)
-    numel = 0
-    for tensor_config in tensor_configs:
-        numel = numel + tensor_numel(tensor_config)
-    return numel
+from .base import APITestBase, total_tensor_numel
 
 
 class APITestPaddleGPUPerformance(APITestBase):
@@ -71,7 +35,7 @@ class APITestPaddleGPUPerformance(APITestBase):
             if not self.build_paddle_input():
                 self.report_case_result("paddle_error", "build_paddle_input failed")
                 return
-            numel = total_numel(self.api_config)
+            numel = total_tensor_numel(self.api_config)
             test_loop = 2147483647 * 20 // numel
             if self.test_amp:
                 with paddle.amp.auto_cast():

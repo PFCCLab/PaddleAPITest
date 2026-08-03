@@ -272,6 +272,15 @@ PaddleAPITest/
 
 ## 开发与扩展
 
+### 开发检查
+
+安装 `pre-commit` 后，每次提交会检查新增的 Python 和 Shell 源码行。新增的非空行中，注释行占比必须至少为 10%；`.txt`、`.yaml`、`.yml`、文档和其他非源码文件不参与统计。检查只计算本次提交新增的行，因此不会被历史代码的注释比例阻塞。
+
+```bash
+pre-commit install
+pre-commit run check-added-comment-ratio
+```
+
 - 新增 Paddle/Torch 映射或 Rule：参见 [Paddle2Torch 文档](tester/paddle_to_torch/README.md)。
 - 采集 API 调用配置：参见 [API Tracer 文档](tools/api_tracer/README.md)。
 - 整理配置、checkpoint 或错误日志：参见 [Tools 文档](tools/README.md)。

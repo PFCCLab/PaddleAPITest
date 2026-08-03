@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import re
 import threading
 import time
 import types
@@ -17,36 +16,59 @@ from .config import (
     select_implementation,
 )
 
-_WORKSPACE_BYTES_RE = re.compile(r"^(?P<indent>[ \t]*)_workspace_bytes = \d+ << 30$", re.MULTILINE)
 _WORKSPACE_PROBE_TTL = 0.25
-_WORKSPACE_PROBE_CACHE: dict[tuple[int | None, int], tuple[float, int]] = {}
+_WORKSPACE_PROBE_CACHE: dict[tuple[str | None, int], tuple[float, int]] = {}
 _WORKSPACE_PROBE_LOCK = threading.Lock()
 _RULE_REGISTRY: dict[str, type] = {}
 _RULE_REGISTRY_VIEW = MappingProxyType(_RULE_REGISTRY)
 _RULE_REGISTRY_FROZEN = False
 
 
-def adaptive_workspace_bytes(torch_module) -> int:
+def adaptive_workspace_bytes(
+    torch_module, execution_values: Mapping[str, Any] | None = None
+) -> int:
     """Return a cached, free-memory-aware workspace size for generated code."""
     workers_on_gpu = read_workers_on_gpu()
-    try:
-        device = int(torch_module.cuda.current_device())
-    except Exception:
-        device = None
-    cache_key = (device, workers_on_gpu)
+
+    def find_cuda_device(value, seen: set[int]):
+        value_id = id(value)
+        if value_id in seen:
+            return None
+        seen.add(value_id)
+        if torch_module.is_tensor(value):
+            return value.device if value.is_cuda else None
+        if isinstance(value, Mapping):
+            for nested in value.values():
+                device = find_cuda_device(nested, seen)
+                if device is not None:
+                    return device
+        elif isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
+            for nested in value:
+                device = find_cuda_device(nested, seen)
+                if device is not None:
+                    return device
+        return None
+
+    device = find_cuda_device(execution_values, set()) if execution_values is not None else None
+    if device is None:
+        try:
+            device = torch_module.cuda.current_device()
+        except Exception:
+            device = None
+    cache_device = str(device) if device is not None else None
+    cache_key = (cache_device, workers_on_gpu)
     now = time.monotonic()
     with _WORKSPACE_PROBE_LOCK:
         cached = _WORKSPACE_PROBE_CACHE.get(cache_key)
         if cached is not None and now - cached[0] < _WORKSPACE_PROBE_TTL:
             return cached[1]
-    try:
-        free_bytes, _ = torch_module.cuda.mem_get_info()
-        workspace = min(
-            32 << 30,
-            max(256 << 20, int(free_bytes) // (5 * workers_on_gpu)),
-        )
-    except Exception:
-        workspace = 8 << 30
+    workspace = 1
+    if device is not None:
+        try:
+            free_bytes, _ = torch_module.cuda.mem_get_info(device)
+            workspace = max(1, min(32 << 30, int(free_bytes) // (5 * workers_on_gpu)))
+        except Exception:
+            pass
     with _WORKSPACE_PROBE_LOCK:
         cached = _WORKSPACE_PROBE_CACHE.get(cache_key)
         if cached is not None and now - cached[0] < _WORKSPACE_PROBE_TTL:
@@ -62,6 +84,7 @@ class Code:
     preprocess: Sequence[str] = field(default_factory=tuple)
     core: Sequence[str] = field(default_factory=tuple)
     postprocess: Sequence[str] = field(default_factory=tuple)
+    workspace_required: bool = False
     preprocess_compiled: types.CodeType | None = field(init=False, default=None)
     core_compiled: types.CodeType | None = field(init=False, default=None)
     postprocess_compiled: types.CodeType | None = field(init=False, default=None)
@@ -82,16 +105,11 @@ class Code:
             self._compile(self.postprocess, "postprocess"),
         )
 
-    @classmethod
-    def _compile(cls, code_lines: Sequence[str], stage: str) -> types.CodeType | None:
+    @staticmethod
+    def _compile(code_lines: Sequence[str], stage: str) -> types.CodeType | None:
         if not code_lines:
             return None
-        source = _WORKSPACE_BYTES_RE.sub(
-            lambda match: (
-                f"{match.group('indent')}_workspace_bytes = _adaptive_workspace_bytes(torch)"
-            ),
-            "\n".join(code_lines),
-        )
+        source = "\n".join(code_lines)
         return compile(source, f"<paddle_to_torch:{stage}>", "exec")
 
 
@@ -146,8 +164,6 @@ class ConvertResult:
         output_var: str = "result",
         kind: ConversionKind = ConversionKind.DIRECT,
     ) -> ConvertResult:
-        if kind is ConversionKind.UNSUPPORTED:
-            raise ValueError("ConvertResult.success requires a supported conversion kind")
         return cls(
             paddle_api,
             kind=kind,
@@ -222,24 +238,21 @@ class BaseRule(ABC):
     def read_mapping(self, mapping: Mapping[str, Any]) -> None:
         self.mapping = mapping
         self.torch_api = mapping.get("torch_api")
-        self.args_map = mapping.get("paddle_torch_args_map", MappingProxyType({}))
-        self.torch_args = mapping.get("torch_args", ())
-        self.torch_kwargs = mapping.get("torch_kwargs", MappingProxyType({}))
         self.is_attribute = mapping.get("is_attribute", False)
-        self.defaults = mapping.get("set_defaults", MappingProxyType({}))
 
     def _build_default_code(self) -> list[str]:
-        return [
-            f"{name} = locals().get('{name}', {value})"
-            for name, value in self.mapping.get("set_defaults", {}).items()
-        ]
+        code = []
+        for name, value in self.mapping.get("set_defaults", {}).items():
+            expression = value if isinstance(value, str) else repr(value)
+            code.append(f"{name} = locals().get({name!r}, {expression})")
+        return code
 
     def _build_argument_map_code(self, *, ensure_args: bool) -> list[str]:
         map_code = []
         if ensure_args or "torch_args" in self.mapping:
             map_code.append("_args = []")
             for arg in self.mapping.get("torch_args", ()):
-                map_code.append(f"_args.extend([{arg!s}])")
+                map_code.append(f"_args.extend([{arg}])")
         if (
             ensure_args
             or "torch_args" in self.mapping
@@ -248,12 +261,13 @@ class BaseRule(ABC):
         ):
             map_code.append("_kwargs = {}")
         for key, value in self.mapping.get("torch_kwargs", {}).items():
-            map_code.append(f"_kwargs['{key}'] = {value!s}")
+            expression = value if isinstance(value, str) else repr(value)
+            map_code.append(f"_kwargs[{key!r}] = {expression}")
         args_map = self.mapping.get("paddle_torch_args_map", {})
         if args_map:
             map_code.append("for paddle_param, torch_param in {")
             for paddle_param, torch_param in args_map.items():
-                map_code.append(f"    '{paddle_param}': '{torch_param}',")
+                map_code.append(f"    {paddle_param!r}: {torch_param!r},")
             map_code.append("}.items():")
             map_code.append("    if paddle_param in locals():")
             map_code.append("        _kwargs[torch_param] = locals()[paddle_param]")
@@ -268,6 +282,7 @@ class BaseRule(ABC):
         core: str | Sequence[str] = (),
         postprocess: str | Sequence[str] = (),
         output_var: str = "result",
+        workspace_required: bool = False,
     ) -> ConvertResult:
         def code_lines(source: str | Sequence[str]) -> Sequence[str]:
             return source.splitlines() if isinstance(source, str) else source
@@ -295,6 +310,7 @@ class BaseRule(ABC):
                 ],
                 core=core_code,
                 postprocess=code_lines(postprocess),
+                workspace_required=workspace_required,
             ),
             output_var=output_var,
             kind=kind,
@@ -2164,6 +2180,7 @@ class Fp8QuantBlockwiseRule(BaseRule):
             kind=ConversionKind.COMPOSITE,
             preprocess=(),
             core=core,
+            workspace_required=impl == "torch",
         )
 
     @staticmethod
@@ -2344,7 +2361,7 @@ def _fp8_quant_blockwise_impl(inp, eps, power2, scale_transpose, ue8m0, method, 
             q = (x_blk * q_scale.unsqueeze(-1)).to(torch.float8_e4m3fn).reshape(m, -1)[:, :n]
             scale = deq_scale.transpose(0, 1).contiguous() if scale_transpose else deq_scale.contiguous()
         else:
-            _workspace_bytes = 32 << 30
+            _workspace_bytes = _adaptive_workspace_bytes(torch, locals())
             _per_row = max(1, n * 4 * 2)
             _chunk = max(1, min(m, _workspace_bytes // _per_row))
             q = torch.empty((m, n), dtype=torch.float8_e4m3fn, device=inp.device)
@@ -2495,7 +2512,7 @@ else:
 
     # One FP32 activation chunk plus its BF16 cast can coexist. Account for the
     # BF16 cast explicitly and never expand scales to [M, N].
-    _workspace_bytes = 32 << 30
+    _workspace_bytes = _adaptive_workspace_bytes(torch, locals())
     _bytes_per_row = max(1, _cols * (4 + 2))
     _row_chunk = max(1, min(_rows, _workspace_bytes // _bytes_per_row))
 
@@ -2534,6 +2551,7 @@ result = _result
             paddle_api,
             kind=ConversionKind.COMPOSITE,
             core=core,
+            workspace_required=True,
         )
 
 
@@ -4864,6 +4882,7 @@ class MoePermuteRule(BaseRule):
             paddle_api,
             kind=ConversionKind.COMPOSITE,
             core=core,
+            workspace_required=impl == "torch",
         )
 
     @staticmethod
@@ -5021,7 +5040,7 @@ if do_gather:
     hidden_states_unzipped = torch.zeros(total_rows, token_dim, dtype=hidden_states.dtype, device=_dev)
     # Advanced indexing materializes the gathered payload before assignment.
     # Bound that temporary while leaving routing fully vectorized.
-    _workspace_bytes = 32 << 30
+    _workspace_bytes = _adaptive_workspace_bytes(torch, locals())
     _payload_bytes_per_row = max(1, token_dim * hidden_states.element_size())
     _payload_chunk = max(1, _workspace_bytes // _payload_bytes_per_row)
     with torch.no_grad():
@@ -5068,6 +5087,7 @@ class MoeUnpermuteRule(BaseRule):
             paddle_api,
             kind=ConversionKind.COMPOSITE,
             core=core,
+            workspace_required=impl == "torch",
         )
 
     @staticmethod
@@ -5139,7 +5159,7 @@ zipped_tokens = torch.empty(seqlen, token_dim, dtype=out_dtype, device=_dev)
 
 # The FP32 accumulator and gathered payload can overlap. Process token rows in
 # a 32 GiB workspace and preserve expert-column accumulation order per token.
-_workspace_bytes = 32 << 30
+_workspace_bytes = _adaptive_workspace_bytes(torch, locals())
 _bytes_per_token = max(1, token_dim * (4 * 2 + out_dtype.itemsize))
 _token_chunk = max(1, min(seqlen, _workspace_bytes // _bytes_per_token))
 with torch.no_grad():
@@ -9159,7 +9179,7 @@ if op_name == "fused_swiglu_bwd":
     _dy_2d = dy.reshape(_outer, _hidden)
     _x_2d = x.reshape(_outer, _hidden * 2)
     _dx = torch.empty_like(_x_2d)
-    _workspace_bytes = 32 << 30
+    _workspace_bytes = _adaptive_workspace_bytes(torch, locals())
     _bytes_per_row = max(1, _hidden * (4 * 7 + x.element_size() * 2))
     _row_chunk = max(1, min(_outer, _workspace_bytes // _bytes_per_row))
     with torch.no_grad():
@@ -9314,7 +9334,7 @@ elif op_name in ("fused_swiglu_probs_bwd", "paddlefleet_fused_swiglu_probs_bwd")
         pg_out = torch.empty([outer], dtype=torch.float32, device=o1.device)
         # At most nine FP32 [chunk, H] buffers overlap below. Include BF16
         # casts so the temporary working set remains within 32 GiB.
-        _workspace_bytes = 32 << 30
+        _workspace_bytes = _adaptive_workspace_bytes(torch, locals())
         bytes_per_row = max(1, H * (4 * 9 + o1.element_size() * 3))
         row_chunk = max(1, min(outer, _workspace_bytes // bytes_per_row))
         # 切片原地写入会触发 autograd 对叶子张量的报错（尤其 fp32 叶子节点），
@@ -9370,7 +9390,7 @@ elif op_name == "fuse_weighted_swiglu_fp8_quant":
     _full_cols = _full_blocks * _TILE
     # LHS, RHS, and the sigmoid temporary can overlap. Include the FP8 cast
     # temporary.
-    _workspace_bytes = 32 << 30
+    _workspace_bytes = _adaptive_workspace_bytes(torch, locals())
     _bytes_per_row = max(1, _half_cols * (4 * 3 + 1))
     _row_chunk = max(1, min(_rows, _workspace_bytes // _bytes_per_row))
 
@@ -9460,7 +9480,7 @@ elif op_name in ("fuse_stack_fp8_quant", "fuse_stack_transpose_fp8_quant"):
     _inv_scale = torch.empty(
         (_num_row_blocks, _num_col_blocks), dtype=torch.float32, device=_dev
     )
-    _workspace_bytes = 32 << 30
+    _workspace_bytes = _adaptive_workspace_bytes(torch, locals())
     _bytes_per_row = max(1, _out_cols * (4 * 2 + 1) + _out_cols * 4)
     _row_blocks_per_chunk = max(
         1, min(_num_row_blocks, _workspace_bytes // _bytes_per_row // _TILE)
@@ -9547,6 +9567,7 @@ else:
             paddle_api,
             kind=ConversionKind.COMPOSITE,
             core=core,
+            workspace_required=True,
         )
 
 

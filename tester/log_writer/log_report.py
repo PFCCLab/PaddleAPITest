@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
+import math
 import os
-from datetime import datetime
+from datetime import datetime, timedelta
 
 from .log_schema import LOG_PREFIXES
 
@@ -149,6 +150,65 @@ def print_case_progress(current, total, status, config, detail):
     )
 
 
+def print_batch_forecast(current, total, rate, elapsed, eta):
+    """打印按吞吐和时长自适应单位的批量任务预测。"""
+    percent = current / total * 100 if total else 100.0
+    elapsed_display = _format_forecast_elapsed(elapsed)
+    eta_display = _format_forecast_eta(eta)
+    finish_time = _format_forecast_finish(eta)
+    rate_display = _format_forecast_rate(rate)
+    print(
+        f"[{current}/{total} {percent:.1f}%] Forecast | {rate_display} | "
+        f"elapsed {elapsed_display} | ETA {eta_display} | finish ~{finish_time}",
+        flush=True,
+    )
+
+
+def _format_forecast_elapsed(seconds):
+    seconds = max(0, int(seconds))
+    if seconds < 3600:
+        minutes, seconds = divmod(seconds, 60)
+        return f"{minutes:02d}:{seconds:02d}"
+    if seconds < 24 * 3600:
+        hours, remainder = divmod(seconds, 3600)
+        minutes = remainder // 60
+        return f"{hours} h {minutes} min"
+    days, remainder = divmod(seconds, 24 * 3600)
+    return f"{days} d {remainder // 3600} h"
+
+
+def _format_forecast_eta(seconds):
+    minutes = max(1, math.ceil(seconds / 60))
+    if minutes < 60:
+        return f"~{minutes} min"
+    if minutes < 24 * 60:
+        hours, minutes = divmod(minutes, 60)
+        return f"~{hours} h" if minutes == 0 else f"~{hours} h {minutes} min"
+    days, minutes = divmod(minutes, 24 * 60)
+    hours = minutes // 60
+    return f"~{days} d" if hours == 0 else f"~{days} d {hours} h"
+
+
+def _format_forecast_finish(seconds):
+    now = datetime.now()
+    finish_time = now + timedelta(seconds=seconds)
+    days_until_finish = (finish_time.date() - now.date()).days
+    if days_until_finish == 0:
+        return finish_time.strftime("%H:%M")
+    if days_until_finish == 1:
+        return f"tomorrow {finish_time:%H:%M}"
+    return finish_time.strftime("%Y-%m-%d %H:%M")
+
+
+def _format_forecast_rate(rate):
+    if rate >= 0.1:
+        return f"{rate:.1f} case/s"
+    per_minute = rate * 60
+    if per_minute >= 0.1:
+        return f"{per_minute:.1f} case/min"
+    return f"{rate * 3600:.1f} case/h"
+
+
 def print_case_notice(status, config, detail):
     """打印不推进完成计数的单行 case 事件。"""
     detail_field = f"{_single_line(detail)} | " if detail else ""
@@ -185,7 +245,7 @@ def print_run_footer(total_case, tested_case, remaining_case, log_counts, elapse
     )
     print(f"Issues: {paddle_issues} Paddle | {test_issues} test | {retest} retest")
     print("Classification")
-    ordered_types = [*LOG_PREFIXES, "incomplete"]
+    ordered_types = [*LOG_PREFIXES, "unclassified"]
     for log_type in ordered_types:
         if log_type in counts:
             print(f"  {log_type}: {counts[log_type]}")

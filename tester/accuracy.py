@@ -279,17 +279,11 @@ class APITestAccuracy(APITestBase):
             self.reset_random_state()
             self.dump_event("torch_forward_start")
 
-            execution_locals = {}
-            if self.api_config.api_name == "paddle.nn.functional.rnnt_loss":
-                if paddle.device.get_device() == "cpu":
-                    execution_locals["fused_log_softmax"] = False
             bound_arguments = bind_paddle_arguments(
                 self.api_config.api_name,
                 self.torch_args,
                 self.torch_kwargs,
             )
-            if bound_arguments is None:
-                raise RuntimeError(f"no argument binding contract for {self.api_config.api_name}")
 
             def execute_core(compiled, exec_globals, exec_locals):
                 if self.test_amp:
@@ -302,7 +296,7 @@ class APITestAccuracy(APITestBase):
                 convert_result,
                 self.torch_args,
                 bound_arguments,
-                execution_locals=execution_locals,
+                execution_locals=self._torch_execution_locals(),
                 core_executor=execute_core,
             )
             self.dump_save("torch_forward_output", torch_output, framework="torch")
