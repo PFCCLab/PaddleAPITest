@@ -74,10 +74,14 @@ Tensor 绑定和未解析原因。规则只应该读取它，不应该自己再�
 
 - `ConfigView`：只读 config 视图，负责原始参数读取、Tensor 绑定查询和 API 名称
 - `ValueFactory`：数值生成入口，负责 value domain 和 backend-native 数组/tensor 操作
-- `InputWriter`：输入写入入口，负责写入、重写、去重、读取已生成值和完整性检查
+- `InputWriter`：输入写入入口，负责暂存、去重、读取已生成值和完成校验
 
-常见批量生成流程由 `generate_all()`、`generate_one()`、`generate_remaining()` 和
-`generate_by_parameter()` 这些 registry helper 承担，避免把参数读取、数值生成和写入状态混在一个对象里。
+常见批量生成流程由 `generate_all()`、`generate_remaining()` 和
+`generate_by_parameter()` 承担。按单个参数处理时，先通过 `config.binding()` 或
+`config.bindings()` 得到绑定，再显式调用 writer。
+
+同一个 `TensorConfig` 对象不能复用于多个 `TensorPath`。绑定阶段会直接拒绝这种配置，
+错误信息同时给出首次路径和冲突路径，避免 path 寻址与对象 identity 寻址产生歧义。
 
 ### Backend Selection
 
@@ -112,9 +116,16 @@ Paddle logical value 经 DLPack 生成，并在 Torch 侧 clone 为 Torch 自有
 ```python
 @rules.register("paddle.clip", aliases=("paddle.Tensor.clip",))
 def clip_values(config: ConfigView, values: ValueFactory, writer: InputWriter):
-    generate_one(config, values, writer, "x", "default")
-    generate_one(config, values, writer, "min", "random_range", low=-1, high=0)
-    generate_one(config, values, writer, "max", "random_range", low=0, high=1)
+    generate_by_parameter(
+        config,
+        values,
+        writer,
+        (
+            ("x", "default"),
+            ("min", lambda binding: values.domain("random_range", binding, -1, 0)),
+            ("max", lambda binding: values.domain("random_range", binding, 0, 1)),
+        ),
+    )
 ```
 
 规则函数只描述 API 语义，不写绑定、物化或日志逻辑。
@@ -122,18 +133,23 @@ def clip_values(config: ConfigView, values: ValueFactory, writer: InputWriter):
 ### 2. 优先使用 registry helper
 
 - `generate_all(config, values, writer, "default")`：同类参数统一生成
-- `generate_one(config, values, writer, "x", "default")`：针对参数名生成
 - `generate_remaining(config, values, writer, "default")`：补齐未生成参数
 - `generate_by_parameter(config, values, writer, ...)`：按参数名映射不同生成策略
 - `config.arg()` / `config.kwarg()`：读取原始参数
-- `config.find()`：按参数名定位绑定
+- `config.binding()`：要求参数名至多对应一个 Tensor；多个匹配会直接报错
+- `config.bindings()`：返回参数名对应的全部 Tensor 绑定
+- `config.binding_for_value()`：按 `TensorConfig` 对象定位绑定
 - `writer.value()`：读取逻辑值
 
 ### 3. 只在必要时写低层值
 
-- `writer.set_value()`：正常写入并同步元数据
-- `writer.rewrite_value()`：重写已有值
-- `writer.set_value_raw()`：仅在需要保留元数据时使用
+- `writer.set_value()`：正常写入并在成功完成时同步元数据
+- `writer.set_value_preserving_spec()`：写入逻辑值，但保留配置原有 shape/dtype
+- `writer.finish(config)`：校验所有 Tensor 均已生成，再统一更新配置元数据并返回待挂载数据
+
+writer 在 rule 执行期间只暂存 backend 拷贝。rule 抛出异常或 `finish()` 发现遗漏时，
+不会挂载部分 `InputData`、修改 `TensorConfig` 元数据或提交 config RNG。重复写入同一 path
+也会直接失败；rule 不应依赖覆盖已有值。
 
 ### 4. 失败要显式
 
@@ -156,7 +172,7 @@ def clip_values(config: ConfigView, values: ValueFactory, writer: InputWriter):
 ### 2. 从逐参数副作用改为完整 config 规则
 
 旧实现常在生成一个参数时顺手读写另一个参数，行为依赖遍历顺序。现在规则以完整 config 为单位
-描述，通过 `generate_one()`、`generate_all()`、`config.arg()` 和 `config.kwarg()`
+描述，通过 `generate_by_parameter()`、`generate_all()`、`config.arg()` 和 `config.kwarg()`
 显式表达参数关系。
 
 ### 3. 从生成逻辑与物化耦合改为分层处理
@@ -177,6 +193,7 @@ def clip_values(config: ConfigView, values: ValueFactory, writer: InputWriter):
 ## 运行时约束
 
 - `ConfigNumpyRNG` 使用独立 `RandomState` 副本
+- 同一 `TensorConfig` 复用于多个输入 path 时，`input_binding.py` 直接拒绝
 - `input_dispatch.py` 只做规则查找和阻断
 - `input_data.py` 只管理输入数据，不承担框架创建
 - `tensor_config.py` 只承担 Tensor 物化和读写

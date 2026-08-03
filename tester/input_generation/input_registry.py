@@ -46,11 +46,11 @@ from .value_gen import (
     generate_unit_plus_one,
 )
 
+# Core protocols and value-domain descriptors.
 ValueGenerator = Callable[..., object]
 ConfigValueGenerator = Callable[[object], object]
 RuleFunction = Callable[["ConfigView", "ValueFactory", "InputWriter"], None]
 BlockerFunction = Callable[[InputContext], str | None]
-_RAW_WRITE = object()
 
 
 # 这些描述符字符串要保持稳定，因为规则体直接依赖它们。
@@ -86,6 +86,7 @@ _VALUE_GENERATORS: dict[str, ValueGenerator] = {
 }
 
 
+# Rule execution and the three author-facing roles.
 @dataclass(frozen=True)
 class RegisteredRule:
     """一条通过装饰器注册的输入生成规则。
@@ -124,8 +125,7 @@ class RegisteredRule:
         values = ValueFactory(backend)
         writer = InputWriter(api_config, backend)
         self.function(config, values, writer)
-        writer.require_complete(config)
-        attach_values(api_config, writer.input_data_items())
+        attach_values(api_config, writer.finish(config))
         backend.commit()
         return True
 
@@ -134,43 +134,53 @@ class ConfigView:
     """规则侧只读 config 视图。"""
 
     def __init__(self, call, raw_config: object):
-        self.call = call
-        self.raw_config = raw_config
+        self._call = call
+        self._raw_config = raw_config
 
-    def find(self, parameter_name: str):
-        for binding in self.call.tensors:
-            if binding.parameter_name == parameter_name:
-                return binding
-        return None
+    def bindings(self, parameter_name: str):
+        return tuple(
+            binding for binding in self._call.tensors if binding.parameter_name == parameter_name
+        )
 
-    def binding_for_config(self, tensor_config):
-        for binding in self.call.tensors:
-            if _tensor_config_at(self.raw_config, binding.path) is tensor_config:
+    def binding(self, parameter_name: str):
+        matches = self.bindings(parameter_name)
+        if len(matches) > 1:
+            raise ValueError(
+                f"rule {self.api_name} found multiple tensors for parameter "
+                f"{parameter_name!r}: {[str(binding.path) for binding in matches]}"
+            )
+        return matches[0] if matches else None
+
+    def binding_for_value(self, value):
+        if not self.is_tensor_config(value):
+            return None
+        for binding in self._call.tensors:
+            if _tensor_config_at(self._raw_config, binding.path) is value:
                 return binding
         return None
 
     @property
     def api_name(self):
-        return self.call.api_name
+        return self._call.api_name
 
     @property
     def tensors(self):
-        return self.call.tensors
+        return self._call.tensors
 
     def arg(self, position, name, default=None):
-        return _api_arg(self.raw_config, position, name, default)
+        return _api_arg(self._raw_config, position, name, default)
 
     def has_kwarg(self, name):
-        return name in self.raw_config.kwargs
+        return name in self._raw_config.kwargs
 
     def kwarg(self, name, default=None):
-        return self.raw_config.kwargs.get(name, default)
+        return self._raw_config.kwargs.get(name, default)
 
     def argument_values(self):
-        return (*self.raw_config.args, *self.raw_config.kwargs.values())
+        return (*self._raw_config.args, *self._raw_config.kwargs.values())
 
     def is_tensor_config(self, value):
-        return _is_tensor_config(value)
+        return isinstance(value, TensorConfig)
 
 
 class ValueFactory:
@@ -180,7 +190,10 @@ class ValueFactory:
         self.backend = backend
 
     def domain(self, generator: str, binding, low=None, high=None):
-        return _VALUE_GENERATORS[generator](binding.spec, low, high, self.backend)
+        generate_value = _VALUE_GENERATORS.get(generator)
+        if generate_value is None:
+            raise ValueError(f"unknown input value generator {generator!r} for {binding.path}")
+        return generate_value(binding.spec, low, high, self.backend)
 
     def dtype_eps(self, dtype):
         dtype = self._numeric_dtype(dtype)
@@ -219,12 +232,13 @@ class InputWriter:
     """规则侧输入写入与完整性状态。"""
 
     def __init__(self, raw_config: object, backend):
-        self.raw_config = raw_config
-        self.backend = backend
+        self._raw_config = raw_config
+        self._backend = backend
         self._generated_paths = set()
         self._input_data_by_path: dict[object, InputData] = {}
+        self._update_config_by_path: dict[object, bool] = {}
 
-    def require_complete(self, config: ConfigView):
+    def finish(self, config: ConfigView):
         missing = [
             str(binding.path)
             for binding in config.tensors
@@ -232,6 +246,13 @@ class InputWriter:
         ]
         if missing:
             raise ValueError(f"rule {config.api_name} left tensors ungenerated: {missing}")
+        for path, data in self._input_data_by_path.items():
+            _apply_input_data(
+                self._raw_config,
+                data,
+                update_config=self._update_config_by_path[path],
+            )
+        return tuple(self._input_data_by_path.values())
 
     def is_generated(self, binding):
         return binding.path in self._generated_paths
@@ -241,41 +262,30 @@ class InputWriter:
             raise ValueError(f"rule generated tensor twice: {binding.path}")
         self._write_value(binding, value, update_config=True)
 
-    def rewrite_value(self, binding, value):
-        self._write_value(binding, value, update_config=True)
-
-    def set_value_raw(self, binding, value):
+    def set_value_preserving_spec(self, binding, value):
         if binding.path in self._generated_paths:
             raise ValueError(f"rule generated tensor twice: {binding.path}")
         self._write_value(binding, value, update_config=False)
-        return _RAW_WRITE
 
     def value(self, binding):
         data = self._input_data_by_path.get(binding.path)
         if data is not None:
             return data.value
-        config = _tensor_config_at(self.raw_config, binding.path)
-        return read_input_value(self.raw_config, config)
-
-    def input_data_items(self):
-        return tuple(self._input_data_by_path.values())
+        config = _tensor_config_at(self._raw_config, binding.path)
+        return read_input_value(self._raw_config, config)
 
     def _write_value(self, binding, value, update_config):
-        storage_value = _apply_value_raw(
-            self.raw_config,
-            binding.path,
-            value,
-            self.backend,
-            update_config,
-        )
+        storage_value = self._backend.asarray(value, copy=True)
         self._input_data_by_path[binding.path] = InputData(
             binding.path,
             storage_value,
-            self.backend.name,
+            self._backend.name,
         )
+        self._update_config_by_path[binding.path] = update_config
         self._generated_paths.add(binding.path)
 
 
+# Generic rule-generation helpers.
 def generate_all(
     config: ConfigView,
     values: ValueFactory,
@@ -286,25 +296,6 @@ def generate_all(
 ):
     for binding in config.tensors:
         _generate_binding(values, writer, binding, generator, low, high)
-
-
-def generate_one(
-    config: ConfigView,
-    values: ValueFactory,
-    writer: InputWriter,
-    parameter_name: str | tuple[str, ...],
-    generator,
-    low=None,
-    high=None,
-):
-    names = (parameter_name,) if isinstance(parameter_name, str) else tuple(parameter_name)
-    matched = False
-    for binding in config.tensors:
-        if binding.parameter_name in names:
-            _generate_binding(values, writer, binding, generator, low, high)
-            matched = True
-    if not matched:
-        raise ValueError(f"rule {config.api_name} did not find parameter {parameter_name!r}")
 
 
 def generate_remaining(config: ConfigView, values: ValueFactory, writer: InputWriter, generator):
@@ -344,17 +335,14 @@ def _generate_binding(
     low=None,
     high=None,
 ):
-    if writer.is_generated(binding):
-        raise ValueError(f"rule generated tensor twice: {binding.path}")
     if callable(generator):
         value = generator(binding)
-        if value is _RAW_WRITE:
-            return
     else:
         value = values.domain(generator, binding, low, high)
     writer.set_value(binding, value)
 
 
+# Registration infrastructure.
 class RuleRegistry:
     """失败即止的装饰器注册表。"""
 
@@ -371,7 +359,15 @@ class RuleRegistry:
         allow_gpu: bool = True,
         allow_cached: bool = True,
     ):
-        names = _normalize_names((*api_names, *aliases), "api_names")
+        names = (*api_names, *aliases)
+        for name in names:
+            if not isinstance(name, str) or not name.strip():
+                raise ValueError("api_names must contain non-empty strings")
+            if name != name.strip():
+                raise ValueError(f"api_names entry has surrounding whitespace: {name!r}")
+        duplicates = sorted(name for name in set(names) if names.count(name) > 1)
+        if duplicates:
+            raise ValueError(f"duplicate api_names: {duplicates}")
         if not names:
             raise ValueError("registered rule must declare at least one API")
 
@@ -403,95 +399,7 @@ class RuleRegistry:
         return dict(self._by_api)
 
 
-def _normalize_names(values, field_name: str) -> tuple[str, ...]:
-    names = tuple(values)
-    for name in names:
-        if not isinstance(name, str) or not name.strip():
-            raise ValueError(f"{field_name} must contain non-empty strings")
-        if name != name.strip():
-            raise ValueError(f"{field_name} entry has surrounding whitespace: {name!r}")
-    duplicates = sorted(name for name in set(names) if names.count(name) > 1)
-    if duplicates:
-        raise ValueError(f"duplicate {field_name}: {duplicates}")
-    return names
-
-
-def _max_unpool_input_size(
-    api_name: str,
-    x_shape,
-    unpool_output_size,
-    kernel_size,
-    stride,
-    padding,
-):
-    ndim = 1
-    if "max_unpool2d" in api_name:
-        ndim = 2
-    elif "max_unpool3d" in api_name:
-        ndim = 3
-    if isinstance(kernel_size, int):
-        kernel_size = [kernel_size] * ndim
-    if isinstance(stride, int):
-        stride = [stride] * ndim
-    if isinstance(padding, int):
-        padding = [padding] * ndim
-
-    pool_input_size = unpool_output_size
-    if pool_input_size is None:
-        if ndim == 1:
-            w_in = x_shape[-1]
-            w_out = (w_in - 1) * stride[0] - 2 * padding[0] + kernel_size[0]
-            pool_input_size = [*x_shape[:-1], w_out]
-        elif ndim == 2:
-            h_in, w_in = x_shape[-2], x_shape[-1]
-            h_out = (h_in - 1) * stride[0] - 2 * padding[0] + kernel_size[0]
-            w_out = (w_in - 1) * stride[1] - 2 * padding[1] + kernel_size[1]
-            pool_input_size = [*x_shape[:-2], h_out, w_out]
-        else:
-            d_in, h_in, w_in = (
-                x_shape[-3],
-                x_shape[-2],
-                x_shape[-1],
-            )
-            d_out = (d_in - 1) * stride[0] - 2 * padding[0] + kernel_size[0]
-            h_out = (h_in - 1) * stride[1] - 2 * padding[1] + kernel_size[1]
-            w_out = (w_in - 1) * stride[2] - 2 * padding[2] + kernel_size[2]
-            pool_input_size = [*x_shape[:-3], d_out, h_out, w_out]
-    elif len(pool_input_size) == ndim:
-        pool_input_size = [*x_shape[:-ndim], *pool_input_size[-ndim:]]
-    elif len(pool_input_size) != len(x_shape):
-        raise ValueError(
-            f"invalid output_size for {api_name}, len(output_size) should be {ndim} or "
-            f"{len(x_shape)} or output_size == None, got len(output_size)="
-            f"{len(pool_input_size)} and output_size={unpool_output_size}"
-        )
-    return kernel_size, stride, padding, pool_input_size
-
-
-def _optimizer_beta_pow(values: ValueFactory, binding, beta, step):
-    import paddle
-
-    use_accuracy_compatible = paddle.get_flags("FLAGS_use_accuracy_compatible_kernel")[
-        "FLAGS_use_accuracy_compatible_kernel"
-    ]
-    if use_accuracy_compatible:
-        beta_pow_value = beta**step
-    else:
-        # Torch/Paddle GPU scalar tensors cannot be passed through NumPy directly.
-        # Extract the scalar first while retaining the float32 power semantics.
-        step_item = step.item() if hasattr(step, "item") else step
-        step_value = int(step_item)
-        beta_pow_value = values.backend.power(numpy.float32(beta), numpy.float32(step_value))
-        beta_pow_value = (
-            beta_pow_value.item() if hasattr(beta_pow_value, "item") else beta_pow_value
-        )
-    return values.backend.full(binding.spec.shape, beta_pow_value, dtype=binding.spec.dtype)
-
-
-def _is_tensor_config(value) -> bool:
-    return isinstance(value, TensorConfig)
-
-
+# Registered API rules remain together in this file for centralized lookup.
 rules = RuleRegistry()
 
 
@@ -589,11 +497,11 @@ def block_multihead_attention_values(config: ConfigView, values: ValueFactory, w
         return values.backend.asarray([seq_len] * batch_size, dtype=binding.spec.dtype)
 
     def set_padding_offsets(binding):
-        seq_lens_this_time = writer.value(config.find("seq_lens_this_time"))
+        seq_lens_this_time = writer.value(config.binding("seq_lens_this_time"))
         cum_offsets_now = values.backend.cumsum(seq_len - seq_lens_this_time)
-        cum_offsets_binding = config.find("cum_offsets")
-        cu_seqlens_q_binding = config.find("cu_seqlens_q")
-        cu_seqlens_k_binding = config.find("cu_seqlens_k")
+        cum_offsets_binding = config.binding("cum_offsets")
+        cu_seqlens_q_binding = config.binding("cu_seqlens_q")
+        cu_seqlens_k_binding = config.binding("cu_seqlens_k")
         cum_offsets = values.backend.zeros((batch_size + 1,), dtype=cum_offsets_binding.spec.dtype)
         cum_offsets[1:] = cum_offsets_now
         token_num = values.backend.sum(seq_lens_this_time)
@@ -627,7 +535,7 @@ def block_multihead_attention_values(config: ConfigView, values: ValueFactory, w
         elif binding.parameter_name == "seq_lens_encoder":
             writer.set_value(binding, seq_len_array(binding))
         elif binding.parameter_name == "seq_lens_this_time":
-            writer.set_value(binding, writer.value(config.find("seq_lens_encoder")))
+            writer.set_value(binding, writer.value(config.binding("seq_lens_encoder")))
         elif binding.parameter_name == "padding_offsets":
             set_padding_offsets(binding)
         elif binding.parameter_name in positive_range_parameters:
@@ -653,6 +561,28 @@ def optimizer_values(config: ConfigView, values: ValueFactory, writer: InputWrit
     zero_parameters = {"moment1", "moment2", "moment2_max"}
     optimizer_step = None
 
+    def beta_pow_value(binding, beta, step):
+        import paddle
+
+        use_accuracy_compatible = paddle.get_flags("FLAGS_use_accuracy_compatible_kernel")[
+            "FLAGS_use_accuracy_compatible_kernel"
+        ]
+        if use_accuracy_compatible:
+            beta_pow = beta**step
+        else:
+            # Preserve the float32 power semantics without passing GPU scalars to NumPy.
+            step = step.item() if hasattr(step, "item") else step
+            beta_pow = values.backend.power(
+                numpy.float32(beta),
+                numpy.float32(int(step)),
+            )
+            beta_pow = beta_pow.item() if hasattr(beta_pow, "item") else beta_pow
+        return values.backend.full(
+            binding.spec.shape,
+            beta_pow,
+            dtype=binding.spec.dtype,
+        )
+
     def generate_value(binding):
         nonlocal optimizer_step
         if binding.parameter_name in zero_parameters:
@@ -666,7 +596,7 @@ def optimizer_values(config: ConfigView, values: ValueFactory, writer: InputWrit
             beta = config.arg(10, "beta1")
             if binding.parameter_name == "beta2_pow":
                 beta = config.arg(11, "beta2")
-            return _optimizer_beta_pow(values, binding, beta, optimizer_step)
+            return beta_pow_value(binding, beta, optimizer_step)
         return values.domain("default", binding)
 
     generate_all(config, values, writer, generate_value)
@@ -678,8 +608,49 @@ def optimizer_values(config: ConfigView, values: ValueFactory, writer: InputWrit
     "paddle.nn.functional.max_unpool3d",
 )
 def max_unpool_values(config: ConfigView, values: ValueFactory, writer: InputWriter):
-    x_binding = config.find("x")
-    indices_binding = config.find("indices")
+    def resolve_parameters(x_shape, output_size, kernel_size, stride, padding):
+        dimensions = {
+            "paddle.nn.functional.max_unpool1d": 1,
+            "paddle.nn.functional.max_unpool2d": 2,
+            "paddle.nn.functional.max_unpool3d": 3,
+        }[config.api_name]
+        if isinstance(kernel_size, numbers.Integral):
+            kernel_size = [kernel_size] * dimensions
+        else:
+            kernel_size = list(kernel_size)
+        if stride is None:
+            stride = list(kernel_size)
+        elif isinstance(stride, numbers.Integral):
+            stride = [stride] * dimensions
+        else:
+            stride = list(stride)
+        if isinstance(padding, numbers.Integral):
+            padding = [padding] * dimensions
+        else:
+            padding = list(padding)
+
+        if output_size is None:
+            spatial_size = [
+                (x_shape[-dimensions + index] - 1) * stride[index]
+                - 2 * padding[index]
+                + kernel_size[index]
+                for index in range(dimensions)
+            ]
+            pool_input_size = [*x_shape[:-dimensions], *spatial_size]
+        elif len(output_size) == dimensions:
+            pool_input_size = [*x_shape[:-dimensions], *output_size]
+        elif len(output_size) == len(x_shape):
+            pool_input_size = list(output_size)
+        else:
+            raise ValueError(
+                f"invalid output_size for {config.api_name}, len(output_size) should be "
+                f"{dimensions} or {len(x_shape)} or output_size == None, got "
+                f"len(output_size)={len(output_size)} and output_size={output_size}"
+            )
+        return kernel_size, stride, padding, pool_input_size
+
+    x_binding = config.binding("x")
+    indices_binding = config.binding("indices")
     if x_binding is None or indices_binding is None:
         raise ValueError(f"rule {config.api_name} requires x and indices tensors")
 
@@ -687,8 +658,7 @@ def max_unpool_values(config: ConfigView, values: ValueFactory, writer: InputWri
     stride = config.arg(3, "stride")
     padding = config.arg(4, "padding")
     output_size = config.arg(5, "output_size")
-    kernel_size, stride, padding, pool_input_size = _max_unpool_input_size(
-        config.api_name,
+    kernel_size, stride, padding, pool_input_size = resolve_parameters(
         x_binding.spec.shape,
         output_size,
         kernel_size,
@@ -741,12 +711,12 @@ def max_unpool_values(config: ConfigView, values: ValueFactory, writer: InputWri
 @rules.register("paddle.arange")
 def arange_values(config: ConfigView, values: ValueFactory, writer: InputWriter):
     def tensor_binding(value):
-        return config.binding_for_config(value) if config.is_tensor_config(value) else None
+        return config.binding_for_value(value)
 
-    def rewrite_tensor(value, tensor_value):
+    def set_tensor(value, tensor_value):
         binding = tensor_binding(value)
         if binding is not None:
-            writer.rewrite_value(binding, tensor_value)
+            writer.set_value(binding, tensor_value)
 
     def generate_step_tensor(step_config, is_positive):
         if "int" in step_config.dtype:
@@ -800,20 +770,20 @@ def arange_values(config: ConfigView, values: ValueFactory, writer: InputWriter)
             if config.is_tensor_config(end_val):
                 if config.is_tensor_config(step_val):
                     flag = values.backend.choice([True, False])
-                    rewrite_tensor(step_val, generate_step_tensor(step_val, flag))
+                    set_tensor(step_val, generate_step_tensor(step_val, flag))
                 else:
                     flag = step_val > 0
-                rewrite_tensor(start_val, random_range(start_val, -50, 50))
-                start = writer.value(config.find("start")).item()
+                set_tensor(start_val, random_range(start_val, -50, 50))
+                start = writer.value(config.binding("start")).item()
                 if flag:
                     low, high = safe_range(start + 1, start + 50)
                 else:
                     low, high = safe_range(start - 50, start - 1)
-                rewrite_tensor(end_val, random_range(end_val, low, high))
+                set_tensor(end_val, random_range(end_val, low, high))
             elif end_val is None:
                 if config.is_tensor_config(step_val):
                     flag = values.backend.choice([True, False])
-                    rewrite_tensor(step_val, generate_step_tensor(step_val, flag))
+                    set_tensor(step_val, generate_step_tensor(step_val, flag))
                 else:
                     flag = step_val > 0
                 if flag:
@@ -837,36 +807,36 @@ def arange_values(config: ConfigView, values: ValueFactory, writer: InputWriter)
                         values.backend.uniform(-50.0, -0.1, shape=start_val.shape),
                         start_val.dtype,
                     )
-                rewrite_tensor(start_val, value)
+                set_tensor(start_val, value)
             else:
                 if config.is_tensor_config(step_val):
                     flag = values.backend.choice([True, False])
-                    rewrite_tensor(step_val, generate_step_tensor(step_val, flag))
+                    set_tensor(step_val, generate_step_tensor(step_val, flag))
                 else:
                     flag = step_val > 0
                 if flag:
                     low, high = safe_range(end_val - 50, end_val - 1)
                 else:
                     low, high = safe_range(end_val + 1, end_val + 50)
-                rewrite_tensor(start_val, random_range(start_val, low, high))
+                set_tensor(start_val, random_range(start_val, low, high))
         elif config.is_tensor_config(end_val):
             if config.is_tensor_config(step_val):
                 flag = values.backend.choice([True, False])
-                rewrite_tensor(step_val, generate_step_tensor(step_val, flag))
+                set_tensor(step_val, generate_step_tensor(step_val, flag))
             else:
                 flag = step_val > 0
             if flag:
                 low, high = safe_range(start_val + 1, start_val + 50)
             else:
                 low, high = safe_range(start_val - 50, start_val - 1)
-            rewrite_tensor(end_val, random_range(end_val, low, high))
+            set_tensor(end_val, random_range(end_val, low, high))
         elif end_val is None:
             if config.is_tensor_config(step_val):
                 flag = start_val > 0
-                rewrite_tensor(step_val, generate_step_tensor(step_val, flag))
+                set_tensor(step_val, generate_step_tensor(step_val, flag))
         elif config.is_tensor_config(step_val):
             flag = start_val < end_val
-            rewrite_tensor(step_val, generate_step_tensor(step_val, flag))
+            set_tensor(step_val, generate_step_tensor(step_val, flag))
 
     for binding in config.tensors:
         if writer.value(binding) is None:
@@ -961,7 +931,7 @@ def moe_permute_values(config: ConfigView, values: ValueFactory, writer: InputWr
         return routemap
 
     def expert_prob_value(binding):
-        routemap_binding = config.find("expert_routemap_topk")
+        routemap_binding = config.binding("expert_routemap_topk")
         probs = values.backend.zeros(binding.spec.shape, dtype="float32")
         if routemap_binding is not None and writer.value(routemap_binding) is not None:
             mask = writer.value(routemap_binding) >= 0
@@ -1048,7 +1018,7 @@ def moe_unpermute_values(config: ConfigView, values: ValueFactory, writer: Input
         return routemap
 
     def rowmap_value(binding):
-        routemap_binding = config.find("expert_routemap_topk")
+        routemap_binding = config.binding("expert_routemap_topk")
         if routemap_binding is not None and not writer.is_generated(routemap_binding):
             writer.set_value(routemap_binding, expert_routemap_value(routemap_binding))
         routemap_config = config.arg(2, "expert_routemap_topk")
@@ -1153,9 +1123,9 @@ def rsqrt_positive(config: ConfigView, values: ValueFactory, writer: InputWriter
 
 @rules.register("paddle.clip", aliases=("paddle.Tensor.clip",))
 def clip_values(config: ConfigView, values: ValueFactory, writer: InputWriter):
-    x_binding = config.find("x")
-    min_binding = config.find("min")
-    max_binding = config.find("max")
+    x_binding = config.binding("x")
+    min_binding = config.binding("min")
+    max_binding = config.binding("max")
     min_config = config.arg(1, "min")
     max_config = config.arg(2, "max")
 
@@ -1702,13 +1672,13 @@ def put_along_axis_values(config: ConfigView, values: ValueFactory, writer: Inpu
                 )
         return indices
 
-    def values_value(binding):
-        indices_binding = config.find("indices")
+    def write_values(binding):
+        indices_binding = config.binding("indices")
         if indices_binding is not None:
             indices = writer.value(indices_binding)
             if tuple(indices.shape) != tuple(binding.spec.shape):
                 if values.backend.prod(binding.spec.shape) == 1:
-                    return writer.set_value_raw(
+                    writer.set_value_preserving_spec(
                         binding,
                         values.backend.full(
                             indices.shape,
@@ -1716,17 +1686,23 @@ def put_along_axis_values(config: ConfigView, values: ValueFactory, writer: Inpu
                             dtype=binding.spec.dtype,
                         ),
                     )
-                return writer.set_value_raw(binding, random_tensor_value(binding, indices.shape))
-            return random_tensor_value(binding, binding.spec.shape)
-        return values.domain("default", binding)
+                else:
+                    writer.set_value_preserving_spec(
+                        binding,
+                        random_tensor_value(binding, indices.shape),
+                    )
+                return
+            writer.set_value(binding, random_tensor_value(binding, binding.spec.shape))
+            return
+        writer.set_value(binding, values.domain("default", binding))
 
-    generate_by_parameter(
-        config,
-        values,
-        writer,
-        (("indices", indices_value), ("values", values_value)),
-        default="default",
-    )
+    for binding in config.tensors:
+        if binding.parameter_name == "indices":
+            writer.set_value(binding, indices_value(binding))
+        elif binding.parameter_name == "values":
+            write_values(binding)
+        else:
+            writer.set_value(binding, values.domain("default", binding))
 
 
 @rules.register("paddle.matrix_transpose")
@@ -2026,7 +2002,7 @@ def index_sample_values(config: ConfigView, values: ValueFactory, writer: InputW
 @rules.register("paddle.Tensor.__getitem__")
 def tensor_getitem_values(config: ConfigView, values: ValueFactory, writer: InputWriter):
     def source_binding():
-        binding = config.find("arr") or config.find("x") or config.find("self")
+        binding = config.binding("arr") or config.binding("x") or config.binding("self")
         if binding is None:
             raise ValueError("Tensor.__getitem__ rule could not find source tensor")
         return binding
@@ -2049,7 +2025,7 @@ def tensor_getitem_values(config: ConfigView, values: ValueFactory, writer: Inpu
 @rules.register("paddle.Tensor.__setitem__")
 def tensor_setitem_values(config: ConfigView, values: ValueFactory, writer: InputWriter):
     def source_binding():
-        binding = config.find("arr") or config.find("x") or config.find("self")
+        binding = config.binding("arr") or config.binding("x") or config.binding("self")
         if binding is None:
             raise ValueError("Tensor.__setitem__ rule could not find source tensor")
         return binding
@@ -2674,7 +2650,7 @@ def strided_slice_values(config: ConfigView, values: ValueFactory, writer: Input
         axes_arg = config.arg(1, "axes")
         axes = axes_arg
         if not isinstance(axes, list):
-            axes = writer.value(config.find("axes"))
+            axes = writer.value(config.binding("axes"))
         if not binding.path.indices:
             return values.domain("default", binding)
         list_index = binding.path.indices[0]
@@ -2687,7 +2663,7 @@ def strided_slice_values(config: ConfigView, values: ValueFactory, writer: Input
         if parameter == "ends":
             return values.backend.cast(
                 values.backend.randint(
-                    writer.value(config.find("starts"))[list_index] + 1,
+                    writer.value(config.binding("starts"))[list_index] + 1,
                     x.shape[axes[list_index]],
                     shape=binding.spec.shape,
                 ),
@@ -3614,8 +3590,8 @@ def gather_tree_values(config: ConfigView, values: ValueFactory, writer: InputWr
 
 @rules.register("paddle.multinomial")
 def multinomial_values(config: ConfigView, values: ValueFactory, writer: InputWriter):
-    x_binding = config.find("x")
-    num_samples_binding = config.find("num_samples")
+    x_binding = config.binding("x")
+    num_samples_binding = config.binding("num_samples")
     if x_binding is not None:
         x_values = values.backend.cast(
             values.backend.abs(values.backend.random(x_binding.spec.shape)),
@@ -3645,8 +3621,8 @@ def multinomial_values(config: ConfigView, values: ValueFactory, writer: InputWr
 
 @rules.register("paddle.nn.functional.one_hot")
 def one_hot_values(config: ConfigView, values: ValueFactory, writer: InputWriter):
-    x_binding = config.find("x")
-    num_classes_binding = config.find("num_classes")
+    x_binding = config.binding("x")
+    num_classes_binding = config.binding("num_classes")
     num_classes_config = config.arg(1, "num_classes")
     default_random_num_classes = values.backend.randint(1, 65535)
     if isinstance(num_classes_config, int):
@@ -3673,6 +3649,7 @@ def one_hot_values(config: ConfigView, values: ValueFactory, writer: InputWriter
     generate_remaining(config, values, writer, "default")
 
 
+# Published registry snapshots and low-level config access.
 INPUT_GENERATION_RULES = rules.rules
 API_RULE_REGISTRY = rules.by_api
 DEFAULT_INPUT_GENERATION_RULE = API_RULE_REGISTRY["paddle.add"]
@@ -3691,15 +3668,13 @@ def _api_arg(api_config, position, name, default=None):
     return api_config.kwargs.get(name, default)
 
 
-def _apply_value_raw(api_config, path, value, backend, update_config):
-    config = _tensor_config_at(api_config, path)
-    storage_value = backend.asarray(value, copy=True)
-    config.input_value = storage_value
-    config.input_value_backend = backend.name
+def _apply_input_data(api_config, data: InputData, update_config):
+    config = _tensor_config_at(api_config, data.path)
+    config.input_value = data.value
+    config.input_value_backend = data.backend
     if update_config:
-        dtype_name = str(getattr(storage_value, "dtype", ""))
+        dtype_name = str(getattr(data.value, "dtype", ""))
         dtype_name = dtype_name.split(".")[-1] if dtype_name else dtype_name
         if config.dtype not in CAST_THROUGH_INTERMEDIATE_DTYPES:
             config.dtype = dtype_name
-        config.shape = list(storage_value.shape)
-    return storage_value
+        config.shape = list(data.value.shape)

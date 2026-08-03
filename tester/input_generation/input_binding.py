@@ -339,9 +339,15 @@ def _path_parameters(api_config, arguments):
     return tuple(bindings)
 
 
-def _walk_tensors(value, path, parameter_name, output):
+def _walk_tensors(value, path, parameter_name, output, path_by_tensor_id):
     # 嵌套 TensorConfig 列表保留顶层参数名，但会扩展 TensorPath。
     if isinstance(value, TensorConfig):
+        previous_path = path_by_tensor_id.get(id(value))
+        if previous_path is not None:
+            raise ValueError(
+                f"TensorConfig is reused across input paths: {previous_path} and {path}"
+            )
+        path_by_tensor_id[id(value)] = path
         output.append(
             TensorBinding(
                 path=path,
@@ -352,7 +358,13 @@ def _walk_tensors(value, path, parameter_name, output):
         return
     if isinstance(value, (list, tuple)):
         for index, child in enumerate(value):
-            _walk_tensors(child, path.child(index), parameter_name, output)
+            _walk_tensors(
+                child,
+                path.child(index),
+                parameter_name,
+                output,
+                path_by_tensor_id,
+            )
 
 
 def bind_input(api_config):
@@ -369,8 +381,15 @@ def bind_input(api_config):
     path_parameters = _path_parameters(api_config, arguments)
     parameter_by_path = {binding.path: binding.parameter_name for binding in path_parameters}
     tensors = []
+    path_by_tensor_id = {}
     for path, value, _fallback_name in _top_level_values(api_config):
-        _walk_tensors(value, path, parameter_by_path.get(path), tensors)
+        _walk_tensors(
+            value,
+            path,
+            parameter_by_path.get(path),
+            tensors,
+            path_by_tensor_id,
+        )
     return InputBinding(
         api_name=api_config.api_name,
         binding_source=resolution.source,
