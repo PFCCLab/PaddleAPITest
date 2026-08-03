@@ -9,11 +9,11 @@ import signal
 import subprocess
 import sys
 import time
-from datetime import datetime
 from pathlib import Path
 from typing import Any
 
 import yaml
+from tester.log_writer import log_runtime
 
 PROJECT_ROOT = Path(__file__).resolve().parent
 DEFAULT_CONFIG = Path("test_pipeline/run_config.yaml")
@@ -142,7 +142,9 @@ def validate_yaml_config(config: dict[str, Any]) -> None:
     output = ensure_mapping(config, "output")
     reject_unknown_keys("output", output, OUTPUT_KEYS)
     if not output.get("log_dir"):
-        raise ValueError("output.log_dir 不能为空")
+        output["log_dir"] = str(
+            log_runtime.default_log_dir(single=bool(input_config.get("api_config")))
+        )
     require_type("output.log_dir", output["log_dir"], str)
 
     retest = retest_config(config)
@@ -499,7 +501,7 @@ def stop_process(pid_file: Path) -> int:
 def latest_log(log_dir: Path) -> Path | None:
     try:
         logs = sorted(
-            log_dir.glob("log_*.log"),
+            log_dir.glob("log_[0-9]*.log"),
             key=lambda path: path.stat().st_mtime,
             reverse=True,
         )
@@ -537,10 +539,9 @@ def show_status(pid_file: Path, engine: str, log_dir: Path) -> int:
     return 0
 
 
-def prepare_log_file(log_dir: Path) -> Path:
+def prepare_log_dir(log_dir: Path) -> Path:
     log_dir.mkdir(parents=True, exist_ok=True)
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    return log_dir / f"log_{timestamp}.log"
+    return log_dir
 
 
 def cleanup_pid_when_done(pid: int, pid_file: Path) -> None:
@@ -551,58 +552,45 @@ def cleanup_pid_when_done(pid: int, pid_file: Path) -> None:
         pid_file.unlink(missing_ok=True)
 
 
-def run_foreground(command: list[str], env: dict[str, str], log_file: Path) -> int:
-    print(f"开始    日志 {display_path(log_file)} | Ctrl+C 终止")
+def run_foreground(command: list[str], env: dict[str, str], log_dir: Path) -> int:
+    print(f"开始    日志目录 {display_path(log_dir)} | Ctrl+C 终止")
     process = subprocess.Popen(
         command,
         cwd=PROJECT_ROOT,
         env=env,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True,
-        bufsize=1,
         start_new_session=True,
     )
-    with log_file.open("a", encoding="utf-8") as log_handle:
-        assert process.stdout is not None
+    try:
+        return process.wait()
+    except KeyboardInterrupt:
+        print("\n[中断] 正在停止测试进程", flush=True)
         try:
-            for line in process.stdout:
-                print(line, end="")
-                log_handle.write(line)
-        except KeyboardInterrupt:
-            print("\n[中断] 正在停止测试进程", flush=True)
+            os.killpg(process.pid, signal.SIGINT)
+        except ProcessLookupError:
+            pass
+        try:
+            process.wait(timeout=30)
+        except subprocess.TimeoutExpired:
             try:
-                try:
-                    os.killpg(process.pid, signal.SIGINT)
-                except ProcessLookupError:
-                    pass
-                remaining_output, _ = process.communicate(timeout=30)
+                os.killpg(process.pid, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+            try:
+                process.wait(timeout=10)
             except subprocess.TimeoutExpired:
                 try:
-                    os.killpg(process.pid, signal.SIGTERM)
+                    os.killpg(process.pid, signal.SIGKILL)
                 except ProcessLookupError:
                     pass
-                try:
-                    remaining_output, _ = process.communicate(timeout=10)
-                except subprocess.TimeoutExpired:
-                    try:
-                        os.killpg(process.pid, signal.SIGKILL)
-                    except ProcessLookupError:
-                        pass
-                    remaining_output, _ = process.communicate()
-            if remaining_output:
-                print(remaining_output, end="")
-                log_handle.write(remaining_output)
-            shutil.rmtree(log_file.parent / ".tmp", ignore_errors=True)
-            return_code = process.returncode
-            return 130 if return_code is None or return_code < 0 else return_code
-    return process.wait()
+                process.wait()
+        shutil.rmtree(log_dir / ".tmp", ignore_errors=True)
+        return 130 if process.returncode is None or process.returncode < 0 else process.returncode
 
 
 def run_background(
     command: list[str],
     env: dict[str, str],
-    log_file: Path,
+    log_dir: Path,
     pid_file: Path,
     engine: str,
     manage_command: str,
@@ -615,16 +603,14 @@ def run_background(
         pid_file.unlink(missing_ok=True)
 
     pid_file.parent.mkdir(parents=True, exist_ok=True)
-    log_handle = log_file.open("a", encoding="utf-8")
     process = subprocess.Popen(
         command,
         cwd=PROJECT_ROOT,
         env=env,
-        stdout=log_handle,
-        stderr=subprocess.STDOUT,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
         start_new_session=True,
     )
-    log_handle.close()
     pid_file.write_text(f"{process.pid}\n", encoding="utf-8")
 
     cleaner_code = (
@@ -656,14 +642,17 @@ def run_background(
 
     time.sleep(1)
     if not process_running(process.pid):
-        print(f"[错误] 启动失败 | {engine}.py | 日志 {display_path(log_file)}")
+        print(f"[错误] 启动失败 | {engine}.py | 日志目录 {display_path(log_dir)}")
         pid_file.unlink(missing_ok=True)
         return 1
 
-    print(f"已启动  PID {process.pid} | 日志 {display_path(log_file)}")
+    log_file = latest_log(log_dir)
+    log_display = display_path(log_file) if log_file else display_path(log_dir)
+    print(f"已启动  PID {process.pid} | 日志 {log_display}")
     print(f"状态    {manage_command} --status")
     print(f"终止    {manage_command} --stop")
-    print(f"跟踪    tail -f {display_path(log_file)}")
+    if log_file:
+        print(f"跟踪    tail -f {display_path(log_file)}")
     return 0
 
 
@@ -751,7 +740,7 @@ def run_once(
             print(f"环境    {' | '.join(environment)}")
         return 0
 
-    log_file = prepare_log_file(log_dir)
+    prepare_log_dir(log_dir)
     foreground = force_foreground or bool(runner.get("foreground"))
     mode = "前台" if foreground else "后台"
     label_field = f" | 轮次 {label}" if label else ""
@@ -778,9 +767,9 @@ def run_once(
     ]
     print(f"参数    {' | '.join(display_args)}")
     if foreground:
-        return run_foreground(command, env, log_file)
+        return run_foreground(command, env, log_dir)
     manage_command = f"python run.py -c {shlex.quote(display_path(config_path))}"
-    return run_background(command, env, log_file, pid_file, engine, manage_command)
+    return run_background(command, env, log_dir, pid_file, engine, manage_command)
 
 
 def run_retest_plan(config_path: Path, config: dict[str, Any], passthrough: list[str]) -> int:

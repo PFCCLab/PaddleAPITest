@@ -34,9 +34,8 @@
       "type": "object",
       "additionalProperties": false,
       "properties": {
-        "log_dir": {"type": "string", "description": "engine 分类日志和 run.py 主日志目录。"}
-      },
-      "required": ["log_dir"]
+        "log_dir": {"type": "string", "description": "engine 分类日志和 run.py 主日志目录；省略时使用 logs/test_log_<timestamp>。单条配置使用 test_log_single_<timestamp>。"}
+      }
     },
     "retest": {
       "type": "object",

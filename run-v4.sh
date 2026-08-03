@@ -153,7 +153,7 @@ case "${1:-}" in
                 # 显示运行时长
                 elapsed=$(ps -o etime= -p "$pid" 2>/dev/null | xargs)
                 # 显示日志文件
-                log=$(ls -t "$LOG_DIR"/log_*.log 2>/dev/null | head -1 || true)
+                log=$(ls -t "$LOG_DIR"/log_[0-9]*.log 2>/dev/null | head -1 || true)
                 echo ">>> 运行状态 | 运行中"
                 echo "进程    PID $pid | $ENGINE.py | Worker $children | 已运行 ${elapsed:-未知}"
                 [[ -n "${log:-}" ]] && echo "日志    $log"
@@ -279,17 +279,15 @@ mkdir -p "$LOG_DIR" || {
     exit 1
 }
 
-LOG_FILE="$LOG_DIR/log_$(date +%Y%m%d_%H%M%S).log"
-
 # ── 启动 ──
 if [[ "$FOREGROUND" == "true" ]]; then
-    echo "开始    日志 $LOG_FILE | Ctrl+C 终止"
+    echo "开始    日志目录 $LOG_DIR | Ctrl+C 终止"
     # 忽略 shell 自身的 SIGINT，让 Ctrl+C 只作用于 python 子进程
     trap '' INT
-    python "$ENGINE.py" "${ALL_ARGS[@]}" 2>&1 | tee "$LOG_FILE"
+    python "$ENGINE.py" "${ALL_ARGS[@]}"
     trap - INT
 else
-    nohup setsid python "$ENGINE.py" "${ALL_ARGS[@]}" >> "$LOG_FILE" 2>&1 &
+    nohup setsid python "$ENGINE.py" "${ALL_ARGS[@]}" >/dev/null 2>&1 &
     PYTHON_PID=$!
     echo "$PYTHON_PID" > "$PID_FILE"
 
@@ -307,12 +305,13 @@ else
 
     sleep 1
     if ! kill -0 "$PYTHON_PID" 2>/dev/null; then
-        echo "[错误] 启动失败 | $ENGINE.py | 日志 $LOG_FILE"
+        echo "[错误] 启动失败 | $ENGINE.py | 日志目录 $LOG_DIR"
         rm -f "$PID_FILE"
         exit 1
     fi
 
-    echo "已启动  PID $PYTHON_PID | 日志 $LOG_FILE"
+    LOG_FILE="$(ls -t "$LOG_DIR"/log_[0-9]*.log 2>/dev/null | head -1 || true)"
+    echo "已启动  PID $PYTHON_PID | 日志 ${LOG_FILE:-$LOG_DIR}"
     echo "管理    状态: ${RUN_COMMAND} --status | 终止: ${RUN_COMMAND} --stop"
-    echo "跟踪    tail -f $LOG_FILE"
+    [[ -n "$LOG_FILE" ]] && echo "跟踪    tail -f $LOG_FILE"
 fi

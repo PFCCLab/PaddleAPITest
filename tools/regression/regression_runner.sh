@@ -12,7 +12,9 @@ if [[ -n "${REGRESSION_LOG_DIR:-}" ]]; then
   mkdir -p "${LOG_ROOT}"
 else
   mkdir -p tools/regression/logs
-  LOG_ROOT="$(mktemp -d tools/regression/logs/run.XXXXXX)"
+  TIMESTAMP="$(date +%Y%m%d_%H%M%S)"
+  LOG_ROOT="tools/regression/logs/test_log_${TIMESTAMP}"
+  mkdir -p "${LOG_ROOT}"
 fi
 
 COMMON_ARGS=(

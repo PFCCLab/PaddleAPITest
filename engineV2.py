@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import atexit
 import errno
 import gc
 import os
@@ -955,7 +956,7 @@ def main():
         "--log_dir",
         type=str,
         default="",
-        help="Directory for test logs.",
+        help="Directory for test logs; default is logs/test_log_<timestamp>.",
     )
     parser.add_argument(
         "--atol",
@@ -1051,6 +1052,10 @@ def main():
     options = parser.parse_args()
     options.paddle_version = paddle_version
     _resolve_dump_options(parser, options)
+    if not options.log_dir:
+        options.log_dir = str(log_runtime.default_log_dir(single=bool(options.api_config)))
+    log_runtime.init_main_output(options.log_dir)
+    atexit.register(log_runtime.close_main_output)
     if options.random_seed != parser.get_default("random_seed"):
         np.random.seed(options.random_seed)
     try:

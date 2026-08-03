@@ -10,23 +10,25 @@ __pycache__/
 .vscode/
 
 # Local run scripts / state at repo root
-run.sh
-run_*.sh
-.run*.pid
+/run.sh
+/run_*.sh
+/.run*.pid
+/.run/
 log.log
 
-# PaddleAPITest generated configs / logs
+# PaddleAPITest generated configs, logs, and runtime output
+/logs/
 test_*log*/
-tools/regression/logs/
-tester/api_config/**/test_log*
-tester/api_config/api_config*
-tester/api_config/output/
-.api_config/
-apitest_config/
+/tools/regression/logs/
+/tester/api_config/**/test_log*
+/tester/api_config/api_config*
+/tester/api_config/output/
+/.api_config/
+/apitest_config/
 
 # Profiler / tracer outputs
 /profiler_outputs/
 *.prof
 *.trace.json
-tools/api_tracer/.huggingface/
-tools/api_tracer/trace_output*
+/tools/api_tracer/.huggingface/
+/tools/api_tracer/trace_output*

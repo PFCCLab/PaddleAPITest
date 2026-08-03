@@ -148,27 +148,27 @@ echo "输入    $FILE_INPUT"
 echo "日志    $LOG_DIR"
 echo "参数    $OPTIONS_TEXT"
 
-# 执行程序
-LOG_FILE="$LOG_DIR/log_$(date +%Y%m%d_%H%M%S).log"
+# 执行程序；engineV2.py 会在 log_dir 中创建主进程日志。
 nohup python engineV2.py \
         "${TEST_MODE_ARGS[@]}" \
         "${TEST_PARAM_ARGS[@]}" \
         "${IN_OUT_ARGS[@]}" \
         "${PARALLEL_ARGS[@]}" \
         "${TIME_OUT_ARGS[@]}" \
-        >> "$LOG_FILE" 2>&1 &
+        >/dev/null 2>&1 &
 
 PYTHON_PID=$!
 
 sleep 1
 if ! ps -p "$PYTHON_PID" > /dev/null; then
-    echo "[错误] 启动失败 | engineV2.py | 日志 $LOG_FILE"
+    echo "[错误] 启动失败 | engineV2.py | 日志目录 $LOG_DIR"
     exit 1
 fi
 
-echo "已启动  PID $PYTHON_PID | 日志 $LOG_FILE"
+LOG_FILE="$(ls -t "$LOG_DIR"/log_[0-9]*.log 2>/dev/null | head -1 || true)"
+echo "已启动  PID $PYTHON_PID | 日志 ${LOG_FILE:-$LOG_DIR}"
 echo "管理    终止: kill $PYTHON_PID"
-echo "跟踪    tail -f $LOG_FILE"
+[[ -n "$LOG_FILE" ]] && echo "跟踪    tail -f $LOG_FILE"
 
 exit 0
 
