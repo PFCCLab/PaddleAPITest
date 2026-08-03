@@ -2795,8 +2795,10 @@
         "set_defaults": {
             "weight": "None",
             "reduction": "'mean'",
+            "ignore_index": "-100",
             "soft_label": "False",
             "label_smoothing": "0.0",
+            "use_softmax": "True",
             "reduction_original": "None"
         },
         "paddle_torch_args_map": {
@@ -2805,7 +2807,8 @@
             "weight": "weight",
             "reduction": "reduction",
             "ignore_index": "ignore_index",
-            "label_smoothing": "label_smoothing"
+            "label_smoothing": "label_smoothing",
+            "use_softmax": "use_softmax"
         }
     },
     "paddle.nn.functional.ctc_loss": {

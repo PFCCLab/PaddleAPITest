@@ -25,17 +25,17 @@ class InputBackend(Protocol):
 
     def generation_dtype(self, dtype: str) -> str: ...
 
-    def random(self, shape=None, size=None, dtype=None): ...
+    def random(self, shape=None, dtype=None): ...
 
-    def uniform(self, low=0.0, high=1.0, shape=None, size=None, dtype=None): ...
+    def uniform(self, low=0.0, high=1.0, shape=None, dtype=None): ...
 
-    def randint(self, low, high=None, shape=None, size=None, dtype=None): ...
+    def randint(self, low, high=None, shape=None, dtype=None): ...
 
-    def randn(self, *shape, size=None, dtype=None): ...
+    def randn(self, *shape, dtype=None): ...
 
-    def choice(self, values, shape=None, size=None, replace=True, p=None): ...
+    def choice(self, values, shape=None, replace=True, p=None): ...
 
-    def asarray(self, value, dtype=None, copy=True, order="K"): ...
+    def asarray(self, value, dtype=None, copy=True): ...
 
     def cast(self, value, dtype): ...
 
@@ -114,33 +114,39 @@ class NumpyInputBackend:
     def generation_dtype(self, dtype: str) -> str:
         return generation_dtype(dtype)
 
-    def random(self, shape=None, size=None, dtype=None):
-        shape = shape if shape is not None else size
+    def _storage_dtype(self, dtype):
+        if dtype is None:
+            return None
+        if isinstance(dtype, str):
+            dtype_name = dtype.replace("paddle.", "")
+        else:
+            try:
+                dtype_name = numpy.dtype(dtype).name
+            except TypeError:
+                dtype_name = str(dtype).split(".")[-1]
+        return generation_dtype(dtype_name)
+
+    def random(self, shape=None, dtype=None):
         value = self.rng.random(shape)
         return numpy.asarray(value).astype(dtype) if dtype is not None else value
 
-    def uniform(self, low=0.0, high=1.0, shape=None, size=None, dtype=None):
-        shape = shape if shape is not None else size
-        value = self.rng.uniform(low=low, high=high, size=shape)
+    def uniform(self, low=0.0, high=1.0, shape=None, dtype=None):
+        value = self.rng.uniform(low=low, high=high, shape=shape)
         return numpy.asarray(value).astype(dtype) if dtype is not None else value
 
-    def randint(self, low, high=None, shape=None, size=None, dtype=None):
-        shape = shape if shape is not None else size
-        value = self.rng.randint(low, high, size=shape)
+    def randint(self, low, high=None, shape=None, dtype=None):
+        value = self.rng.randint(low, high, shape=shape)
         return numpy.asarray(value).astype(dtype) if dtype is not None else value
 
-    def randn(self, *shape, size=None, dtype=None):
-        if size is not None and not shape:
-            shape = tuple(size) if isinstance(size, (list, tuple)) else (size,)
+    def randn(self, *shape, dtype=None):
         value = self.rng.randn(*shape)
         return numpy.asarray(value).astype(dtype) if dtype is not None else value
 
-    def choice(self, values, shape=None, size=None, replace=True, p=None):
-        shape = shape if shape is not None else size
-        return self.rng.choice(values, size=shape, replace=replace, p=p)
+    def choice(self, values, shape=None, replace=True, p=None):
+        return self.rng.choice(values, shape=shape, replace=replace, p=p)
 
-    def asarray(self, value, dtype=None, copy=True, order="K"):
-        return numpy.array(value, dtype=dtype, copy=copy, order=order)
+    def asarray(self, value, dtype=None, copy=True):
+        return numpy.array(value, dtype=dtype, copy=copy)
 
     def cast(self, value, dtype):
         return numpy.asarray(value).astype(dtype)
@@ -256,27 +262,12 @@ class TorchInputBackend(NumpyInputBackend):
 
         return torch
 
-    def _shape(self, shape=None, size=None):
-        return shape if shape is not None else size
-
     def _torch_shape(self, shape):
         if shape is None:
             return ()
         if isinstance(shape, numbers.Integral):
             return (int(shape),)
         return tuple(shape)
-
-    def _storage_dtype(self, dtype):
-        if dtype is None:
-            return None
-        if isinstance(dtype, str):
-            dtype_name = dtype.replace("paddle.", "")
-        else:
-            try:
-                dtype_name = numpy.dtype(dtype).name
-            except TypeError:
-                dtype_name = str(dtype).split(".")[-1]
-        return generation_dtype(dtype_name)
 
     def _torch_dtype(self, dtype):
         if isinstance(dtype, str):
@@ -300,9 +291,8 @@ class TorchInputBackend(NumpyInputBackend):
             return torch.float64
         return torch.float32
 
-    def random(self, shape=None, size=None, dtype=None):
+    def random(self, shape=None, dtype=None):
         torch = self._torch()
-        shape = self._shape(shape, size)
         torch_shape = self._torch_shape(shape)
         value = torch.rand(
             torch_shape,
@@ -312,9 +302,8 @@ class TorchInputBackend(NumpyInputBackend):
         )
         return self.cast(value, dtype) if dtype is not None else value
 
-    def uniform(self, low=0.0, high=1.0, shape=None, size=None, dtype=None):
+    def uniform(self, low=0.0, high=1.0, shape=None, dtype=None):
         torch = self._torch()
-        shape = self._shape(shape, size)
         torch_shape = self._torch_shape(shape)
         value = torch.empty(
             torch_shape,
@@ -327,9 +316,8 @@ class TorchInputBackend(NumpyInputBackend):
         )
         return self.cast(value, dtype) if dtype is not None else value
 
-    def randint(self, low, high=None, shape=None, size=None, dtype=None):
+    def randint(self, low, high=None, shape=None, dtype=None):
         torch = self._torch()
-        shape = self._shape(shape, size)
         torch_shape = self._torch_shape(shape)
         if high is None:
             low, high = 0, low
@@ -343,10 +331,8 @@ class TorchInputBackend(NumpyInputBackend):
         )
         return self.cast(value, dtype) if dtype is not None else value
 
-    def randn(self, *shape, size=None, dtype=None):
+    def randn(self, *shape, dtype=None):
         torch = self._torch()
-        if size is not None and not shape:
-            shape = tuple(size) if isinstance(size, (list, tuple)) else (size,)
         value = torch.randn(
             tuple(shape),
             dtype=torch.float32,
@@ -355,9 +341,8 @@ class TorchInputBackend(NumpyInputBackend):
         )
         return self.cast(value, dtype) if dtype is not None else value
 
-    def choice(self, values, shape=None, size=None, replace=True, p=None):
+    def choice(self, values, shape=None, replace=True, p=None):
         torch = self._torch()
-        shape = self._shape(shape, size)
         scalar = shape is None
         torch_shape = (
             () if scalar else tuple(shape) if isinstance(shape, (list, tuple)) else (shape,)
@@ -398,10 +383,8 @@ class TorchInputBackend(NumpyInputBackend):
             return result.item()
         return self.reshape(result, torch_shape)
 
-    def asarray(self, value, dtype=None, copy=True, order="K"):
+    def asarray(self, value, dtype=None, copy=True):
         torch = self._torch()
-        if order not in {"K", "C", None}:
-            raise ValueError(f"unsupported torch input array order: {order!r}")
         torch_dtype = self._torch_dtype(dtype)
         if isinstance(value, torch.Tensor):
             tensor = value.to(device=self._device, dtype=torch_dtype)
@@ -572,27 +555,12 @@ class PaddleInputBackend(NumpyInputBackend):
 
         return paddle
 
-    def _shape(self, shape=None, size=None):
-        return shape if shape is not None else size
-
     def _paddle_shape(self, shape):
         if shape is None:
             return []
         if isinstance(shape, numbers.Integral):
             return [int(shape)]
         return list(shape)
-
-    def _storage_dtype(self, dtype):
-        if dtype is None:
-            return None
-        if isinstance(dtype, str):
-            dtype_name = dtype.replace("paddle.", "")
-        else:
-            try:
-                dtype_name = numpy.dtype(dtype).name
-            except TypeError:
-                dtype_name = str(dtype).split(".")[-1]
-        return generation_dtype(dtype_name)
 
     def _paddle_dtype(self, dtype):
         storage_dtype = self._storage_dtype(dtype)
@@ -606,9 +574,8 @@ class PaddleInputBackend(NumpyInputBackend):
             return "float64"
         return "float32"
 
-    def random(self, shape=None, size=None, dtype=None):
+    def random(self, shape=None, dtype=None):
         paddle = self._paddle()
-        shape = self._shape(shape, size)
         value = paddle.rand(
             self._paddle_shape(shape),
             dtype="float32",
@@ -616,9 +583,8 @@ class PaddleInputBackend(NumpyInputBackend):
         )
         return self.cast(value, dtype) if dtype is not None else value
 
-    def uniform(self, low=0.0, high=1.0, shape=None, size=None, dtype=None):
+    def uniform(self, low=0.0, high=1.0, shape=None, dtype=None):
         paddle = self._paddle()
-        shape = self._shape(shape, size)
         value = paddle.uniform(
             self._paddle_shape(shape),
             dtype=self._paddle_float_generation_dtype(dtype),
@@ -628,9 +594,8 @@ class PaddleInputBackend(NumpyInputBackend):
         )
         return self.cast(value, dtype) if dtype is not None else value
 
-    def randint(self, low, high=None, shape=None, size=None, dtype=None):
+    def randint(self, low, high=None, shape=None, dtype=None):
         paddle = self._paddle()
-        shape = self._shape(shape, size)
         if high is None:
             low, high = 0, low
         value = paddle.randint(
@@ -642,10 +607,8 @@ class PaddleInputBackend(NumpyInputBackend):
         )
         return self.cast(value, dtype) if dtype is not None else value
 
-    def randn(self, *shape, size=None, dtype=None):
+    def randn(self, *shape, dtype=None):
         paddle = self._paddle()
-        if size is not None and not shape:
-            shape = tuple(size) if isinstance(size, (list, tuple)) else (size,)
         value = paddle.randn(
             self._paddle_shape(shape),
             dtype="float32",
@@ -653,9 +616,8 @@ class PaddleInputBackend(NumpyInputBackend):
         )
         return self.cast(value, dtype) if dtype is not None else value
 
-    def choice(self, values, shape=None, size=None, replace=True, p=None):
+    def choice(self, values, shape=None, replace=True, p=None):
         paddle = self._paddle()
-        shape = self._shape(shape, size)
         scalar = shape is None
         paddle_shape = (
             [] if scalar else list(shape) if isinstance(shape, (list, tuple)) else [shape]
@@ -692,10 +654,8 @@ class PaddleInputBackend(NumpyInputBackend):
             return result.item()
         return self.reshape(result, paddle_shape)
 
-    def asarray(self, value, dtype=None, copy=True, order="K"):
+    def asarray(self, value, dtype=None, copy=True):
         paddle = self._paddle()
-        if order not in {"K", "C", None}:
-            raise ValueError(f"unsupported paddle input array order: {order!r}")
         paddle_dtype = self._paddle_dtype(dtype)
         if isinstance(value, paddle.Tensor):
             tensor = value._copy_to(self._place, False)
@@ -856,7 +816,7 @@ class PaddleInputBackend(NumpyInputBackend):
 INPUT_BACKEND_ENV_VAR = "PADDLEAPITEST_INPUT_BACKEND"
 # Only used when no case-local RNG is available, such as legacy TensorConfig helpers.
 _DEFAULT_BACKENDS = {}
-_WARNED_CACHED_TORCH_BACKEND = False
+_WARNED_CACHED_NON_NUMPY_BACKEND = False
 
 
 def _use_cached_numpy() -> bool:
@@ -868,22 +828,24 @@ def _use_gpu_mode() -> bool:
 
 
 def create_input_backend(rng=NUMPY_RNG) -> InputBackend:
-    global _WARNED_CACHED_TORCH_BACKEND
+    global _WARNED_CACHED_NON_NUMPY_BACKEND
 
     requested = os.environ.get(INPUT_BACKEND_ENV_VAR)
     normalized_requested = (requested or "numpy").strip().lower()
+    use_cached_numpy = _use_cached_numpy()
+    use_gpu_mode = _use_gpu_mode()
 
-    if _use_cached_numpy():
-        if normalized_requested in {"torch", "paddle"} and not _WARNED_CACHED_TORCH_BACKEND:
+    if use_cached_numpy:
+        if normalized_requested in {"torch", "paddle"} and not _WARNED_CACHED_NON_NUMPY_BACKEND:
             message = (
                 "USE_CACHED_NUMPY=True requires the numpy input backend; "
                 f"ignoring {INPUT_BACKEND_ENV_VAR}={normalized_requested}."
             )
             warnings.warn(message, RuntimeWarning, stacklevel=2)
             print(f"[WARNING] {message}", file=sys.stderr, flush=True)
-            _WARNED_CACHED_TORCH_BACKEND = True
+            _WARNED_CACHED_NON_NUMPY_BACKEND = True
         normalized = "numpy"
-    elif _use_gpu_mode() and requested is None:
+    elif use_gpu_mode and requested is None:
         normalized = "torch"
     else:
         normalized = normalized_requested
@@ -891,21 +853,23 @@ def create_input_backend(rng=NUMPY_RNG) -> InputBackend:
     if normalized not in {"numpy", "torch", "paddle"}:
         raise ValueError(f"unsupported input generation backend: {requested!r}")
 
-    if normalized == "torch":
-        device = "cuda:0" if _use_gpu_mode() else "cpu"
-    elif normalized == "paddle":
-        device = "gpu:0" if _use_gpu_mode() else "cpu"
-    else:
-        device = "cpu"
+    device = {
+        "numpy": "cpu",
+        "torch": "cuda:0" if use_gpu_mode else "cpu",
+        "paddle": "gpu:0" if use_gpu_mode else "cpu",
+    }[normalized]
+
     cache_key = (normalized, device)
     if rng is NUMPY_RNG and cache_key in _DEFAULT_BACKENDS:
         return _DEFAULT_BACKENDS[cache_key]
+
     if normalized == "numpy":
         backend = NumpyInputBackend(rng)
     elif normalized == "torch":
         backend = TorchInputBackend(rng, device=device)
     else:
         backend = PaddleInputBackend(rng, device=device)
+
     if rng is NUMPY_RNG:
         _DEFAULT_BACKENDS[cache_key] = backend
     return backend

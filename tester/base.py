@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import collections
-import contextlib
 import gc
 import os
 from dataclasses import dataclass
@@ -12,12 +11,7 @@ import yaml
 
 from .dtype_utils import to_torch_dtype
 from .dump_writer import DEFAULT_DUMP_DIR, DumpContext, dump_enabled
-from .input_generation.input_backend import create_input_backend
-from .input_generation.input_binding import (
-    bind_parameters,
-    get_arg,
-)
-from .input_generation.input_data import input_value, write_input_value
+from .input_generation.input_binding import bind_parameters
 from .input_generation.tensor_config import (
     TensorConfig,
     get_cached_numpy_array,
@@ -25,14 +19,12 @@ from .input_generation.tensor_config import (
 from .log_writer import log_worker
 from .log_writer.log_comparison import log_accuracy_tolerance
 from .log_writer.log_schema import MAX_CSV_CONFIG_LENGTH
-from .log_writer.log_worker import write_to_log
 from .runtime_config import TestRuntimeConfig
 
 with open("tester/base_config.yaml", encoding="utf-8") as f:
     config = yaml.safe_load(f)
 
 forward_only_apis = frozenset(config.get("forward_only_apis", []))
-handle_axes_api = frozenset(config.get("handle_axes_api", []))
 not_check_dtype = frozenset(config.get("not_check_dtype", []))
 rand_apis = frozenset(config.get("rand_apis", []))
 stochastic_behavior_apis = frozenset(config.get("stochastic_behavior_apis", []))
@@ -626,208 +618,6 @@ class APITestBase:
             return True
         return finish(resolution.arguments)
 
-    def _handle_list_or_tuple(
-        self, config_items, is_tuple=False, index=None, key=None, list_index=None
-    ):
-        """处理 list 或 tuple"""
-        if list_index is None:
-            list_index = []
-        need_axes_handling = self.api_config.api_name in handle_axes_api
-        need_indices_handling = self.api_config.api_name == "paddle.index_put"
-
-        if need_indices_handling and (index == 1 or key == "indices"):
-            return self._handle_indices_arg(config_items, is_tuple)
-        elif need_axes_handling and (index == 1 or key == "axis"):
-            return self._handle_axis_arg(config_items, is_tuple)
-
-        tmp = []
-        for i, item in enumerate(config_items):
-            current_list_index = [*list_index, i]
-            if isinstance(item, (list, tuple)):
-                is_nested_tuple = isinstance(item, tuple)
-                processed_item = self._handle_list_or_tuple(
-                    item,
-                    is_tuple=is_nested_tuple,
-                    index=index,
-                    key=key,
-                    list_index=current_list_index,
-                )
-            elif isinstance(item, TensorConfig):
-                processed_item = input_value(self.api_config, item)
-            else:
-                processed_item = item
-            tmp.append(processed_item)
-        return tuple(tmp) if is_tuple else tmp
-
-    def _handle_axis_arg(self, config_items, is_tuple=False):
-        """处理 axis 参数"""
-        x = (
-            self.paddle_args_config[0]
-            if len(self.paddle_args_config) > 0
-            else self.paddle_kwargs_config["x"]
-        )
-        max_dim = max(len(x.shape), 1)  # scalar
-
-        tmp = []
-        used_axes = set()
-        tensor_configs = []
-
-        for item in config_items:
-            if isinstance(item, TensorConfig):
-                if item.shape not in [[], [1]] or item.dtype not in ["int32", "int64"]:
-                    raise ValueError(
-                        f"Invalid TensorConfig for axis: shape {item.shape} or dtype {item.dtype}"
-                    )
-                tensor_configs.append(item)
-                tmp.append(0)  # placeholder
-            elif isinstance(item, int):
-                if not (-max_dim <= item < max_dim):
-                    raise ValueError(f"Axis value {item} out of range [-{max_dim}, {max_dim})")
-                positive_axis = item + max_dim if item < 0 else item
-                if positive_axis in used_axes:
-                    raise ValueError(f"Duplicate axis value: {item}")
-                used_axes.add(positive_axis)
-                tmp.append(item)
-            else:
-                raise ValueError(f"Invalid item type for axis: {type(item)}")
-
-        if tensor_configs:
-            backend = create_input_backend()
-            available_dims = list(set(range(max_dim)) - used_axes)
-            if len(available_dims) < len(tensor_configs):
-                raise ValueError(
-                    f"Not enough available dimensions ({len(available_dims)}) for {len(tensor_configs)} TensorConfig items"
-                )
-            selected_dims = backend.choice(available_dims, size=len(tensor_configs), replace=False)
-            mask = backend.cast(backend.randint(0, 2, size=len(tensor_configs)), "bool")
-            final_dims = backend.where(mask, selected_dims - max_dim, selected_dims)
-            tensor_idx = 0
-            for i, item in enumerate(config_items):
-                if isinstance(item, TensorConfig):
-                    write_input_value(
-                        self.api_config,
-                        item,
-                        backend.full(item.shape, final_dims[tensor_idx], dtype=item.dtype),
-                    )
-                    tmp[i] = input_value(self.api_config, item)
-                    tensor_idx += 1
-        return tuple(tmp) if is_tuple else tmp
-
-    def _generate_int_indices(self, item_shape, dim_size, backend):
-        num_elements = backend.prod(item_shape)
-        if num_elements > dim_size:
-            indices_flat = backend.randint(-dim_size, dim_size, size=num_elements)
-        else:
-            indices_flat = backend.choice(dim_size, size=num_elements, replace=False)
-        return backend.reshape(indices_flat, item_shape)
-
-    def _generate_constrained_bool_mask(self, shape, num_true, backend):
-        mask_size = backend.prod(shape)
-        if mask_size < num_true:
-            raise ValueError(
-                f"Cannot generate a mask with {num_true} true values in a {mask_size} element mask"
-            )
-        mask_flat = backend.zeros(mask_size, dtype="bool")
-        true_indices = backend.choice(mask_size, num_true, replace=False)
-        mask_flat[true_indices] = True
-        return backend.reshape(mask_flat, shape)
-
-    def _broadcast_or_raise(self, shapes):
-        return numpy.broadcast_shapes(*[tuple(s) for s in shapes])
-
-    def _handle_indices_arg(self, config_items, is_tuple=False):
-        x = (
-            self.paddle_args_config[0]
-            if len(self.paddle_args_config) > 0
-            else self.paddle_kwargs_config["x"]
-        )
-        value = (
-            self.paddle_args_config[2]
-            if len(self.paddle_args_config) > 2
-            else self.paddle_kwargs_config["value"]
-        )
-        x_shape = x.shape
-        value_shape = value.shape
-        int_index_shapes = []
-        has_bool_index = False
-        dims_consumed = 0
-        for item in config_items:
-            if item.dtype == "bool":
-                b_rank = len(item.shape)
-                has_bool_index = True
-                dims_consumed += b_rank
-            else:
-                int_index_shapes.append(tuple(item.shape))
-                dims_consumed += 1
-
-        if dims_consumed > len(x_shape):
-            raise ValueError(
-                f"Too many indices: consume {dims_consumed} dims but x has {len(x_shape)} dims"
-            )
-        num_true_needed = -1
-        num_remaining_dims = len(x_shape) - dims_consumed
-        advanced_shape = ()
-        if int_index_shapes:
-            try:
-                advanced_shape = self._broadcast_or_raise(int_index_shapes)
-                # give a default 1
-                if (
-                    has_bool_index
-                    and len(value_shape) > num_remaining_dims
-                    and advanced_shape[-1] == 1
-                    and value_shape[-num_remaining_dims - 1] != 1
-                ):
-                    advanced_shape = (
-                        *advanced_shape[:-1],
-                        value_shape[-num_remaining_dims - 1],
-                    )
-                num_true_needed = advanced_shape[-1]
-            except Exception:
-                raise ValueError(
-                    f"Incompatible integer index shapes for broadcasting: {int_index_shapes}"
-                )
-        elif has_bool_index:
-            if len(value_shape) > num_remaining_dims:
-                advanced_shape = (value_shape[0],)
-                num_true_needed = value_shape[0]
-            else:
-                # give a default 1, other valid(not out of bound) shape also can.
-                advanced_shape = (1,)
-                num_true_needed = 1
-        res_dims = advanced_shape + tuple(x_shape[dims_consumed:])
-        try:
-            # only for checking.
-            self._broadcast_or_raise([value_shape, res_dims])
-        except ValueError:
-            raise ValueError(
-                f"Value shape {value_shape} cannot be broadcast to the indexed shape {res_dims}."
-            )
-        processed_indices = []
-        x_dim_cursor = 0
-        backend = create_input_backend()
-        for item in config_items:
-            if item.dtype == "bool":
-                if num_true_needed < 0:
-                    raise ValueError(
-                        "Cannot determine the number of True elements for the boolean mask."
-                    )
-                index_value = self._generate_constrained_bool_mask(
-                    item.shape,
-                    num_true_needed,
-                    backend,
-                )
-                x_dim_cursor += len(item.shape)
-            else:
-                x_dim_to_index = x_shape[x_dim_cursor]
-                indices = self._generate_int_indices(item.shape, x_dim_to_index, backend)
-                index_value = backend.cast(indices, item.dtype)
-                x_dim_cursor += 1
-
-            write_input_value(self.api_config, item, index_value)
-            processed_indices.append(input_value(self.api_config, item))
-
-        return tuple(processed_indices) if is_tuple else processed_indices
-
     def gen_input_data(self):
         from .input_generation.input_dispatch import dispatch_input
 
@@ -883,18 +673,6 @@ class APITestBase:
                 self.paddle_args[3] = "gels"
             elif "driver" in self.paddle_kwargs:
                 self.paddle_kwargs["driver"] = "gels"
-        elif self.api_config.api_name == "paddle.nn.functional.cross_entropy":
-            use_softmax = get_arg(self.api_config, 8, "use_softmax", True)
-            if not use_softmax:
-                axis = get_arg(self.api_config, 7, "axis", -1)
-                if len(self.paddle_args) > 0:
-                    self.paddle_args[0] = paddle.nn.functional.softmax(
-                        self.paddle_args[0], axis=axis
-                    )
-                else:
-                    self.paddle_kwargs["input"] = paddle.nn.functional.softmax(
-                        self.paddle_kwargs["input"], axis=axis
-                    )
 
         # In-place ops require a non-leaf tensor as target.  Always copy inputs
         # so the in-place op doesn't hit "Leaf Var can't use inplace strategy".
@@ -2365,10 +2143,6 @@ class APITestBase:
             )
         else:
             torch.cuda.empty_cache()
-
-    def clear_numpy_tensor(self):
-        if not self._clear_tensor_config_cache("clear_numpy_tensor", self.api_config):
-            return
 
     def is_forward_only(self):
         api = self.api_config.api_name[self.api_config.api_name.rindex(".") + 1 :]

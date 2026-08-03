@@ -54,8 +54,8 @@ Tensor 绑定和未解析原因。规则只应该读取它，不应该自己再�
 
 ### `InputContext`
 
-`InputContext` 把一次生成需要的上下文一次性封装起来：绑定结果、配置指纹、seed、
-Torch 开关和 GPU 开关。规则不应直接依赖全局状态。
+`InputContext` 把一次生成需要的上下文一次性封装起来：绑定结果、配置指纹、seed
+和 GPU 开关。规则不应直接依赖全局状态。
 
 ### `InputData`
 

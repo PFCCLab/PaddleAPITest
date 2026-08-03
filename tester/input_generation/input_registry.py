@@ -14,7 +14,7 @@ from .input_backend import create_input_backend
 from .input_binding import InputContext
 from .input_data import InputData, attach_values
 from .input_data import input_value as read_input_value
-from .tensor_config import CAST_THROUGH_INTERMEDIATE_DTYPES, not_zero_apis
+from .tensor_config import CAST_THROUGH_INTERMEDIATE_DTYPES, TensorConfig, not_zero_apis
 from .tensor_spec import TensorSpec
 from .value_gen import (
     create_case_rng,
@@ -153,7 +153,6 @@ class InputDataBuilder:
         generator: str | CaseValueGenerator,
         low=None,
         high=None,
-        required: bool = True,
     ):
         names = (parameter_name,) if isinstance(parameter_name, str) else tuple(parameter_name)
         matched = False
@@ -161,15 +160,15 @@ class InputDataBuilder:
             if binding.parameter_name in names:
                 self._generate_binding(binding, generator, low, high)
                 matched = True
-        if required and not matched:
+        if not matched:
             raise ValueError(
                 f"rule {self.context.call.api_name} did not find parameter {parameter_name!r}"
             )
 
-    def generate_remaining(self, generator: str | CaseValueGenerator, low=None, high=None):
+    def generate_remaining(self, generator: str | CaseValueGenerator):
         for binding in self.context.call.tensors:
             if binding.path not in self._generated_paths:
-                self._generate_binding(binding, generator, low, high)
+                self._generate_binding(binding, generator)
 
     def generate_by_parameter(
         self, parameter_generators, default: str | CaseValueGenerator | None = None
@@ -218,13 +217,33 @@ class InputDataBuilder:
     def set_value(self, binding, value):
         if binding.path in self._generated_paths:
             raise ValueError(f"rule generated tensor twice: {binding.path}")
-        storage_value = _apply_value(self.raw_case, binding.path, value, self.backend)
-        self._input_data_by_path[binding.path] = self._input_value(binding, storage_value)
+        storage_value = _apply_value_raw(
+            self.raw_case,
+            binding.path,
+            value,
+            self.backend,
+            True,
+        )
+        self._input_data_by_path[binding.path] = InputData(
+            binding.path,
+            storage_value,
+            self.backend.name,
+        )
         self._generated_paths.add(binding.path)
 
     def rewrite_value(self, binding, value):
-        storage_value = _apply_value(self.raw_case, binding.path, value, self.backend)
-        self._input_data_by_path[binding.path] = self._input_value(binding, storage_value)
+        storage_value = _apply_value_raw(
+            self.raw_case,
+            binding.path,
+            value,
+            self.backend,
+            True,
+        )
+        self._input_data_by_path[binding.path] = InputData(
+            binding.path,
+            storage_value,
+            self.backend.name,
+        )
         self._generated_paths.add(binding.path)
 
     def set_value_raw(self, binding, value):
@@ -235,23 +254,15 @@ class InputDataBuilder:
             binding.path,
             value,
             self.backend,
-            update_metadata=False,
+            False,
         )
-        self._input_data_by_path[binding.path] = self._input_value(
-            binding, storage_value, update_metadata=False
+        self._input_data_by_path[binding.path] = InputData(
+            binding.path,
+            storage_value,
+            self.backend.name,
         )
         self._generated_paths.add(binding.path)
         return _RAW_WRITE
-
-    def _input_value(self, binding, value, update_metadata=True):
-        return InputData(
-            binding.path,
-            value,
-            update_metadata=update_metadata,
-            backend=self.backend.name,
-            declared_dtype=binding.spec.dtype,
-            storage_dtype=str(getattr(value, "dtype", "")) or None,
-        )
 
     def find(self, parameter_name: str):
         for binding in self.context.call.tensors:
@@ -266,14 +277,11 @@ class InputDataBuilder:
         return None
 
     def value(self, binding):
-        data = self.input_data(binding)
+        data = self._input_data_by_path.get(binding.path)
         if data is not None:
             return data.value
         config = _tensor_config_at(self.raw_case, binding.path)
         return read_input_value(self.raw_case, config)
-
-    def input_data(self, binding):
-        return self._input_data_by_path.get(binding.path)
 
     def input_data_items(self):
         return tuple(self._input_data_by_path.values())
@@ -293,10 +301,6 @@ class InputDataBuilder:
 
     def argument_values(self):
         return (*self.raw_case.args, *self.raw_case.kwargs.values())
-
-    def binding_list_index(self, binding, default=None):
-        config = _tensor_config_at(self.raw_case, binding.path)
-        return getattr(config, "list_index", default)
 
     def is_tensor_config(self, value):
         return _is_tensor_config(value)
@@ -432,7 +436,7 @@ def _optimizer_beta_pow(inputs: InputDataBuilder, binding, beta, step):
 
 
 def _is_tensor_config(value) -> bool:
-    return hasattr(value, "input_value") and hasattr(value, "shape") and hasattr(value, "dtype")
+    return isinstance(value, TensorConfig)
 
 
 rules = RuleRegistry()
@@ -462,7 +466,7 @@ def default_values(ctx: InputContext, inputs: InputDataBuilder):
 def fused_act_dequant_values(ctx: InputContext, inputs: InputDataBuilder):
     def x_scale_value(binding):
         if binding.spec.dtype == "int32":
-            exponent = inputs.backend.randint(120, 128, size=binding.spec.shape, dtype="int32")
+            exponent = inputs.backend.randint(120, 128, shape=binding.spec.shape, dtype="int32")
             return exponent * inputs.backend.asarray(0x01010101, dtype="int32")
         return inputs.value_domain("default", binding)
 
@@ -484,7 +488,7 @@ def variable_length_memory_efficient_attention_values(ctx: InputContext, inputs:
 
     def mask_value(binding):
         return inputs.backend.cast(
-            inputs.backend.randint(0, 2, size=binding.spec.shape),
+            inputs.backend.randint(0, 2, shape=binding.spec.shape),
             binding.spec.dtype,
         ) * inputs.dtype_min(binding.spec.dtype)
 
@@ -692,20 +696,20 @@ def arange_values(ctx: InputContext, inputs: InputDataBuilder):
         if "int" in step_config.dtype:
             if is_positive:
                 return inputs.backend.cast(
-                    inputs.backend.randint(1, 10, size=step_config.shape),
+                    inputs.backend.randint(1, 10, shape=step_config.shape),
                     step_config.dtype,
                 )
             return inputs.backend.cast(
-                inputs.backend.randint(-10, -1, size=step_config.shape),
+                inputs.backend.randint(-10, -1, shape=step_config.shape),
                 step_config.dtype,
             )
         if is_positive:
             return inputs.backend.cast(
-                inputs.backend.uniform(0.1, 5.0, size=step_config.shape),
+                inputs.backend.uniform(0.1, 5.0, shape=step_config.shape),
                 step_config.dtype,
             )
         return inputs.backend.cast(
-            inputs.backend.uniform(-5.0, -0.1, size=step_config.shape),
+            inputs.backend.uniform(-5.0, -0.1, shape=step_config.shape),
             step_config.dtype,
         )
 
@@ -723,11 +727,11 @@ def arange_values(ctx: InputContext, inputs: InputDataBuilder):
     def random_range(tensor_config, low, high):
         if "int" in tensor_config.dtype:
             return inputs.backend.cast(
-                inputs.backend.randint(low, high, size=tensor_config.shape),
+                inputs.backend.randint(low, high, shape=tensor_config.shape),
                 tensor_config.dtype,
             )
         return inputs.backend.cast(
-            inputs.backend.uniform(low, high, size=tensor_config.shape),
+            inputs.backend.uniform(low, high, shape=tensor_config.shape),
             tensor_config.dtype,
         )
 
@@ -759,22 +763,22 @@ def arange_values(ctx: InputContext, inputs: InputDataBuilder):
                 if flag:
                     if "int" in start_val.dtype:
                         value = inputs.backend.cast(
-                            inputs.backend.randint(1, 50, size=start_val.shape),
+                            inputs.backend.randint(1, 50, shape=start_val.shape),
                             start_val.dtype,
                         )
                     else:
                         value = inputs.backend.cast(
-                            inputs.backend.uniform(0.1, 50.0, size=start_val.shape),
+                            inputs.backend.uniform(0.1, 50.0, shape=start_val.shape),
                             start_val.dtype,
                         )
                 elif "int" in start_val.dtype:
                     value = inputs.backend.cast(
-                        inputs.backend.randint(-50, -1, size=start_val.shape),
+                        inputs.backend.randint(-50, -1, shape=start_val.shape),
                         start_val.dtype,
                     )
                 else:
                     value = inputs.backend.cast(
-                        inputs.backend.uniform(-50.0, -0.1, size=start_val.shape),
+                        inputs.backend.uniform(-50.0, -0.1, shape=start_val.shape),
                         start_val.dtype,
                     )
                 rewrite_tensor(start_val, value)
@@ -1138,7 +1142,7 @@ def conv2d_transpose_values(ctx: InputContext, inputs: InputDataBuilder):
     def tensor_value(binding):
         if "int" in binding.spec.dtype:
             return inputs.backend.cast(
-                inputs.backend.randint(-65535, 65535, size=binding.spec.shape),
+                inputs.backend.randint(-65535, 65535, shape=binding.spec.shape),
                 binding.spec.dtype,
             )
         return inputs.backend.cast(
@@ -1159,14 +1163,14 @@ def distribute_fpn_proposals_values(ctx: InputContext, inputs: InputDataBuilder)
     def fpn_rois_value(binding):
         num = binding.spec.shape[0]
         state["num"] = num
-        rois = inputs.backend.randint(1, 1024, size=[num, 4])
+        rois = inputs.backend.randint(1, 1024, shape=[num, 4])
         rois[:, 0] = rois[:, 0] + inputs.backend.random([num])
         rois[:, 1] = rois[:, 1] + inputs.backend.random([num])
         rois[:, 2] = (
-            rois[:, 0] + inputs.backend.randint(1, 1024, size=[num]) + inputs.backend.random([num])
+            rois[:, 0] + inputs.backend.randint(1, 1024, shape=[num]) + inputs.backend.random([num])
         )
         rois[:, 3] = (
-            rois[:, 1] + inputs.backend.randint(1, 1024, size=[num]) + inputs.backend.random([num])
+            rois[:, 1] + inputs.backend.randint(1, 1024, shape=[num]) + inputs.backend.random([num])
         )
         return rois
 
@@ -1209,7 +1213,7 @@ def generate_proposals_values(ctx: InputContext, inputs: InputDataBuilder):
 
     def img_size_value(binding):
         return inputs.backend.cast(
-            inputs.backend.randint(0, 1024, size=binding.spec.shape),
+            inputs.backend.randint(0, 1024, shape=binding.spec.shape),
             binding.spec.dtype,
         )
 
@@ -1259,7 +1263,7 @@ def nms_values(ctx: InputContext, inputs: InputDataBuilder):
 
     def default_vision_value(binding):
         return inputs.backend.cast(
-            inputs.backend.randint(0, 1024, size=binding.spec.shape),
+            inputs.backend.randint(0, 1024, shape=binding.spec.shape),
             binding.spec.dtype,
         )
 
@@ -1473,7 +1477,7 @@ def atan2_values(ctx: InputContext, inputs: InputDataBuilder):
 def bincount_values(ctx: InputContext, inputs: InputDataBuilder):
     def integer_value(binding):
         return inputs.backend.cast(
-            inputs.backend.randint(0, 65535, size=binding.spec.shape),
+            inputs.backend.randint(0, 65535, shape=binding.spec.shape),
             binding.spec.dtype,
         )
 
@@ -1493,7 +1497,7 @@ def adaptive_avg_pool_values(ctx: InputContext, inputs: InputDataBuilder):
     def output_size(binding):
         x_shape = inputs.arg(0, "x").shape
         return inputs.backend.cast(
-            inputs.backend.randint(1, 2 * max(x_shape), size=binding.spec.shape),
+            inputs.backend.randint(1, 2 * max(x_shape), shape=binding.spec.shape),
             binding.spec.dtype,
         )
 
@@ -1521,7 +1525,7 @@ def repeat_interleave_values(ctx: InputContext, inputs: InputDataBuilder):
                 inputs.backend.randint(-input_dims, input_dims), dtype=binding.spec.dtype
             )
         return inputs.backend.cast(
-            inputs.backend.randint(-input_dims, input_dims, size=binding.spec.shape),
+            inputs.backend.randint(-input_dims, input_dims, shape=binding.spec.shape),
             binding.spec.dtype,
         )
 
@@ -1570,7 +1574,7 @@ def put_along_axis_values(ctx: InputContext, inputs: InputDataBuilder):
                     dim_size = x_shape[axis]
                     if dim_size > 0:
                         axis_indices = inputs.backend.choice(
-                            dim_size, size=new_shape[axis], replace=False
+                            dim_size, shape=new_shape[axis], replace=False
                         )
                         axis_indices = inputs.backend.cast(axis_indices, "int64")
                         idx_tuple = tuple(
@@ -1591,7 +1595,7 @@ def put_along_axis_values(ctx: InputContext, inputs: InputDataBuilder):
             dim_size = x_shape[axis]
             for idx in inputs.backend.ndindex(tuple(current_shape[:-1])):
                 indices[idx] = inputs.backend.choice(
-                    dim_size, size=current_shape[-1], replace=False
+                    dim_size, shape=current_shape[-1], replace=False
                 )
         return indices
 
@@ -1624,7 +1628,7 @@ def matrix_transpose_values(ctx: InputContext, inputs: InputDataBuilder):
         shape = binding.spec.shape if len(binding.spec.shape) >= 2 else (2, 2)
         dtype = binding.spec.dtype
         if "int" in dtype:
-            return inputs.backend.cast(inputs.backend.randint(-65535, 65535, size=shape), dtype)
+            return inputs.backend.cast(inputs.backend.randint(-65535, 65535, shape=shape), dtype)
         return inputs.backend.cast(inputs.backend.random(shape) - 0.5, dtype)
 
     inputs.generate_by_parameter((("x", x_value),), default="default")
@@ -1673,7 +1677,7 @@ def class_center_sample_values(ctx: InputContext, inputs: InputDataBuilder):
     def label_value(binding):
         num_classes = inputs.arg(1, "num_classes")
         return inputs.backend.cast(
-            inputs.backend.randint(0, num_classes, size=binding.spec.shape),
+            inputs.backend.randint(0, num_classes, shape=binding.spec.shape),
             binding.spec.dtype,
         )
 
@@ -1687,7 +1691,7 @@ def shard_index_values(ctx: InputContext, inputs: InputDataBuilder):
         if index_num is None:
             index_num = inputs.backend.randint(1, 1000)
         return inputs.backend.cast(
-            inputs.backend.randint(0, index_num, size=binding.spec.shape),
+            inputs.backend.randint(0, index_num, shape=binding.spec.shape),
             binding.spec.dtype,
         )
 
@@ -1721,7 +1725,7 @@ def argminmax_values(ctx: InputContext, inputs: InputDataBuilder):
         x_shape = inputs.arg(0, "x").shape
         min_dim = len(x_shape)
         return inputs.backend.cast(
-            inputs.backend.randint(-min_dim, min_dim - 1, size=binding.spec.shape),
+            inputs.backend.randint(-min_dim, min_dim - 1, shape=binding.spec.shape),
             "int64",
         )
 
@@ -1732,7 +1736,7 @@ def argminmax_values(ctx: InputContext, inputs: InputDataBuilder):
 def cumsum_values(ctx: InputContext, inputs: InputDataBuilder):
     def axis_value(binding):
         x_shape = inputs.arg(0, "x").shape
-        return inputs.backend.randint(-len(x_shape), len(x_shape), size=binding.spec.shape)
+        return inputs.backend.randint(-len(x_shape), len(x_shape), shape=binding.spec.shape)
 
     inputs.generate_by_parameter((("axis", axis_value),), default="default")
 
@@ -1741,16 +1745,59 @@ def cumsum_values(ctx: InputContext, inputs: InputDataBuilder):
     "paddle.mean", "paddle.max", "paddle.min", "paddle.prod", "paddle.sum", "paddle.squeeze"
 )
 def reduction_axis_values(ctx: InputContext, inputs: InputDataBuilder):
+    used_list_axes = None
+
+    def init_used_list_axes(x_shape, axis_arg):
+        used_axes = set()
+        max_dim = max(len(x_shape), 1)
+        if isinstance(axis_arg, (list, tuple)):
+            for item in axis_arg:
+                if inputs.is_tensor_config(item):
+                    continue
+                if not isinstance(item, int):
+                    raise ValueError(f"Invalid item type for axis: {type(item)}")
+                if not (-max_dim <= item < max_dim):
+                    raise ValueError(f"Axis value {item} out of range [-{max_dim}, {max_dim})")
+                positive_axis = item + max_dim if item < 0 else item
+                if positive_axis in used_axes:
+                    raise ValueError(f"Duplicate axis value: {item}")
+                used_axes.add(positive_axis)
+        return used_axes
+
     def axis_value(binding):
+        nonlocal used_list_axes
         x_shape = inputs.arg(0, "x").shape
         max_dim = max(len(x_shape), 1)
+        axis_arg = inputs.arg(1, "axis", None)
+        if isinstance(axis_arg, (list, tuple)) and binding.path.indices:
+            if binding.spec.shape not in [(), (1,)]:
+                raise ValueError(
+                    f"Invalid TensorConfig for axis: shape {binding.spec.shape} "
+                    f"or dtype {binding.spec.dtype}"
+                )
+            if binding.spec.dtype not in {"int32", "int64"}:
+                raise ValueError(
+                    f"Invalid TensorConfig for axis: shape {binding.spec.shape} "
+                    f"or dtype {binding.spec.dtype}"
+                )
+            if used_list_axes is None:
+                used_list_axes = init_used_list_axes(x_shape, axis_arg)
+            available_dims = sorted(set(range(max_dim)) - used_list_axes)
+            if not available_dims:
+                raise ValueError("Not enough available dimensions for axis TensorConfig items")
+            dim = inputs.backend.choice(available_dims, replace=False)
+            dim = int(dim)
+            used_list_axes.add(dim)
+            if inputs.backend.random() > 0.5:
+                dim -= max_dim
+            return inputs.backend.asarray(dim, dtype=binding.spec.dtype)
         if len(binding.spec.shape) == 0:
             dim = inputs.backend.randint(0, max_dim)
             if inputs.backend.random() > 0.5:
                 dim -= max_dim
             return inputs.backend.asarray(dim, dtype=binding.spec.dtype)
         if len(binding.spec.shape) == 1:
-            dims = inputs.backend.choice(max_dim, size=binding.spec.shape[0], replace=False)
+            dims = inputs.backend.choice(max_dim, shape=binding.spec.shape[0], replace=False)
             mask = inputs.backend.random(binding.spec.shape[0]) > 0.5
             dims = inputs.backend.where(mask, dims - max_dim, dims)
             return inputs.backend.asarray(dims, dtype=binding.spec.dtype)
@@ -1773,7 +1820,7 @@ def unsqueeze_values(ctx: InputContext, inputs: InputDataBuilder):
                 dim -= max_dim
             return inputs.backend.asarray(dim, dtype=binding.spec.dtype)
         if len(binding.spec.shape) == 1:
-            dims = inputs.backend.choice(max_dim, size=binding.spec.shape[0], replace=False)
+            dims = inputs.backend.choice(max_dim, shape=binding.spec.shape[0], replace=False)
             mask = inputs.backend.random(binding.spec.shape[0]) > 0.5
             dims = inputs.backend.where(mask, dims - max_dim, dims)
             return inputs.backend.asarray(dims, dtype=binding.spec.dtype)
@@ -1790,7 +1837,7 @@ def unflatten_values(ctx: InputContext, inputs: InputDataBuilder):
     def axis_value(binding):
         x_shape = inputs.arg(0, "x").shape
         return inputs.backend.cast(
-            inputs.backend.randint(0, len(x_shape), size=binding.spec.shape),
+            inputs.backend.randint(0, len(x_shape), shape=binding.spec.shape),
             binding.spec.dtype,
         )
 
@@ -1815,7 +1862,7 @@ def topk_values(ctx: InputContext, inputs: InputDataBuilder):
             )
         if dtype in {"int32", "int64"}:
             return inputs.backend.cast(
-                inputs.backend.randint(-10, 10, size=binding.spec.shape),
+                inputs.backend.randint(-10, 10, shape=binding.spec.shape),
                 dtype,
             )
         raise ValueError(
@@ -1833,7 +1880,7 @@ def topk_values(ctx: InputContext, inputs: InputDataBuilder):
                 inputs.backend.randint(1, max_k_value + 1), dtype=binding.spec.dtype
             )
         return inputs.backend.cast(
-            inputs.backend.randint(1, max_k_value + 1, size=binding.spec.shape),
+            inputs.backend.randint(1, max_k_value + 1, shape=binding.spec.shape),
             binding.spec.dtype,
         )
 
@@ -1850,7 +1897,7 @@ def topk_values(ctx: InputContext, inputs: InputDataBuilder):
 def index_sample_values(ctx: InputContext, inputs: InputDataBuilder):
     def index_value(binding):
         x_dim = inputs.arg(0, "x").shape[1]
-        return inputs.backend.randint(0, x_dim, size=binding.spec.shape)
+        return inputs.backend.randint(0, x_dim, shape=binding.spec.shape)
 
     inputs.generate_by_parameter((("index", index_value),), default="default")
 
@@ -1867,9 +1914,9 @@ def tensor_getitem_values(ctx: InputContext, inputs: InputDataBuilder):
         min_dim = min(source_binding().spec.shape)
         numel = math.prod(binding.spec.shape)
         if binding.spec.dtype == "bool":
-            indices = inputs.backend.choice([0, 1], size=numel)
+            indices = inputs.backend.choice([0, 1], shape=numel)
         else:
-            indices = inputs.backend.randint(0, min_dim, size=numel)
+            indices = inputs.backend.randint(0, min_dim, shape=numel)
         return inputs.backend.cast(
             inputs.backend.reshape(indices, binding.spec.shape),
             binding.spec.dtype,
@@ -1894,12 +1941,12 @@ def tensor_setitem_values(ctx: InputContext, inputs: InputDataBuilder):
             if value is not None and hasattr(value, "shape"):
                 indices = inputs.backend.zeros(numel, dtype="int64")
                 num_true = min(value.shape[0], numel)
-                true_indices = inputs.backend.choice(numel, size=num_true, replace=False)
+                true_indices = inputs.backend.choice(numel, shape=num_true, replace=False)
                 indices[true_indices] = 1
             else:
-                indices = inputs.backend.choice([0, 1], size=numel)
+                indices = inputs.backend.choice([0, 1], shape=numel)
         else:
-            indices = inputs.backend.randint(0, min_dim, size=numel)
+            indices = inputs.backend.randint(0, min_dim, shape=numel)
         return inputs.backend.cast(
             inputs.backend.reshape(indices, binding.spec.shape),
             binding.spec.dtype,
@@ -1920,7 +1967,7 @@ def index_update_values(ctx: InputContext, inputs: InputDataBuilder):
             raise ValueError(f"Invalid axis {axis} for shape {x_shape}")
         if len(binding.spec.shape) >= 1:
             return inputs.backend.cast(
-                inputs.backend.randint(0, x_shape[axis], size=binding.spec.shape),
+                inputs.backend.randint(0, x_shape[axis], shape=binding.spec.shape),
                 binding.spec.dtype,
             )
         raise ValueError(
@@ -1937,7 +1984,7 @@ def take_values(ctx: InputContext, inputs: InputDataBuilder):
         x = inputs.arg(0, "x")
         dim_size = math.prod(x.shape)
         return inputs.backend.cast(
-            inputs.backend.randint(0, dim_size, size=binding.spec.shape),
+            inputs.backend.randint(0, dim_size, shape=binding.spec.shape),
             binding.spec.dtype,
         )
 
@@ -1955,13 +2002,13 @@ def gather_values(ctx: InputContext, inputs: InputDataBuilder):
         else:
             axis = 0
         return inputs.backend.cast(
-            inputs.backend.randint(0, x.shape[axis], size=binding.spec.shape),
+            inputs.backend.randint(0, x.shape[axis], shape=binding.spec.shape),
             binding.spec.dtype,
         )
 
     def axis_value(binding):
         return inputs.backend.cast(
-            inputs.backend.randint(0, 2, size=binding.spec.shape),
+            inputs.backend.randint(0, 2, shape=binding.spec.shape),
             binding.spec.dtype,
         )
 
@@ -1982,7 +2029,7 @@ def gather_nd_values(ctx: InputContext, inputs: InputDataBuilder):
         result = inputs.backend.zeros(index_shape, dtype=binding.spec.dtype)
         for index in range(index_shape[-1]):
             result[..., index] = inputs.backend.randint(
-                0, x_shape[index], size=result[..., index].shape
+                0, x_shape[index], shape=result[..., index].shape
             )
         return result
 
@@ -1999,7 +2046,7 @@ def index_select_values(ctx: InputContext, inputs: InputDataBuilder):
         if x.shape[axis] == 0:
             return inputs.backend.zeros(binding.spec.shape, dtype=binding.spec.dtype)
         return inputs.backend.cast(
-            inputs.backend.randint(0, x.shape[axis], size=binding.spec.shape),
+            inputs.backend.randint(0, x.shape[axis], shape=binding.spec.shape),
             binding.spec.dtype,
         )
 
@@ -2023,9 +2070,9 @@ def take_along_axis_values(ctx: InputContext, inputs: InputDataBuilder):
             indices = inputs.backend.asarray([0], dtype=dtype)
         else:
             indices = inputs.backend.cast(
-                inputs.backend.randint(0, dim_size, size=num_elements), dtype
+                inputs.backend.randint(0, dim_size, shape=num_elements), dtype
             )
-            positions_to_replace = inputs.backend.choice(num_elements, size=2, replace=False)
+            positions_to_replace = inputs.backend.choice(num_elements, shape=2, replace=False)
             flat_indices = inputs.backend.flatten(indices)
             flat_indices[positions_to_replace[0]] = 0
             flat_indices[positions_to_replace[1]] = dim_size - 1
@@ -2037,7 +2084,121 @@ def take_along_axis_values(ctx: InputContext, inputs: InputDataBuilder):
 
 @rules.register("paddle.index_put", aliases=("paddle.Tensor.index_put",))
 def index_put_values(ctx: InputContext, inputs: InputDataBuilder):
-    inputs.generate_all("default")
+    state = {}
+
+    def prepare_indices_state():
+        x = inputs.arg(0, "x")
+        value = inputs.arg(2, "value")
+        indices = inputs.arg(1, "indices")
+        if not isinstance(indices, (list, tuple)):
+            return None
+
+        x_shape = x.shape
+        value_shape = value.shape
+        int_index_shapes = []
+        has_bool_index = False
+        dims_consumed = 0
+        for item in indices:
+            if not inputs.is_tensor_config(item):
+                continue
+            if item.dtype == "bool":
+                has_bool_index = True
+                dims_consumed += len(item.shape)
+            else:
+                int_index_shapes.append(tuple(item.shape))
+                dims_consumed += 1
+
+        if dims_consumed > len(x_shape):
+            raise ValueError(
+                f"Too many indices: consume {dims_consumed} dims but x has {len(x_shape)} dims"
+            )
+
+        num_true_needed = -1
+        num_remaining_dims = len(x_shape) - dims_consumed
+        advanced_shape = ()
+        if int_index_shapes:
+            try:
+                advanced_shape = numpy.broadcast_shapes(*int_index_shapes)
+                if (
+                    has_bool_index
+                    and len(value_shape) > num_remaining_dims
+                    and advanced_shape[-1] == 1
+                    and value_shape[-num_remaining_dims - 1] != 1
+                ):
+                    advanced_shape = (
+                        *advanced_shape[:-1],
+                        value_shape[-num_remaining_dims - 1],
+                    )
+                num_true_needed = advanced_shape[-1]
+            except Exception as err:
+                raise ValueError(
+                    f"Incompatible integer index shapes for broadcasting: {int_index_shapes}"
+                ) from err
+        elif has_bool_index:
+            if len(value_shape) > num_remaining_dims:
+                advanced_shape = (value_shape[0],)
+                num_true_needed = value_shape[0]
+            else:
+                advanced_shape = (1,)
+                num_true_needed = 1
+
+        result_shape = advanced_shape + tuple(x_shape[dims_consumed:])
+        try:
+            numpy.broadcast_shapes(tuple(value_shape), result_shape)
+        except ValueError as err:
+            raise ValueError(
+                f"Value shape {value_shape} cannot be broadcast to the indexed shape "
+                f"{result_shape}."
+            ) from err
+
+        return {
+            "x_shape": x_shape,
+            "x_dim_cursor": 0,
+            "num_true_needed": num_true_needed,
+        }
+
+    def int_indices(shape, dim_size):
+        num_elements = inputs.backend.prod(shape)
+        if num_elements > dim_size:
+            indices_flat = inputs.backend.randint(-dim_size, dim_size, shape=num_elements)
+        else:
+            indices_flat = inputs.backend.choice(dim_size, shape=num_elements, replace=False)
+        return inputs.backend.reshape(indices_flat, shape)
+
+    def bool_mask(shape, num_true):
+        mask_size = inputs.backend.prod(shape)
+        if mask_size < num_true:
+            raise ValueError(
+                f"Cannot generate a mask with {num_true} true values in a {mask_size} element mask"
+            )
+        mask_flat = inputs.backend.zeros(mask_size, dtype="bool")
+        true_indices = inputs.backend.choice(mask_size, shape=num_true, replace=False)
+        mask_flat[true_indices] = True
+        return inputs.backend.reshape(mask_flat, shape)
+
+    def index_value(binding):
+        if not state:
+            prepared = prepare_indices_state()
+            if prepared is None:
+                return inputs.value_domain("default", binding)
+            state.update(prepared)
+
+        if binding.spec.dtype == "bool":
+            if state["num_true_needed"] < 0:
+                raise ValueError(
+                    "Cannot determine the number of True elements for the boolean mask."
+                )
+            state["x_dim_cursor"] += len(binding.spec.shape)
+            return bool_mask(binding.spec.shape, state["num_true_needed"])
+
+        x_dim_to_index = state["x_shape"][state["x_dim_cursor"]]
+        state["x_dim_cursor"] += 1
+        return inputs.backend.cast(
+            int_indices(binding.spec.shape, x_dim_to_index),
+            binding.spec.dtype,
+        )
+
+    inputs.generate_by_parameter((("indices", index_value),), default="default")
 
 
 @rules.register("paddle.multiplex")
@@ -2045,7 +2206,7 @@ def multiplex_values(ctx: InputContext, inputs: InputDataBuilder):
     def index_value(binding):
         axis_values = inputs.arg(0, "inputs")
         return inputs.backend.cast(
-            inputs.backend.randint(0, len(axis_values), size=binding.spec.shape),
+            inputs.backend.randint(0, len(axis_values), shape=binding.spec.shape),
             binding.spec.dtype,
         )
 
@@ -2067,7 +2228,7 @@ def segment_values(ctx: InputContext, inputs: InputDataBuilder):
         batch_size = inputs.arg(0, "x").shape[0]
         max_segments = inputs.backend.randint(1, batch_size + 1)
         values = inputs.backend.cast(
-            inputs.backend.randint(0, max_segments, size=binding.spec.shape),
+            inputs.backend.randint(0, max_segments, shape=binding.spec.shape),
             binding.spec.dtype,
         )
         return inputs.backend.sort(values)
@@ -2084,7 +2245,7 @@ def geometric_send_values(ctx: InputContext, inputs: InputDataBuilder):
     def index_value(binding):
         num_nodes = inputs.arg(0, "x").shape[0]
         return inputs.backend.cast(
-            inputs.backend.randint(0, num_nodes, size=binding.spec.shape),
+            inputs.backend.randint(0, num_nodes, shape=binding.spec.shape),
             binding.spec.dtype,
         )
 
@@ -2100,7 +2261,7 @@ def sample_neighbors_values(ctx: InputContext, inputs: InputDataBuilder):
         colptr_shape = inputs.arg(1, "colptr").shape
         num_nodes = colptr_shape[0] - 1
         return inputs.backend.randint(
-            0, num_nodes, size=binding.spec.shape, dtype=binding.spec.dtype
+            0, num_nodes, shape=binding.spec.shape, dtype=binding.spec.dtype
         )
 
     def colptr_value(binding):
@@ -2111,7 +2272,7 @@ def sample_neighbors_values(ctx: InputContext, inputs: InputDataBuilder):
         if num_nodes > 0 and num_edges > 0:
             splits = inputs.backend.choice(
                 inputs.backend.arange(num_edges + 1),
-                size=num_nodes - 1,
+                shape=num_nodes - 1,
                 replace=True,
             )
             splits = inputs.backend.sort(splits)
@@ -2122,7 +2283,7 @@ def sample_neighbors_values(ctx: InputContext, inputs: InputDataBuilder):
     def input_nodes_value(binding):
         num_nodes = binding.spec.shape[0] - 1
         return inputs.backend.randint(
-            0, num_nodes, size=binding.spec.shape, dtype=binding.spec.dtype
+            0, num_nodes, shape=binding.spec.shape, dtype=binding.spec.dtype
         )
 
     def edge_order_value(binding):
@@ -2189,14 +2350,14 @@ def reshape_values(ctx: InputContext, inputs: InputDataBuilder):
             return result
         if state["tensornum"] == 1:
             return inputs.backend.cast(
-                inputs.backend.randint(maxvalue, maxvalue + 1, size=shape),
+                inputs.backend.randint(maxvalue, maxvalue + 1, shape=shape),
                 dtype,
             )
         state["tensornum"] -= 1
-        result = inputs.backend.cast(inputs.backend.randint(1, maxvalue + 1, size=shape), dtype)
+        result = inputs.backend.cast(inputs.backend.randint(1, maxvalue + 1, shape=shape), dtype)
         while maxvalue % result:
             result = inputs.backend.cast(
-                inputs.backend.randint(1, maxvalue + 1, size=shape),
+                inputs.backend.randint(1, maxvalue + 1, shape=shape),
                 dtype,
             )
         state["maxvalue"] = maxvalue // result
@@ -2312,11 +2473,11 @@ def scatter_values(ctx: InputContext, inputs: InputDataBuilder):
             binding.spec.shape == () or binding.spec.shape[0]
         ) <= first_dim:
             return inputs.backend.cast(
-                inputs.backend.choice(first_dim, size=binding.spec.shape, replace=False),
+                inputs.backend.choice(first_dim, shape=binding.spec.shape, replace=False),
                 binding.spec.dtype,
             )
         return inputs.backend.cast(
-            inputs.backend.randint(0, first_dim, size=binding.spec.shape),
+            inputs.backend.randint(0, first_dim, shape=binding.spec.shape),
             binding.spec.dtype,
         )
 
@@ -2335,7 +2496,7 @@ def scatter_nd_values(ctx: InputContext, inputs: InputDataBuilder):
                 result[..., axis] = inputs.backend.randint(
                     -output_shape[axis],
                     output_shape[axis],
-                    size=result[..., axis].shape,
+                    shape=result[..., axis].shape,
                 )
                 result[..., axis] = inputs.backend.cast(result[..., axis], binding.spec.dtype)
             return result
@@ -2353,7 +2514,7 @@ def scatter_nd_add_values(ctx: InputContext, inputs: InputDataBuilder):
             result[..., axis] = inputs.backend.randint(
                 -x_shape[axis],
                 x_shape[axis],
-                size=result[..., axis].shape,
+                shape=result[..., axis].shape,
             )
             result[..., axis] = inputs.backend.cast(result[..., axis], binding.spec.dtype)
         return result
@@ -2366,7 +2527,7 @@ def strided_slice_values(ctx: InputContext, inputs: InputDataBuilder):
     def axes_value(binding):
         x = inputs.arg(0, "x")
         return inputs.backend.cast(
-            inputs.backend.randint(0, len(x.shape), size=binding.spec.shape),
+            inputs.backend.randint(0, len(x.shape), shape=binding.spec.shape),
             binding.spec.dtype,
         )
 
@@ -2376,14 +2537,13 @@ def strided_slice_values(ctx: InputContext, inputs: InputDataBuilder):
         axes = axes_arg
         if not isinstance(axes, list):
             axes = inputs.value(inputs.find("axes"))
-        list_index_path = inputs.binding_list_index(binding)
-        if list_index_path is None:
+        if not binding.path.indices:
             return inputs.value_domain("default", binding)
-        list_index = list_index_path[0]
+        list_index = binding.path.indices[0]
         parameter = binding.parameter_name
         if parameter == "starts":
             return inputs.backend.cast(
-                inputs.backend.randint(0, x.shape[axes[list_index]] - 1, size=binding.spec.shape),
+                inputs.backend.randint(0, x.shape[axes[list_index]] - 1, shape=binding.spec.shape),
                 binding.spec.dtype,
             )
         if parameter == "ends":
@@ -2391,13 +2551,13 @@ def strided_slice_values(ctx: InputContext, inputs: InputDataBuilder):
                 inputs.backend.randint(
                     inputs.value(inputs.find("starts"))[list_index] + 1,
                     x.shape[axes[list_index]],
-                    size=binding.spec.shape,
+                    shape=binding.spec.shape,
                 ),
                 binding.spec.dtype,
             )
         if parameter == "strides":
             return inputs.backend.cast(
-                inputs.backend.randint(1, x.shape[axes[list_index]], size=binding.spec.shape),
+                inputs.backend.randint(1, x.shape[axes[list_index]], shape=binding.spec.shape),
                 binding.spec.dtype,
             )
         return inputs.value_domain("default", binding)
@@ -2504,7 +2664,7 @@ def embedding_values(ctx: InputContext, inputs: InputDataBuilder):
         if vocab_size == 0:
             return inputs.backend.zeros(binding.spec.shape, dtype=binding.spec.dtype)
         return inputs.backend.cast(
-            inputs.backend.randint(0, vocab_size, size=binding.spec.shape),
+            inputs.backend.randint(0, vocab_size, shape=binding.spec.shape),
             binding.spec.dtype,
         )
 
@@ -2523,7 +2683,7 @@ def affine_grid_values(ctx: InputContext, inputs: InputDataBuilder):
     def out_shape_value(binding):
         theta_shape = inputs.arg(0, "theta").shape
         values = inputs.backend.cast(
-            inputs.backend.randint(1, 128, size=binding.spec.shape),
+            inputs.backend.randint(1, 128, shape=binding.spec.shape),
             binding.spec.dtype,
         )
         values[0] = theta_shape[0]
@@ -2537,14 +2697,14 @@ def hsigmoid_loss_values(ctx: InputContext, inputs: InputDataBuilder):
     def label_value(binding):
         num_classes = inputs.arg(2, "num_classes")
         return inputs.backend.cast(
-            inputs.backend.randint(0, num_classes, size=binding.spec.shape),
+            inputs.backend.randint(0, num_classes, shape=binding.spec.shape),
             binding.spec.dtype,
         )
 
     def path_table_value(binding):
         weight = inputs.arg(3, "weight")
         return inputs.backend.cast(
-            inputs.backend.randint(0, weight.shape[0], size=binding.spec.shape),
+            inputs.backend.randint(0, weight.shape[0], shape=binding.spec.shape),
             binding.spec.dtype,
         )
 
@@ -2563,7 +2723,7 @@ def margin_cross_entropy_values(ctx: InputContext, inputs: InputDataBuilder):
     def label_value(binding):
         logits = inputs.arg(0, "logits")
         return inputs.backend.cast(
-            inputs.backend.randint(0, logits.shape[1], size=binding.spec.shape),
+            inputs.backend.randint(0, logits.shape[1], shape=binding.spec.shape),
             binding.spec.dtype,
         )
 
@@ -2575,7 +2735,7 @@ def multi_margin_loss_values(ctx: InputContext, inputs: InputDataBuilder):
     def label_value(binding):
         logits = inputs.arg(0, "input")
         return inputs.backend.cast(
-            inputs.backend.randint(0, logits.shape[1], size=binding.spec.shape),
+            inputs.backend.randint(0, logits.shape[1], shape=binding.spec.shape),
             binding.spec.dtype,
         )
 
@@ -2587,7 +2747,7 @@ def dice_loss_values(ctx: InputContext, inputs: InputDataBuilder):
     def label_value(binding):
         tensor = inputs.arg(0, "input")
         return inputs.backend.cast(
-            inputs.backend.randint(0, tensor.shape[-1], size=binding.spec.shape),
+            inputs.backend.randint(0, tensor.shape[-1], shape=binding.spec.shape),
             binding.spec.dtype,
         )
 
@@ -2600,7 +2760,7 @@ def nll_loss_values(ctx: InputContext, inputs: InputDataBuilder):
         input_config = inputs.arg(0, "input")
         n_classes = inputs.backend.randint(5, 50) if input_config is None else input_config.shape[1]
         return inputs.backend.cast(
-            inputs.backend.randint(0, n_classes, size=binding.spec.shape),
+            inputs.backend.randint(0, n_classes, shape=binding.spec.shape),
             binding.spec.dtype,
         )
 
@@ -2617,13 +2777,22 @@ def adaptive_log_softmax_with_loss_values(ctx: InputContext, inputs: InputDataBu
             generation_size = 1
         if n_classes == 1:
             return inputs.backend.zeros(generation_size, dtype=binding.spec.dtype)
-        return inputs.backend.randint(0, n_classes, size=generation_size, dtype=binding.spec.dtype)
+        return inputs.backend.randint(0, n_classes, shape=generation_size, dtype=binding.spec.dtype)
 
     inputs.generate_by_parameter((("label", label_value),), default="default")
 
 
 @rules.register("paddle.nn.functional.cross_entropy")
 def cross_entropy_values(ctx: InputContext, inputs: InputDataBuilder):
+    def input_value(binding):
+        use_softmax = inputs.arg(8, "use_softmax", True)
+        if use_softmax:
+            return inputs.value_domain("default", binding)
+        axis = inputs.arg(7, "axis", -1)
+        values = inputs.backend.random(binding.spec.shape)
+        probabilities = values / inputs.backend.sum(values, axis=axis, keepdims=True)
+        return inputs.backend.cast(probabilities, binding.spec.dtype)
+
     def label_value(binding):
         input_shape = inputs.arg(0, "input").shape
         axis = inputs.arg(7, "axis", -1)
@@ -2634,12 +2803,12 @@ def cross_entropy_values(ctx: InputContext, inputs: InputDataBuilder):
             label_smoothing == 0 and soft_label
         ):
             soft_labels = inputs.backend.random(binding.spec.shape)
-            soft_labels = soft_labels / inputs.backend.sum(soft_labels, axis=1, keepdims=True)
+            soft_labels = soft_labels / inputs.backend.sum(soft_labels, axis=axis, keepdims=True)
             return inputs.backend.cast(soft_labels, binding.spec.dtype)
         if num_classes == 0:
             return inputs.backend.zeros(binding.spec.shape, dtype=binding.spec.dtype)
         return inputs.backend.cast(
-            inputs.backend.randint(0, num_classes, size=binding.spec.shape),
+            inputs.backend.randint(0, num_classes, shape=binding.spec.shape),
             binding.spec.dtype,
         )
 
@@ -2649,6 +2818,7 @@ def cross_entropy_values(ctx: InputContext, inputs: InputDataBuilder):
 
     inputs.generate_by_parameter(
         (
+            ("input", input_value),
             ("label", label_value),
             ("weight", weight_value),
         ),
@@ -2665,7 +2835,7 @@ def ctc_loss_values(ctx: InputContext, inputs: InputDataBuilder):
         if not valid_label_indices:
             return inputs.backend.zeros(binding.spec.shape, dtype=binding.spec.dtype)
         return inputs.backend.cast(
-            inputs.backend.choice(valid_label_indices, size=binding.spec.shape, replace=True),
+            inputs.backend.choice(valid_label_indices, shape=binding.spec.shape, replace=True),
             binding.spec.dtype,
         )
 
@@ -2674,7 +2844,7 @@ def ctc_loss_values(ctx: InputContext, inputs: InputDataBuilder):
         return inputs.backend.randint(
             1,
             max_logit_length + 1,
-            size=binding.spec.shape,
+            shape=binding.spec.shape,
             dtype=binding.spec.dtype,
         )
 
@@ -2684,13 +2854,13 @@ def ctc_loss_values(ctx: InputContext, inputs: InputDataBuilder):
         cand_label_lengths = inputs.backend.randint(
             1,
             max_label_length + 1,
-            size=binding.spec.shape,
+            shape=binding.spec.shape,
             dtype=binding.spec.dtype,
         )
         compatible_input_lengths = inputs.backend.randint(
             1,
             max_logit_length + 1,
-            size=binding.spec.shape,
+            shape=binding.spec.shape,
             dtype=binding.spec.dtype,
         )
         final_label_lengths = inputs.backend.minimum(cand_label_lengths, compatible_input_lengths)
@@ -2715,12 +2885,12 @@ def sequence_mask_values(ctx: InputContext, inputs: InputDataBuilder):
             provided_maxlen = max(1, maxlen_config)
         if provided_maxlen is not None:
             return inputs.backend.cast(
-                inputs.backend.randint(0, provided_maxlen + 1, size=binding.spec.shape),
+                inputs.backend.randint(0, provided_maxlen + 1, shape=binding.spec.shape),
                 binding.spec.dtype,
             )
         high_value = inputs.backend.randint(1, 2048)
         values = inputs.backend.cast(
-            inputs.backend.randint(0, high_value, size=binding.spec.shape),
+            inputs.backend.randint(0, high_value, shape=binding.spec.shape),
             binding.spec.dtype,
         )
         if inputs.backend.prod(values.shape) > 0 and inputs.backend.count_nonzero(values) == 0:
@@ -2746,7 +2916,7 @@ def softmax_with_cross_entropy_values(ctx: InputContext, inputs: InputDataBuilde
         else:
             num_classes = inputs.backend.randint(5, 20)
         return inputs.backend.cast(
-            inputs.backend.randint(0, num_classes, size=binding.spec.shape),
+            inputs.backend.randint(0, num_classes, shape=binding.spec.shape),
             binding.spec.dtype,
         )
 
@@ -2794,17 +2964,17 @@ def covariance_values(ctx: InputContext, inputs: InputDataBuilder):
 
     def fweights_value(binding):
         return inputs.backend.cast(
-            inputs.backend.randint(1, 11, size=(observation_count(),)),
+            inputs.backend.randint(1, 11, shape=(observation_count(),)),
             binding.spec.dtype,
         )
 
     def aweights_value(binding):
         if binding.spec.dtype in ["float32", "float64"]:
             return inputs.backend.uniform(
-                0.1, 1.0, size=(observation_count(),), dtype=binding.spec.dtype
+                0.1, 1.0, shape=(observation_count(),), dtype=binding.spec.dtype
             )
         return inputs.backend.cast(
-            inputs.backend.randint(1, 11, size=(observation_count(),)),
+            inputs.backend.randint(1, 11, shape=(observation_count(),)),
             binding.spec.dtype,
         )
 
@@ -2871,7 +3041,7 @@ def lu_unpack_values(ctx: InputContext, inputs: InputDataBuilder):
     def pivot_value(binding):
         row_count = inputs.arg(0, "x").shape[-2]
         return inputs.backend.cast(
-            inputs.backend.randint(1, row_count + 1, size=binding.spec.shape),
+            inputs.backend.randint(1, row_count + 1, shape=binding.spec.shape),
             binding.spec.dtype,
         )
 
@@ -2906,13 +3076,13 @@ def determinant_values(ctx: InputContext, inputs: InputDataBuilder):
         is_complex = binding.spec.dtype.startswith("complex")
         if is_complex:
             real_dtype = "float32" if binding.spec.dtype == "complex64" else "float64"
-            real = inputs.backend.uniform(0.5, 1.0, size=binding.spec.shape, dtype=real_dtype)
-            imag = inputs.backend.uniform(0.5, 1.0, size=binding.spec.shape, dtype=real_dtype)
+            real = inputs.backend.uniform(0.5, 1.0, shape=binding.spec.shape, dtype=real_dtype)
+            imag = inputs.backend.uniform(0.5, 1.0, shape=binding.spec.shape, dtype=real_dtype)
             matrix = inputs.backend.cast(real + 1j * imag, binding.spec.dtype)
             matrix_h = inputs.backend.swapaxes(inputs.backend.conj(matrix), -1, -2)
         else:
             matrix = inputs.backend.uniform(
-                0.5, 1.0, size=binding.spec.shape, dtype=binding.spec.dtype
+                0.5, 1.0, shape=binding.spec.shape, dtype=binding.spec.dtype
             )
             matrix_h = inputs.backend.swapaxes(matrix, -1, -2)
         return inputs.backend.matmul(matrix, matrix_h) + inputs.backend.eye(
@@ -3126,7 +3296,7 @@ def rnnt_loss_values(ctx: InputContext, inputs: InputDataBuilder):
 
     def labels(binding):
         shape = binding.spec.shape if len(binding.spec.shape) == 2 else (3, 2)
-        return inputs.backend.cast(inputs.backend.randint(1, 4, size=shape), binding.spec.dtype)
+        return inputs.backend.cast(inputs.backend.randint(1, 4, shape=shape), binding.spec.dtype)
 
     def lengths(max_possible_length):
         def generate(binding):
@@ -3229,13 +3399,13 @@ def expand_values(ctx: InputContext, inputs: InputDataBuilder):
         shape_index = binding.path.indices[0] if binding.path.indices else 0
         if len(x_shape) == 0 or shape_index > len(x_shape) - 1 or x_shape[shape_index] == 1:
             return inputs.backend.cast(
-                inputs.backend.randint(1, 127, size=binding.spec.shape),
+                inputs.backend.randint(1, 127, shape=binding.spec.shape),
                 binding.spec.dtype,
             )
         if len(binding.spec.shape) == 0 or binding.spec.shape[0] == 1:
             return inputs.backend.asarray(x_shape[shape_index])
         values = inputs.backend.cast(
-            inputs.backend.randint(1, 127, size=binding.spec.shape),
+            inputs.backend.randint(1, 127, shape=binding.spec.shape),
             binding.spec.dtype,
         )
         offset = binding.spec.shape[0] - len(x_shape)
@@ -3291,7 +3461,7 @@ def multinomial_values(ctx: InputContext, inputs: InputDataBuilder):
                 inputs.backend.randint(
                     1,
                     max_allow + 1,
-                    size=num_samples_binding.spec.shape,
+                    shape=num_samples_binding.spec.shape,
                 ),
                 num_samples_binding.spec.dtype,
             ),
@@ -3322,7 +3492,7 @@ def one_hot_values(ctx: InputContext, inputs: InputDataBuilder):
             inputs.backend.randint(
                 0,
                 determined_num_classes,
-                size=x_binding.spec.shape,
+                shape=x_binding.spec.shape,
                 dtype=x_binding.spec.dtype,
             ),
         )
@@ -3332,20 +3502,6 @@ def one_hot_values(ctx: InputContext, inputs: InputDataBuilder):
 INPUT_GENERATION_RULES = rules.rules
 API_RULE_REGISTRY = rules.by_api
 DEFAULT_INPUT_GENERATION_RULE = API_RULE_REGISTRY["paddle.add"]
-
-
-def build_registry(rule_records=INPUT_GENERATION_RULES) -> dict[str, RegisteredRule]:
-    registry = {}
-    for rule in rule_records:
-        for api_name in rule.api_names:
-            if api_name in registry:
-                raise ValueError(f"input-generation API overlap: {api_name}")
-            registry[api_name] = rule
-    return registry
-
-
-def get_rule(api_name: str) -> RegisteredRule | None:
-    return API_RULE_REGISTRY.get(api_name)
 
 
 def _tensor_config_at(inputs, path):
@@ -3361,22 +3517,12 @@ def _api_arg(inputs, position, name, default=None):
     return inputs.kwargs.get(name, default)
 
 
-def _apply_value(inputs, path, value, backend):
-    return _apply_value_raw(inputs, path, value, backend, update_metadata=True)
-
-
-def _apply_value_raw(inputs, path, value, backend, update_metadata):
+def _apply_value_raw(inputs, path, value, backend, update_config):
     config = _tensor_config_at(inputs, path)
-    if path.root == "args":
-        config.index = path.key
-    else:
-        config.key = path.key
-    if path.indices:
-        config.list_index = list(path.indices)
-    storage_value = backend.asarray(value, copy=True, order="K")
+    storage_value = backend.asarray(value, copy=True)
     config.input_value = storage_value
     config.input_value_backend = backend.name
-    if update_metadata:
+    if update_config:
         dtype_name = str(getattr(storage_value, "dtype", ""))
         dtype_name = dtype_name.split(".")[-1] if dtype_name else dtype_name
         if config.dtype not in CAST_THROUGH_INTERMEDIATE_DTYPES:

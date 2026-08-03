@@ -9,10 +9,7 @@ from .tensor_path import TensorPath
 class InputData:
     path: TensorPath
     value: object
-    update_metadata: bool = True
-    backend: str = "numpy"
-    declared_dtype: str | None = None
-    storage_dtype: str | None = None
+    backend: str
 
 
 _VALUES_ATTR = "_input_generation_values"
@@ -32,16 +29,12 @@ def _tensor_value_at_path(api_config, path: TensorPath):
 def attach_values(api_config, values):
     # 同时保留有序 value 和对象 id 索引，便于顺序遍历和快速查找。
     values = tuple(values)
-    value_by_tensor_id = {}
-    for value in values:
-        value_by_tensor_id[id(_tensor_value_at_path(api_config, value.path))] = value
+    value_by_tensor_id = {
+        id(_tensor_value_at_path(api_config, value.path)): value for value in values
+    }
     setattr(api_config, _VALUES_ATTR, values)
     setattr(api_config, _VALUE_BY_TENSOR_ID_ATTR, value_by_tensor_id)
     return values
-
-
-def values_for(api_config):
-    return getattr(api_config, _VALUES_ATTR, None)
 
 
 def value_for_tensor(api_config, tensor_config):
@@ -72,7 +65,7 @@ def _backend_for_value(value):
     return "numpy"
 
 
-def write_input_value(api_config, tensor_config, new_value, update_metadata=True):
+def write_input_value(api_config, tensor_config, new_value):
     existing_value = value_for_tensor(api_config, tensor_config)
     backend = (
         existing_value.backend if existing_value is not None else _backend_for_value(new_value)
@@ -81,10 +74,7 @@ def write_input_value(api_config, tensor_config, new_value, update_metadata=True
         updated_value = InputData(
             existing_value.path,
             new_value,
-            update_metadata=update_metadata,
             backend=backend,
-            declared_dtype=existing_value.declared_dtype,
-            storage_dtype=str(getattr(new_value, "dtype", "")) or None,
         )
         value_by_tensor_id = getattr(api_config, _VALUE_BY_TENSOR_ID_ATTR, None)
         if value_by_tensor_id is not None:

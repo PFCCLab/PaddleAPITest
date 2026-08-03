@@ -858,6 +858,25 @@ if soft_label and weight is not None and shp == input.shape:
     reduction = "none"
     weight = None
 """
+        core = """
+if not use_softmax and not soft_label and label_smoothing == 0.0:
+    result = torch.nn.functional.nll_loss(
+        torch.log(input),
+        label,
+        weight=weight,
+        ignore_index=ignore_index,
+        reduction=reduction,
+    )
+else:
+    result = torch.nn.functional.cross_entropy(
+        input if use_softmax else torch.log(input),
+        label,
+        weight=weight,
+        ignore_index=ignore_index,
+        reduction=reduction,
+        label_smoothing=label_smoothing,
+    )
+"""
         postprocess = """
 if reduction_original is not None:
     reduction = reduction_original
@@ -881,6 +900,7 @@ else:
             paddle_api,
             kind=ConversionKind.DIRECT,
             preprocess=preprocess.splitlines(),
+            core=core,
             postprocess=postprocess,
         )
 

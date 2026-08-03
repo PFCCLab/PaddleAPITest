@@ -161,19 +161,6 @@ class InputBinding:
     tensors: tuple[TensorBinding, ...]
     unresolved_reason: str | None = None
 
-    def parameter_for(self, path):
-        top_level = path.top_level()
-        for binding in self.parameter_bindings:
-            if binding.path == top_level:
-                return binding.parameter_name
-        return None
-
-    def tensor_at(self, path):
-        for binding in self.tensors:
-            if binding.path == path:
-                return binding
-        raise KeyError(str(path))
-
 
 @dataclass(frozen=True)
 class InputContext:
@@ -182,26 +169,7 @@ class InputContext:
     call: InputBinding
     config_fingerprint: str
     seed: int
-    use_torch: bool
     gpu_enabled: bool
-
-    @classmethod
-    def create(
-        cls,
-        call,
-        config_text,
-        seed=0,
-        use_torch=True,
-        gpu_enabled=False,
-    ):
-        fingerprint = hashlib.sha256(config_text.encode()).hexdigest()
-        return cls(
-            call=call,
-            config_fingerprint=fingerprint,
-            seed=int(seed),
-            use_torch=bool(use_torch),
-            gpu_enabled=bool(gpu_enabled),
-        )
 
 
 @dataclass(frozen=True)
@@ -210,7 +178,6 @@ class SignatureResolution:
 
     signature: inspect.Signature | None
     source: str
-    resolved_api_name: str | None = None
     unresolved_reason: str | None = None
 
 
@@ -220,7 +187,6 @@ class ArgumentBindingResolution:
 
     arguments: collections.OrderedDict
     source: str
-    resolved_api_name: str | None = None
     unresolved_reason: str | None = None
 
 
@@ -236,20 +202,13 @@ def resolve_api(api_name):
     return value
 
 
-def resolve_signature(api_name, api=None, signature_cache=None):
+def resolve_signature(api_name, api=None):
     api = api or resolve_api(api_name)
-    # 签名结果按 resolver 缓存，避免同一个 case 中重复 import 和 inspect。
-    if signature_cache is not None and api_name in signature_cache:
-        signature = signature_cache[api_name]
-    else:
-        try:
-            signature = inspect.signature(api)
-        except (TypeError, ValueError):
-            signature = None
-        if signature_cache is not None:
-            signature_cache[api_name] = signature
+    try:
+        signature = inspect.signature(api)
+    except (TypeError, ValueError):
+        signature = None
     source = "signature"
-    resolved_api_name = api_name
     if signature is None:
         # 某些 C-ops 会通过可读的 Paddle 公共 API 暴露。对公共别名绑定能保持参数名稳定。
         public_api_name = COPS_PUBLIC_ALIASES.get(api_name)
@@ -257,31 +216,21 @@ def resolve_signature(api_name, api=None, signature_cache=None):
             return SignatureResolution(
                 signature=None,
                 source="unresolved",
-                resolved_api_name=None,
                 unresolved_reason="API has no inspectable signature or public alias",
             )
         public_api = resolve_api(public_api_name)
-        if signature_cache is not None and public_api_name in signature_cache:
-            signature = signature_cache[public_api_name]
-        else:
-            try:
-                signature = inspect.signature(public_api)
-            except (TypeError, ValueError):
-                signature = None
-            if signature_cache is not None:
-                signature_cache[public_api_name] = signature
+        try:
+            signature = inspect.signature(public_api)
+        except (TypeError, ValueError):
+            signature = None
         if signature is None:
             return SignatureResolution(
                 signature=None,
                 source="unresolved",
-                resolved_api_name=public_api_name,
                 unresolved_reason=f"public alias has no signature: {public_api_name}",
             )
         source = f"public-alias:{public_api_name}"
-        resolved_api_name = public_api_name
-    return SignatureResolution(
-        signature=signature, source=source, resolved_api_name=resolved_api_name
-    )
+    return SignatureResolution(signature=signature, source=source)
 
 
 def _manual_arguments(args, kwargs, parameter_names):
@@ -300,7 +249,6 @@ def bind_parameters(
     kwargs,
     *,
     api=None,
-    signature_cache=None,
     keep_name=False,
 ):
     if api_name in MANUAL_PARAMETER_NAMES:
@@ -325,13 +273,12 @@ def bind_parameters(
                 source="variadic-reshape",
             )
 
-    resolution = resolve_signature(api_name, api=api, signature_cache=signature_cache)
+    resolution = resolve_signature(api_name, api=api)
     signature = resolution.signature
     if signature is None:
         return ArgumentBindingResolution(
             arguments=collections.OrderedDict(),
             source=resolution.source,
-            resolved_api_name=resolution.resolved_api_name,
             unresolved_reason=resolution.unresolved_reason,
         )
 
@@ -358,17 +305,8 @@ def bind_parameters(
     return ArgumentBindingResolution(
         arguments=arguments,
         source=resolution.source,
-        resolved_api_name=resolution.resolved_api_name,
         unresolved_reason=resolution.unresolved_reason,
     )
-
-
-@dataclass(frozen=True)
-class BindingResolution:
-    arguments: collections.OrderedDict
-    source: str
-    path_parameters: tuple[ParameterBinding, ...]
-    unresolved_reason: str | None = None
 
 
 def _contains_identity(value, target):
@@ -400,49 +338,6 @@ def _path_parameters(api_config, arguments):
     return tuple(bindings)
 
 
-class SignatureResolver:
-    """按 case 复用签名缓存的解析器。"""
-
-    def __init__(self):
-        self._signature_cache = {}
-
-    def _resolved(self, api_config, arguments, source, keep_name=False):
-        # 大多数 API 都把 `name` 当元数据，而不是输入生成参数。
-        arguments = collections.OrderedDict(arguments)
-        if not keep_name:
-            arguments.pop("name", None)
-        return BindingResolution(
-            arguments=arguments,
-            source=source,
-            path_parameters=_path_parameters(api_config, arguments),
-        )
-
-    def resolve(self, api_config, api=None):
-        api_name = api_config.api_name
-        resolution = bind_parameters(
-            api_name,
-            api_config.args,
-            api_config.kwargs,
-            api=api or None,
-            signature_cache=self._signature_cache,
-            keep_name=api_name in {"paddle.Tensor.unflatten", "paddle.unflatten"},
-        )
-        if resolution.source == "unresolved":
-            return BindingResolution(
-                arguments=collections.OrderedDict(),
-                source="unresolved",
-                path_parameters=_path_parameters(api_config, {}),
-                unresolved_reason=resolution.unresolved_reason
-                or "API has no inspectable signature or public alias",
-            )
-        return self._resolved(
-            api_config,
-            resolution.arguments,
-            resolution.source,
-            keep_name=api_name in {"paddle.Tensor.unflatten", "paddle.unflatten"},
-        )
-
-
 def _walk_tensors(value, path, parameter_name, output):
     # 嵌套 TensorConfig 列表保留顶层参数名，但会扩展 TensorPath。
     if isinstance(value, TensorConfig):
@@ -459,13 +354,19 @@ def _walk_tensors(value, path, parameter_name, output):
             _walk_tensors(child, path.child(index), parameter_name, output)
 
 
-def bind_input(api_config, resolver=None):
+def bind_input(api_config):
     # `InputBinding` 是规则层唯一应该直接读取的绑定对象。
-    resolver = resolver or SignatureResolver()
-    resolution = resolver.resolve(api_config)
-    parameter_by_path = {
-        binding.path: binding.parameter_name for binding in resolution.path_parameters
-    }
+    resolution = bind_parameters(
+        api_config.api_name,
+        api_config.args,
+        api_config.kwargs,
+        keep_name=api_config.api_name in {"paddle.Tensor.unflatten", "paddle.unflatten"},
+    )
+    arguments = (
+        collections.OrderedDict() if resolution.source == "unresolved" else resolution.arguments
+    )
+    path_parameters = _path_parameters(api_config, arguments)
+    parameter_by_path = {binding.path: binding.parameter_name for binding in path_parameters}
     tensors = []
     for index, value in enumerate(api_config.args):
         path = TensorPath.positional(index)
@@ -476,24 +377,25 @@ def bind_input(api_config, resolver=None):
     return InputBinding(
         api_name=api_config.api_name,
         binding_source=resolution.source,
-        parameter_bindings=resolution.path_parameters,
+        parameter_bindings=path_parameters,
         tensors=tuple(tensors),
-        unresolved_reason=resolution.unresolved_reason,
+        unresolved_reason=resolution.unresolved_reason
+        or (
+            "API has no inspectable signature or public alias"
+            if resolution.source == "unresolved"
+            else None
+        ),
     )
 
 
 def build_input_context(
     api_config,
-    resolver=None,
-    seed=0,
-    use_torch=True,
-    gpu_enabled=False,
+    seed,
+    gpu_enabled,
 ):
-    call = bind_input(api_config, resolver=resolver)
-    return InputContext.create(
-        call=call,
-        config_text=api_config.config,
+    return InputContext(
+        call=bind_input(api_config),
+        config_fingerprint=hashlib.sha256(api_config.config.encode()).hexdigest(),
         seed=seed,
-        use_torch=use_torch,
         gpu_enabled=gpu_enabled,
     )
