@@ -671,7 +671,7 @@ class WorkerPool:
         return len(self.slots)
 
     def start(self):
-        """启动所有 worker 进程并启动 watchdog 线程。"""
+        """并行启动所有 worker 进程，然后启动 watchdog 线程。"""
         for slot in self.slots:
             self._spawn_worker(slot)
         self._watchdog_thread = threading.Thread(
@@ -761,18 +761,18 @@ class WorkerPool:
         return True
 
     def warmup(self, timeout=None):
-        """等待至少一个 worker 就绪，或直到启动超时。"""
+        """等待所有 worker 就绪，或直到启动超时。"""
         if timeout is None:
             timeout = self._startup_timeout()
-        ready_slots = set()
+        ready_slots = {slot.index for slot in self.slots if slot.state == "idle"}
         deadline = time.monotonic() + timeout
 
-        while not ready_slots and time.monotonic() < deadline:
+        while len(ready_slots) < self.total_workers and time.monotonic() < deadline:
             try:
                 remaining = max(0.1, deadline - time.monotonic())
                 msg = self.result_queue.get(timeout=min(5.0, remaining))
                 if self._handle_worker_control_message(msg):
-                    if msg[0] == "ready":
+                    if msg[0] == "ready" and self.slots[msg[1]].state == "idle":
                         ready_slots.add(msg[1])
                     continue
             except queue.Empty:
@@ -780,8 +780,8 @@ class WorkerPool:
                 for slot in self.slots:
                     self._check_starting_worker(slot, now=now)
 
-        ready_count = len(ready_slots)
-        if ready_count == 0:
+        ready_count = sum(slot.state == "idle" for slot in self.slots)
+        if ready_count != self.total_workers:
             print(
                 f"[workers] READY_TIMEOUT | {ready_count}/{self.total_workers} ready | "
                 f"timeout {timeout} s",
@@ -1724,24 +1724,23 @@ def _run_batch_mode(
         print(f"Workers: starting | {len(pool.slots)} requested", flush=True)
         pool.start()
         ready_workers = pool.warmup()
-        requested_field = (
-            f" | {len(pool.slots)} requested" if ready_workers != len(pool.slots) else ""
-        )
         print(
-            f"Workers: ready | {ready_workers} online{requested_field} | "
+            f"Workers: ready | {ready_workers} online | {len(pool.slots)} requested | "
             f"{log_report.format_duration(time.monotonic() - worker_start_time)}",
             flush=True,
         )
 
-        if ready_workers == 0:
-            print("Workers: failed | no worker became ready", flush=True)
+        if ready_workers != len(pool.slots):
+            print(
+                "Workers: failed | startup barrier incomplete; no cases will be dispatched",
+                flush=True,
+            )
             batch_state.batch_exit_code = 1
             batch_state.shutdown_force = True
             batch_state.abort_run = True
 
         config_iter = iter(api_configs)
         pending_dispatch = deque()
-        batch_state.abort_run = ready_workers == 0
 
         def refill_idle_workers():
             if not batch_state.abort_run:
