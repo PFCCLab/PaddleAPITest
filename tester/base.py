@@ -543,6 +543,9 @@ class APITestBase:
 
         if not paddle_only and self.api_config.config in torch_error_skip:
             return True
+        api_name = self.api_config.api_name
+        if not paddle_only and (api_name in rand_apis or api_name in stochastic_behavior_apis):
+            return True
         # float8 dtypes are handled by TensorConfig / paddle_to_torch Rules;
         # do not skip accuracy-mode comparison solely because of float8 inputs.
 
@@ -858,7 +861,9 @@ class APITestBase:
         dtype = _dtype_name(output.dtype)
         paddle_grad = self._make_paddle_output_grad(output.shape, dtype, place=output.place)
         paddle_grad.stop_gradient = False
-        return OutputGradSlot(seed_numpy=paddle_grad.numpy(), paddle_grad=paddle_grad)
+        # Keep the native tensor. NumPy has no BF16 dtype and GPU tensors should
+        # not be forced through a host conversion merely to seed the other side.
+        return OutputGradSlot(seed_numpy=None, paddle_grad=paddle_grad)
 
     def _make_gpu_output_grad_pair_slot(self, output):
         dtype = _dtype_name(output.dtype)
@@ -872,10 +877,30 @@ class APITestBase:
         )
         paddle_grad.stop_gradient = False
         return OutputGradSlot(
-            seed_numpy=torch_grad.detach().cpu().numpy(),
+            seed_numpy=None,
             paddle_grad=paddle_grad,
             torch_grad=torch_grad,
         )
+
+    @staticmethod
+    def _torch_grad_to_paddle(torch_grad, output):
+        if output.place.is_gpu_place():
+            device = torch.device("cuda", int(output.place.gpu_device_id()))
+        else:
+            device = torch.device("cpu")
+        torch_grad = torch_grad.detach().to(device=device)
+        paddle_grad = paddle.utils.dlpack.from_dlpack(torch.utils.dlpack.to_dlpack(torch_grad))
+        paddle_grad.stop_gradient = False
+        return paddle_grad
+
+    @staticmethod
+    def _paddle_grad_to_torch(paddle_grad, output):
+        if output.device.type == "cuda":
+            place = paddle.CUDAPlace(int(output.device.index or 0))
+        else:
+            place = paddle.CPUPlace()
+        paddle_grad = paddle_grad.detach()._copy_to(place, False)
+        return torch.utils.dlpack.from_dlpack(paddle.utils.dlpack.to_dlpack(paddle_grad))
 
     def clear_output_grad_cache(self):
         """Drop all cached output-grad seeds for the current execution."""
@@ -890,7 +915,7 @@ class APITestBase:
         if slot.seed_numpy is not None:
             return self._numpy_output_grad_to_paddle(slot.seed_numpy, output)
         if slot.torch_grad is not None:
-            return self._numpy_output_grad_to_paddle(slot.torch_grad.detach().cpu().numpy(), output)
+            return self._torch_grad_to_paddle(slot.torch_grad, output)
         raise RuntimeError("output grad slot is empty")
 
     def _output_grad_slot_to_torch(self, slot, output):
@@ -901,7 +926,7 @@ class APITestBase:
         if slot.seed_numpy is not None:
             return self._numpy_output_grad_to_torch(slot.seed_numpy, output)
         if slot.paddle_grad is not None:
-            return self._numpy_output_grad_to_torch(slot.paddle_grad.numpy(), output)
+            return self._paddle_grad_to_torch(slot.paddle_grad, output)
         raise RuntimeError("output grad slot is empty")
 
     def _prepare_output_grad_slots(self, result_outputs):

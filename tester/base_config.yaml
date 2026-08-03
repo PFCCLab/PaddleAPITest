@@ -91,7 +91,10 @@ not_check_dtype:
   - paddle.where
 
 # keep rand_apis and stochastic_behavior_apis lists for future reference when checking if new api configs have random behavior @Cutelemon6
-# rand_apis:
+rand_apis:
+  # Uninitialized allocation has no cross-framework value contract.
+  - paddle.empty
+  - paddle.empty_like
 #   - paddle.Tensor.__dir__
 #   - paddle.Tensor.bernoulli_
 #   - paddle.Tensor.cauchy_

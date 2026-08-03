@@ -2174,6 +2174,7 @@
         }
     },
     "paddle.Tensor.max": {
+        "Rule": "ReduceRule",
         "torch_api": "torch.Tensor.max",
         "paddle_torch_args_map": {
             "axis": "dim",

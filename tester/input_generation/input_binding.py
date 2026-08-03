@@ -51,6 +51,8 @@ SINGLE_OP_PARAMETER_NAMES = {
 # 手工参数名只覆盖 inspect.signature 不可靠的 API；正常公共 API 仍应走运行时绑定。
 MANUAL_PARAMETER_NAMES = {
     **SINGLE_OP_PARAMETER_NAMES,
+    "paddle.Tensor.clone": ("self",),
+    "paddle.Tensor.detach": ("self",),
     "paddle.Tensor.__getitem__": ("self", "item"),
     "paddle.Tensor.__setitem__": ("self", "item", "value"),
     "paddle._C_ops.adam_": (

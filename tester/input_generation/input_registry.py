@@ -477,7 +477,14 @@ def _optimizer_beta_pow(values: ValueFactory, binding, beta, step):
     if use_accuracy_compatible:
         beta_pow_value = beta**step
     else:
-        beta_pow_value = values.backend.power(numpy.float32(beta), numpy.float32(step)).item()
+        # Torch/Paddle GPU scalar tensors cannot be passed through NumPy directly.
+        # Extract the scalar first while retaining the float32 power semantics.
+        step_item = step.item() if hasattr(step, "item") else step
+        step_value = int(step_item)
+        beta_pow_value = values.backend.power(numpy.float32(beta), numpy.float32(step_value))
+        beta_pow_value = (
+            beta_pow_value.item() if hasattr(beta_pow_value, "item") else beta_pow_value
+        )
     return values.backend.full(binding.spec.shape, beta_pow_value, dtype=binding.spec.dtype)
 
 
@@ -947,7 +954,9 @@ def moe_permute_values(config: ConfigView, values: ValueFactory, writer: InputWr
             positions = values.backend.arange(cursor, cursor + count, dtype="int64")
             rows = positions % seqlen
             columns = (positions // seqlen) % topk
-            routemap[rows, columns] = expert
+            routemap[rows, columns] = values.backend.cast(
+                values.backend.full(rows.shape, expert, dtype="int32"), "int32"
+            )
             cursor += count
         return routemap
 
@@ -1035,7 +1044,7 @@ def moe_unpermute_values(config: ConfigView, values: ValueFactory, writer: Input
         positions = values.backend.arange(route_count, dtype="int64")
         rows = positions % seqlen
         columns = positions // seqlen
-        routemap[rows, columns] = (rows + columns) % num_experts
+        routemap[rows, columns] = values.backend.cast((rows + columns) % num_experts, "int32")
         return routemap
 
     def rowmap_value(binding):
@@ -1072,7 +1081,9 @@ def moe_unpermute_values(config: ConfigView, values: ValueFactory, writer: Input
                     positions = values.backend.nonzero(routemap[row_index] == expert)[0]
                     if values.backend.prod(positions.shape) == 0:
                         continue
-                    rowmap[row_index, expert] = expert_offsets[expert] + expert_counters[expert]
+                    rowmap[row_index, expert] = values.backend.cast(
+                        expert_offsets[expert] + expert_counters[expert], "int32"
+                    )
                     expert_counters[expert] += 1
         return rowmap
 
@@ -3369,7 +3380,10 @@ def view_values(config: ConfigView, values: ValueFactory, writer: InputWriter):
                     )
                     uint32_value = values.backend.view_dtype(finite_f32, "uint32")
                     return values.backend.view_dtype(
-                        values.backend.cast(uint32_value >> 16, "uint16"),
+                        values.backend.cast(
+                            values.backend.cast(uint32_value, "int64") >> 16,
+                            "uint16",
+                        ),
                         "uint8",
                     )
                 finite = values.backend.cast(

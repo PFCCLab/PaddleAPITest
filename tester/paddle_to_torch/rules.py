@@ -5645,7 +5645,7 @@ class PutAlongAxisRule(BaseRule):
 
     def apply(self, paddle_api: str) -> ConvertResult:
         pre = """
-input = arr
+input = locals().get("arr", locals().get("x"))
 dim = axis
 index = indices
 src = values
@@ -5668,7 +5668,7 @@ def infer_broadcast_shape(input, index, dim):
     return broadcast_shape
 
 if broadcast == True:
-    broadcast_shape = infer_broadcast_shape(arr, indices, axis)
+    broadcast_shape = infer_broadcast_shape(input, indices, axis)
     if broadcast_shape:
         index = torch.broadcast_to(index, broadcast_shape)
         src = torch.broadcast_to(src, broadcast_shape)
@@ -6192,6 +6192,7 @@ if isinstance(axis, torch.Tensor):
 class ReduceRule(BaseRule):
     PADDLE_APIS = (
         "paddle.max",
+        "paddle.Tensor.max",
         "paddle.mean",
         "paddle.Tensor.mean",
         "paddle.min",
@@ -6267,6 +6268,15 @@ if isinstance(axis, tuple) and not keepdim:
 """
         elif paddle_api == "paddle.sum":
             core = "result = torch.sum(x, dim=axis, keepdim=keepdim, dtype=dtype)"
+            post = ""
+        elif paddle_api == "paddle.Tensor.max":
+            core = """
+if axis is None:
+    result = torch.max(x)
+else:
+    _max_result = torch.max(x, dim=axis, keepdim=keepdim)
+    result = _max_result.values
+"""
             post = ""
         else:
             core = f"result = {self.torch_api}(x, dim=axis, keepdim=keepdim)"
@@ -8740,13 +8750,15 @@ class CopsFusedLinearParamGradAddRule(BaseRule):
     Computes dweight += x.T @ dout  (and optionally dbias += dout.sum(0)).
 
     Reference implementation is selected via PADDLEAPITEST_IMPL env var:
-      - "te"    (default): Transformer Engine general_gemm (BF16 + FP32 accum)
+      - "te":    Transformer Engine general_gemm (BF16 + FP32 accum)
       - "apex":            Apex/Megatron wgrad_gemm_accum_fp32
       - "torch":           aten.linear_backward + matmul fallback
     """
 
     SUPPORTED_IMPLEMENTATIONS = frozenset({"apex", "te", "torch"})
-    DEFAULT_IMPLEMENTATION = "te"
+    # The Torch fallback is portable across Torch/Transformer Engine builds;
+    # TE remains available through PADDLEAPITEST_IMPL=te.
+    DEFAULT_IMPLEMENTATION = "torch"
 
     def apply(self, paddle_api: str) -> ConvertResult:
         impl = self.select_implementation()

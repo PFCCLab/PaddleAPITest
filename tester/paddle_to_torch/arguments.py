@@ -41,6 +41,8 @@ _MANUAL_ARGUMENT_NAMES = {
 }
 _MANUAL_ARGUMENT_NAMES.update(
     {
+        "paddle.Tensor.clone": ("self",),
+        "paddle.Tensor.detach": ("self",),
         "paddle._C_ops.adamw_": (
             "param",
             "grad",

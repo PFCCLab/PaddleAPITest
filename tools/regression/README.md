@@ -2,7 +2,8 @@
 
 `tools/regression` 维护项目级固定回归配置集，用于在修改后验证 `paddle_only` 和 `accuracy` 两类门禁。
 
-当前固定集合为 `tools/regression/regression_configs.txt`，覆盖 147 个 API key、609 条配置。
+当前固定集合为 `tools/regression/regression_configs.txt`，覆盖 146 个 API key、438 条配置；每个
+API key 保留 3 条不同的小型配置。
 
 ## 运行回归
 
@@ -65,35 +66,5 @@ GPU_IDS=0 REGRESSION_NUM_GPUS=1 REGRESSION_WORKERS_PER_GPU=2 \
 
 ## 维护配置集合
 
-如需从外部 APIConfig 文件重新收集固定集合，显式传入来源目录或文件：
-
-```bash
-python tools/regression/collect_configs.py \
-  --source /path/to/api_config_dir \
-  --source /path/to/api_config_file.txt \
-  --output tools/regression/regression_configs.txt \
-  --summary tools/regression/regression_summary.txt
-```
-
-`collect_configs.py` 扫描来源目录内所有文件名包含 `4096` 或 `1M` 的 `.txt` 文件，并
-为每个 API key 保留最多 5 条不同配置。源配置不足 5 条时，按实际数量进入回归集合，
-不生成或修改配置。
-
-收集策略：
-
-- 先收集 4096 配置，再用 1M 配置补充新 API 或不足 5 条的 API。
-- 1M 候选按 Tensor shape 的总元素量、最大 Tensor 元素量和最大维度从小到大选择。
-- 排除路径中包含 `needfix`、`need_fix` 或 `not_monitor` 的配置文件。
-- 不按 dtype 或 API 支持状态过滤配置。
-- 每条配置使用项目 `APIConfig` 解析并规范化，无法解析的行不进入集合。
-- `paddle._C_ops._run_custom_op` 按第一个参数 `op_name` 细分 API key，例如 `paddle._C_ops._run_custom_op:fused_swiglu_scale_clamp`。
-
-如候选集运行产生非允许分类，可根据 `error_stat` 结果剔除失败配置：
-
-```bash
-python tools/regression/refine_configs.py \
-  --input tools/regression/regression_configs.txt \
-  --output tools/regression/regression_configs.txt \
-  --log-dir /path/to/log/paddle_only \
-  --log-dir /path/to/log/accuracy
-```
+固定配置集直接维护在 `regression_configs.txt`。修改单条配置时，先以
+`engineV4.py --api_config=...` 最小复现，再运行本目录的回归入口验证。
