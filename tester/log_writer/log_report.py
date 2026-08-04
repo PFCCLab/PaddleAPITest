@@ -235,13 +235,14 @@ def print_run_footer(total_case, tested_case, remaining_case, log_counts, elapse
     )
     completed_case = counts.get("checkpoint", tested_case)
     overall_total = max(total_case, completed_case + remaining_case)
-    failed_case = max(completed_case - counts.get("pass", 0) - counts.get("skip", 0), 0)
+    skipped_case = counts.get("skip", 0) + counts.get("memory_skip", 0)
+    failed_case = max(completed_case - counts.get("pass", 0) - skipped_case, 0)
     progress = completed_case / overall_total * 100 if overall_total else 100.0
     _print_section_banner("RESULT")
     print(f"Progress: {completed_case} / {overall_total} | {progress:.1f}%")
     print(
         f"Cases: {counts.get('pass', 0)} pass | {failed_case} fail | "
-        f"{counts.get('skip', 0)} skip | {remaining_case} remaining"
+        f"{skipped_case} skip | {remaining_case} remaining"
     )
     print(f"Issues: {paddle_issues} Paddle | {test_issues} test | {retest} retest")
     print("Classification")

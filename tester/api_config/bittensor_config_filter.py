@@ -13,13 +13,6 @@ def is_0D_tensor(tensor_config):
     return len(tensor_config.shape) == 0
 
 
-def tensor_numel(tensor_config):
-    numel = 1
-    for i in tensor_config.shape:
-        numel = numel * i
-    return numel
-
-
 def get_tensor_configs(api_config):
     tensor_configs = []
     for arg_config in api_config.args:
@@ -50,6 +43,6 @@ if __name__ == "__main__":
         for api_config in tqdm(api_configs):
             tensor_configs = get_tensor_configs(api_config)
             for tensor_config in tensor_configs:
-                if tensor_numel(tensor_config) >= 2147483647:
+                if tensor_config.numel() >= 2147483647:
                     print(api_config.config)
                     break

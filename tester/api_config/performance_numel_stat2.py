@@ -13,13 +13,6 @@ def is_0D_tensor(tensor_config):
     return len(tensor_config.shape) == 0
 
 
-def tensor_numel(tensor_config):
-    numel = 1
-    for i in tensor_config.shape:
-        numel = numel * i
-    return numel
-
-
 def get_tensor_configs(api_config):
     tensor_configs = []
     for arg_config in api_config.args:
@@ -72,7 +65,7 @@ if __name__ == "__main__":
             tensor_configs = get_tensor_configs(api_config)
             numel = 0
             for tensor_config in tensor_configs:
-                numel = numel + tensor_numel(tensor_config)
+                numel = numel + tensor_config.numel()
             api_info = API_info2()
             api_info.numel = numel
             api_info.config = api_config.config

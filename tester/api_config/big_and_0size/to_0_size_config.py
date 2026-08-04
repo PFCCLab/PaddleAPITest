@@ -18,13 +18,6 @@ def is_0D_tensor(tensor_config):
     return len(tensor_config.shape) == 0
 
 
-def tensor_numel(tensor_config):
-    numel = 1
-    for i in tensor_config.shape:
-        numel = numel * i
-    return numel
-
-
 def get_tensor_configs(api_config):
     tensor_configs = []
     for arg_config in api_config.args:
@@ -233,10 +226,7 @@ def to_big_tensor_config(api_config):
             else:
                 base_size = 2281701378
             tmp_tensor_configs[i].shape[j] = (
-                int(
-                    base_size
-                    / (tensor_numel(tmp_tensor_configs[i]) / tmp_tensor_configs[i].shape[j])
-                )
+                int(base_size / (tmp_tensor_configs[i].numel() / tmp_tensor_configs[i].shape[j]))
                 + 1
             )
             config_str = str(tmp_api_config)
@@ -265,8 +255,7 @@ def to_big_tensor_config(api_config):
                     base_size = 2281701378
                 tmp_tensor_configs[i].shape[j] = (
                     int(
-                        base_size
-                        / (tensor_numel(tmp_tensor_configs[0]) / tmp_tensor_configs[0].shape[j])
+                        base_size / (tmp_tensor_configs[0].numel() / tmp_tensor_configs[0].shape[j])
                     )
                     + 1
                 )

@@ -4,7 +4,8 @@ import time
 
 import paddle
 
-from .base import APITestBase, total_tensor_numel
+from .base import APITestBase
+from .input_generation.tensor_config import tensor_config_tree_numel
 
 
 class APITestPaddleGPUPerformance(APITestBase):
@@ -35,7 +36,7 @@ class APITestPaddleGPUPerformance(APITestBase):
             if not self.build_paddle_input():
                 self.report_case_result("paddle_error", "build_paddle_input failed")
                 return
-            numel = total_tensor_numel(self.api_config)
+            numel = tensor_config_tree_numel(self.api_config.args, self.api_config.kwargs)
             test_loop = 2147483647 * 20 // numel
             if self.test_amp:
                 with paddle.amp.auto_cast():

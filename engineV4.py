@@ -69,10 +69,6 @@ os.environ["FLAGS_use_system_allocator"] = "1"
 os.environ["NVIDIA_TF32_OVERRIDE"] = "0"
 
 
-class GpuMemoryDeferred(Exception):
-    """当 GPU 模式下的 case 需要等待更多可用显存时抛出。"""
-
-
 # 运行时透传给 test class 的选项白名单。
 VALID_TEST_ARGS = {
     "test_amp",
@@ -254,10 +250,6 @@ class BatchMessage:
             message.reason = msg[3] if len(msg) > 3 else ""
             message.worker_pid = msg[4] if len(msg) > 4 else None
             message.completed_offset = msg[5] if len(msg) > 5 else None
-        elif message.msg_type == "deferred":
-            message.reason = msg[3] if len(msg) > 3 else "insufficient GPU memory"
-            message.worker_pid = msg[4] if len(msg) > 4 else None
-            message.completed_offset = msg[5] if len(msg) > 5 else None
         elif message.msg_type == "crashed":
             message.exitcode = msg[3] if len(msg) > 3 else None
             if len(msg) > 5 and msg[5] == "child":
@@ -402,17 +394,6 @@ def _worker_loop(
                     "done",
                     slot_index,
                     api_config_str,
-                    os.getpid(),
-                    log_worker.get_worker_log_offset(),
-                )
-            )
-        except GpuMemoryDeferred as e:
-            result_queue.put(
-                (
-                    "deferred",
-                    slot_index,
-                    api_config_str,
-                    str(e),
                     os.getpid(),
                     log_worker.get_worker_log_offset(),
                 )
@@ -1590,7 +1571,7 @@ def _handle_batch_result(
             message.completed_offset,
         )
 
-    worker_reusable = msg_type in ("done", "error", "deferred") or (
+    worker_reusable = msg_type in ("done", "error") or (
         msg_type == "crashed" and options.use_compute_sanitizer and crash_source == "child"
     )
     external_kill = msg_type == "crashed" and exitcode in (-signal.SIGKILL, -signal.SIGTERM)
@@ -1621,11 +1602,6 @@ def _handle_batch_result(
 
     if worker_reusable:
         pool.mark_idle(slot_index)
-
-    if msg_type == "deferred":
-        pending_dispatch.append(config)
-        log_report.print_case_notice("DEFERRED", config, reason)
-        return
 
     batch_state.tested_case += 1
     progress_status = "DONE"
@@ -1807,7 +1783,7 @@ def _run_batch_mode(
                     slot_idx = msg[1]
                     with pool._lock:
                         pool.slots[slot_idx].task_start_time = time.time()
-                elif msg_type in ("done", "error", "timeout", "deferred", "crashed"):
+                elif msg_type in ("done", "error", "timeout", "crashed"):
                     _handle_batch_result(
                         pool=pool,
                         options=options,
@@ -2040,9 +2016,6 @@ def run_test_case(api_config_str, options):
             del test_class, api_config, case
             _cleanup_case_runtime(options)
 
-    except GpuMemoryDeferred:
-        case_status = "deferred"
-        raise
     except BaseException:
         case_status = "error"
         raise

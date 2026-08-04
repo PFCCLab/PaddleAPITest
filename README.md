@@ -91,7 +91,7 @@ python engineV4.py \
   --gpu_ids=0-3
 ```
 
-多个分类用逗号分隔，例如 `--retest=config_input,timeout`。可用分类与 `api_config_*.txt` 对应，包括 `pass`、`skip`、`paddle_error`、`paddle_accuracy`、`paddle_bitwise`、`paddle_cuda`、`paddle_crash`、`oom`、`timeout`、`torch_error`、`config_input`、`config_parse` 和 `config_convert`。
+多个分类用逗号分隔，例如 `--retest=config_input,timeout`。可用分类与 `api_config_*.txt` 对应，包括 `pass`、`skip`、`memory_skip`、`paddle_error`、`paddle_accuracy`、`paddle_bitwise`、`paddle_cuda`、`paddle_crash`、`oom`、`timeout`、`torch_error`、`config_input`、`config_parse` 和 `config_convert`。
 
 复测开始时，引擎会从 checkpoint、主分类、`comp/` 分类和 stable/tolerance CSV 中移除所选配置的旧结构化结果；`log_inorder.log` 保留历史 case。复测中断后，重新执行相同命令只运行尚未 checkpoint 的配置；全部完成后恢复文件自动删除。`engineV2.py` 支持相同参数。不要让多个进程同时复测同一日志目录。
 
@@ -143,6 +143,10 @@ python run.py -c test_pipeline/run_config.yaml
 ## GPU Mode 与动态显存管理
 
 `--use_gpu_mode=True` 在 GPU 上生成 Tensor 并进行比较，复用 CUDA allocator，适用于大规模 `accuracy_stable` 测试。此模式会忽略 `--use_cached_numpy=True`。
+
+GPU mode 会在输入生成前按测试模式估算阶段存活集合。单 worker 独占 GPU 时使用整卡容量，
+多 worker 共享时按 worker 数均分；只有估算下界已经超过容量的配置才进入 `memory_skip`，
+未知算子 workspace 仍由运行时 OOM 治理兜底。
 
 GPU mode 不需要选择固定显存策略。框架会在 Torch/Paddle 阶段边界查询整卡空闲显存，
 按下一阶段输入、已观测输出/梯度和 reference workspace 估算 headroom；有压力时先释放两个

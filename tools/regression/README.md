@@ -49,6 +49,7 @@ GPU_IDS=0 REGRESSION_NUM_GPUS=1 REGRESSION_WORKERS_PER_GPU=2 \
 
 - `pass`
 - `skip`
+- `memory_skip`
 - `paddle_bitwise`
 
 不允许分类：

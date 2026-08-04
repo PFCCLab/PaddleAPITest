@@ -86,12 +86,6 @@ DEVICE_COUNT = None  # total number of devices
 _MEM_SNAPSHOT = None  # dict: gpu_id -> (total_gb, used_gb)
 _MEM_SNAPSHOT_TS = 0.0
 _MEM_SNAPSHOT_TTL = 2.0  # seconds — snapshot cache ttl
-MEMORY_WAIT_SECONDS = 10
-MEMORY_WAIT_LOG_INTERVAL = 60
-
-
-class GpuMemoryDeferred(Exception):
-    """Raised when a GPU-mode case should wait for more free memory."""
 
 
 def cleanup(pool):
@@ -800,9 +794,6 @@ def run_test_case(api_config_str, options):
                     )
 
         return completion
-    except GpuMemoryDeferred:
-        case_status = "deferred"
-        raise
     except BaseException:
         case_status = "error"
         raise
@@ -1454,11 +1445,6 @@ def main():
                                 log_aggregation.mark_inorder_case_complete(
                                     worker_pid, completed_offset
                                 )
-                        except GpuMemoryDeferred as err:
-                            checkpoint_ready = False
-                            progress_status = "DEFERRED"
-                            progress_detail = str(err)
-                            schedule_config(config)
                         except Exception as err:
                             log_worker.write_to_log("config_parse", config)
                             progress_status = "CONFIG_PARSE"
@@ -1478,7 +1464,7 @@ def main():
                                     config,
                                     progress_detail,
                                 )
-                        elif progress_status in ("RETRY", "DEFERRED", "CONFIG_PARSE"):
+                        elif progress_status == "RETRY":
                             log_report.print_case_notice(progress_status, config, progress_detail)
                 log_aggregation.aggregate_logs()
             pool.close()

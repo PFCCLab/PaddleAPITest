@@ -3,8 +3,9 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 
-ALLOWED_RESULT_TYPES = frozenset({"pass", "skip", "checkpoint", "paddle_bitwise"})
+ALLOWED_RESULT_TYPES = frozenset({"pass", "skip", "memory_skip", "checkpoint", "paddle_bitwise"})
 RESULT_FILES = {
+    "memory_skip": "api_config_memory_skip.txt",
     "paddle_error": "api_config_paddle_error.txt",
     "paddle_accuracy": "api_config_paddle_accuracy.txt",
     "paddle_bitwise": "api_config_paddle_bitwise.txt",

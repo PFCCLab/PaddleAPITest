@@ -7,7 +7,8 @@ import paddle
 import torch
 from func_timeout import func_set_timeout
 
-from .base import APITestBase, total_tensor_numel
+from .base import APITestBase
+from .input_generation.tensor_config import tensor_config_tree_numel
 from .paddle_to_torch import ConversionKind, get_converter
 from .paddle_to_torch.arguments import bind_paddle_arguments
 
@@ -650,7 +651,7 @@ class APITestPaddleTorchGPUPerformance(APITestBase):
             )
             return
 
-        numel = total_tensor_numel(self.api_config)
+        numel = tensor_config_tree_numel(self.api_config.args, self.api_config.kwargs)
         # test_loop = 1000
         test_loop = api_loop.get(self.api_config.api_name, 1000)
         # test_loop = 2147483647 * 20 // numel

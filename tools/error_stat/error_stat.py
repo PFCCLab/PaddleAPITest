@@ -24,6 +24,7 @@ RESULT_DIR_NAME = "error_stat_result"
 #   retest        — 资源/超时，主要用于重测筛选
 #   test_issue    — 测试侧问题，不直接代表 Paddle bug
 SUMMARY_GROUPS = {
+    "skipped": ("memory_skip",),
     "paddle_issue": (
         "paddle_error",
         "paddle_accuracy",

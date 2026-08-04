@@ -731,6 +731,10 @@ class APITestAccuracyStable(APITestBase):
             )
             return
 
+        memory_mode = "accuracy_stable_dual_gpu" if self.use_dual_gpu else "accuracy_stable"
+        if not self.run_gpu_memory_preflight(memory_mode):
+            return
+
         try:
             if not self.generate_input_values():
                 self.report_case_result("config_input", "generate_input_values failed")
@@ -743,6 +747,8 @@ class APITestAccuracyStable(APITestBase):
 
         try:
             self.save_original_inputs_to_cpu()
+            # 后续两轮只从不可变 CPU 副本重建，GPU 生成源在此结束生命周期。
+            self.clear_generated_input_values()
         except Exception as err:
             _, fatal = self.report_runtime_error(err, "config_input", "input cache")
             if fatal:

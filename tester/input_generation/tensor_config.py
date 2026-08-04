@@ -34,6 +34,26 @@ USE_CACHED_NUMPY = os.getenv("USE_CACHED_NUMPY", "False").lower() == "true"
 TEST_NON_CONTIGUOUS = os.getenv("TEST_NON_CONTIGUOUS", "0").lower() in ("true", "1")
 USE_GPU_MODE = os.getenv("USE_GPU_MODE", "False").lower() == "true"
 cached_numpy = {}
+_DTYPE_BYTES = {
+    "bool": 1,
+    "uint8": 1,
+    "int8": 1,
+    "float8_e4m3fn": 1,
+    "float8_e5m2": 1,
+    "uint16": 2,
+    "int16": 2,
+    "float16": 2,
+    "bfloat16": 2,
+    "uint32": 4,
+    "int32": 4,
+    "float32": 4,
+    "uint64": 8,
+    "int64": 8,
+    "float64": 8,
+    "complex64": 8,
+    "complex128": 16,
+}
+# dtype 集合既服务实际物化，也服务预检；新增 dtype 时必须同步元素字节数。
 AUTOGRAD_DTYPES = frozenset(
     ["float32", "float64", "float16", "complex64", "complex128", "bfloat16"]
 )
@@ -64,11 +84,54 @@ def _shape_tuple(shape):
     return tuple(int(dim) for dim in shape)
 
 
-def _numel(shape):
+def dtype_name(dtype):
+    """将框架 dtype 和配置字符串统一为稳定名称。"""
+    return str(dtype).replace("paddle.", "").replace("torch.", "").split(".")[-1]
+
+
+def dtype_element_size(dtype, *, default=None):
+    """返回配置 dtype 的元素字节数；未知类型必须由调用方显式处理。"""
+    size = _DTYPE_BYTES.get(dtype_name(dtype))
+    if size is not None:
+        return size
+    if default is not None:
+        return int(default)
+    raise ValueError(f"unknown TensorConfig dtype size: {dtype!r}")
+
+
+def shape_numel(shape):
+    """计算配置 shape 的逻辑元素数，标量 shape 的结果为 1。"""
+    # Python int 无溢出风险，不能把超过 int32/int64 的目标 case 截断。
     numel = 1
     for dim in shape:
         numel *= int(dim)
     return numel
+
+
+def shape_storage_numel(shape, *, is_contiguous=True, strides=None):
+    """计算承载一个配置 Tensor 所需的底层 storage 元素数。"""
+    # 非连续 storage 取最大可达 offset + 1；零尺寸不访问任何 storage。
+    logical_numel = shape_numel(shape)
+    if logical_numel == 0:
+        return 0
+    if logical_numel < 0:
+        raise ValueError(f"negative TensorConfig shape is not a valid storage: {shape!r}")
+    if is_contiguous or strides is None:
+        return logical_numel
+    if len(shape) != len(strides):
+        raise ValueError(f"shape and strides rank mismatch: shape={shape!r}, strides={strides!r}")
+
+    storage_numel = 1
+    for dimension, stride in zip(shape, strides, strict=True):
+        dimension = int(dimension)
+        stride = int(stride)
+        if dimension < 0 or stride < 0:
+            raise ValueError(
+                f"negative shape/stride is not supported: shape={shape!r}, strides={strides!r}"
+            )
+        if dimension > 0:
+            storage_numel += (dimension - 1) * stride
+    return storage_numel
 
 
 def _normalize_cache_dtype(dtype):
@@ -176,7 +239,22 @@ class TensorConfig:
         return self.__str__()
 
     def numel(self):
-        return _numel(self.shape)
+        return shape_numel(self.shape)
+
+    def storage_numel(self):
+        """返回物化该配置所需的 storage 元素数。"""
+        return shape_storage_numel(
+            self.shape,
+            is_contiguous=self.is_contiguous,
+            strides=self.strides,
+        )
+
+    def nbytes(self, *, storage=True):
+        """返回逻辑 Tensor 或实际 storage 的配置字节数。"""
+        numel = self.storage_numel() if storage else self.numel()
+        if numel < 0:
+            raise ValueError(f"negative TensorConfig numel is invalid: {self.shape!r}")
+        return numel * dtype_element_size(self.dtype)
 
     def _use_gpu(self):
         if not is_gpu_mode():
@@ -305,11 +383,7 @@ class TensorConfig:
         return self.paddle_tensor
 
     def _strided_storage_size(self):
-        storage_size = 1
-        for i in range(len(self.shape)):
-            if self.shape[i] > 0:
-                storage_size += (self.shape[i] - 1) * self.strides[i]
-        return storage_size
+        return self.storage_numel()
 
     def _create_paddle_strided(self, api_config):
         """基于共享逻辑输入创建非连续 Paddle Tensor。"""
@@ -452,6 +526,10 @@ class TensorConfig:
         if not is_gpu_mode():
             torch.cuda.empty_cache()
 
+    def clear_generated_input_value(self, api_config):
+        """释放规则生成值，但保留已物化 Tensor 和 stable CPU 副本。"""
+        clear_input_value(api_config, self)
+
     def save_cpu_copy(self, api_config):
         """保留一份不可变 CPU 副本，用于重建隔离后的测试输入。"""
         if self.cpu_tensor is not None:
@@ -463,3 +541,37 @@ class TensorConfig:
 
     def clear_cpu_copy(self):
         self.cpu_tensor = None
+
+
+def iter_unique_tensor_configs(*roots):
+    """按对象身份遍历任意配置树中的 TensorConfig。"""
+    # 同一 TensorConfig 被多个参数位置引用时只统计一次底层配置 storage。
+    # list、tuple 和 dict 覆盖 APIConfig 当前支持的全部嵌套容器。
+    seen = set()
+
+    def visit(value):
+        if isinstance(value, TensorConfig):
+            if id(value) not in seen:
+                seen.add(id(value))
+                yield value
+            return
+        if isinstance(value, (list, tuple)):
+            for item in value:
+                yield from visit(item)
+            return
+        if isinstance(value, dict):
+            for item in value.values():
+                yield from visit(item)
+
+    for root in roots:
+        yield from visit(root)
+
+
+def tensor_config_tree_numel(*roots):
+    """汇总配置树中唯一 TensorConfig 的逻辑元素数。"""
+    return sum(config.numel() for config in iter_unique_tensor_configs(*roots))
+
+
+def tensor_config_tree_nbytes(*roots, storage=True):
+    """汇总配置树中唯一 TensorConfig 的逻辑或 storage 字节数。"""
+    return sum(config.nbytes(storage=storage) for config in iter_unique_tensor_configs(*roots))

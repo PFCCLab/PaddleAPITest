@@ -8,6 +8,7 @@ LogType = Literal[
     "checkpoint",
     "pass",
     "skip",
+    "memory_skip",
     "paddle_error",
     "paddle_accuracy",
     "paddle_bitwise",
@@ -25,6 +26,7 @@ LOG_PREFIXES: dict[LogType, str] = {
     "checkpoint": "checkpoint",
     "pass": "api_config_pass",
     "skip": "api_config_skip",
+    "memory_skip": "api_config_memory_skip",
     "paddle_error": "api_config_paddle_error",
     "paddle_accuracy": "api_config_paddle_accuracy",
     "paddle_bitwise": "api_config_paddle_bitwise",
@@ -77,6 +79,7 @@ FINAL_RESULT_PRIORITY = (
     "config_input",
     "config_parse",
     "config_convert",
+    "memory_skip",
     "skip",
     "pass",
 )

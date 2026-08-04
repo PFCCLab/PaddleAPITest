@@ -11,10 +11,14 @@ import yaml
 
 from .dtype_utils import to_torch_dtype
 from .dump_writer import DEFAULT_DUMP_DIR, DumpContext, dump_enabled
+from .gpu_memory_preflight import decide_gpu_memory_preflight
 from .input_generation.binding import bind_input_parameters
 from .input_generation.tensor_config import (
     TensorConfig,
+    dtype_element_size,
+    dtype_name,
     get_cached_numpy_array,
+    tensor_config_tree_nbytes,
 )
 from .log_writer import log_worker
 from .log_writer.log_comparison import log_accuracy_tolerance
@@ -50,20 +54,6 @@ class _LazyTorch:
 torch = _LazyTorch()
 
 
-def total_tensor_numel(api_config):
-    total = 0
-    values = (*api_config.args, *api_config.kwargs.values())
-    for value in values:
-        candidates = value if isinstance(value, (list, tuple)) else (value,)
-        for candidate in candidates:
-            if isinstance(candidate, TensorConfig):
-                numel = 1
-                for dimension in candidate.shape:
-                    numel *= dimension
-                total += numel
-    return total
-
-
 CUDA_ERROR = frozenset(
     [
         "CUDA error",
@@ -84,26 +74,6 @@ CUDA_OOM = frozenset(
 
 GPU_MEMORY_PROBE_MIN_BYTES = 256 << 20
 _GIB = 1024**3
-_TENSOR_DTYPE_BYTES = {
-    "bool": 1,
-    "uint8": 1,
-    "int8": 1,
-    "float8_e4m3fn": 1,
-    "float8_e5m2": 1,
-    "uint16": 2,
-    "int16": 2,
-    "float16": 2,
-    "bfloat16": 2,
-    "uint32": 4,
-    "int32": 4,
-    "float32": 4,
-    "uint64": 8,
-    "int64": 8,
-    "float64": 8,
-    "complex64": 8,
-    "complex128": 16,
-}
-
 _OUTPUT_GRAD_DTYPES = frozenset(
     [
         "float16",
@@ -117,7 +87,7 @@ _OUTPUT_GRAD_DTYPES = frozenset(
 
 
 def _dtype_element_size(dtype):
-    return _TENSOR_DTYPE_BYTES.get(_dtype_name(dtype), 4)
+    return dtype_element_size(dtype, default=4)
 
 
 def _tensor_element_size(value):
@@ -128,7 +98,7 @@ def _tensor_element_size(value):
 
 
 def _dtype_name(value):
-    return str(value).split(".")[-1]
+    return dtype_name(value)
 
 
 @dataclass(frozen=True)
@@ -453,6 +423,22 @@ class APITestBase:
             write_main_log=write_main_log,
         )
         return log_type
+
+    def run_gpu_memory_preflight(self, mode):
+        """在输入生成前统一执行 GPU 容量准入，并记录可审计终态。"""
+        decision = decide_gpu_memory_preflight(
+            self.api_config,
+            mode,
+            self.gpu_mode_config,
+            check_grad=self.need_check_grad(),
+        )
+        if not decision.should_skip:
+            return True
+        self.record_memory_governance_metric("memory_preflight_skip")
+        message = decision.message()
+        self.report_case_result("memory_skip", phase="preflight", message=message)
+        self.dump_finalize("memory_skip", memory_preflight=message)
+        return False
 
     def reset_random_state(self, seed=None):
         """Reset NumPy and framework RNGs for reproducible executions."""
@@ -1843,13 +1829,13 @@ class APITestBase:
 
     @staticmethod
     def _gpu_safety_reserve_bytes(total_bytes, budget_bytes):
-        """Keep a small physical reserve without double-counting allocator state."""
-        minimum_reserve = 1 * 1024**3
+        """仅保留固定运行时余量，不再按大卡容量百分比扣减。"""
+        minimum_reserve = 256 * 1024**2
         total_bytes = max(0, int(total_bytes))
         budget_bytes = max(0, int(budget_bytes))
         if budget_bytes > 0 and budget_bytes < total_bytes:
             return max(minimum_reserve, total_bytes - budget_bytes)
-        return max(minimum_reserve, total_bytes // 20)
+        return minimum_reserve
 
     def test(self):
         pass
@@ -2158,17 +2144,16 @@ class APITestBase:
             *self._tensor_config_roots(),
         )
 
+    def clear_generated_input_values(self):
+        """框架输入取得所有权后释放 GPU 生成源，避免跨阶段长期驻留。"""
+        self._for_each_tensor_config(
+            lambda config: config.clear_generated_input_value(self.api_config),
+            *self._tensor_config_roots(),
+        )
+
     def estimate_input_bytes(self):
-        """Estimate total configured input bytes for memory probe gating."""
-        total_bytes = 0
-
-        def visit(config):
-            nonlocal total_bytes
-            dtype = getattr(config, "dtype", "float32")
-            total_bytes += int(config.numel()) * _dtype_element_size(dtype)
-
-        self._for_each_tensor_config(visit, *self._tensor_config_roots())
-        return total_bytes
+        """Estimate unique configured input storage bytes for memory probe gating."""
+        return tensor_config_tree_nbytes(*self._tensor_config_roots(), storage=True)
 
     def clear_paddle_tensor(self):
         if not self._clear_tensor_config_cache("clear_paddle_tensor"):

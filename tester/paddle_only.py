@@ -106,6 +106,8 @@ class APITestPaddleOnly(APITestBase):
             self._finalize_paddle_only("config_parse")
             return
         self.dump_event("api_analyze_done", api_name=self.api_config.api_name)
+        if not self.run_gpu_memory_preflight("paddle_only"):
+            return
 
         try:
             self.dump_event("numpy_input_start")
@@ -126,6 +128,7 @@ class APITestPaddleOnly(APITestBase):
                 self.report_case_result("paddle_error", "build_paddle_input failed")
                 self._finalize_paddle_only("paddle_error")
                 return
+            self.clear_generated_input_values()
             self.dump_save(
                 "paddle_inputs",
                 {"args": self.paddle_args, "kwargs": self.paddle_kwargs},

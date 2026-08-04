@@ -12,7 +12,12 @@ import numpy
 
 from .backend import create_input_backend
 from .binding import InputApiBinding, InputGenerationContext
-from .tensor_config import CAST_THROUGH_INTERMEDIATE_DTYPES, TensorConfig, not_zero_apis
+from .tensor_config import (
+    CAST_THROUGH_INTERMEDIATE_DTYPES,
+    TensorConfig,
+    not_zero_apis,
+    shape_numel,
+)
 from .tensor_spec import InputTensorSpec
 from .value import InputValue, attach_input_values, read_input_value
 from .value_generators import (
@@ -1416,7 +1421,7 @@ def generate_roi_pool_inputs(rule: InputRuleContext):
             state["boxes_shape"] = boxes.shape
         boxes_remaining = state["boxes_shape"][0]
         result = rule.ops.zeros(input_binding.shape, dtype=input_binding.dtype)
-        numel = math.prod(input_binding.shape)
+        numel = shape_numel(input_binding.shape)
         for index in range(numel - 1):
             if boxes_remaining < numel:
                 result[index] = 0
@@ -2070,7 +2075,7 @@ def generate_tensor_getitem_inputs(rule: InputRuleContext):
 
     def generate_item_input_value(input_binding):
         min_dim = min(source_binding().shape)
-        numel = math.prod(input_binding.shape)
+        numel = shape_numel(input_binding.shape)
         if input_binding.dtype == "bool":
             indices = rule.ops.choice([0, 1], shape=numel)
         else:
@@ -2095,7 +2100,7 @@ def generate_tensor_setitem_inputs(rule: InputRuleContext):
 
     def generate_item_input_value(input_binding):
         min_dim = min(source_binding().shape)
-        numel = math.prod(input_binding.shape)
+        numel = shape_numel(input_binding.shape)
         if input_binding.dtype == "bool":
             value = rule.arg("value")
             if value is not None and hasattr(value, "shape"):
@@ -2146,7 +2151,7 @@ def generate_take_inputs(rule: InputRuleContext):
 
     def generate_index_input_value(input_binding):
         x = rule.arg("x")
-        dim_size = math.prod(x.shape)
+        dim_size = shape_numel(x.shape)
         return rule.ops.cast(
             rule.ops.randint(0, dim_size, shape=input_binding.shape),
             input_binding.dtype,
@@ -2230,7 +2235,7 @@ def generate_take_along_axis_inputs(rule: InputRuleContext):
         generate_axis_input_value = axis if axis >= 0 else axis + len(arr_shape)
         dim_size = arr_shape[generate_axis_input_value]
         dtype = input_binding.dtype if input_binding.dtype in {"int32", "int64"} else "int64"
-        num_elements = math.prod(input_binding.shape)
+        num_elements = shape_numel(input_binding.shape)
         if num_elements == 0:
             indices = rule.ops.asarray([], dtype=dtype)
         elif dim_size == 1:
@@ -2491,7 +2496,7 @@ def generate_reshape_inputs(rule: InputRuleContext):
         shape = input_binding.shape
         if 0 not in shape and state["shape"] is None:
             state["shape"] = shape
-            state["maxvalue"] = math.prod(shape)
+            state["maxvalue"] = shape_numel(shape)
             state["tensornum"] = 0
             for candidate in rule.argument_values():
                 if isinstance(candidate, (list, tuple)):
@@ -2577,7 +2582,7 @@ def generate_slice_inputs(rule: InputRuleContext):
             state["indice"] += 1
             return rule.ops.asarray(value, dtype=input_binding.dtype)
         result = rule.ops.zeros(input_binding.shape, dtype=input_binding.dtype)
-        for index in range(math.prod(input_binding.shape)):
+        for index in range(shape_numel(input_binding.shape)):
             coin = rule.ops.randint(0, 2)
             if coin == 0:
                 result[index] = rule.ops.randint(0, dim_sizes[state["indice"]] - 1)
@@ -2614,7 +2619,7 @@ def generate_slice_inputs(rule: InputRuleContext):
             state["index"] += 1
             return rule.ops.asarray(value, dtype=input_binding.dtype)
         result = rule.ops.zeros(input_binding.shape, dtype=input_binding.dtype)
-        for index in range(math.prod(input_binding.shape)):
+        for index in range(shape_numel(input_binding.shape)):
             coin = rule.ops.randint(0, 2)
             current = start[state["index"]]
             if coin == 0:
@@ -2775,7 +2780,7 @@ def generate_tensordot_inputs(rule: InputRuleContext):
             if state["tensor1"] is None:
                 result = rule.ops.zeros(input_binding.shape, dtype=input_binding.dtype)
                 used = []
-                for index in range(math.prod(input_binding.shape)):
+                for index in range(shape_numel(input_binding.shape)):
                     result[index] = rule.ops.randint(0, rank)
                     while (
                         state["shape1"][result[index]] not in state["shape2"]
@@ -2787,7 +2792,7 @@ def generate_tensordot_inputs(rule: InputRuleContext):
                 return result
             result = rule.ops.zeros(input_binding.shape, dtype=input_binding.dtype)
             used = []
-            for index in range(math.prod(input_binding.shape)):
+            for index in range(shape_numel(input_binding.shape)):
                 result[index] = rule.ops.randint(0, rank)
                 while (
                     state["shape2"][result[index]] != state["shape1"][state["tensor1"][index]]
@@ -2796,7 +2801,7 @@ def generate_tensordot_inputs(rule: InputRuleContext):
                     result[index] = rule.ops.randint(0, rank)
                 used.append(result[index])
             return result
-        if input_binding.shape == () or math.prod(input_binding.shape) == 1:
+        if input_binding.shape == () or shape_numel(input_binding.shape) == 1:
             candidates = [
                 index
                 for index in range(min(len(state["shape1"]), len(state["shape2"])))
@@ -3394,7 +3399,7 @@ def generate_view_inputs(rule: InputRuleContext):
     def generate_x_input_value(input_binding):
         if input_binding.dtype == "uint8":
             target = str(rule.arg("shape_or_dtype", ""))
-            nbytes = math.prod(input_binding.shape)
+            nbytes = shape_numel(input_binding.shape)
             itemsize = {
                 "paddle.bfloat16": 2,
                 "paddle.float16": 2,

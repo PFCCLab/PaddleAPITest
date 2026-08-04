@@ -5,7 +5,8 @@ from contextlib import nullcontext
 
 import torch
 
-from .base import APITestBase, total_tensor_numel
+from .base import APITestBase
+from .input_generation.tensor_config import tensor_config_tree_numel
 from .paddle_to_torch import ConversionKind, get_converter
 from .paddle_to_torch.arguments import bind_paddle_arguments
 
@@ -47,7 +48,7 @@ class APITestTorchGPUPerformance(APITestBase):
                 raise
             return
 
-        numel = total_tensor_numel(self.api_config)
+        numel = tensor_config_tree_numel(self.api_config.args, self.api_config.kwargs)
         test_loop = 2147483647 * 20 // numel
         combined = ""
 

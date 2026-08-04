@@ -423,6 +423,8 @@ class APITestAccuracy(APITestBase):
                 self.report_case_result("paddle_error", "build_paddle_input failed")
                 self.dump_finalize("paddle_error")
                 return False, None
+            # Torch 已完成，Paddle 输入已持有数据；生成源不再有后续消费者。
+            self.clear_generated_input_values()
 
             # Reseed before executing paddle so that random APIs
             # (paddle.uniform / normal / randn / bernoulli / dropout ...)
@@ -526,6 +528,8 @@ class APITestAccuracy(APITestBase):
 
         convert_result = self._convert_api()
         if convert_result is None:
+            return
+        if not self.run_gpu_memory_preflight("accuracy"):
             return
         if not self._generate_input_values():
             return

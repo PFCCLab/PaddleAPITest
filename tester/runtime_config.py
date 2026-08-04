@@ -13,7 +13,7 @@ class GpuModeConfig:
     memory_budget: float = 0.0
     comparison_total_memory: float = 0.0
     comparison_memory_budget: float = 0.0
-    memory_fraction: float = 0.85
+    memory_fraction: float = 1.0
     cleanup_pressure_ratio: float = 0.25
     cleanup_used_ratio: float = 0.90
 
