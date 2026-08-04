@@ -241,11 +241,11 @@ class APITestAccuracy(APITestBase):
         self.dump_event("config_convert_done")
         return convert_result
 
-    def _gen_input_data(self):
+    def _generate_input_values(self):
         try:
             self.dump_event("numpy_input_start")
-            if not self.gen_input_data():
-                self.report_case_result("config_input", "gen_input_data failed")
+            if not self.generate_input_values():
+                self.report_case_result("config_input", "generate_input_values failed")
                 self.dump_finalize("config_input")
                 return False
             self.dump_event("numpy_input_done")
@@ -527,7 +527,7 @@ class APITestAccuracy(APITestBase):
         convert_result = self._convert_api()
         if convert_result is None:
             return
-        if not self._gen_input_data():
+        if not self._generate_input_values():
             return
         probe_bytes = self.estimate_input_bytes()
 

@@ -6,24 +6,24 @@ from dataclasses import dataclass
 
 
 @dataclass(frozen=True)
-class TensorPath:
+class InputTensorPath:
     """一次 API 调用中 Tensor 的稳定路径。"""
 
     # 这个路径不受 TensorConfig 可变字段影响，规则和输入数据都依赖它。
-    root: str
-    key: int | str
-    indices: tuple[int, ...] = ()
+    argument_kind: str
+    argument_key: int | str
+    item_indices: tuple[int, ...] = ()
 
     def __post_init__(self):
-        if self.root == "args":
-            if not isinstance(self.key, int) or self.key < 0:
+        if self.argument_kind == "args":
+            if not isinstance(self.argument_key, int) or self.argument_key < 0:
                 raise ValueError("args path key must be a non-negative integer")
-        elif self.root == "kwargs":
-            if not isinstance(self.key, str) or not self.key:
+        elif self.argument_kind == "kwargs":
+            if not isinstance(self.argument_key, str) or not self.argument_key:
                 raise ValueError("kwargs path key must be a non-empty string")
         else:
-            raise ValueError(f"unsupported argument root: {self.root!r}")
-        if any(not isinstance(index, int) or index < 0 for index in self.indices):
+            raise ValueError(f"unsupported argument kind: {self.argument_kind!r}")
+        if any(not isinstance(index, int) or index < 0 for index in self.item_indices):
             raise ValueError("nested argument indices must be non-negative integers")
 
     @classmethod
@@ -35,13 +35,21 @@ class TensorPath:
         return cls("kwargs", name, tuple(indices))
 
     def child(self, index):
-        return TensorPath(self.root, self.key, (*self.indices, index))
+        return InputTensorPath(
+            self.argument_kind,
+            self.argument_key,
+            (*self.item_indices, index),
+        )
 
     def top_level(self):
-        return TensorPath(self.root, self.key)
+        return InputTensorPath(self.argument_kind, self.argument_key)
 
     def __str__(self):
-        value = f"args[{self.key}]" if self.root == "args" else f"kwargs.{self.key}"
-        for index in self.indices:
+        value = (
+            f"args[{self.argument_key}]"
+            if self.argument_kind == "args"
+            else f"kwargs.{self.argument_key}"
+        )
+        for index in self.item_indices:
             value += f"[{index}]"
         return value

@@ -13,7 +13,7 @@ from typing import Protocol
 import numpy
 from tester.dtype_utils import to_torch_dtype
 
-from .value_gen import NUMPY_RNG, generation_dtype
+from .value_generators import INPUT_NUMPY_RANDOM_STATE, resolve_input_dtype
 
 
 class InputBackend(Protocol):
@@ -23,7 +23,7 @@ class InputBackend(Protocol):
 
     def commit(self) -> None: ...
 
-    def generation_dtype(self, dtype: str) -> str: ...
+    def resolve_input_dtype(self, dtype: str) -> str: ...
 
     def random(self, shape=None, dtype=None): ...
 
@@ -99,20 +99,20 @@ class InputBackend(Protocol):
 
 
 @dataclass
-class NumpyInputBackend:
+class NumPyInputBackend:
     """NumPy implementation of the input-generation backend."""
 
-    rng: object = NUMPY_RNG
+    input_random_state: object = INPUT_NUMPY_RANDOM_STATE
 
     name = "numpy"
 
     def commit(self) -> None:
-        commit = getattr(self.rng, "commit", None)
+        commit = getattr(self.input_random_state, "commit", None)
         if commit is not None:
             commit()
 
-    def generation_dtype(self, dtype: str) -> str:
-        return generation_dtype(dtype)
+    def resolve_input_dtype(self, dtype: str) -> str:
+        return resolve_input_dtype(dtype)
 
     def _storage_dtype(self, dtype):
         if dtype is None:
@@ -124,26 +124,26 @@ class NumpyInputBackend:
                 dtype_name = numpy.dtype(dtype).name
             except TypeError:
                 dtype_name = str(dtype).split(".")[-1]
-        return generation_dtype(dtype_name)
+        return resolve_input_dtype(dtype_name)
 
     def random(self, shape=None, dtype=None):
-        value = self.rng.random(shape)
+        value = self.input_random_state.random(shape)
         return numpy.asarray(value).astype(dtype) if dtype is not None else value
 
     def uniform(self, low=0.0, high=1.0, shape=None, dtype=None):
-        value = self.rng.uniform(low=low, high=high, shape=shape)
+        value = self.input_random_state.uniform(low=low, high=high, shape=shape)
         return numpy.asarray(value).astype(dtype) if dtype is not None else value
 
     def randint(self, low, high=None, shape=None, dtype=None):
-        value = self.rng.randint(low, high, shape=shape)
+        value = self.input_random_state.randint(low, high, shape=shape)
         return numpy.asarray(value).astype(dtype) if dtype is not None else value
 
     def randn(self, *shape, dtype=None):
-        value = self.rng.randn(*shape)
+        value = self.input_random_state.randn(*shape)
         return numpy.asarray(value).astype(dtype) if dtype is not None else value
 
     def choice(self, values, shape=None, replace=True, p=None):
-        return self.rng.choice(values, shape=shape, replace=replace, p=p)
+        return self.input_random_state.choice(values, shape=shape, replace=replace, p=p)
 
     def asarray(self, value, dtype=None, copy=True):
         return numpy.array(value, dtype=dtype, copy=copy)
@@ -240,7 +240,7 @@ class NumpyInputBackend:
 
 
 @dataclass
-class TorchInputBackend(NumpyInputBackend):
+class TorchInputBackend(NumPyInputBackend):
     """Torch implementation of the input-generation backend."""
 
     device: str = "cpu"
@@ -248,9 +248,7 @@ class TorchInputBackend(NumpyInputBackend):
     _generator: object = field(init=False, repr=False)
 
     def __post_init__(self):
-        seed_material = (
-            f"{getattr(self.rng, 'seed', 0)}:{getattr(self.rng, 'config_fingerprint', '')}"
-        )
+        seed_material = f"{getattr(self.input_random_state, 'seed', 0)}:{getattr(self.input_random_state, 'config_fingerprint', '')}"
         seed = int(hashlib.sha256(seed_material.encode()).hexdigest()[:16], 16) % (2**63)
         torch = self._torch()
         self._device = torch.device(self.device)
@@ -280,7 +278,7 @@ class TorchInputBackend(NumpyInputBackend):
             return None
         return to_torch_dtype(storage_dtype)
 
-    def _torch_float_generation_dtype(self, dtype):
+    def _resolve_torch_float_dtype(self, dtype):
         torch = self._torch()
         storage_dtype = self._storage_dtype(dtype)
         if storage_dtype == "float64":
@@ -303,7 +301,7 @@ class TorchInputBackend(NumpyInputBackend):
         torch_shape = self._torch_shape(shape)
         value = torch.empty(
             torch_shape,
-            dtype=self._torch_float_generation_dtype(dtype),
+            dtype=self._resolve_torch_float_dtype(dtype),
             device=self._device,
         ).uniform_(
             float(low),
@@ -524,16 +522,14 @@ class TorchInputBackend(NumpyInputBackend):
 
 
 @dataclass
-class PaddleInputBackend(NumpyInputBackend):
+class PaddleInputBackend(NumPyInputBackend):
     """Paddle implementation of the input-generation backend."""
 
     device: str = "cpu"
     name = "paddle"
 
     def __post_init__(self):
-        seed_material = (
-            f"{getattr(self.rng, 'seed', 0)}:{getattr(self.rng, 'config_fingerprint', '')}"
-        )
+        seed_material = f"{getattr(self.input_random_state, 'seed', 0)}:{getattr(self.input_random_state, 'config_fingerprint', '')}"
         seed = int(hashlib.sha256(seed_material.encode()).hexdigest()[:8], 16) % (2**31)
         paddle = self._paddle()
         paddle.seed(seed)
@@ -556,7 +552,7 @@ class PaddleInputBackend(NumpyInputBackend):
             return None
         return getattr(self._paddle(), storage_dtype)
 
-    def _paddle_float_generation_dtype(self, dtype):
+    def _resolve_paddle_float_dtype(self, dtype):
         storage_dtype = self._storage_dtype(dtype)
         if storage_dtype == "float64":
             return "float64"
@@ -575,7 +571,7 @@ class PaddleInputBackend(NumpyInputBackend):
         paddle = self._paddle()
         value = paddle.uniform(
             self._paddle_shape(shape),
-            dtype=self._paddle_float_generation_dtype(dtype),
+            dtype=self._resolve_paddle_float_dtype(dtype),
             min=float(low),
             max=float(high),
             device=self.device,
@@ -799,8 +795,8 @@ class PaddleInputBackend(NumpyInputBackend):
 
 INPUT_BACKEND_ENV_VAR = "PADDLEAPITEST_INPUT_BACKEND"
 # Only used when no config-local RNG is available, such as legacy TensorConfig helpers.
-_DEFAULT_BACKENDS = {}
-_WARNED_CACHED_NON_NUMPY_BACKEND = False
+_DEFAULT_INPUT_BACKENDS = {}
+_WARNED_CACHED_INPUT_BACKEND = False
 _TRUE_VALUES = {"true", "1", "yes", "y"}
 
 
@@ -822,8 +818,8 @@ def _choice_shape(shape, *, scalar_empty):
     return scalar, normalized, 1 if scalar else int(numpy.prod(normalized))
 
 
-def create_input_backend(rng=NUMPY_RNG) -> InputBackend:
-    global _WARNED_CACHED_NON_NUMPY_BACKEND
+def create_input_backend(input_random_state=INPUT_NUMPY_RANDOM_STATE) -> InputBackend:
+    global _WARNED_CACHED_INPUT_BACKEND
 
     requested = os.environ.get(INPUT_BACKEND_ENV_VAR)
     normalized_requested = (requested or "numpy").strip().lower()
@@ -831,14 +827,14 @@ def create_input_backend(rng=NUMPY_RNG) -> InputBackend:
     use_gpu_mode = _env_flag("USE_GPU_MODE")
 
     if use_cached_numpy:
-        if normalized_requested in {"torch", "paddle"} and not _WARNED_CACHED_NON_NUMPY_BACKEND:
+        if normalized_requested in {"torch", "paddle"} and not _WARNED_CACHED_INPUT_BACKEND:
             message = (
                 "USE_CACHED_NUMPY=True requires the numpy input backend; "
                 f"ignoring {INPUT_BACKEND_ENV_VAR}={normalized_requested}."
             )
             warnings.warn(message, RuntimeWarning, stacklevel=2)
             print(f"[WARNING] {message}", file=sys.stderr, flush=True)
-            _WARNED_CACHED_NON_NUMPY_BACKEND = True
+            _WARNED_CACHED_INPUT_BACKEND = True
         normalized = "numpy"
     elif use_gpu_mode and requested is None:
         normalized = "torch"
@@ -855,16 +851,16 @@ def create_input_backend(rng=NUMPY_RNG) -> InputBackend:
     }[normalized]
 
     cache_key = (normalized, device)
-    if rng is NUMPY_RNG and cache_key in _DEFAULT_BACKENDS:
-        return _DEFAULT_BACKENDS[cache_key]
+    if input_random_state is INPUT_NUMPY_RANDOM_STATE and cache_key in _DEFAULT_INPUT_BACKENDS:
+        return _DEFAULT_INPUT_BACKENDS[cache_key]
 
     if normalized == "numpy":
-        backend = NumpyInputBackend(rng)
+        input_backend = NumPyInputBackend(input_random_state)
     elif normalized == "torch":
-        backend = TorchInputBackend(rng, device=device)
+        input_backend = TorchInputBackend(input_random_state, device=device)
     else:
-        backend = PaddleInputBackend(rng, device=device)
+        input_backend = PaddleInputBackend(input_random_state, device=device)
 
-    if rng is NUMPY_RNG:
-        _DEFAULT_BACKENDS[cache_key] = backend
-    return backend
+    if input_random_state is INPUT_NUMPY_RANDOM_STATE:
+        _DEFAULT_INPUT_BACKENDS[cache_key] = input_backend
+    return input_backend

@@ -11,13 +11,13 @@ from pathlib import Path
 import yaml
 
 from .tensor_config import TensorConfig
-from .tensor_path import TensorPath
-from .tensor_spec import TensorSpec
+from .tensor_path import InputTensorPath
+from .tensor_spec import InputTensorSpec
 
-BASE_CONFIG = Path(__file__).resolve().parents[1] / "base_config.yaml"
+INPUT_BASE_CONFIG = Path(__file__).resolve().parents[1] / "base_config.yaml"
 
 # C-ops 别名映射留在这里，确保调度层不依赖 inspect 逻辑。
-COPS_PUBLIC_ALIASES = {
+INPUT_C_OP_PUBLIC_ALIASES = {
     "paddle._C_ops.add_": "paddle.add",
     "paddle._C_ops.bitwise_not": "paddle.bitwise_not",
     "paddle._C_ops.clip": "paddle.clip",
@@ -36,21 +36,21 @@ COPS_PUBLIC_ALIASES = {
 }
 
 
-def _load_no_sig_ops() -> tuple[str, ...]:
-    data = yaml.safe_load(BASE_CONFIG.read_text())
-    return tuple(data.get("single_op_no_signature_apis", []))
+def _load_signatureless_input_apis() -> tuple[str, ...]:
+    base_config = yaml.safe_load(INPUT_BASE_CONFIG.read_text())
+    return tuple(base_config.get("single_op_no_signature_apis", []))
 
 
 # 这些 Tensor 方法没有稳定的 inspect 签名，因此 `base_config.yaml` 仍是它们的唯一来源。
-SINGLE_OP_NO_SIGNATURE_APIS = _load_no_sig_ops()
+INPUT_APIS_WITHOUT_SIGNATURE = _load_signatureless_input_apis()
 
-SINGLE_OP_PARAMETER_NAMES = {
-    f"paddle.Tensor.{method}": ("self", "y") for method in SINGLE_OP_NO_SIGNATURE_APIS
+INPUT_SINGLE_OP_PARAMETER_NAMES = {
+    f"paddle.Tensor.{method}": ("self", "y") for method in INPUT_APIS_WITHOUT_SIGNATURE
 }
 
 # 手工参数名只覆盖 inspect.signature 不可靠的 API；正常公共 API 仍应走运行时绑定。
-MANUAL_PARAMETER_NAMES = {
-    **SINGLE_OP_PARAMETER_NAMES,
+INPUT_MANUAL_PARAMETER_NAMES = {
+    **INPUT_SINGLE_OP_PARAMETER_NAMES,
     "paddle.Tensor.clone": ("self",),
     "paddle.Tensor.detach": ("self",),
     "paddle.Tensor.__getitem__": ("self", "item"),
@@ -133,56 +133,56 @@ MANUAL_PARAMETER_NAMES = {
 
 
 @dataclass(frozen=True)
-class TensorBinding:
-    path: TensorPath
+class InputTensorBinding:
+    path: InputTensorPath
     parameter_name: str | None
-    spec: TensorSpec
+    input_spec: InputTensorSpec
 
     @property
     def shape(self):
-        # 高频规格直接代理到只读快照，规则无需了解 TensorSpec 的存储层级。
-        return self.spec.shape
+        # 高频规格直接代理到只读快照，规则无需了解 InputTensorSpec 的存储层级。
+        return self.input_spec.shape
 
     @property
     def dtype(self):
-        return self.spec.dtype
+        return self.input_spec.dtype
 
     @property
     def place(self):
-        return self.spec.place
+        return self.input_spec.place
 
     @property
     def is_contiguous(self):
-        return self.spec.is_contiguous
+        return self.input_spec.is_contiguous
 
     @property
     def strides(self):
-        return self.spec.strides
+        return self.input_spec.strides
 
 
 @dataclass(frozen=True)
-class InputBinding:
+class InputApiBinding:
     """规则侧看到的一次 APIConfig 绑定结果。"""
 
     api_name: str
     binding_source: str
-    tensors: tuple[TensorBinding, ...]
+    tensor_bindings: tuple[InputTensorBinding, ...]
     arguments: tuple[tuple[str, object], ...] = ()
     parameter_names: tuple[str, ...] = ()
     unresolved_reason: str | None = None
 
 
 @dataclass(frozen=True)
-class InputContext:
+class InputGenerationContext:
     """一次输入生成所需的绑定和 backend seed 元数据。"""
 
-    call: InputBinding
+    input_binding: InputApiBinding
     config_fingerprint: str
     seed: int
 
 
 @dataclass(frozen=True)
-class SignatureResolution:
+class InputSignatureResult:
     """一次签名解析的结果。"""
 
     signature: inspect.Signature | None
@@ -191,30 +191,31 @@ class SignatureResolution:
 
 
 @dataclass(frozen=True)
-class ArgumentBindingResolution:
+class InputParameterBindingResult:
     """一次参数绑定的结果。"""
 
+    # source 与 unresolved_reason 必须随参数结果传递，规则层不能重新猜测失败原因。
     arguments: collections.OrderedDict
     source: str
     parameter_names: tuple[str, ...] = ()
     unresolved_reason: str | None = None
 
 
-def resolve_api(api_name):
+def resolve_input_api(api_name):
     import paddle
 
-    value = paddle
-    parts = api_name.split(".")
-    if not parts or parts[0] != "paddle":
+    resolved_api = paddle
+    api_path_parts = api_name.split(".")
+    if not api_path_parts or api_path_parts[0] != "paddle":
         raise ValueError(f"unsupported API root: {api_name}")
-    for part in parts[1:]:
-        value = getattr(value, part)
-    return value
+    for part in api_path_parts[1:]:
+        resolved_api = getattr(resolved_api, part)
+    return resolved_api
 
 
-def resolve_signature(api_name, api=None):
+def resolve_input_signature(api_name, api=None):
     # inspectable 公共 API 是参数名真源；仅对无签名 C-op 使用显式别名。
-    api = api or resolve_api(api_name)
+    api = api or resolve_input_api(api_name)
     try:
         signature = inspect.signature(api)
     except (TypeError, ValueError):
@@ -222,29 +223,29 @@ def resolve_signature(api_name, api=None):
     source = "signature"
     if signature is None:
         # 某些 C-ops 会通过可读的 Paddle 公共 API 暴露。对公共别名绑定能保持参数名稳定。
-        public_api_name = COPS_PUBLIC_ALIASES.get(api_name)
+        public_api_name = INPUT_C_OP_PUBLIC_ALIASES.get(api_name)
         if public_api_name is None:
-            return SignatureResolution(
+            return InputSignatureResult(
                 signature=None,
                 source="unresolved",
                 unresolved_reason="API has no inspectable signature or public alias",
             )
-        public_api = resolve_api(public_api_name)
+        public_api = resolve_input_api(public_api_name)
         try:
             signature = inspect.signature(public_api)
         except (TypeError, ValueError):
             signature = None
         if signature is None:
-            return SignatureResolution(
+            return InputSignatureResult(
                 signature=None,
                 source="unresolved",
                 unresolved_reason=f"public alias has no signature: {public_api_name}",
             )
         source = f"public-alias:{public_api_name}"
-    return SignatureResolution(signature=signature, source=source)
+    return InputSignatureResult(signature=signature, source=source)
 
 
-def _manual_arguments(args, kwargs, parameter_names):
+def _bind_manual_input_arguments(args, kwargs, parameter_names):
     # 只记录调用实际提供的值，不能把缺失参数伪装成显式 None。
     arguments = collections.OrderedDict()
     for position, name in enumerate(parameter_names):
@@ -255,18 +256,18 @@ def _manual_arguments(args, kwargs, parameter_names):
     return arguments
 
 
-def bind_parameters(
+def bind_input_parameters(
     api_name,
     args,
     kwargs,
     *,
     api=None,
-    keep_name=False,
+    include_name_parameter=False,
 ):
-    if api_name in MANUAL_PARAMETER_NAMES:
-        parameter_names = MANUAL_PARAMETER_NAMES[api_name]
-        return ArgumentBindingResolution(
-            arguments=_manual_arguments(args, kwargs, parameter_names),
+    if api_name in INPUT_MANUAL_PARAMETER_NAMES:
+        parameter_names = INPUT_MANUAL_PARAMETER_NAMES[api_name]
+        return InputParameterBindingResult(
+            arguments=_bind_manual_input_arguments(args, kwargs, parameter_names),
             source="manual",
             parameter_names=parameter_names,
         )
@@ -274,7 +275,7 @@ def bind_parameters(
         # view/reshape 接受可变长 shape，这里归一成一个参数名。
         rest = args[1:]
         if len(rest) > 1 and all(isinstance(arg, int) for arg in rest):
-            return ArgumentBindingResolution(
+            return InputParameterBindingResult(
                 arguments=collections.OrderedDict([("x", args[0]), ("shape_or_dtype", list(rest))]),
                 source="variadic-view",
                 parameter_names=("x", "shape_or_dtype"),
@@ -283,23 +284,23 @@ def bind_parameters(
         # reshape 和 view 一样有可变长 shape 问题。
         rest = args[1:]
         if rest and all(isinstance(arg, int) for arg in rest):
-            return ArgumentBindingResolution(
+            return InputParameterBindingResult(
                 arguments=collections.OrderedDict([("x", args[0]), ("shape", list(rest))]),
                 source="variadic-reshape",
                 parameter_names=("x", "shape"),
             )
 
-    resolution = resolve_signature(api_name, api=api)
-    signature = resolution.signature
+    signature_result = resolve_input_signature(api_name, api=api)
+    signature = signature_result.signature
     if signature is None:
-        return ArgumentBindingResolution(
+        return InputParameterBindingResult(
             arguments=collections.OrderedDict(),
-            source=resolution.source,
+            source=signature_result.source,
             parameter_names=(),
-            unresolved_reason=resolution.unresolved_reason,
+            unresolved_reason=signature_result.unresolved_reason,
         )
 
-    if resolution.source.startswith("public-alias:"):
+    if signature_result.source.startswith("public-alias:"):
         # C-op 可能携带公共签名不存在的内部属性，绑定前需过滤这些关键字。
         positional_count = sum(
             parameter.kind in (parameter.POSITIONAL_ONLY, parameter.POSITIONAL_OR_KEYWORD)
@@ -312,7 +313,7 @@ def bind_parameters(
         bound = signature.bind(*args, **kwargs)
 
     arguments = collections.OrderedDict(bound.arguments)
-    if not keep_name:
+    if not include_name_parameter:
         arguments.pop("name", None)
     if api_name == "paddle.arange" and "end" not in arguments:
         # `paddle.arange(start)` 的语义等价于 `arange(0, start)`。
@@ -320,11 +321,13 @@ def bind_parameters(
         arguments["start"] = 0
     if api_name in {"paddle.Tensor.unflatten", "paddle.unflatten"}:
         arguments["name"] = None
-    return ArgumentBindingResolution(
+    return InputParameterBindingResult(
         arguments=arguments,
-        source=resolution.source,
-        parameter_names=tuple(name for name in signature.parameters if keep_name or name != "name"),
-        unresolved_reason=resolution.unresolved_reason,
+        source=signature_result.source,
+        parameter_names=tuple(
+            name for name in signature.parameters if include_name_parameter or name != "name"
+        ),
+        unresolved_reason=signature_result.unresolved_reason,
     )
 
 
@@ -337,24 +340,27 @@ def _contains_identity(value, target):
     return False
 
 
-def _top_level_values(api_config):
+def _iter_top_level_inputs(api_config):
     yield from (
-        (TensorPath.positional(index), value, None) for index, value in enumerate(api_config.args)
+        (InputTensorPath.positional(index), value, None)
+        for index, value in enumerate(api_config.args)
     )
-    yield from ((TensorPath.keyword(key), value, key) for key, value in api_config.kwargs.items())
+    yield from (
+        (InputTensorPath.keyword(key), value, key) for key, value in api_config.kwargs.items()
+    )
 
 
-def _parameter_names_by_path(api_config, arguments):
+def _map_input_parameter_names_by_path(api_config, arguments):
     # path 是写回配置的稳定地址，参数名只承担规则分发职责。
     parameter_names = {}
-    for path, value, fallback_name in _top_level_values(api_config):
+    for path, value, fallback_name in _iter_top_level_inputs(api_config):
         names = [name for name, bound in arguments.items() if _contains_identity(bound, value)]
         parameter_names[path] = names[0] if len(names) == 1 else fallback_name
     return parameter_names
 
 
-def _walk_tensors(value, path, parameter_name, output, path_by_tensor_id):
-    # 嵌套 TensorConfig 列表保留顶层参数名，但会扩展 TensorPath。
+def _collect_input_tensor_bindings(value, path, parameter_name, output, path_by_tensor_id):
+    # 嵌套 TensorConfig 列表保留顶层参数名，但会扩展 InputTensorPath。
     if isinstance(value, TensorConfig):
         previous_path = path_by_tensor_id.get(id(value))
         if previous_path is not None:
@@ -364,16 +370,16 @@ def _walk_tensors(value, path, parameter_name, output, path_by_tensor_id):
             )
         path_by_tensor_id[id(value)] = path
         output.append(
-            TensorBinding(
+            InputTensorBinding(
                 path=path,
                 parameter_name=parameter_name,
-                spec=TensorSpec.from_tensor_config(value),
+                input_spec=InputTensorSpec.from_tensor_config(value),
             )
         )
         return
     if isinstance(value, (list, tuple)):
         for index, child in enumerate(value):
-            _walk_tensors(
+            _collect_input_tensor_bindings(
                 child,
                 path.child(index),
                 parameter_name,
@@ -382,48 +388,51 @@ def _walk_tensors(value, path, parameter_name, output, path_by_tensor_id):
             )
 
 
-def bind_input(api_config):
-    # `InputBinding` 是规则层唯一应该直接读取的绑定对象。
-    resolution = bind_parameters(
+def bind_api_inputs(api_config):
+    # `InputApiBinding` 是规则层唯一应该直接读取的绑定对象。
+    parameter_binding = bind_input_parameters(
         api_config.api_name,
         api_config.args,
         api_config.kwargs,
-        keep_name=api_config.api_name in {"paddle.Tensor.unflatten", "paddle.unflatten"},
+        include_name_parameter=api_config.api_name
+        in {"paddle.Tensor.unflatten", "paddle.unflatten"},
     )
     arguments = (
-        collections.OrderedDict() if resolution.source == "unresolved" else resolution.arguments
+        collections.OrderedDict()
+        if parameter_binding.source == "unresolved"
+        else parameter_binding.arguments
     )
     # 未解析 API 仍可通过关键字回退识别 Tensor，但不会猜测位置参数名。
-    parameter_names_by_path = _parameter_names_by_path(api_config, arguments)
+    parameter_names_by_path = _map_input_parameter_names_by_path(api_config, arguments)
     tensors = []
     path_by_tensor_id = {}
-    for path, value, _fallback_name in _top_level_values(api_config):
-        _walk_tensors(
+    for path, value, _fallback_name in _iter_top_level_inputs(api_config):
+        _collect_input_tensor_bindings(
             value,
             path,
             parameter_names_by_path.get(path),
             tensors,
             path_by_tensor_id,
         )
-    return InputBinding(
+    return InputApiBinding(
         api_name=api_config.api_name,
-        binding_source=resolution.source,
-        tensors=tuple(tensors),
+        binding_source=parameter_binding.source,
+        tensor_bindings=tuple(tensors),
         arguments=tuple(arguments.items()),
-        parameter_names=resolution.parameter_names,
-        unresolved_reason=resolution.unresolved_reason
+        parameter_names=parameter_binding.parameter_names,
+        unresolved_reason=parameter_binding.unresolved_reason
         or (
             "API has no inspectable signature or public alias"
-            if resolution.source == "unresolved"
+            if parameter_binding.source == "unresolved"
             else None
         ),
     )
 
 
-def build_input_context(api_config, seed):
+def build_input_generation_context(api_config, seed):
     # 配置文本指纹使不同调用在原生 backend 中获得稳定且隔离的随机流。
-    return InputContext(
-        call=bind_input(api_config),
+    return InputGenerationContext(
+        input_binding=bind_api_inputs(api_config),
         config_fingerprint=hashlib.sha256(api_config.config.encode()).hexdigest(),
         seed=seed,
     )

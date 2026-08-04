@@ -11,7 +11,7 @@ import yaml
 
 from .dtype_utils import to_torch_dtype
 from .dump_writer import DEFAULT_DUMP_DIR, DumpContext, dump_enabled
-from .input_generation.input_binding import bind_parameters
+from .input_generation.binding import bind_input_parameters
 from .input_generation.tensor_config import (
     TensorConfig,
     get_cached_numpy_array,
@@ -625,20 +625,20 @@ class APITestBase:
             self.torch_args_config = self.api_config.args
             return True
 
-        resolution = bind_parameters(
+        parameter_binding = bind_input_parameters(
             api_name,
             self.api_config.args,
             self.api_config.kwargs,
             api=self.paddle_api,
         )
-        if resolution.source == "unresolved":
+        if parameter_binding.source == "unresolved":
             return True
-        return finish(resolution.arguments)
+        return finish(parameter_binding.arguments)
 
-    def gen_input_data(self):
-        from .input_generation.input_dispatch import dispatch_input
+    def generate_input_values(self):
+        from .input_generation.dispatcher import dispatch_input_generation
 
-        return dispatch_input(self)
+        return dispatch_input_generation(self)
 
     def _torch_execution_locals(self):
         if (
@@ -670,7 +670,7 @@ class APITestBase:
     def build_paddle_input(self):
         """Generate Paddle inputs from config and materialize TensorConfig leaves.
 
-        Call gen_input_data() first because build_paddle_input() only materializes
+        Call generate_input_values() first because build_paddle_input() only materializes
         TensorConfig leaves and does not generate logical input values.
         """
         self.paddle_args = []
@@ -1097,7 +1097,7 @@ class APITestBase:
     def build_torch_input(self):
         """Generate Torch inputs from config and materialize TensorConfig leaves.
 
-        Call gen_input_data() first because build_torch_input() only materializes
+        Call generate_input_values() first because build_torch_input() only materializes
         TensorConfig leaves and does not generate logical input values.
         """
         self.torch_args = []

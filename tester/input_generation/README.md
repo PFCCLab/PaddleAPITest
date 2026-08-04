@@ -1,28 +1,43 @@
 # 输入生成运行时
 
 本目录只保留输入生成运行时代码，不再承载治理脚本或冻结报告。
-`input_registry.py` 保留为输入规则注册中心，`README.md` 同时承担模块地图和设计说明。
+`generation_rules.py` 保留为输入规则注册中心，`README.md` 同时承担模块地图和设计说明。
 
 ## 运行链路
 
 ```text
-APIConfig -> APITestBase.gen_input_data -> input_dispatch.py -> input_binding.py -> input_registry.py -> input_data.py -> tensor_config.py
+APIConfig -> APITestBase.generate_input_values -> dispatcher.py -> binding.py -> generation_rules.py -> value.py -> tensor_config.py
 ```
 
 ## 模块地图
 
-- `tensor_path.py`：输入 Tensor 路径 `TensorPath`
-- `tensor_spec.py`：张量只读描述 `TensorSpec`
-- `input_binding.py`：签名解析、参数绑定、调用绑定和运行时上下文
-- `input_data.py`：输入数据 `InputData` 的读写、挂载和清理
-- `value_gen.py`：与 API 无关的通用值生成，具体数组/tensor 由 backend 决定
-- `input_registry.py`：`@rules.register` 规则、`RuleContext` 和规则执行入口
-- `input_dispatch.py`：输入生成调度和规则查找
-- `input_backend.py`：输入生成 backend 选择和 numpy/torch/paddle 实现
+- `tensor_path.py`：输入 Tensor 路径 `InputTensorPath`
+- `tensor_spec.py`：张量只读描述 `InputTensorSpec`
+- `binding.py`：签名解析、参数绑定、调用绑定和运行时上下文
+- `value.py`：输入数据 `InputValue` 的读写、挂载和清理
+- `value_generators.py`：与 API 无关的通用值生成，具体数组/tensor 由 backend 决定
+- `generation_rules.py`：`@input_rules.register` 规则、`InputRuleContext` 和规则执行入口
+- `dispatcher.py`：输入生成调度和规则查找
+- `backend.py`：输入生成 backend 选择和 numpy/torch/paddle 实现
 - `tensor_config.py`：张量配置、缓存和框架物化
 
 规则接口优化计划见
 `docs/superpowers/plans/2026-08-03-input-generation-rule-api-optimization.md`。
+
+## 命名约束
+
+- `input_generation` 包已经提供领域上下文，包内模块使用职责名，不重复添加 `input_` 前缀。
+- 跨模块使用的类型、函数和全局对象继续使用 `Input` 或 `input_` 标识，离开包上下文后仍能识别归属。
+- 规则模块使用 `generation_rules.py`，既表达输入构造职责，也避免与 `paddle_to_torch/rules.py` 重名。
+- `Generation` 和 `Rule` 不单独作为顶层领域名称，分别使用 `InputGeneration` 和 `InputRule`。
+- API 级规则统一命名为 `generate_<对象>_inputs`，例如 `generate_clip_inputs`。
+- 单 Tensor 值生成器统一命名为 `generate_<值域>_input_value`。
+- 流程变量明确区分 `api_config`、`input_binding`、`rule`、`input_value`、
+  `input_backend` 和 `input_random_state`，不使用脱离上下文的 `config`、`binding` 或 `data`。
+- backend 的 `reshape`、`uniform` 等标准数组原语，以及 `InputRuleContext` 的规则 DSL 短方法保留
+  领域惯用名称，避免增加不必要的调用噪声。
+- 单值生成函数内部允许使用数值计算惯例中的 `spec` 和 `rng`，函数名与类型注解负责标识输入领域。
+- `tensor_config.py` 和 `TensorConfig` 保留现名；它们在全局没有歧义，也是配置 DSL 的稳定入口。
 
 ## 设计目标
 
@@ -34,43 +49,43 @@ APIConfig -> APITestBase.gen_input_data -> input_dispatch.py -> input_binding.py
 
 ## 核心模型
 
-### `TensorPath`
+### `InputTensorPath`
 
-`TensorPath` 描述一次 API 调用中某个 Tensor 的稳定位置，例如 `args[0]`、`kwargs.x`、
+`InputTensorPath` 描述一次 API 调用中某个 Tensor 的稳定位置，例如 `args[0]`、`kwargs.x`、
 `args[1][2]`。它替代 `index/key/list_index` 组合状态，避免规则依赖遍历顺序。
 
-### `TensorSpec`
+### `InputTensorSpec`
 
-`TensorSpec` 是从 `TensorConfig` 提取出的只读快照，只保留值生成所需的 shape、dtype、
+`InputTensorSpec` 是从 `TensorConfig` 提取出的只读快照，只保留值生成所需的 shape、dtype、
 place、连续性和 strides。
 
-### `InputBinding`
+### `InputApiBinding`
 
-`InputBinding` 是规则侧看到的“一次调用”的绑定结果，包含 API 名称、已绑定参数、
+`InputApiBinding` 是规则侧看到的“一次调用”的绑定结果，包含 API 名称、已绑定参数、
 Tensor 绑定和未解析原因。规则只应该读取它，不应该自己再做签名推断。
 
-### `InputContext`
+### `InputGenerationContext`
 
-`InputContext` 封装绑定结果、配置指纹和 seed。NumPy RNG 使用独立状态副本，Torch/Paddle
+`InputGenerationContext` 封装绑定结果、配置指纹和 seed。NumPy RNG 使用独立状态副本，Torch/Paddle
 backend 使用 seed 与配置指纹初始化自己的 generator。
 
-### `InputData`
+### `InputValue`
 
-`InputData` 是输入数据容器。它是规则输出的真源；`TensorConfig` 只保留
+`InputValue` 是输入数据容器。它是规则输出的真源；`TensorConfig` 只保留
 `input_value` / `input_value_backend` 作为当前对象的逻辑值缓存，不再提供
 `numpy_tensor` 兼容存储。
 
-### `RegisteredRule`
+### `InputRule`
 
-`RegisteredRule` 表示一条 decorator 注册规则，负责执行规则函数、检查完整性并提交输入数据。
+`InputRule` 表示一条 decorator 注册规则，负责执行规则函数、检查完整性并提交输入数据。
 
 ### 规则参数
 
-所有规则函数只接收一个 `RuleContext`。它直接负责只读参数查询、Tensor 绑定和值域生成，并通过
-私有 `_InputWriter` 暂存写入。规则使用 `rule.arg()`、`rule.tensor()`、`rule.tensors()`、
+所有规则函数只接收一个 `InputRuleContext`。它直接负责只读参数查询、Tensor 绑定和值域生成，并通过
+私有 `_InputValueWriter` 暂存写入。规则使用 `rule.arg()`、`rule.tensor()`、`rule.tensors()`、
 `rule.default()`、`rule.set()` 和 `rule.generate()`，不直接接触 writer 或 backend 实现。
 
-同一个 `TensorConfig` 对象不能复用于多个 `TensorPath`。绑定阶段会直接拒绝这种配置，
+同一个 `TensorConfig` 对象不能复用于多个 `InputTensorPath`。绑定阶段会直接拒绝这种配置，
 错误信息同时给出首次路径和冲突路径，避免 path 寻址与对象 identity 寻址产生歧义。
 
 ### Backend Selection
@@ -94,13 +109,13 @@ Paddle logical value 经 DLPack 生成，并在 Torch 侧 clone 为 Torch 自有
 
 ## 规则编写方法
 
-`input_registry.py` 是唯一的规则入口。编写规则时遵循下面的顺序。
+`generation_rules.py` 是唯一的规则入口。编写规则时遵循下面的顺序。
 
 ### 1. 先注册，再写逻辑
 
 ```python
-@rules.register("paddle.clip", aliases=("paddle.Tensor.clip",))
-def clip_values(rule: RuleContext):
+@input_rules.register("paddle.clip", aliases=("paddle.Tensor.clip",))
+def generate_clip_inputs(rule: InputRuleContext):
     rule.generate(
         {
             "min": lambda tensor: rule.domain("random_range", tensor, -1, 0),
@@ -111,7 +126,7 @@ def clip_values(rule: RuleContext):
 
 规则函数只描述 API 语义，不写绑定、物化或日志逻辑。
 
-### 2. 优先使用 RuleContext
+### 2. 优先使用 InputRuleContext
 
 - `rule.arg(name, default)`：按签名参数名读取值
 - `rule.tensor(name)`：要求参数名至多对应一个 Tensor；多个匹配会直接报错
@@ -128,7 +143,7 @@ def clip_values(rule: RuleContext):
 - rule 结束后统一校验所有 Tensor 均已生成，再更新配置元数据并挂载数据
 
 writer 在 rule 执行期间只暂存 backend 拷贝。rule 抛出异常或完整性检查发现遗漏时，
-不会挂载部分 `InputData`、修改 `TensorConfig` 元数据或提交 config RNG。重复写入同一 path
+不会挂载部分 `InputValue`、修改 `TensorConfig` 元数据或提交 config RNG。重复写入同一 path
 也会直接失败；rule 不应依赖覆盖已有值。
 
 ### 4. 失败要显式
@@ -138,21 +153,21 @@ writer 在 rule 执行期间只暂存 backend 拷贝。rule 抛出异常或完�
 
 ### 5. 值域逻辑和 API 逻辑分离
 
-`value_gen.py` 只负责 dtype、shape 和 value domain，不读取 API 名称。API 专属关系应留在
-`input_registry.py` 的 rule 函数里。
+`value_generators.py` 只负责 dtype、shape 和 value domain，不读取 API 名称。API 专属关系应留在
+`generation_rules.py` 的输入规则函数里。
 
 ## 与旧实现的区别
 
 ### 1. 从单体条件链改为显式模块
 
 最初的 `config_analyzer` 把解析、绑定、值生成、物化和调度都塞进一个大类里，再用长
-`if/elif api_name` 条件链分派。现在这些职责拆成 `input_binding.py`、`input_registry.py`、
-`input_dispatch.py`、`value_gen.py`、`input_data.py` 和 `tensor_config.py`，边界更清楚。
+`if/elif api_name` 条件链分派。现在这些职责拆成 `binding.py`、`generation_rules.py`、
+`dispatcher.py`、`value_generators.py`、`value.py` 和 `tensor_config.py`，边界更清楚。
 
 ### 2. 从逐参数副作用改为完整 config 规则
 
 旧实现常在生成一个参数时顺手读写另一个参数，行为依赖遍历顺序。现在规则以完整 config 为单位
-描述，并统一通过 `RuleContext` 显式表达参数关系。
+描述，并统一通过 `InputRuleContext` 显式表达参数关系。
 
 ### 3. 从生成逻辑与物化耦合改为分层处理
 
@@ -171,14 +186,14 @@ writer 在 rule 执行期间只暂存 backend 拷贝。rule 抛出异常或完�
 
 ## 运行时约束
 
-- `ConfigNumpyRNG` 使用独立 `RandomState` 副本
-- 同一 `TensorConfig` 复用于多个输入 path 时，`input_binding.py` 直接拒绝
-- `input_dispatch.py` 只做规则查找和上下文构造
-- `input_data.py` 只管理输入数据，不承担框架创建
+- `InputConfigRandomState` 使用独立 `RandomState` 副本
+- 同一 `TensorConfig` 复用于多个输入 path 时，`binding.py` 直接拒绝
+- `dispatcher.py` 只做规则查找和上下文构造
+- `value.py` 只管理输入数据，不承担框架创建
 - `tensor_config.py` 只承担 Tensor 物化和读写
 
 ## 当前状态
 
-- `ConfigNumpyRNG` 使用独立 `RandomState` 副本，并在规则成功后提交到全局
-- 所有注册规则统一使用单参数 `RuleContext` 协议
+- `InputConfigRandomState` 使用独立 `RandomState` 副本，并在规则成功后提交到全局
+- 所有注册规则统一使用单参数 `InputRuleContext` 协议
 - 运行时目录只保留当前实现代码

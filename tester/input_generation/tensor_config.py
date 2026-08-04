@@ -9,8 +9,8 @@ import paddle
 import yaml
 from tester.dtype_utils import to_torch_dtype
 
-from .input_backend import create_input_backend
-from .input_data import clear_input_value, input_value, input_value_backend
+from .backend import create_input_backend
+from .value import clear_input_value, read_input_value, read_input_value_backend
 
 # 优化器的零填充位置属于物化层专用数据。
 OPTIMIZER_APIS = {
@@ -236,8 +236,8 @@ class TensorConfig:
         return getattr(value, "size", 0)
 
     def _logical_paddle_tensor(self, api_config, dtype, place=None):
-        value = input_value(api_config, self)
-        backend = input_value_backend(api_config, self)
+        value = read_input_value(api_config, self)
+        backend = read_input_value_backend(api_config, self)
         if backend == "paddle" and isinstance(value, paddle.Tensor):
             if place is not None:
                 if "cpu" in str(place).lower():
@@ -270,7 +270,7 @@ class TensorConfig:
                 )
                 self.paddle_tensor.stop_gradient = not self._requires_autograd(api_config)
                 return self.paddle_tensor
-            if input_value(api_config, self) is None:
+            if read_input_value(api_config, self) is None:
                 raise self._missing_input_error(api_config, "Paddle")
             if not self.is_contiguous and self.strides is not None:
                 self.paddle_tensor = self._create_paddle_strided(api_config)
@@ -325,7 +325,7 @@ class TensorConfig:
                 device=self.place,
             )
             tensor = paddle.as_strided(flat_tensor, self.shape, self.strides)
-            logical_value = input_value(api_config, self)
+            logical_value = read_input_value(api_config, self)
             if self._logical_numel(logical_value) > 0:
                 tensor[...] = self._logical_paddle_tensor(
                     api_config,
@@ -350,7 +350,7 @@ class TensorConfig:
                 if self._requires_autograd(api_config):
                     self.torch_tensor = self.torch_tensor.detach().requires_grad_(True)
                 return self.torch_tensor
-            if input_value(api_config, self) is None:
+            if read_input_value(api_config, self) is None:
                 raise self._missing_input_error(api_config, "Torch")
             if not self.is_contiguous and self.strides is not None:
                 self.torch_tensor = self._create_torch_strided(api_config)
@@ -388,7 +388,7 @@ class TensorConfig:
             device=device,
         )
         tensor = torch.as_strided(flat_tensor, self.shape, self.strides)
-        logical_value = input_value(api_config, self)
+        logical_value = read_input_value(api_config, self)
         if self._logical_numel(logical_value) > 0:
             tensor.copy_(
                 self._logical_torch_tensor(
@@ -406,8 +406,8 @@ class TensorConfig:
         return tensor
 
     def _logical_torch_tensor(self, api_config, dtype, device, requires_grad=False):
-        value = input_value(api_config, self)
-        backend = input_value_backend(api_config, self)
+        value = read_input_value(api_config, self)
+        backend = read_input_value_backend(api_config, self)
         if backend == "torch" and isinstance(value, torch.Tensor):
             tensor = value.to(device=device, dtype=dtype)
             if requires_grad:

@@ -38,8 +38,8 @@ class APITestTorchGPUPerformance(APITestBase):
             return
 
         try:
-            if not self.gen_input_data():
-                self.report_case_result("config_input", "gen_input_data failed")
+            if not self.generate_input_values():
+                self.report_case_result("config_input", "generate_input_values failed")
                 return
         except Exception as err:
             log_type, fatal = self.report_runtime_error(err, "config_input", "input")
