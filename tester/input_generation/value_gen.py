@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-
 import numpy
 
 from .tensor_spec import TensorSpec
@@ -55,20 +53,18 @@ class NumPyRNG:
 NUMPY_RNG = NumPyRNG()
 
 
-@dataclass(frozen=True)
 class ConfigNumpyRNG(NumPyRNG):
     """基于独立 RandomState 副本的单 config RNG。"""
 
-    seed: int
-    config_fingerprint: str
-    _state: numpy.random.RandomState = field(init=False, repr=False, compare=False)
-
-    def __post_init__(self):
-        state = numpy.random.RandomState()
-        state.set_state(numpy.random.get_state())
-        object.__setattr__(self, "_state", state)
+    def __init__(self, seed, config_fingerprint):
+        # seed/指纹由 Torch、Paddle backend 消费，不能视作 NumPy 冗余字段删除。
+        self.seed = seed
+        self.config_fingerprint = config_fingerprint
+        self._state = numpy.random.RandomState()
+        self._state.set_state(numpy.random.get_state())
 
     def commit(self):
+        # 仅成功规则调用 commit，从而保持失败前后的全局随机状态一致。
         numpy.random.set_state(self._state.get_state())
 
     def random(self, shape=None):
@@ -90,7 +86,7 @@ class ConfigNumpyRNG(NumPyRNG):
 
 
 def create_config_rng(context) -> ConfigNumpyRNG:
-    return ConfigNumpyRNG(seed=context.seed, config_fingerprint=context.config_fingerprint)
+    return ConfigNumpyRNG(context.seed, context.config_fingerprint)
 
 
 def generation_dtype(dtype: str) -> str:

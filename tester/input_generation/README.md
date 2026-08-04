@@ -16,22 +16,19 @@ APIConfig -> APITestBase.gen_input_data -> input_dispatch.py -> input_binding.py
 - `input_binding.py`：签名解析、参数绑定、调用绑定和运行时上下文
 - `input_data.py`：输入数据 `InputData` 的读写、挂载和清理
 - `value_gen.py`：与 API 无关的通用值生成，具体数组/tensor 由 backend 决定
-- `input_registry.py`：`@rules.register` 规则、`ConfigView` / `ValueFactory` / `InputWriter` 和规则执行入口
-- `input_dispatch.py`：输入生成调度、规则查找和阻断
+- `input_registry.py`：`@rules.register` 规则、`RuleContext` 和规则执行入口
+- `input_dispatch.py`：输入生成调度和规则查找
 - `input_backend.py`：输入生成 backend 选择和 numpy/torch/paddle 实现
 - `tensor_config.py`：张量配置、缓存和框架物化
 
-输入生成后端抽象和 backend-native 迁移的设计与进度见：
-
-- `docs/superpowers/specs/2026-08-02-backend-native-input-generation-design.md`
-- `docs/superpowers/plans/2026-08-02-backend-native-input-generation-migration.md`
+规则接口优化计划见
+`docs/superpowers/plans/2026-08-03-input-generation-rule-api-optimization.md`。
 
 ## 设计目标
 
-- 默认路径先进入规则注册表，未注册 API 使用默认输入生成规则
-- 需要参数关系或特殊取值域的 API 使用显式注册规则，规则被阻断或生成不完整时 fail fast
+- 未注册 API 使用注册表持有的独立默认规则
+- 需要参数关系或特殊取值域的 API 使用显式注册规则，生成不完整时 fail fast
 - 同一 seed 下保持 dtype、shape、bytes 和最终 RNG 状态一致
-- GPU 或缓存未准备好时，在生成前直接阻断
 - 输入数据与框架输入构造分离，便于单独验证
 - config 级 RNG 只在规则成功后提交，失败不污染后续 config
 
@@ -49,13 +46,13 @@ place、连续性和 strides。
 
 ### `InputBinding`
 
-`InputBinding` 是规则侧看到的“一次调用”的绑定结果，包含 API 名称、参数绑定、
+`InputBinding` 是规则侧看到的“一次调用”的绑定结果，包含 API 名称、已绑定参数、
 Tensor 绑定和未解析原因。规则只应该读取它，不应该自己再做签名推断。
 
 ### `InputContext`
 
-`InputContext` 把一次生成需要的上下文一次性封装起来：绑定结果、配置指纹、seed
-和 GPU 开关。规则不应直接依赖全局状态。
+`InputContext` 封装绑定结果、配置指纹和 seed。NumPy RNG 使用独立状态副本，Torch/Paddle
+backend 使用 seed 与配置指纹初始化自己的 generator。
 
 ### `InputData`
 
@@ -65,32 +62,20 @@ Tensor 绑定和未解析原因。规则只应该读取它，不应该自己再�
 
 ### `RegisteredRule`
 
-`RegisteredRule` 表示一条 decorator 注册规则，负责校验 GPU/cache 阻断、执行规则函数、
-检查完整性并提交输入数据。
+`RegisteredRule` 表示一条 decorator 注册规则，负责执行规则函数、检查完整性并提交输入数据。
 
 ### 规则参数
 
-规则函数接收三个职责明确的参数：
-
-- `ConfigView`：只读 config 视图，负责原始参数读取、Tensor 绑定查询和 API 名称
-- `ValueFactory`：数值生成入口，负责 value domain 和 backend-native 数组/tensor 操作
-- `InputWriter`：输入写入入口，负责暂存、去重、读取已生成值和完成校验
-
-常见批量生成流程由 `generate_all()`、`generate_remaining()` 和
-`generate_by_parameter()` 承担。按单个参数处理时，先通过 `config.binding()` 或
-`config.bindings()` 得到绑定，再显式调用 writer。
+所有规则函数只接收一个 `RuleContext`。它直接负责只读参数查询、Tensor 绑定和值域生成，并通过
+私有 `_InputWriter` 暂存写入。规则使用 `rule.arg()`、`rule.tensor()`、`rule.tensors()`、
+`rule.default()`、`rule.set()` 和 `rule.generate()`，不直接接触 writer 或 backend 实现。
 
 同一个 `TensorConfig` 对象不能复用于多个 `TensorPath`。绑定阶段会直接拒绝这种配置，
 错误信息同时给出首次路径和冲突路径，避免 path 寻址与对象 identity 寻址产生歧义。
 
 ### Backend Selection
 
-当前 backend 迁移目标见：
-
-- `docs/superpowers/specs/2026-08-02-backend-native-input-generation-design.md`
-- `docs/superpowers/plans/2026-08-02-backend-native-input-generation-migration.md`
-
-目标状态下，未显式设置 backend 时 `use_gpu_mode=True` 自动使用 torch backend；
+未显式设置 backend 时 `use_gpu_mode=True` 自动使用 torch backend；
 显式设置环境变量时按请求选择：
 
 ```bash
@@ -115,46 +100,41 @@ Paddle logical value 经 DLPack 生成，并在 Torch 侧 clone 为 Torch 自有
 
 ```python
 @rules.register("paddle.clip", aliases=("paddle.Tensor.clip",))
-def clip_values(config: ConfigView, values: ValueFactory, writer: InputWriter):
-    generate_by_parameter(
-        config,
-        values,
-        writer,
-        (
-            ("x", "default"),
-            ("min", lambda binding: values.domain("random_range", binding, -1, 0)),
-            ("max", lambda binding: values.domain("random_range", binding, 0, 1)),
-        ),
+def clip_values(rule: RuleContext):
+    rule.generate(
+        {
+            "min": lambda tensor: rule.domain("random_range", tensor, -1, 0),
+            "max": lambda tensor: rule.domain("random_range", tensor, 0, 1),
+        }
     )
 ```
 
 规则函数只描述 API 语义，不写绑定、物化或日志逻辑。
 
-### 2. 优先使用 registry helper
+### 2. 优先使用 RuleContext
 
-- `generate_all(config, values, writer, "default")`：同类参数统一生成
-- `generate_remaining(config, values, writer, "default")`：补齐未生成参数
-- `generate_by_parameter(config, values, writer, ...)`：按参数名映射不同生成策略
-- `config.arg()` / `config.kwarg()`：读取原始参数
-- `config.binding()`：要求参数名至多对应一个 Tensor；多个匹配会直接报错
-- `config.bindings()`：返回参数名对应的全部 Tensor 绑定
-- `config.binding_for_value()`：按 `TensorConfig` 对象定位绑定
-- `writer.value()`：读取逻辑值
+- `rule.arg(name, default)`：按签名参数名读取值
+- `rule.tensor(name)`：要求参数名至多对应一个 Tensor；多个匹配会直接报错
+- `rule.tensors(name)`：返回参数名对应的全部 Tensor 绑定
+- `rule.ops`：执行 backend-native 数组或 Tensor 操作
+- `rule.domain()` / `rule.default()`：生成值域数据
+- `rule.generate(mapping)`：按参数名生成，未指定 Tensor 默认使用 default domain
+- `rule.set()` / `rule.value()`：写入或读取逻辑值
 
 ### 3. 只在必要时写低层值
 
-- `writer.set_value()`：正常写入并在成功完成时同步元数据
-- `writer.set_value_preserving_spec()`：写入逻辑值，但保留配置原有 shape/dtype
-- `writer.finish(config)`：校验所有 Tensor 均已生成，再统一更新配置元数据并返回待挂载数据
+- `rule.set()`：正常写入并在成功完成时同步元数据
+- `rule.set_preserving_spec()`：写入逻辑值，但保留配置原有 shape/dtype
+- rule 结束后统一校验所有 Tensor 均已生成，再更新配置元数据并挂载数据
 
-writer 在 rule 执行期间只暂存 backend 拷贝。rule 抛出异常或 `finish()` 发现遗漏时，
+writer 在 rule 执行期间只暂存 backend 拷贝。rule 抛出异常或完整性检查发现遗漏时，
 不会挂载部分 `InputData`、修改 `TensorConfig` 元数据或提交 config RNG。重复写入同一 path
 也会直接失败；rule 不应依赖覆盖已有值。
 
 ### 4. 失败要显式
 
-如果某个规则不支持 GPU、缓存或某种参数关系，直接返回阻断原因，不要让默认分支悄悄补值。
-`block_reason()` 的职责就是在生成前失败。
+不支持的参数关系应直接抛出带 API 上下文的异常，不要让默认分支悄悄补值。注册表不保留没有
+实际消费者的 GPU/cache 阻断元数据。
 
 ### 5. 值域逻辑和 API 逻辑分离
 
@@ -172,8 +152,7 @@ writer 在 rule 执行期间只暂存 backend 拷贝。rule 抛出异常或 `fin
 ### 2. 从逐参数副作用改为完整 config 规则
 
 旧实现常在生成一个参数时顺手读写另一个参数，行为依赖遍历顺序。现在规则以完整 config 为单位
-描述，通过 `generate_by_parameter()`、`generate_all()`、`config.arg()` 和 `config.kwarg()`
-显式表达参数关系。
+描述，并统一通过 `RuleContext` 显式表达参数关系。
 
 ### 3. 从生成逻辑与物化耦合改为分层处理
 
@@ -183,7 +162,7 @@ writer 在 rule 执行期间只暂存 backend 拷贝。rule 抛出异常或 `fin
 ### 4. 从隐藏 fallback 改为显式默认规则和 fail-fast
 
 纯输入生成且不依赖参数关系的 API 走默认规则；需要特殊语义的 API 必须显式注册。
-已注册规则被阻断、重复写入或遗漏 Tensor 时直接失败，避免静默产出错误输入。
+已注册规则重复写入或遗漏 Tensor 时直接失败，避免静默产出错误输入。
 
 ### 5. 从全局随机状态改为 config-owned RNG
 
@@ -194,12 +173,12 @@ writer 在 rule 执行期间只暂存 backend 拷贝。rule 抛出异常或 `fin
 
 - `ConfigNumpyRNG` 使用独立 `RandomState` 副本
 - 同一 `TensorConfig` 复用于多个输入 path 时，`input_binding.py` 直接拒绝
-- `input_dispatch.py` 只做规则查找和阻断
+- `input_dispatch.py` 只做规则查找和上下文构造
 - `input_data.py` 只管理输入数据，不承担框架创建
 - `tensor_config.py` 只承担 Tensor 物化和读写
 
 ## 当前状态
 
 - `ConfigNumpyRNG` 使用独立 `RandomState` 副本，并在规则成功后提交到全局
-- GPU 和 cached 阻断通过 `allow_gpu` / `allow_cached` 控制
+- 所有注册规则统一使用单参数 `RuleContext` 协议
 - 运行时目录只保留当前实现代码

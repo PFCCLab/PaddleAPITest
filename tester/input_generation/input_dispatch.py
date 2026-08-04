@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from .input_binding import build_input_context
-from .input_registry import API_RULE_REGISTRY, DEFAULT_INPUT_GENERATION_RULE
+from .input_registry import rules
 
 
 def dispatch_input(api_test) -> bool:
@@ -12,17 +12,7 @@ def dispatch_input(api_test) -> bool:
     api_config = api_test.api_config
     api_name = api_config.api_name
 
-    rule = API_RULE_REGISTRY.get(api_name)
-    if rule is None:
-        rule = DEFAULT_INPUT_GENERATION_RULE
+    rule = rules.resolve(api_name)
 
-    context = build_input_context(
-        api_config,
-        seed=api_test.runtime_config.random_seed,
-        gpu_enabled=api_test.runtime_config.gpu_mode.enabled,
-    )
-    block_reason = getattr(rule, "block_reason", lambda _context: None)(context)
-    if block_reason:
-        raise RuntimeError(f"input-generation rule blocked for {api_name}: {block_reason}")
-
+    context = build_input_context(api_config, seed=api_test.runtime_config.random_seed)
     return rule.generate(context, api_config)
