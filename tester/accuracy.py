@@ -8,7 +8,7 @@ import torch
 import yaml
 
 from .accuracy_common import process_grad_output, process_output
-from .base import APITestBase, gpu_mode_maybe_empty_cache
+from .base import APITestBase, gpu_mode_memory_decision
 from .paddle_to_torch import ConversionKind, get_converter
 from .paddle_to_torch.arguments import bind_paddle_arguments
 
@@ -67,7 +67,7 @@ class APITestAccuracy(APITestBase):
     ):
         retained_tree_bytes = self.tensor_tree_nbytes((torch_output, torch_out_grads))
         reference_workspace_bytes = self._reference_workspace_bytes(convert_result)
-        return gpu_mode_maybe_empty_cache(
+        return gpu_mode_memory_decision(
             self.gpu_mode_config,
             request_spill=True,
             probe_bytes=probe_bytes,
@@ -77,7 +77,7 @@ class APITestAccuracy(APITestBase):
                 + retained_tree_bytes
                 + max(retained_tree_bytes, reference_workspace_bytes)
             ),
-        )
+        ).should_spill
 
     def _prepare_torch_result_tree(self, value, *, keep_on_device):
         if isinstance(value, (torch.return_types.max, torch.return_types.min)):
@@ -408,13 +408,13 @@ class APITestAccuracy(APITestBase):
         gc.collect()
         if self.use_gpu_mode:
             self.clear_torch_tensor(probe_bytes=probe_bytes)
-            gpu_mode_maybe_empty_cache(
+            gpu_mode_memory_decision(
                 self.gpu_mode_config,
                 force=not keep_torch_outputs_on_device,
                 probe_bytes=probe_bytes,
             )
         else:
-            torch.cuda.empty_cache()
+            self.release_framework_gpu_cache("torch")
         return torch_output, torch_out_grads
 
     def get_paddle_output(self):
@@ -564,7 +564,7 @@ class APITestAccuracy(APITestBase):
 
         self.is_backward = False
         if self.use_gpu_mode:
-            gpu_mode_maybe_empty_cache(
+            gpu_mode_memory_decision(
                 self.gpu_mode_config,
                 probe_bytes=probe_bytes,
             )
@@ -575,7 +575,7 @@ class APITestAccuracy(APITestBase):
         # Then do paddle backward and backward result check.
         if self.use_gpu_mode:
             del torch_output
-            gpu_mode_maybe_empty_cache(
+            gpu_mode_memory_decision(
                 self.gpu_mode_config,
                 probe_bytes=probe_bytes,
             )
@@ -598,7 +598,7 @@ class APITestAccuracy(APITestBase):
                 return
 
             if self.use_gpu_mode:
-                gpu_mode_maybe_empty_cache(
+                gpu_mode_memory_decision(
                     self.gpu_mode_config,
                     probe_bytes=probe_bytes,
                 )

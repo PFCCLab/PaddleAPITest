@@ -132,23 +132,32 @@ class APITestAccuracyStable(APITestBase):
         with torch.cuda.device(device_id):
             return callback()
 
-    def _compute_gpu_cache_needs_release(self, required_headroom_bytes):
+    def _manage_compute_headroom(
+        self,
+        required_headroom_bytes,
+        framework=None,
+        *,
+        enforce=False,
+    ):
+        """按计算卡 headroom 释放 cache，并可在分配前强制校验。"""
         memory_state = self.gpu_memory_state(0, budget_gib=self.gpu_mode_config.memory_budget)
-        return memory_state.free_bytes <= memory_state.reserve_bytes + int(
-            required_headroom_bytes or 0
+        required_headroom_bytes = int(required_headroom_bytes or 0)
+        under_pressure = (
+            memory_state.free_bytes <= memory_state.reserve_bytes + required_headroom_bytes
         )
-
-    def _maybe_release_compute_gpu_cache(self, required_headroom_bytes, framework=None):
-        if self._compute_gpu_cache_needs_release(required_headroom_bytes):
+        if under_pressure:
+            # 只在命中压力阈值时释放，正常小 Tensor 路径不承担跨框架 cache 开销。
             self._release_compute_gpu_cache(framework)
-
-    def _ensure_compute_headroom(self, required_headroom_bytes, framework=None):
-        """双卡单 worker 路径在下一次框架分配前保留已知输入空间。"""
-        self._maybe_release_compute_gpu_cache(required_headroom_bytes, framework)
-        memory_state = self.gpu_memory_state(0, budget_gib=self.gpu_mode_config.memory_budget)
-        if memory_state.free_bytes <= memory_state.reserve_bytes + int(
-            required_headroom_bytes or 0
-        ):
+            if enforce:
+                # 强校验必须在释放后重新读取物理 free，首次快照不能决定最终分类。
+                memory_state = self.gpu_memory_state(
+                    0,
+                    budget_gib=self.gpu_mode_config.memory_budget,
+                )
+                under_pressure = (
+                    memory_state.free_bytes <= memory_state.reserve_bytes + required_headroom_bytes
+                )
+        if enforce and under_pressure:
             raise GpuMemoryGuardSkip(
                 "compute GPU capacity guard: known inputs exceed current safe headroom"
             )
@@ -569,7 +578,7 @@ class APITestAccuracyStable(APITestBase):
         self.reset_random_state()
         try:
             if self.use_dual_gpu:
-                self._ensure_compute_headroom(probe_bytes, "torch")
+                self._manage_compute_headroom(probe_bytes, "torch", enforce=True)
             torch_output, torch_out_grads, torch_grad_success = self.get_torch_output(
                 convert_result, iter_idx
             )
@@ -615,7 +624,7 @@ class APITestAccuracyStable(APITestBase):
             except Exception:
                 self._abort_case_resources(state, pairs)
                 raise
-            self._maybe_release_compute_gpu_cache(probe_bytes, "torch")
+            self._manage_compute_headroom(probe_bytes, "torch")
         elif self.use_gpu_mode:
             torch_live_bytes = self.tensor_tree_nbytes((torch_output, torch_out_grads))
             # Release idle Torch blocks before the next Paddle execution;
@@ -641,7 +650,7 @@ class APITestAccuracyStable(APITestBase):
         self.reset_random_state()
         try:
             if self.use_dual_gpu:
-                self._ensure_compute_headroom(probe_bytes, "paddle")
+                self._manage_compute_headroom(probe_bytes, "paddle", enforce=True)
             paddle_output, paddle_out_grads = self.get_paddle_output(torch_grad_success, iter_idx)
         except Exception:
             self._abort_case_resources(state, pairs)
@@ -687,7 +696,7 @@ class APITestAccuracyStable(APITestBase):
             except Exception:
                 self._abort_case_resources(state, pairs)
                 raise
-            self._maybe_release_compute_gpu_cache(probe_bytes, "paddle")
+            self._manage_compute_headroom(probe_bytes, "paddle")
 
         # if torch_grad_success = False, out_grads = [] and compare return
         pairs.append(torch_output, torch_out_grads, paddle_output, paddle_out_grads)

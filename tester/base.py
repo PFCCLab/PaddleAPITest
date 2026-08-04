@@ -11,13 +11,14 @@ import yaml
 
 from .dtype_utils import to_torch_dtype
 from .dump_writer import DEFAULT_DUMP_DIR, DumpContext, dump_enabled
-from .gpu_memory_preflight import decide_gpu_memory_preflight
+from .gpu_memory_preflight import GpuMemoryDeferred, decide_gpu_memory_preflight
 from .input_generation.binding import bind_input_parameters
 from .input_generation.tensor_config import (
     TensorConfig,
     dtype_element_size,
     dtype_name,
     get_cached_numpy_array,
+    iter_unique_tensor_configs,
     tensor_config_tree_nbytes,
 )
 from .log_writer import log_worker
@@ -243,25 +244,6 @@ def gpu_mode_memory_decision(
     )
 
 
-def gpu_mode_maybe_empty_cache(
-    gpu_config,
-    force=False,
-    request_spill=False,
-    probe_bytes=None,
-    retained_tree_bytes=0,
-    required_headroom_bytes=None,
-):
-    decision = gpu_mode_memory_decision(
-        gpu_config,
-        force=force,
-        request_spill=request_spill,
-        probe_bytes=probe_bytes,
-        retained_tree_bytes=retained_tree_bytes,
-        required_headroom_bytes=required_headroom_bytes,
-    )
-    return decision.should_spill if request_spill else decision.cleanup_performed
-
-
 def classify_runtime_error(error_msg):
     """Classify runtime errors without printing or mutating log state."""
     error_msg_lower = error_msg.lower()
@@ -455,8 +437,7 @@ class APITestBase:
                 )
                 if runtime_decision.cleanup_performed:
                     self.record_memory_governance_metric("preflight_cache_release")
-                # 静态预算使用整卡容量；这里只拒绝清缓存后物理 free 仍放不下的已知峰值。
-                # 驱动查询不可用时保持静态判定，避免监控故障改变合法 case 的测试分类。
+                # 静态预算决定终态 skip；整卡 free 只是瞬时调度信号，不能固化为 skip。
                 physical_free_bytes = runtime_decision.free_after_bytes
                 if (
                     physical_free_bytes is not None
@@ -468,6 +449,8 @@ class APITestBase:
                         f"physical_free={physical_free_bytes / _GIB:.2f} GiB, "
                         "basis=post_cleanup_physical_headroom"
                     )
+                    self.record_memory_governance_metric("memory_preflight_defer")
+                    raise GpuMemoryDeferred(message)
                 else:
                     return True
             else:
@@ -508,10 +491,8 @@ class APITestBase:
         for attr_name in attr_names:
             if hasattr(self, attr_name):
                 delattr(self, attr_name)
-        if not self.gpu_mode_config.enabled and framework == "torch":
-            torch.cuda.empty_cache()
-        elif not self.gpu_mode_config.enabled:
-            paddle.device.cuda.empty_cache()
+        if not self.gpu_mode_config.enabled:
+            self.release_framework_gpu_cache(framework)
 
     def gpu_memory_state(self, device_id, *, budget_gib=0.0):
         """Return physical headroom and configured live budget for one CUDA device."""
@@ -1142,7 +1123,7 @@ class APITestBase:
             self.torch_args, self.torch_kwargs = self.copy_torch_input()
 
         if not self.gpu_mode_config.enabled:
-            torch.cuda.empty_cache()
+            self.release_framework_gpu_cache("torch")
         return True
 
     def np_assert_accuracy(self, np_paddle, np_torch, atol=1e-2, rtol=1e-2):
@@ -1882,34 +1863,9 @@ class APITestBase:
         if not self._clear_tensor_config_cache("clear_tensor", self.api_config):
             return
         if self.gpu_mode_config.enabled:
-            gpu_mode_maybe_empty_cache(self.gpu_mode_config)
+            gpu_mode_memory_decision(self.gpu_mode_config)
         else:
-            torch.cuda.empty_cache()
-            paddle.device.cuda.empty_cache()
-
-    def _for_each_tensor_config(self, callback, *roots):
-        """Apply callback to every TensorConfig in the parsed argument tree."""
-        seen = set()
-
-        def visit(value):
-            if isinstance(value, TensorConfig):
-                if id(value) not in seen:
-                    seen.add(id(value))
-                    callback(value)
-            elif isinstance(value, (list, tuple)):
-                for item in value:
-                    visit(item)
-            elif isinstance(value, dict):
-                for item in value.values():
-                    visit(item)
-
-        if not roots:
-            roots = (
-                getattr(self, "paddle_args_config", ()),
-                getattr(self, "paddle_kwargs_config", {}),
-            )
-        for value in roots:
-            visit(value)
+            self.release_framework_gpu_cache()
 
     def _tensor_config_roots(self):
         return (
@@ -1921,13 +1877,12 @@ class APITestBase:
         )
 
     def _clear_tensor_config_cache(self, clear_method_name, *args):
-        roots = self._tensor_config_roots()
-        if not any(roots):
+        # 共享 iterator 按对象身份去重，避免 merged/torch/paddle 配置别名被重复释放。
+        configs = tuple(iter_unique_tensor_configs(*self._tensor_config_roots()))
+        if not configs:
             return False
-        self._for_each_tensor_config(
-            lambda config: getattr(config, clear_method_name)(*args),
-            *roots,
-        )
+        for config in configs:
+            getattr(config, clear_method_name)(*args)
         return True
 
     def _map_tensor_tree(self, value, tensor_mapper):
@@ -2171,23 +2126,18 @@ class APITestBase:
 
     def save_original_inputs_to_cpu(self):
         """Save config inputs on CPU before either framework can mutate them."""
-        self._for_each_tensor_config(
-            lambda config: config.save_cpu_copy(self.api_config),
-            *self._tensor_config_roots(),
-        )
+        # stable snapshot 与清理必须遍历同一组唯一配置，否则别名路径会产生半清理状态。
+        for config in iter_unique_tensor_configs(*self._tensor_config_roots()):
+            config.save_cpu_copy(self.api_config)
 
     def clear_original_cpu_inputs(self):
-        self._for_each_tensor_config(
-            lambda config: config.clear_cpu_copy(),
-            *self._tensor_config_roots(),
-        )
+        for config in iter_unique_tensor_configs(*self._tensor_config_roots()):
+            config.clear_cpu_copy()
 
     def clear_generated_input_values(self):
         """框架输入取得所有权后释放 GPU 生成源，避免跨阶段长期驻留。"""
-        self._for_each_tensor_config(
-            lambda config: config.clear_generated_input_value(self.api_config),
-            *self._tensor_config_roots(),
-        )
+        for config in iter_unique_tensor_configs(*self._tensor_config_roots()):
+            config.clear_generated_input_value(self.api_config)
 
     def estimate_input_bytes(self):
         """Estimate unique configured input storage bytes for memory probe gating."""
@@ -2197,20 +2147,20 @@ class APITestBase:
         if not self._clear_tensor_config_cache("clear_paddle_tensor"):
             return
         if self.gpu_mode_config.enabled:
-            gpu_mode_maybe_empty_cache(self.gpu_mode_config)
+            gpu_mode_memory_decision(self.gpu_mode_config)
         else:
-            paddle.device.cuda.empty_cache()
+            self.release_framework_gpu_cache("paddle")
 
     def clear_torch_tensor(self, probe_bytes=None):
         if not self._clear_tensor_config_cache("clear_torch_tensor"):
             return
         if self.gpu_mode_config.enabled:
-            gpu_mode_maybe_empty_cache(
+            gpu_mode_memory_decision(
                 self.gpu_mode_config,
                 probe_bytes=probe_bytes,
             )
         else:
-            torch.cuda.empty_cache()
+            self.release_framework_gpu_cache("torch")
 
     def is_forward_only(self):
         api = self.api_config.api_name[self.api_config.api_name.rindex(".") + 1 :]

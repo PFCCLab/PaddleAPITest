@@ -7,8 +7,10 @@ from dataclasses import dataclass
 from .input_generation.backend import resolve_input_backend_name
 from .input_generation.tensor_config import (
     AUTOGRAD_DTYPES,
+    build_materialization_plan,
     dtype_element_size,
     dtype_name,
+    generated_value_nbytes,
     iter_unique_tensor_configs,
 )
 
@@ -21,6 +23,11 @@ _SUPPORTED_MODES = frozenset(
         "accuracy_stable_dual_gpu",
     }
 )
+
+
+class GpuMemoryDeferred(RuntimeError):
+    """动态物理显存不足；本次 case 可在稍后重试。"""
+
 
 # 预检只统计能由 TensorConfig 和执行模式可靠确定的 GPU 存活集合。
 # 输出、output grad、kernel workspace 等 API 相关项保持未知，交给运行时治理。
@@ -90,15 +97,6 @@ def _logical_nbytes(config):
     return config.nbytes(storage=False)
 
 
-def _generated_value_nbytes(config):
-    # GPU 生成 backend 对 BF16/FP8 使用可生成的中间 dtype。
-    name = dtype_name(config.dtype)
-    generated_dtype = (
-        "float32" if name == "bfloat16" else "float16" if name.startswith("float8") else name
-    )
-    return max(0, config.numel()) * dtype_element_size(generated_dtype)
-
-
 def _input_generation_peak(configs):
     # writer 按配置顺序提交值；此前已提交值与当前局部临时量同时存活。
     resident_bytes = 0
@@ -107,7 +105,7 @@ def _input_generation_peak(configs):
         logical_bytes = _logical_nbytes(config)
         numel = max(0, config.numel())
         name = dtype_name(config.dtype)
-        generated_bytes = _generated_value_nbytes(config)
+        generated_bytes = generated_value_nbytes(config)
         if name.startswith("complex"):
             # 实部、虚部与复数结果的峰值，和 writer 的 source/clone 峰值均为两份逻辑值。
             temporary_peak = 2 * logical_bytes
@@ -131,16 +129,6 @@ def _is_gpu_input(config):
     return config.place is None or "cpu" not in str(config.place).lower()
 
 
-def _requires_dtype_or_layout_materialization(config):
-    # 中间 dtype 和非连续 storage 都会打破生成值与框架输入的直接所有权复用。
-    name = dtype_name(config.dtype)
-    return not config.is_contiguous or name in {
-        "bfloat16",
-        "float8_e4m3fn",
-        "float8_e5m2",
-    }
-
-
 def _framework_live_input_bytes(config):
     """返回框架输入最终持有的 GPU storage。"""
     if not _is_gpu_input(config):
@@ -148,84 +136,34 @@ def _framework_live_input_bytes(config):
     return config.nbytes(storage=True)
 
 
-def _reuses_generated_storage(config, input_backend, framework):
-    # NumPy source 位于主存，任何 GPU 框架输入都必须拥有一份设备 storage。
-    if not _is_gpu_input(config) or input_backend == "numpy":
-        return False
-    if input_backend == "paddle" and framework == "torch":
-        # Paddle -> Torch 的 DLPack 路径显式 clone，Torch 不借用 Paddle 输入所有权。
-        return False
-    return not _requires_dtype_or_layout_materialization(config)
-
-
-def _materialized_input_bytes(config, input_backend, framework):
-    """返回 GPU 生成源之外由目标框架长期持有的 storage。"""
-    if _reuses_generated_storage(config, input_backend, framework):
-        return 0
-    return _framework_live_input_bytes(config)
-
-
-def _strided_intermediate_bytes(config):
-    name = dtype_name(config.dtype)
-    intermediate_size = (
-        dtype_element_size("float16")
-        if name.startswith("float8")
-        else dtype_element_size(config.dtype)
-    )
-    return config.storage_numel() * intermediate_size
-
-
-def _materialization_extra_peak(config, input_backend, framework):
-    """返回一次框架输入物化相对既有 GPU 生成源的新增峰值。"""
-    # 返回值不包含仍存活的 GPU 生成源，调用方在阶段组件中只统一加一次。
-    target_bytes = _materialized_input_bytes(config, input_backend, framework)
-    if not target_bytes or _reuses_generated_storage(config, input_backend, framework):
-        return 0
-
-    name = dtype_name(config.dtype)
-    generated_bytes = _generated_value_nbytes(config)
-    if config.is_contiguous:
-        # cast-through dtype 在 NumPy/Paddle->Torch 路径先形成中间 Tensor，再形成最终 dtype。
-        if name in {"bfloat16", "float8_e4m3fn", "float8_e5m2"}:
-            needs_intermediate_copy = input_backend == "numpy" or (
-                input_backend == "paddle" and framework == "torch"
-            )
-            return (generated_bytes if needs_intermediate_copy else 0) + target_bytes
-        return target_bytes
-
-    flat_intermediate_bytes = _strided_intermediate_bytes(config)
-    # NumPy 或 Paddle -> Torch 需要创建逻辑 Tensor；原生/DLPack 路径仅 BF16 发生 cast。
-    needs_logical_copy = input_backend == "numpy" or (
-        input_backend == "paddle" and framework == "torch"
-    )
-    logical_copy_bytes = (
-        max(0, config.numel())
-        * (
-            dtype_element_size("float16")
-            if name.startswith("float8")
-            else dtype_element_size(config.dtype)
-        )
-        if needs_logical_copy or name == "bfloat16"
-        else 0
-    )
-    final_cast_bytes = target_bytes if name.startswith("float8") else 0
-    return max(
-        flat_intermediate_bytes + logical_copy_bytes,
-        flat_intermediate_bytes + final_cast_bytes,
+def _requires_inplace_input_copy(api_config):
+    # 与 build_*_input 的 API 判断保持同一协议，避免预检和执行路径分叉。
+    api_name = getattr(api_config, "api_name", "")
+    return (api_name.endswith("_") and not api_name.endswith("__")) or api_name == (
+        "paddle.Tensor.__setitem__"
     )
 
 
-def _framework_materialization(configs, input_backend, framework):
-    # 输入按参数顺序物化；只延续此前输入的最终 storage，不延续其局部 cast 临时量。
-    # resident_bytes 只统计新增所有者；复用生成 storage 的输入已由阶段公共组件持有。
+def _framework_materialization(configs, input_backend, framework, *, force_clone=False):
+    # 物化规则由 TensorConfig 统一给出；此处只累积顺序阶段的驻留量。
     resident_bytes = 0
     peak_bytes = 0
+    # clone_target 独立累计，避免把复用的 native source 再算成一份框架驻留。
+    clone_target_bytes = 0
     for config in configs:
+        plan = build_materialization_plan(config, input_backend, framework)
         peak_bytes = max(
             peak_bytes,
-            resident_bytes + _materialization_extra_peak(config, input_backend, framework),
+            resident_bytes + plan.peak_bytes,
         )
-        resident_bytes += _materialized_input_bytes(config, input_backend, framework)
+        # persistent 只表示生成 source 之外、跨越当前物化步骤继续存活的 storage。
+        resident_bytes += plan.persistent_bytes
+        clone_target_bytes += _framework_live_input_bytes(config)
+    if force_clone:
+        # 复用的生成 source 已由阶段公共组件持有；这里只增加额外驻留与新 clone。
+        peak_bytes = max(peak_bytes, resident_bytes + clone_target_bytes)
+        # clone 完成后旧框架 storage 释放，执行阶段只持有新 target。
+        resident_bytes = clone_target_bytes
     return max(peak_bytes, resident_bytes), resident_bytes
 
 
@@ -252,12 +190,23 @@ def estimate_gpu_memory(api_config, mode, *, check_grad, input_backend="torch"):
     # NumPy backend 的生成峰值属于主存，不能为了 GPU mode 而误计入设备容量。
     generation_peak = _input_generation_peak(configs) if native_gpu_generation else 0
     generated_input_bytes = (
-        sum(_generated_value_nbytes(config) for config in configs) if native_gpu_generation else 0
+        sum(generated_value_nbytes(config) for config in configs) if native_gpu_generation else 0
     )
+    # 原地 API 的 clone 是框架输入生命周期的一部分，不能留给运行时未知项。
+    force_input_copy = _requires_inplace_input_copy(api_config)
     torch_materialization_peak, torch_materialized_input_bytes = _framework_materialization(
-        configs, input_backend, "torch"
+        configs,
+        input_backend,
+        "torch",
+        force_clone=force_input_copy,
     )
-    paddle_materialization_peak, _ = _framework_materialization(configs, input_backend, "paddle")
+    paddle_materialization_peak, _ = _framework_materialization(
+        configs,
+        input_backend,
+        "paddle",
+        force_clone=force_input_copy,
+    )
+    # 执行阶段只保留最终框架输入；clone 的瞬时峰值已在 materialization stage 计入。
     framework_input_bytes = sum(_framework_live_input_bytes(config) for config in configs)
     input_grad_bytes = _input_grad_bytes(configs, check_grad)
 
@@ -305,8 +254,18 @@ def estimate_gpu_memory(api_config, mode, *, check_grad, input_backend="torch"):
     else:
         # stable 保存 CPU snapshot 时可能先经 Torch 物化；每个输入完成拷贝后即释放其 GPU target。
         snapshot_extra_peak = max(
-            (_materialization_extra_peak(config, input_backend, "torch") for config in configs),
+            (
+                build_materialization_plan(config, input_backend, "torch").peak_bytes
+                for config in configs
+            ),
             default=0,
+        )
+        # stable 从 CPU snapshot 重建，使用 NumPy source 只模拟目标 GPU storage。
+        stable_framework_peak, _ = _framework_materialization(
+            configs,
+            "numpy",
+            "torch",
+            force_clone=force_input_copy,
         )
         stages.append(
             MemoryStageEstimate(
@@ -323,7 +282,7 @@ def estimate_gpu_memory(api_config, mode, *, check_grad, input_backend="torch"):
             MemoryStageEstimate(
                 "framework_input_materialization",
                 "compute",
-                (("framework_inputs", framework_input_bytes),),
+                (("framework_inputs", stable_framework_peak),),
             )
         )
 

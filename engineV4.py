@@ -51,6 +51,7 @@ from tester.dump_writer import (
     record_dump_terminal_status,
     resolve_dump_options,
 )
+from tester.gpu_memory_preflight import GpuMemoryDeferred
 from tester.log_writer import (
     init_log,
     log_aggregation,
@@ -180,11 +181,14 @@ FORECAST_MIN_INTERVAL_SECONDS = 60
 FORECAST_MAX_INTERVAL_SECONDS = 30 * 60
 FORECAST_TARGET_CASES = 100
 FORECAST_INITIAL_MAX_WAIT_SECONDS = 5 * 60
+GPU_MEMORY_DEFER_INITIAL_BACKOFF_SECONDS = 1.0
+GPU_MEMORY_DEFER_MAX_BACKOFF_SECONDS = 30.0
 
 
 @dataclass
 class BatchRetryState:
     per_case_external_kill_retries: dict[str, int] = field(default_factory=dict)
+    per_case_memory_defer_retries: dict[str, int] = field(default_factory=dict)
     total_external_kills: int = 0
     unsafe_environment: bool = False
 
@@ -199,6 +203,14 @@ class BatchRunState:
     test_started_at: float | None = None
     last_forecast_at: float | None = None
     last_forecast_case: int = 0
+
+
+@dataclass(frozen=True)
+class PendingCase:
+    """待重试 case 及其最早可再次派发时间。"""
+
+    config: str
+    ready_at: float = 0.0
 
 
 @dataclass
@@ -246,6 +258,10 @@ class BatchMessage:
         if message.msg_type == "done":
             message.worker_pid = msg[3] if len(msg) > 3 else None
             message.completed_offset = msg[4] if len(msg) > 4 else None
+        elif message.msg_type == "deferred":
+            message.reason = msg[3] if len(msg) > 3 else ""
+            message.worker_pid = msg[4] if len(msg) > 4 else None
+            message.completed_offset = msg[5] if len(msg) > 5 else None
         elif message.msg_type == "error":
             message.reason = msg[3] if len(msg) > 3 else ""
             message.worker_pid = msg[4] if len(msg) > 4 else None
@@ -394,6 +410,17 @@ def _worker_loop(
                     "done",
                     slot_index,
                     api_config_str,
+                    os.getpid(),
+                    log_worker.get_worker_log_offset(),
+                )
+            )
+        except GpuMemoryDeferred as e:
+            result_queue.put(
+                (
+                    "deferred",
+                    slot_index,
+                    api_config_str,
+                    str(e),
                     os.getpid(),
                     log_worker.get_worker_log_offset(),
                 )
@@ -1483,11 +1510,32 @@ def _handle_external_kill_retry(
     retry_count = retry_state.per_case_external_kill_retries.get(api_config_str, 0)
     if retry_count < max_case_retries:
         retry_state.per_case_external_kill_retries[api_config_str] = retry_count + 1
-        pending_dispatch.appendleft(api_config_str)
+        pending_dispatch.appendleft(PendingCase(api_config_str))
         return True
 
     retry_state.unsafe_environment = True
     return False
+
+
+def _pop_ready_pending_case(pending_dispatch, now=None):
+    """从 pending 队列取出一个已到重试时间的 case。"""
+    if not pending_dispatch:
+        return None
+    now = time.monotonic() if now is None else now
+    for _ in range(len(pending_dispatch)):
+        pending = pending_dispatch.popleft()
+        if pending.ready_at <= now:
+            return pending.config
+        pending_dispatch.append(pending)
+    return None
+
+
+def _next_pending_delay(pending_dispatch, now=None):
+    """返回 pending 队列中最近一次可重试的剩余等待时间。"""
+    if not pending_dispatch:
+        return None
+    now = time.monotonic() if now is None else now
+    return max(0.0, min(pending.ready_at for pending in pending_dispatch) - now)
 
 
 def resolve_batch_worker_layout(
@@ -1533,9 +1581,8 @@ def _fill_idle_workers(pool, pending_dispatch, config_iter):
         slot = next(pool.idle_slots(), None)
         if slot is None:
             break
-        if pending_dispatch:
-            config = pending_dispatch.popleft()
-        else:
+        config = _pop_ready_pending_case(pending_dispatch)
+        if config is None:
             config = next(config_iter, None)
         if config is None:
             break
@@ -1571,7 +1618,7 @@ def _handle_batch_result(
             message.completed_offset,
         )
 
-    worker_reusable = msg_type in ("done", "error") or (
+    worker_reusable = msg_type in ("done", "error", "deferred") or (
         msg_type == "crashed" and options.use_compute_sanitizer and crash_source == "child"
     )
     external_kill = msg_type == "crashed" and exitcode in (-signal.SIGKILL, -signal.SIGTERM)
@@ -1602,6 +1649,21 @@ def _handle_batch_result(
 
     if worker_reusable:
         pool.mark_idle(slot_index)
+
+    if msg_type == "deferred":
+        retry_count = retry_state.per_case_memory_defer_retries.get(config, 0)
+        retry_state.per_case_memory_defer_retries[config] = retry_count + 1
+        delay = min(
+            GPU_MEMORY_DEFER_MAX_BACKOFF_SECONDS,
+            GPU_MEMORY_DEFER_INITIAL_BACKOFF_SECONDS * (2 ** min(retry_count, 5)),
+        )
+        pending_dispatch.append(PendingCase(config=config, ready_at=time.monotonic() + delay))
+        log_report.print_case_notice(
+            "DEFER",
+            config,
+            f"retry {retry_count + 1} in {delay:.1f}s | {reason}",
+        )
+        return
 
     batch_state.tested_case += 1
     progress_status = "DONE"
@@ -1776,14 +1838,16 @@ def _run_batch_mode(
 
         # 主循环只负责收消息、补空闲 worker、以及把结果交给专门的处理逻辑。
         while (batch_state.active_tasks > 0 or pending_dispatch) and not batch_state.abort_run:
-            msg = pool.collect_one(timeout=5.0)
+            pending_delay = _next_pending_delay(pending_dispatch)
+            timeout = 5.0 if pending_delay is None else min(5.0, max(0.1, pending_delay))
+            msg = pool.collect_one(timeout=timeout)
             if msg is not None and not pool._handle_worker_control_message(msg):
                 msg_type = msg[0]
                 if msg_type == "ack":
                     slot_idx = msg[1]
                     with pool._lock:
                         pool.slots[slot_idx].task_start_time = time.time()
-                elif msg_type in ("done", "error", "timeout", "crashed"):
+                elif msg_type in ("done", "deferred", "error", "timeout", "crashed"):
                     _handle_batch_result(
                         pool=pool,
                         options=options,
@@ -2008,6 +2072,8 @@ def run_test_case(api_config_str, options):
                 case.run_with_dump()
             else:
                 case.test()
+        except GpuMemoryDeferred:
+            raise
         except Exception as err:
             if _handle_case_exception(api_config_str, err):
                 return
@@ -2016,6 +2082,9 @@ def run_test_case(api_config_str, options):
             del test_class, api_config, case
             _cleanup_case_runtime(options)
 
+    except GpuMemoryDeferred:
+        case_status = "deferred"
+        raise
     except BaseException:
         case_status = "error"
         raise
@@ -2078,7 +2147,23 @@ def _run_sanitizer_child_mode(options):
     try:
         _init_worker_runtime(None, None, None, options, redirect_output=False)
         options.api_config = options.api_config.strip()
-        run_test_case(options.api_config, options)
+        defer_retry_count = 0
+        while True:
+            try:
+                run_test_case(options.api_config, options)
+                break
+            except GpuMemoryDeferred as err:
+                delay = min(
+                    GPU_MEMORY_DEFER_MAX_BACKOFF_SECONDS,
+                    GPU_MEMORY_DEFER_INITIAL_BACKOFF_SECONDS * (2 ** min(defer_retry_count, 5)),
+                )
+                defer_retry_count += 1
+                print(
+                    f"[DEFER] {options.api_config} | retry {defer_retry_count} "
+                    f"in {delay:.1f}s | {err}",
+                    flush=True,
+                )
+                time.sleep(delay)
     except SystemExit:
         raise
     except Exception as err:
@@ -2188,9 +2273,26 @@ def _run_single_case_mode(options, start_time):
 
     options.api_config = options.api_config.strip()
     single_case_error = None
+    defer_retry_count = 0
     try:
-        run_test_case(options.api_config, options)
-        log_worker.write_to_log("checkpoint", options.api_config)
+        while True:
+            try:
+                run_test_case(options.api_config, options)
+            except GpuMemoryDeferred as err:
+                delay = min(
+                    GPU_MEMORY_DEFER_MAX_BACKOFF_SECONDS,
+                    GPU_MEMORY_DEFER_INITIAL_BACKOFF_SECONDS * (2 ** min(defer_retry_count, 5)),
+                )
+                defer_retry_count += 1
+                log_report.print_case_notice(
+                    "DEFER",
+                    options.api_config,
+                    f"retry {defer_retry_count} in {delay:.1f}s | {err}",
+                )
+                time.sleep(delay)
+                continue
+            log_worker.write_to_log("checkpoint", options.api_config)
+            break
     except Exception as err:
         single_case_error = err
         print(f"[test error] {options.api_config}: {err}", flush=True)

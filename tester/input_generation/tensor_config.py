@@ -3,6 +3,7 @@ from __future__ import annotations
 import copy
 import os
 import random
+from dataclasses import dataclass
 
 import numpy
 import paddle
@@ -541,6 +542,110 @@ class TensorConfig:
 
     def clear_cpu_copy(self):
         self.cpu_tensor = None
+
+
+@dataclass(frozen=True)
+class MaterializationPlan:
+    """描述单个 TensorConfig 在一个框架物化阶段的 GPU 存活量。"""
+
+    persistent_bytes: int = 0
+    peak_bytes: int = 0
+    source_bytes: int = 0
+    temporary_bytes: int = 0
+
+
+def generated_value_nbytes(config):
+    """返回生成 backend 为一个配置实际持有的元素存储字节数。"""
+    # BF16/FP8 在生成阶段使用可写的中间 dtype，不能直接按逻辑 dtype 计量。
+    name = dtype_name(config.dtype)
+    generated_dtype = (
+        "float32" if name == "bfloat16" else "float16" if name in FLOAT8_DTYPES else name
+    )
+    return max(0, config.numel()) * dtype_element_size(generated_dtype)
+
+
+def _materialization_target_bytes(config):
+    # 显式 CPU place 不参与 GPU 预检，即使后续框架会在主存中物化它。
+    if config.place is not None and "cpu" in str(config.place).lower():
+        return 0
+    return config.nbytes(storage=True)
+
+
+def _materialization_intermediate_bytes(config):
+    # 非连续 Tensor 先创建 flat storage，再通过 view/as_strided 暴露逻辑布局。
+    name = dtype_name(config.dtype)
+    intermediate_size = dtype_element_size("float16" if name in FLOAT8_DTYPES else config.dtype)
+    return config.storage_numel() * intermediate_size
+
+
+def build_materialization_plan(config, input_backend, framework):
+    """由实际 TensorConfig 物化规则生成 GPU 物化计划。"""
+    if input_backend not in {"numpy", "torch", "paddle"}:
+        raise ValueError(f"unsupported input backend: {input_backend}")
+    if framework not in {"torch", "paddle"}:
+        raise ValueError(f"unsupported materialization framework: {framework}")
+
+    target_bytes = _materialization_target_bytes(config)
+    if target_bytes == 0:
+        return MaterializationPlan()
+
+    source_bytes = generated_value_nbytes(config) if input_backend != "numpy" else 0
+    # NumPy source 在 CPU；Torch/Paddle native source 才可能与 GPU target 共享所有权。
+    name = dtype_name(config.dtype)
+    cast_required = name in CAST_THROUGH_INTERMEDIATE_DTYPES
+
+    if config.is_contiguous:
+        if input_backend == "paddle" and framework == "torch":
+            # Paddle -> Torch 会先 copy_to，再经 DLPack 构造视图，最后 clone 成独立所有者。
+            # BF16/FP8 source 仍是生成阶段的中间 dtype，copy_to 按 source storage 计量。
+            transfer_bytes = source_bytes or target_bytes
+            # `_copy_to` 的返回值在 clone 完成前仍存活，DLPack 只创建借用视图。
+            if cast_required:
+                intermediate_bytes = source_bytes or generated_value_nbytes(config)
+                temporary_bytes = transfer_bytes + max(
+                    2 * intermediate_bytes,
+                    intermediate_bytes + target_bytes,
+                )
+            else:
+                # 普通 dtype 的 DLPack view 不增加 storage，但最终 clone 必须独立持有。
+                temporary_bytes = transfer_bytes + target_bytes
+            return MaterializationPlan(
+                persistent_bytes=target_bytes,
+                peak_bytes=temporary_bytes,
+                source_bytes=source_bytes,
+                temporary_bytes=temporary_bytes,
+            )
+
+        # 原生同 dtype、同设备输入可复用生成 storage；cast 只在最终目标上新增 storage。
+        reuses_source = input_backend != "numpy" and not cast_required
+        persistent_bytes = 0 if reuses_source else target_bytes
+        temporary_bytes = 0 if reuses_source else target_bytes
+        return MaterializationPlan(
+            persistent_bytes=persistent_bytes,
+            peak_bytes=temporary_bytes,
+            source_bytes=source_bytes,
+            temporary_bytes=temporary_bytes,
+        )
+
+    # 非连续路径需要 flat storage；其局部逻辑 copy 与 float8 cast 都可能同时存在。
+    flat_bytes = _materialization_intermediate_bytes(config)
+    logical_copy_bytes = (
+        max(0, config.numel())
+        * dtype_element_size("float16" if name in FLOAT8_DTYPES else config.dtype)
+        if input_backend == "numpy" or (input_backend == "paddle" and framework == "torch")
+        else 0
+    )
+    final_cast_bytes = target_bytes if name in FLOAT8_DTYPES else 0
+    temporary_bytes = max(flat_bytes + logical_copy_bytes, flat_bytes + final_cast_bytes)
+    if input_backend == "paddle" and framework == "torch":
+        # Paddle->Torch 的逻辑临时 Tensor 在写入 flat storage 前仍可能保留一份 clone。
+        temporary_bytes += source_bytes or target_bytes
+    return MaterializationPlan(
+        persistent_bytes=target_bytes,
+        peak_bytes=temporary_bytes,
+        source_bytes=source_bytes,
+        temporary_bytes=temporary_bytes,
+    )
 
 
 def iter_unique_tensor_configs(*roots):
