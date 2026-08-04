@@ -8,7 +8,13 @@ import paddle
 import torch
 
 from .accuracy_common import process_grad_output, process_output
-from .base import CUDA_ERROR, CUDA_OOM, APITestBase, gpu_mode_memory_decision
+from .base import (
+    CUDA_ERROR,
+    CUDA_OOM,
+    APITestBase,
+    GpuMemoryGuardSkip,
+    gpu_mode_memory_decision,
+)
 from .log_writer import log_comparison, log_worker
 from .paddle_to_torch import ConversionKind, get_converter
 from .paddle_to_torch.arguments import bind_paddle_arguments
@@ -136,8 +142,35 @@ class APITestAccuracyStable(APITestBase):
         if self._compute_gpu_cache_needs_release(required_headroom_bytes):
             self._release_compute_gpu_cache(framework)
 
+    def _ensure_compute_headroom(self, required_headroom_bytes, framework=None):
+        """双卡单 worker 路径在下一次框架分配前保留已知输入空间。"""
+        self._maybe_release_compute_gpu_cache(required_headroom_bytes, framework)
+        memory_state = self.gpu_memory_state(0, budget_gib=self.gpu_mode_config.memory_budget)
+        if memory_state.free_bytes <= memory_state.reserve_bytes + int(
+            required_headroom_bytes or 0
+        ):
+            raise GpuMemoryGuardSkip(
+                "compute GPU capacity guard: known inputs exceed current safe headroom"
+            )
+
     def _move_tensor_tree_to_comparison_gpu(self, value):
-        return self.move_tensor_tree_to_gpu(value, self.comparison_device_id)
+        # 所有双卡结果搬运集中经过此入口，避免某一结果族绕过物理 headroom 检查。
+        if self._ensure_comparison_copy_headroom(value) <= 0:
+            return value
+        try:
+            return self.move_tensor_tree_to_gpu(value, self.comparison_device_id)
+        except Exception as err:
+            err_str = str(err).lower()
+            if not any(marker.lower() in err_str for marker in CUDA_OOM):
+                raise
+            # 复制 OOM 不涉及算子正确性；清 cache 后转换为可审计的容量 skip。
+            try:
+                self._release_comparison_gpu_cache()
+            except Exception as cleanup_error:
+                self._log_dual_cleanup_error(cleanup_error)
+            raise GpuMemoryGuardSkip(
+                "comparison GPU capacity guard: result copy failed after cache release"
+            ) from err
 
     def _clear_execution_resources(self):
         for attr_name in (
@@ -175,9 +208,9 @@ class APITestAccuracyStable(APITestBase):
             reserve_bytes = memory_state.reserve_bytes
 
         if free_bytes <= reserve_bytes + int(torch_result_bytes):
-            raise RuntimeError(
-                "comparison out of memory prevention: the first six result trees "
-                "exceed the comparison card's safe capacity before P2 execution"
+            raise GpuMemoryGuardSkip(
+                "comparison GPU capacity guard: retained first results leave no room "
+                "for the second Torch result family"
             )
         if free_bytes < target_free:
             if not state.phased_result_residency:
@@ -200,9 +233,8 @@ class APITestAccuracyStable(APITestBase):
             free_bytes = memory_state.free_bytes
             reserve_bytes = memory_state.reserve_bytes
         if free_bytes <= reserve_bytes + new_bytes:
-            raise RuntimeError(
-                "comparison out of memory prevention: the second result family "
-                "exceeds the comparison card's safe capacity"
+            raise GpuMemoryGuardSkip(
+                "comparison GPU capacity guard: second result family exceeds safe capacity"
             )
         self._stream_second_slot_to_comparison_gpu(
             pairs.paddle_outputs,
@@ -289,6 +321,8 @@ class APITestAccuracyStable(APITestBase):
                 discard_results=True,
                 cache_release_policy="always",
             )
+        except GpuMemoryGuardSkip:
+            pass
         except Exception as cleanup_error:
             self._log_dual_cleanup_error(cleanup_error)
         try:
@@ -362,10 +396,19 @@ class APITestAccuracyStable(APITestBase):
 
         self._run_with_torch_device(0, run)
 
-    def _ensure_comparison_stream_headroom(self, value):
-        value_bytes = self.tensor_tree_nbytes(value)
+    def _ensure_comparison_copy_headroom(self, value):
+        # 已在目标卡上的结果再次经过归一化入口时是 no-op，不能重复占用复制预算。
+        copy_leaves = tuple(
+            tensor
+            for tensor in self.iter_unique_tensor_tree_leaves(value)
+            if not self.tensor_is_gpu(tensor)
+            or self.tensor_gpu_device_id(tensor) != self.comparison_device_id
+        )
+        if not copy_leaves:
+            return 0
+        value_bytes = self.tensor_tree_nbytes(copy_leaves)
         if value_bytes <= 0:
-            return
+            return 0
         memory_state = self._comparison_gpu_memory_state()
         free_bytes = memory_state.free_bytes
         reserve_bytes = memory_state.reserve_bytes
@@ -375,28 +418,14 @@ class APITestAccuracyStable(APITestBase):
             free_bytes = memory_state.free_bytes
             reserve_bytes = memory_state.reserve_bytes
         if free_bytes <= reserve_bytes + value_bytes:
-            raise RuntimeError(
-                "comparison out of memory prevention: streaming a second result "
-                "would consume the comparison card's safe reserve"
+            raise GpuMemoryGuardSkip(
+                "comparison GPU capacity guard: result copy would consume the safe reserve"
             )
+        return value_bytes
 
     def _stream_second_slot_to_comparison_gpu(self, values, index, *, release_compute_cache=True):
         source = values[index]
-        self._ensure_comparison_stream_headroom(source)
-        try:
-            values[index] = self._move_tensor_tree_to_comparison_gpu(source)
-        except Exception as err:
-            err_str = str(err).lower()
-            if not any(marker.lower() in err_str for marker in CUDA_OOM):
-                raise
-            try:
-                self._release_comparison_gpu_cache()
-            except Exception as cleanup_error:
-                self._log_dual_cleanup_error(cleanup_error)
-            raise RuntimeError(
-                "comparison out of memory prevention: streaming a second result "
-                "failed on the comparison card"
-            ) from err
+        values[index] = self._move_tensor_tree_to_comparison_gpu(source)
         del source
         if release_compute_cache:
             self._release_compute_gpu_cache()
@@ -539,6 +568,8 @@ class APITestAccuracyStable(APITestBase):
         # ======== torch ========
         self.reset_random_state()
         try:
+            if self.use_dual_gpu:
+                self._ensure_compute_headroom(probe_bytes, "torch")
             torch_output, torch_out_grads, torch_grad_success = self.get_torch_output(
                 convert_result, iter_idx
             )
@@ -609,6 +640,8 @@ class APITestAccuracyStable(APITestBase):
         # ======== paddle ========
         self.reset_random_state()
         try:
+            if self.use_dual_gpu:
+                self._ensure_compute_headroom(probe_bytes, "paddle")
             paddle_output, paddle_out_grads = self.get_paddle_output(torch_grad_success, iter_idx)
         except Exception:
             self._abort_case_resources(state, pairs)
@@ -761,11 +794,15 @@ class APITestAccuracyStable(APITestBase):
         execution_state = _StableExecutionState()
 
         # Every execution recreates its input from the same immutable CPU copy.
-        for iter_idx in range(2):
-            if not self._run_stable_iteration(
-                iter_idx, convert_result, probe_bytes, pairs, execution_state
-            ):
-                return
+        try:
+            for iter_idx in range(2):
+                if not self._run_stable_iteration(
+                    iter_idx, convert_result, probe_bytes, pairs, execution_state
+                ):
+                    return
+        except GpuMemoryGuardSkip as err:
+            self.report_case_result("skip", phase="memory_guard", message=str(err))
+            return
 
         summary_failed = False
         try:
@@ -780,6 +817,10 @@ class APITestAccuracyStable(APITestBase):
 
             self._run_summary_comparisons(pairs, execution_state)
             log_worker.write_stable_passes(self.api_config.config)
+        except GpuMemoryGuardSkip as err:
+            summary_failed = True
+            self.report_case_result("skip", phase="memory_guard", message=str(err))
+            return
         except Exception:
             summary_failed = True
             raise
@@ -1122,6 +1163,8 @@ class APITestAccuracyStable(APITestBase):
                         tensor_index=tensor_index,
                         tensor_count=tensor_count,
                     )
+                except GpuMemoryGuardSkip:
+                    raise
                 except Exception as err:
                     self.report_stable_compare_error(
                         err,

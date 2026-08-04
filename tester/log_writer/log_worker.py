@@ -309,7 +309,7 @@ def write_case_end(status, api_config_str, *, duration_ms=None):
     result_types = set(_case_result_types.get(api_config_str, ()))
     if result_types == {"pass"}:
         outcome = "PASS"
-    elif result_types in ({"skip"}, {"memory_skip"}):
+    elif result_types == {"skip"}:
         outcome = "SKIP"
     elif result_types:
         outcome = "FAIL"
@@ -317,7 +317,7 @@ def write_case_end(status, api_config_str, *, duration_ms=None):
         outcome = status.upper()
     final_result, final_dimensions = _get_final_case_result(api_config_str, result_types)
     _print_case_comparison_summary()
-    if final_result not in (None, "pass", "skip", "memory_skip") and final_dimensions:
+    if final_result not in (None, "pass", "skip") and final_dimensions:
         print(
             f"> FINAL RESULT | {final_result} | dimensions {','.join(final_dimensions)}",
             flush=True,

@@ -818,6 +818,24 @@ def _choice_shape(shape, *, scalar_empty):
     return scalar, normalized, 1 if scalar else int(numpy.prod(normalized))
 
 
+def resolve_input_backend_name() -> str:
+    """返回环境配置最终选择的输入 backend 名称。"""
+    # 解析逻辑独立于 backend 实例创建，供输入生成和分配前显存预检共享。
+    # cached NumPy 的契约优先级最高，不能让显式原生 backend 绕过缓存语义。
+    requested = os.environ.get(INPUT_BACKEND_ENV_VAR)
+    normalized_requested = (requested or "numpy").strip().lower()
+    if _env_flag("USE_CACHED_NUMPY"):
+        normalized = "numpy"
+    elif _env_flag("USE_GPU_MODE") and requested is None:
+        # GPU mode 的默认 Torch backend 是零拷贝物化模型成立的协议前提。
+        normalized = "torch"
+    else:
+        normalized = normalized_requested
+    if normalized not in {"numpy", "torch", "paddle"}:
+        raise ValueError(f"unsupported input generation backend: {requested!r}")
+    return normalized
+
+
 def create_input_backend(input_random_state=INPUT_NUMPY_RANDOM_STATE) -> InputBackend:
     global _WARNED_CACHED_INPUT_BACKEND
 
@@ -835,14 +853,7 @@ def create_input_backend(input_random_state=INPUT_NUMPY_RANDOM_STATE) -> InputBa
             warnings.warn(message, RuntimeWarning, stacklevel=2)
             print(f"[WARNING] {message}", file=sys.stderr, flush=True)
             _WARNED_CACHED_INPUT_BACKEND = True
-        normalized = "numpy"
-    elif use_gpu_mode and requested is None:
-        normalized = "torch"
-    else:
-        normalized = normalized_requested
-
-    if normalized not in {"numpy", "torch", "paddle"}:
-        raise ValueError(f"unsupported input generation backend: {requested!r}")
+    normalized = resolve_input_backend_name()
 
     device = {
         "numpy": "cpu",

@@ -6,6 +6,7 @@ from .backend import (
     PaddleInputBackend,
     TorchInputBackend,
     create_input_backend,
+    resolve_input_backend_name,
 )
 from .tensor_config import (
     USE_CACHED_NUMPY,
@@ -24,6 +25,7 @@ __all__ = [
     "PaddleInputBackend",
     "TorchInputBackend",
     "create_input_backend",
+    "resolve_input_backend_name",
     "cached_numpy",
     "get_cached_numpy_array",
 ]

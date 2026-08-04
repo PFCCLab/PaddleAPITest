@@ -122,6 +122,10 @@ class GpuMemoryState:
     live_budget_bytes: int
 
 
+class GpuMemoryGuardSkip(RuntimeError):
+    """运行时已知驻留集合无法安全放入目标 GPU。"""
+
+
 @dataclass(frozen=True)
 class OutputGradSlot:
     seed_numpy: object | None = None
@@ -433,11 +437,46 @@ class APITestBase:
             check_grad=self.need_check_grad(),
         )
         if not decision.should_skip:
-            return True
+            # 预检按总容量准入；首次分配前按计算卡公共阶段峰值释放上个 case 的跨框架缓存。
+            # 双卡可选 plan 描述后续驻留策略，不属于首次输入分配必须同时满足的集合。
+            compute_stages = tuple(
+                stage
+                for stage in getattr(decision.estimate, "stages", ())
+                if stage.device == "compute" and stage.plan is None
+            )
+            required_headroom_bytes = max(
+                (stage.total_bytes for stage in compute_stages),
+                default=0,
+            )
+            if required_headroom_bytes > 0:
+                runtime_decision = gpu_mode_memory_decision(
+                    self.gpu_mode_config,
+                    required_headroom_bytes=required_headroom_bytes,
+                )
+                if runtime_decision.cleanup_performed:
+                    self.record_memory_governance_metric("preflight_cache_release")
+                # 静态预算使用整卡容量；这里只拒绝清缓存后物理 free 仍放不下的已知峰值。
+                # 驱动查询不可用时保持静态判定，避免监控故障改变合法 case 的测试分类。
+                physical_free_bytes = runtime_decision.free_after_bytes
+                if (
+                    physical_free_bytes is not None
+                    and required_headroom_bytes > physical_free_bytes
+                ):
+                    message = (
+                        f"mode={mode}, stage=runtime_headroom, device=compute, "
+                        f"estimated_peak={required_headroom_bytes / _GIB:.2f} GiB, "
+                        f"physical_free={physical_free_bytes / _GIB:.2f} GiB, "
+                        "basis=post_cleanup_physical_headroom"
+                    )
+                else:
+                    return True
+            else:
+                return True
+        else:
+            message = decision.message()
         self.record_memory_governance_metric("memory_preflight_skip")
-        message = decision.message()
-        self.report_case_result("memory_skip", phase="preflight", message=message)
-        self.dump_finalize("memory_skip", memory_preflight=message)
+        self.report_case_result("skip", phase="preflight", message=message)
+        self.dump_finalize("skip", memory_preflight=message)
         return False
 
     def reset_random_state(self, seed=None):
@@ -1712,9 +1751,8 @@ class APITestBase:
                 except Exception:
                     pass
                 if insufficient_dual_headroom:
-                    raise RuntimeError(
-                        "[torch_assert_OOM] comparison card lacks the reserved headroom "
-                        "for a bounded GPU comparison"
+                    raise GpuMemoryGuardSkip(
+                        "comparison GPU capacity guard: no reserved headroom for bounded compare"
                     )
             if self._should_chunk_accuracy_compare(estimated_temp_bytes, working_bytes):
                 self.record_memory_governance_metric("chunk_compare")
