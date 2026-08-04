@@ -657,7 +657,10 @@ def run_background(
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="PaddleAPITest runner")
+    parser = argparse.ArgumentParser(
+        description="PaddleAPITest runner",
+        epilog="未识别的参数会自动透传给 engine；-- 后透传的旧写法也仍然支持。",
+    )
     parser.add_argument("-c", "--config", default=str(DEFAULT_CONFIG), help="YAML 任务配置文件")
     parser.add_argument("--stop", action="store_true", help="终止后台任务")
     parser.add_argument("--status", action="store_true", help="查看后台任务状态")
@@ -702,8 +705,10 @@ def parse_args() -> argparse.Namespace:
         default=[],
         help="追加或覆盖 engine 参数 KEY=VALUE",
     )
-    parser.add_argument("passthrough", nargs=argparse.REMAINDER, help="-- 后原样透传给 engine")
-    return parser.parse_args()
+    # 未声明参数属于 engine 协议，不能在外层入口提前拒绝。
+    args, passthrough = parser.parse_known_args()
+    args.passthrough = passthrough
+    return args
 
 
 def run_once(

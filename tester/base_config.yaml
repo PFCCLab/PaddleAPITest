@@ -508,6 +508,7 @@ forward_only_apis:
   - print
   - prior_box
   - prune_gate_by_capacity
+  - put_along_axis_
   - pull_box_sparse
   - push_dense
   - push_sparse_v2
@@ -569,6 +570,7 @@ forward_only_apis:
   - tril_indices
   - triu_indices
   - truncated_gaussian_random
+  - trunc_normal_
   - uniform
   - uniform_random_batch_size_like
   - unique
