@@ -14,6 +14,8 @@ def _torch_dtype_maps():
     # 本模块也被 Paddle-only 的 TensorConfig 导入，因此 Torch 必须停留在调用边界内。
     import torch
 
+    # 延迟导入保持 Paddle-only 启动路径不依赖 Torch 动态库。
+
     # 名称映射同时接受配置规范名和历史简写，不能只保留 torch.dtype 的标准拼写。
     by_name = MappingProxyType(
         {
@@ -99,6 +101,7 @@ def _dtype_name(value: Any) -> str | None:
 
 
 def to_torch_dtype(value: Any, *, strict: bool = True) -> Any:
+    # 统一从名称和值两条入口解析，保证配置文本与运行时 dtype 行为一致。
     # 调用该 API 即进入 Torch 语义；Paddle-only 路径不得为了类型预判调用它。
     torch, by_name, by_value = _torch_dtype_maps()
     if value is None or isinstance(value, torch.dtype):

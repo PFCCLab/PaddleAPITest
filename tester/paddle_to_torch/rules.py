@@ -6745,7 +6745,7 @@ if not isinstance(num_or_sections, int):
 """
         core = """
 if isinstance(num_or_sections, int):
-    result = torch.split(x, x.shape[axis] // num_or_sections, dim=axis)
+    result = torch.tensor_split(x, num_or_sections, dim=axis)
 else:
     result = torch.split(x, num_or_sections, dim=axis)
 """
@@ -9019,6 +9019,25 @@ transpose_y = transpose_y
 
 x_mat = x.mT if transpose_x else x
 y_mat = y.mT if transpose_y else y
+
+# meta 张量只推导广播后的输出形状，不会为真实计算分配显存。
+try:
+    expected_dout_shape = torch.matmul(
+        torch.empty(tuple(x_mat.shape), device="meta"),
+        torch.empty(tuple(y_mat.shape), device="meta"),
+    ).shape
+except (RuntimeError, ValueError) as err:
+    raise ValueError(
+        f"matmul_grad received incompatible x/y shapes: "
+        f"{tuple(x.shape)} and {tuple(y.shape)}"
+    ) from err
+if tuple(dout.shape) != tuple(expected_dout_shape):
+    # 反向输入必须与前向 matmul 的输出逐维一致，避免后续报出误导性错误。
+    raise ValueError(
+        f"matmul_grad expected dout shape {tuple(expected_dout_shape)}, "
+        f"but got {tuple(dout.shape)}"
+    )
+
 matmul_backward_success = False
 try:
     dx_mat, dy_mat = torch.ops.aten.matmul_backward(dout, x_mat, y_mat, [True, True])
@@ -9035,6 +9054,14 @@ if not matmul_backward_success:
     dy_mat = torch.matmul(x_mat.mT, dout)
     dx = dx_mat.mT if transpose_x else dx_mat
     dy = dy_mat.mT if transpose_y else dy_mat
+
+if tuple(dx.shape) != tuple(x.shape) or tuple(dy.shape) != tuple(y.shape):
+    # aten fallback 可接受部分广播形状，返回前需恢复 Paddle 梯度接口的严格契约。
+    raise ValueError(
+        "matmul_grad produced invalid gradient shapes: "
+        f"dx={tuple(dx.shape)}, expected {tuple(x.shape)}; "
+        f"dy={tuple(dy.shape)}, expected {tuple(y.shape)}"
+    )
 
 result = [dx, dy]
 """
@@ -9297,11 +9324,38 @@ elif op_name in ("fused_swiglu_probs_bwd", "paddlefleet_fused_swiglu_probs_bwd")
     do2_s  = arg2
     probs  = arg3
     inplace_flag = bool(arg4) if arg4 is not None else False
+
+    # 此自定义 CUDA 内核只定义 bf16 激活和 fp32 概率的组合。
+    if o1.ndim < 1 or do2_s.ndim < 1:
+        raise ValueError("fused_swiglu_probs_bwd expects o1 and do2_s to have rank >= 1")
+    if o1.dtype != torch.bfloat16 or do2_s.dtype != torch.bfloat16:
+        raise TypeError("fused_swiglu_probs_bwd expects bfloat16 o1 and do2_s")
+    if probs.dtype != torch.float32:
+        raise TypeError("fused_swiglu_probs_bwd expects float32 unzipped_probs")
+    if tuple(o1.shape[:-1]) != tuple(do2_s.shape[:-1]):
+        raise ValueError(
+            "fused_swiglu_probs_bwd expects matching o1/do2_s outer shapes, "
+            f"but got {tuple(o1.shape)} and {tuple(do2_s.shape)}"
+        )
     H2 = o1.shape[-1]
     H = H2 // 2
+    # 最后一维将 o1 均分为 SwiGLU 的 gate/value，两部分必须与上游梯度对齐。
+    if H <= 0:
+        raise ValueError(f"moe_intermediate_size must be > 0, but got {H}")
+    if H2 != H * 2 or do2_s.shape[-1] != H:
+        raise ValueError(
+            "fused_swiglu_probs_bwd expects o1.shape[-1] == "
+            f"2 * do2_s.shape[-1], but got {H2} and {do2_s.shape[-1]}"
+        )
     outer = 1
     for _s in o1.shape[:-1]:
         outer *= _s
+    # 每个外层位置恰好使用一个解压概率，禁止依赖隐式广播掩盖配置错误。
+    if probs.numel() != outer:
+        raise ValueError(
+            f"fused_swiglu_probs_bwd expects {outer} probabilities, "
+            f"but got {probs.numel()}"
+        )
 
     # Paddle 的 SwigluProbsGradCUDABackward:
     #   do1      = inplace ? o1    : empty_like(o1)

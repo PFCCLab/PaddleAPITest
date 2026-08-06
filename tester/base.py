@@ -192,6 +192,7 @@ def gpu_mode_memory_decision(
     required_headroom_bytes=None,
     use_torch=True,
 ):
+    # 该入口统一承载 Paddle-only 与 Accuracy 两种显存治理协议。
     """Release idle allocator blocks and decide whether live result trees must spill."""
     if not gpu_config.enabled:
         return GpuMemoryDecision()

@@ -359,6 +359,7 @@ def estimate_gpu_memory(api_config, mode, *, check_grad, input_backend="torch"):
 
 
 def decide_gpu_memory_preflight(api_config, mode, gpu_config, *, check_grad):
+    # 预检只做 admission decision，不分配测试 Tensor，失败结果由调用方转换为 skip。
     """仅当配置峰值下界明显超过设备容量时返回 skip。"""
     if not gpu_config.enabled:
         return GpuMemoryPreflightDecision(False, reason="GPU mode disabled")

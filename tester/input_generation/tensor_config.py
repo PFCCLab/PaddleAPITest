@@ -678,5 +678,6 @@ def tensor_config_tree_numel(*roots):
 
 
 def tensor_config_tree_nbytes(*roots, storage=True):
+    # 估算树大小只依赖静态 shape/dtype，避免预检阶段触发真实显存分配。
     """汇总配置树中唯一 TensorConfig 的逻辑或 storage 字节数。"""
     return sum(config.nbytes(storage=storage) for config in iter_unique_tensor_configs(*roots))

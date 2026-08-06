@@ -1,0 +1,4 @@
+interface:
+  display_name: "Optimize API Seq Derivation"
+  short_description: "Optimize cross-model API seq derivation accuracy"
+  default_prompt: "Use $optimize-api-seq-derivation to optimize and validate cross-model API sequence configuration derivation."

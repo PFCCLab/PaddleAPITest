@@ -65,6 +65,7 @@ class APITestAccuracy(APITestBase):
     def _should_spill_torch_result_tree(
         self, convert_result, torch_output, torch_out_grads, probe_bytes
     ):
+        # 保留输出树与参考工作区的联合预算，避免比较阶段瞬时超出显存余量。
         retained_tree_bytes = self.tensor_tree_nbytes((torch_output, torch_out_grads))
         reference_workspace_bytes = self._reference_workspace_bytes(convert_result)
         return gpu_mode_memory_decision(
@@ -80,6 +81,7 @@ class APITestAccuracy(APITestBase):
         ).should_spill
 
     def _prepare_torch_result_tree(self, value, *, keep_on_device):
+        # Torch 结果树的驻留策略必须先于递归转换确定，避免中途产生不可回收副本。
         if isinstance(value, (torch.return_types.max, torch.return_types.min)):
             value = value.values
         if isinstance(value, torch.Tensor):
@@ -160,6 +162,7 @@ class APITestAccuracy(APITestBase):
         self.clear_output_grad_cache()
 
     def _compare_accuracy_tree(self, actual, expected, tensor_index=0, tensor_count=None):
+        # 递归比较沿用统一的索引上下文，便于错误日志定位到嵌套输出位置。
         tensor_types = (paddle.Tensor, torch.Tensor)
 
         def compare_leaf(left, right, index, count):
@@ -424,6 +427,7 @@ class APITestAccuracy(APITestBase):
         return torch_output, torch_out_grads
 
     def get_paddle_output(self):
+        # Paddle 侧必须在 Torch 结果清理后开始，避免两套 runtime 同时持有峰值数据。
         try:
             if not self.build_paddle_input():
                 self.report_case_result("paddle_error", "build_paddle_input failed")
