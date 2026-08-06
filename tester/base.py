@@ -4,6 +4,7 @@ import collections
 import gc
 import os
 from dataclasses import dataclass
+from pathlib import Path
 
 import numpy
 import paddle
@@ -11,9 +12,14 @@ import yaml
 
 from .dtype_utils import to_torch_dtype
 from .dump_writer import DEFAULT_DUMP_DIR, DumpContext, dump_enabled
-from .gpu_memory_preflight import GpuMemoryDeferred, decide_gpu_memory_preflight
+from .gpu_memory_preflight import (
+    GpuMemoryDeferred,
+    decide_gpu_memory_preflight,
+    requires_inplace_input_copy,
+)
 from .input_generation.binding import bind_input_parameters
 from .input_generation.tensor_config import (
+    AUTOGRAD_DTYPES,
     TensorConfig,
     dtype_element_size,
     dtype_name,
@@ -26,7 +32,9 @@ from .log_writer.log_comparison import log_accuracy_tolerance
 from .log_writer.log_schema import MAX_CSV_CONFIG_LENGTH
 from .runtime_config import TestRuntimeConfig
 
-with open("tester/base_config.yaml", encoding="utf-8") as f:
+_TESTER_DIR = Path(__file__).resolve().parent
+
+with (_TESTER_DIR / "base_config.yaml").open(encoding="utf-8") as f:
     config = yaml.safe_load(f)
 
 forward_only_apis = frozenset(config.get("forward_only_apis", []))
@@ -38,7 +46,7 @@ paddle_error_dismiss = {}  # disabled: covered by the unified runtime error repo
 # paddle_error_dismiss = config.get("paddle_error_dismiss", {})
 special_accuracy_atol_rtol = config.get("special_accuracy_atol_rtol", {})
 
-with open("tester/api_config/torch_error_skip.txt") as f:
+with (_TESTER_DIR / "api_config" / "torch_error_skip.txt").open(encoding="utf-8") as f:
     torch_error_skip = frozenset(line.strip() for line in f if line.strip())
 
 del config
@@ -74,17 +82,9 @@ CUDA_OOM = frozenset(
 
 
 GPU_MEMORY_PROBE_MIN_BYTES = 256 << 20
+COMPARISON_WORKSPACE_FAST_PATH_BYTES = 256 << 20
+DEFAULT_COMPARISON_WORKSPACE_BYTES = 1 << 30
 _GIB = 1024**3
-_OUTPUT_GRAD_DTYPES = frozenset(
-    [
-        "float16",
-        "float32",
-        "float64",
-        "bfloat16",
-        "complex64",
-        "complex128",
-    ]
-)
 
 
 def _dtype_element_size(dtype):
@@ -155,21 +155,29 @@ def _gpu_memory_is_under_pressure(gpu_config, free_bytes, total_bytes, required_
     return over_budget or low_free or insufficient_headroom
 
 
-def _release_gpu_allocator_caches(torch_module):
+def _release_gpu_allocator_caches(torch_module=None):
+    # torch_module=None 是 Paddle-only 协议值，不表示 Torch 查询失败后的隐式降级。
     gc.collect()
-    try:
-        torch_module.cuda.empty_cache()
-    except Exception:
-        pass
+    if torch_module is not None:
+        try:
+            torch_module.cuda.empty_cache()
+        except Exception:
+            pass
     try:
         paddle.device.cuda.empty_cache()
     except Exception:
         pass
 
 
-def _query_gpu_memory(torch_module):
+def _query_gpu_memory(torch_module=None):
     try:
-        free_bytes, total_bytes = torch_module.cuda.mem_get_info()
+        if torch_module is not None:
+            # Accuracy 需要查询 Tensor 实际所在的 CUDA runtime，仍由 Torch 提供快照。
+            free_bytes, total_bytes = torch_module.cuda.mem_get_info()
+        else:
+            # Paddle-only 不能借显存探测间接加载 Torch，统一使用当前 Paddle 设备。
+            free_bytes = paddle.base.core.gpu_memory_available()
+            total_bytes = paddle.device.cuda.get_device_properties().total_memory
         return int(free_bytes), int(total_bytes)
     except Exception:
         return None
@@ -182,6 +190,7 @@ def gpu_mode_memory_decision(
     probe_bytes=None,
     retained_tree_bytes=0,
     required_headroom_bytes=None,
+    use_torch=True,
 ):
     """Release idle allocator blocks and decide whether live result trees must spill."""
     if not gpu_config.enabled:
@@ -196,9 +205,14 @@ def gpu_mode_memory_decision(
     if not force and decision_probe_bytes < GPU_MEMORY_PROBE_MIN_BYTES:
         return GpuMemoryDecision(required_headroom_bytes=required_headroom_bytes)
 
-    try:
-        import torch as torch_module
-    except (ImportError, OSError):
+    torch_module = None
+    if use_torch:
+        # 只有声明使用 Torch 的模式才允许触发依赖加载。
+        try:
+            import torch as torch_module
+        except (ImportError, OSError):
+            torch_module = None
+    if use_torch and torch_module is None:
         if force:
             gc.collect()
             try:
@@ -294,6 +308,7 @@ class APITestBase:
     def __init__(self, api_config, use_torch=True, runtime_config=None):
         self.api_config = api_config
         self.api_config.use_torch = use_torch
+        self.use_torch = bool(use_torch)
         self.runtime_config = runtime_config or TestRuntimeConfig()
         self.gpu_mode_config = self.runtime_config.gpu_mode
         self.memory_governance_metrics = collections.Counter()
@@ -306,6 +321,8 @@ class APITestBase:
         )
         self.output_grad_slots = []
         self.output_grad_slots_signature = None
+        # 同一 case 的结果树共享设备快照，避免每个叶子重复查询 CUDA allocator。
+        self.comparison_workspace_cache = {}
         if use_torch:
             torch.set_num_threads(8)
             torch.set_printoptions(threshold=100, linewidth=120)
@@ -317,6 +334,9 @@ class APITestBase:
         with self.dump_context.tee_output():
             try:
                 return self.test()
+            except GpuMemoryDeferred:
+                # deferred 属于 worker 重试协议，不能固化为本次 case 的错误终态。
+                raise
             except Exception as err:
                 if self.dump_context._data.get("status") is None:
                     self.dump_finalize("engine_error", error=str(err))
@@ -434,6 +454,7 @@ class APITestBase:
                 runtime_decision = gpu_mode_memory_decision(
                     self.gpu_mode_config,
                     required_headroom_bytes=required_headroom_bytes,
+                    use_torch=self.use_torch,
                 )
                 if runtime_decision.cleanup_performed:
                     self.record_memory_governance_metric("preflight_cache_release")
@@ -478,12 +499,13 @@ class APITestBase:
                     pass
         except Exception:
             pass
-        try:
-            torch.manual_seed(seed)
-            if torch.cuda.is_available():
-                torch.cuda.manual_seed_all(seed)
-        except Exception:
-            pass
+        if self.use_torch:
+            try:
+                torch.manual_seed(seed)
+                if torch.cuda.is_available():
+                    torch.cuda.manual_seed_all(seed)
+            except Exception:
+                pass
 
     def clear_runtime_inputs(self, framework):
         """Release one framework's generated inputs after an execution."""
@@ -709,9 +731,7 @@ class APITestBase:
         # so the in-place op doesn't hit "Leaf Var can't use inplace strategy".
         # (Previously guarded by need_check_grad(), but forward_only in-place ops
         # still need the copy to avoid Paddle's leaf-variable restriction.)
-        if (
-            self.api_config.api_name[-1] == "_" and self.api_config.api_name[-2:] != "__"
-        ) or self.api_config.api_name == "paddle.Tensor.__setitem__":
+        if requires_inplace_input_copy(self.api_config):
             self.paddle_args, self.paddle_kwargs = self.copy_paddle_input()
 
         return True
@@ -728,17 +748,34 @@ class APITestBase:
         kwargs = collections.OrderedDict((k, _deep_copy(v)) for k, v in self.paddle_kwargs.items())
         return args, kwargs
 
+    def _iter_tensor_tree_leaves(self, value, *, tensor_type=None, unique=False):
+        if tensor_type is None:
+            # Paddle-only 的默认遍历类型不能为了构造 tuple 而解析 Torch lazy proxy。
+            tensor_type = (
+                (paddle.Tensor, torch.Tensor) if getattr(self, "use_torch", True) else paddle.Tensor
+            )
+        seen = set()
+
+        def visit(item):
+            if isinstance(item, tensor_type):
+                if unique and id(item) in seen:
+                    return
+                if unique:
+                    seen.add(id(item))
+                yield item
+                return
+            if isinstance(item, (list, tuple)):
+                for child in item:
+                    yield from visit(child)
+                return
+            if isinstance(item, dict):
+                for child in item.values():
+                    yield from visit(child)
+
+        yield from visit(value)
+
     def _collect_tensor_leaves(self, value, result, tensor_type):
-        if isinstance(value, tensor_type):
-            result.append(value)
-            return
-        if isinstance(value, (list, tuple)):
-            for item in value:
-                self._collect_tensor_leaves(item, result, tensor_type)
-            return
-        if isinstance(value, dict):
-            for item in value.values():
-                self._collect_tensor_leaves(item, result, tensor_type)
+        result.extend(self._iter_tensor_tree_leaves(value, tensor_type=tensor_type))
 
     def get_paddle_input_list(self):
         result = []
@@ -862,10 +899,10 @@ class APITestBase:
         if not self.gpu_mode_config.enabled:
             return False
         dtype = _dtype_name(output.dtype)
-        if isinstance(output, torch.Tensor):
-            return output.device.type != "cpu" and dtype in _OUTPUT_GRAD_DTYPES
         if isinstance(output, paddle.Tensor):
-            return output.place.is_gpu_place() and dtype in _OUTPUT_GRAD_DTYPES
+            return output.place.is_gpu_place() and dtype in AUTOGRAD_DTYPES
+        if self.use_torch and isinstance(output, torch.Tensor):
+            return output.device.type != "cpu" and dtype in AUTOGRAD_DTYPES
         return False
 
     @staticmethod
@@ -874,15 +911,15 @@ class APITestBase:
 
     @staticmethod
     def _tensor_matches_output_place(tensor, output):
-        if isinstance(tensor, torch.Tensor) and isinstance(output, torch.Tensor):
-            tensor_device = 0 if tensor.device.index is None else int(tensor.device.index)
-            output_device = 0 if output.device.index is None else int(output.device.index)
-            return tensor.device.type == output.device.type and tensor_device == output_device
         if isinstance(tensor, paddle.Tensor) and isinstance(output, paddle.Tensor):
             if tensor.place.is_cpu_place() and output.place.is_cpu_place():
                 return True
             if tensor.place.is_gpu_place() and output.place.is_gpu_place():
                 return int(tensor.place.gpu_device_id()) == int(output.place.gpu_device_id())
+        if isinstance(tensor, torch.Tensor) and isinstance(output, torch.Tensor):
+            tensor_device = 0 if tensor.device.index is None else int(tensor.device.index)
+            output_device = 0 if output.device.index is None else int(output.device.index)
+            return tensor.device.type == output.device.type and tensor_device == output_device
         return False
 
     def _make_gpu_paddle_output_grad_slot(self, output):
@@ -966,12 +1003,12 @@ class APITestBase:
             self.output_grad_slots = []
             for output in result_outputs:
                 if self._use_gpu_output_grad(output):
-                    if isinstance(output, torch.Tensor):
-                        self.output_grad_slots.append(self._make_gpu_output_grad_pair_slot(output))
-                    else:
+                    if isinstance(output, paddle.Tensor):
                         self.output_grad_slots.append(
                             self._make_gpu_paddle_output_grad_slot(output)
                         )
+                    else:
+                        self.output_grad_slots.append(self._make_gpu_output_grad_pair_slot(output))
                 else:
                     self.output_grad_slots.append(
                         OutputGradSlot(seed_numpy=self._make_numpy_output_grad(output))
@@ -1023,19 +1060,10 @@ class APITestBase:
                 else:
                     raise ValueError("outputs format not support")
 
-        paddle_autograd_dtypes = {
-            "float16",
-            "float32",
-            "float64",
-            "bfloat16",
-            "complex64",
-            "complex128",
-        }
         result_outputs = [
             output
             for output in result_outputs
-            if not output.stop_gradient
-            and str(output.dtype).split(".")[-1] in paddle_autograd_dtypes
+            if not output.stop_gradient and str(output.dtype).split(".")[-1] in AUTOGRAD_DTYPES
         ]
 
         self._prepare_output_grad_slots(result_outputs)
@@ -1117,9 +1145,7 @@ class APITestBase:
                 convert_dtype=key == "dtype",
             )
 
-        if (
-            self.api_config.api_name[-1] == "_" and self.api_config.api_name[-2:] != "__"
-        ) or self.api_config.api_name == "paddle.Tensor.__setitem__":
+        if requires_inplace_input_copy(self.api_config):
             self.torch_args, self.torch_kwargs = self.copy_torch_input()
 
         if not self.gpu_mode_config.enabled:
@@ -1502,6 +1528,101 @@ class APITestBase:
             error_msg,
         )
 
+    @staticmethod
+    def _comparison_cuda_device_id(value):
+        if isinstance(value, torch.Tensor):
+            if value.device.type != "cuda":
+                return None
+            return 0 if value.device.index is None else int(value.device.index)
+        if isinstance(value, paddle.Tensor) and value.place.is_gpu_place():
+            return int(value.place.gpu_device_id())
+        return None
+
+    @staticmethod
+    def _comparison_temporary_bytes(actual, expected):
+        return int(actual.numel()) * max(
+            32,
+            4 * max(_tensor_element_size(actual), _tensor_element_size(expected)) + 16,
+        )
+
+    def _resolve_comparison_workspace(self, actual, estimated_temp_bytes, dual_gpu):
+        """按实际比较设备解析并缓存 bounded compare 工作区。"""
+        estimated_temp_bytes = max(0, int(estimated_temp_bytes))
+        device_id = self._comparison_cuda_device_id(actual)
+        if device_id is None:
+            return DEFAULT_COMPARISON_WORKSPACE_BYTES
+        if estimated_temp_bytes <= COMPARISON_WORKSPACE_FAST_PATH_BYTES:
+            # 独占设备上的小比较不做驱动探测，避免大量小叶子产生同步查询。
+            return DEFAULT_COMPARISON_WORKSPACE_BYTES
+
+        cache = getattr(self, "comparison_workspace_cache", None)
+        if cache is None:
+            cache = self.comparison_workspace_cache = {}
+        cache_key = (device_id, bool(dual_gpu))
+        # estimated/numel 与比较内核的 per-element 估算同源，避免另设固定最小块。
+        min_working_bytes = max(
+            1,
+            estimated_temp_bytes // max(1, int(actual.numel())),
+        )
+        if cache_key in cache:
+            # dtype 不同会改变单元素临时量，因此复用设备快照时仍保留当前最小推进量。
+            return max(min_working_bytes, cache[cache_key])
+
+        try:
+            # 同一 case 首次遇到大比较时读取一次物理快照，后续叶子只复用结果。
+            free_bytes, total_bytes = torch.cuda.mem_get_info(device_id)
+            memory_budget = float(getattr(self.gpu_mode_config, "memory_budget", 0.0) or 0.0)
+            comparison_device_id = getattr(self.gpu_mode_config, "comparison_device_id", None)
+            if device_id == comparison_device_id:
+                memory_budget = float(
+                    getattr(
+                        self.gpu_mode_config,
+                        "comparison_memory_budget",
+                        memory_budget,
+                    )
+                    or memory_budget
+                )
+
+            if dual_gpu:
+                # comparison 卡独占一个 worker，但仍要保留运行时和框架 allocator reserve。
+                budget_bytes = int(memory_budget * _GIB) if memory_budget > 0 else 0
+                reserve_bytes = self._gpu_safety_reserve_bytes(total_bytes, budget_bytes)
+                working_bytes = self._comparison_workspace_bytes(
+                    free_bytes,
+                    reserve_bytes,
+                    dual_gpu=True,
+                )
+            else:
+                # memory_reserved 代表本 worker 的 Torch allocator footprint，用于约束新增块。
+                reserved_bytes = torch.cuda.memory_reserved(torch.device("cuda", device_id))
+                working_bytes = self._comparison_workspace_bytes(free_bytes)
+                if memory_budget > 0:
+                    # 单卡只允许预算余量的四分之一用于比较；零余量仅保留单元素推进量。
+                    budget_headroom = max(0, int(memory_budget * _GIB) - reserved_bytes)
+                    working_bytes = min(
+                        working_bytes,
+                        max(min_working_bytes, budget_headroom // 4),
+                    )
+        except Exception:
+            # 查询失败不能放大到 1 GiB；保守分块仍允许 best-effort 继续执行。
+            # 失败结果也写入 case cache，避免后续每个叶子重复触发同一个驱动异常。
+            # 该降级路径不再依赖额外的驱动调用，优先保证比较可以继续推进。
+            working_bytes = max(
+                min_working_bytes,
+                min(COMPARISON_WORKSPACE_FAST_PATH_BYTES, estimated_temp_bytes),
+            )
+            cache[cache_key] = working_bytes
+            return working_bytes
+
+        if dual_gpu and working_bytes < min_working_bytes:
+            # 双卡结果已经搬运到 comparison 卡，无法退回 CPU 或切换设备继续比较。
+            raise GpuMemoryGuardSkip(
+                "comparison GPU capacity guard: no reserved headroom for bounded compare"
+            )
+        working_bytes = max(min_working_bytes, working_bytes)
+        cache[cache_key] = working_bytes
+        return working_bytes
+
     def torch_assert_accuracy(
         self,
         actual,
@@ -1578,7 +1699,12 @@ class APITestBase:
                 )
 
             try:
-                working_bytes = int(getattr(self, "comparison_working_bytes", 1024**3))
+                estimated_temp_bytes = self._comparison_temporary_bytes(actual, expected)
+                working_bytes = self._resolve_comparison_workspace(
+                    actual,
+                    estimated_temp_bytes,
+                    dual_gpu,
+                )
                 self._torch_assert_accuracy_in_logical_slabs(
                     actual,
                     expected,
@@ -1680,61 +1806,15 @@ class APITestBase:
             )
 
         try:
-            working_bytes = 1024**3
-            estimated_temp_bytes = actual_tensor.numel() * max(
-                32,
-                4 * max(actual_tensor.element_size(), expected_tensor.element_size()) + 16,
+            estimated_temp_bytes = self._comparison_temporary_bytes(
+                actual_tensor,
+                expected_tensor,
             )
-            # Small tensors always use torch.testing.assert_close directly. Avoid
-            # querying the CUDA driver for a working budget on that hot path.
-            needs_chunk_budget = estimated_temp_bytes > working_bytes
-            if actual_tensor.is_cuda and needs_chunk_budget:
-                insufficient_dual_headroom = False
-                try:
-                    free_bytes, total_bytes = torch.cuda.mem_get_info(actual_tensor.device.index)
-                    min_working_bytes = 256 * 1024**2
-                    memory_budget = float(
-                        getattr(self.gpu_mode_config, "memory_budget", 0.0) or 0.0
-                    )
-                    comparison_device_id = getattr(
-                        self.gpu_mode_config, "comparison_device_id", None
-                    )
-                    if actual_tensor.device.index == comparison_device_id:
-                        memory_budget = float(
-                            getattr(
-                                self.gpu_mode_config,
-                                "comparison_memory_budget",
-                                memory_budget,
-                            )
-                            or memory_budget
-                        )
-
-                    if dual_gpu:
-                        budget_bytes = int(memory_budget * (1024**3)) if memory_budget > 0 else 0
-                        reserve_bytes = self._gpu_safety_reserve_bytes(total_bytes, budget_bytes)
-                        working_bytes = self._comparison_workspace_bytes(
-                            free_bytes, reserve_bytes, dual_gpu=True
-                        )
-                        insufficient_dual_headroom = working_bytes == 0
-                    else:
-                        reserved_bytes = torch.cuda.memory_reserved(actual_tensor.device)
-                        working_bytes = self._comparison_workspace_bytes(free_bytes)
-
-                    if memory_budget > 0 and not dual_gpu:
-                        budget_headroom = max(
-                            0,
-                            int(memory_budget * (1024**3)) - reserved_bytes,
-                        )
-                        working_bytes = min(
-                            working_bytes,
-                            max(min_working_bytes, budget_headroom // 4),
-                        )
-                except Exception:
-                    pass
-                if insufficient_dual_headroom:
-                    raise GpuMemoryGuardSkip(
-                        "comparison GPU capacity guard: no reserved headroom for bounded compare"
-                    )
+            working_bytes = self._resolve_comparison_workspace(
+                actual_tensor,
+                estimated_temp_bytes,
+                dual_gpu,
+            )
             if self._should_chunk_accuracy_compare(estimated_temp_bytes, working_bytes):
                 self.record_memory_governance_metric("chunk_compare")
                 self._torch_assert_accuracy_in_chunks(
@@ -1823,6 +1903,7 @@ class APITestBase:
 
     def _should_chunk_accuracy_compare(self, estimated_temp_bytes, working_bytes):
         """Use bounded GPU workspaces when a full comparison would exceed the budget."""
+        # 只有预估临时量超过当前工作区时才切 slab，避免小比较引入额外 kernel 调度。
         return bool(estimated_temp_bytes > working_bytes)
 
     @staticmethod
@@ -1863,7 +1944,7 @@ class APITestBase:
         if not self._clear_tensor_config_cache("clear_tensor", self.api_config):
             return
         if self.gpu_mode_config.enabled:
-            gpu_mode_memory_decision(self.gpu_mode_config)
+            gpu_mode_memory_decision(self.gpu_mode_config, use_torch=self.use_torch)
         else:
             self.release_framework_gpu_cache()
 
@@ -1886,7 +1967,9 @@ class APITestBase:
         return True
 
     def _map_tensor_tree(self, value, tensor_mapper):
-        if isinstance(value, (torch.Tensor, paddle.Tensor)):
+        if isinstance(value, paddle.Tensor):
+            return tensor_mapper(value)
+        if self.use_torch and isinstance(value, torch.Tensor):
             return tensor_mapper(value)
         if isinstance(value, list):
             return [self._map_tensor_tree(item, tensor_mapper) for item in value]
@@ -1917,38 +2000,23 @@ class APITestBase:
 
     def iter_unique_tensor_tree_leaves(self, value):
         """Yield unique framework tensor leaves from a result tree."""
-        seen = set()
-
-        def visit(item):
-            if isinstance(item, (torch.Tensor, paddle.Tensor)):
-                if id(item) in seen:
-                    return
-                seen.add(id(item))
-                yield item
-                return
-            if isinstance(item, (list, tuple)):
-                for child in item:
-                    yield from visit(child)
-                return
-            if isinstance(item, dict):
-                for child in item.values():
-                    yield from visit(child)
-
-        yield from visit(value)
+        yield from self._iter_tensor_tree_leaves(value, unique=True)
 
     @staticmethod
     def tensor_is_gpu(value):
-        if isinstance(value, torch.Tensor):
-            return value.device.type != "cpu"
         if isinstance(value, paddle.Tensor):
             return value.place.is_gpu_place()
+        if isinstance(value, torch.Tensor):
+            return value.device.type != "cpu"
         return False
 
     @staticmethod
     def tensor_gpu_device_id(value):
+        if isinstance(value, paddle.Tensor):
+            return int(value.place.gpu_device_id())
         if isinstance(value, torch.Tensor):
             return 0 if value.device.index is None else int(value.device.index)
-        return int(value.place.gpu_device_id())
+        raise TypeError(f"Expected Paddle or Torch tensor, but got {type(value)}")
 
     def tensor_tree_nbytes(self, value):
         """Estimate logical bytes held by unique tensor leaves in a result tree."""
@@ -2147,7 +2215,7 @@ class APITestBase:
         if not self._clear_tensor_config_cache("clear_paddle_tensor"):
             return
         if self.gpu_mode_config.enabled:
-            gpu_mode_memory_decision(self.gpu_mode_config)
+            gpu_mode_memory_decision(self.gpu_mode_config, use_torch=self.use_torch)
         else:
             self.release_framework_gpu_cache("paddle")
 

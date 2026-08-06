@@ -136,7 +136,7 @@ def _framework_live_input_bytes(config):
     return config.nbytes(storage=True)
 
 
-def _requires_inplace_input_copy(api_config):
+def requires_inplace_input_copy(api_config):
     # 与 build_*_input 的 API 判断保持同一协议，避免预检和执行路径分叉。
     api_name = getattr(api_config, "api_name", "")
     return (api_name.endswith("_") and not api_name.endswith("__")) or api_name == (
@@ -193,7 +193,7 @@ def estimate_gpu_memory(api_config, mode, *, check_grad, input_backend="torch"):
         sum(generated_value_nbytes(config) for config in configs) if native_gpu_generation else 0
     )
     # 原地 API 的 clone 是框架输入生命周期的一部分，不能留给运行时未知项。
-    force_input_copy = _requires_inplace_input_copy(api_config)
+    force_input_copy = requires_inplace_input_copy(api_config)
     torch_materialization_peak, torch_materialized_input_bytes = _framework_materialization(
         configs,
         input_backend,

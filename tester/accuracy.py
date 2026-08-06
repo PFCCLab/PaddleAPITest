@@ -119,6 +119,8 @@ class APITestAccuracy(APITestBase):
             force_log_type=force_log_type,
         )
         self.dump_finalize(log_type or default_log_type)
+        # 终态上报后立即释放共享 output-grad，避免错误 case 延长 GPU 生命周期。
+        self.clear_output_grad_cache()
         return log_type, fatal
 
     def _report_comparison_error(self, err, tensor_index=0, tensor_count=1):
@@ -130,6 +132,8 @@ class APITestAccuracy(APITestBase):
             tensor_position=f"{tensor_index + 1}/{tensor_count}",
         )
         self.dump_finalize(log_type or "paddle_accuracy")
+        # 比较失败也属于终态，不能把 output-grad seed 留给后续 case。
+        self.clear_output_grad_cache()
         if fatal or self.exit_on_error:
             raise err
 
@@ -152,6 +156,8 @@ class APITestAccuracy(APITestBase):
             error=detail_text or None,
         )
         self.dump_finalize("paddle_accuracy")
+        # 结构不匹配不会进入统一 compare 收尾，因此这里单独清理缓存。
+        self.clear_output_grad_cache()
 
     def _compare_accuracy_tree(self, actual, expected, tensor_index=0, tensor_count=None):
         tensor_types = (paddle.Tensor, torch.Tensor)
@@ -421,6 +427,7 @@ class APITestAccuracy(APITestBase):
         try:
             if not self.build_paddle_input():
                 self.report_case_result("paddle_error", "build_paddle_input failed")
+                self.clear_output_grad_cache()
                 self.dump_finalize("paddle_error")
                 return False, None
             # Torch 已完成，Paddle 输入已持有数据；生成源不再有后续消费者。
@@ -605,5 +612,7 @@ class APITestAccuracy(APITestBase):
             if not self._compare_accuracy_tree(paddle_out_grads, torch_out_grads):
                 return
 
+        # backward compare 已经消费完两侧共享的 output-grad seed。
+        self.clear_output_grad_cache()
         self.report_case_result("pass")
         self.dump_finalize("pass")
