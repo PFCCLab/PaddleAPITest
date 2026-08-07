@@ -2338,6 +2338,8 @@ def _run_single_case_mode(options, start_time):
     except ValueError as err:
         return _argument_error(str(err))
 
+    log_report.print_running_banner()
+
     # 单 case 执行与 worker 复用同样的静默 Paddle/bootstrap 路径。
     _init_runtime_modules(options)
     init_log(options.log_dir)
