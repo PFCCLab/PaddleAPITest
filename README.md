@@ -117,8 +117,8 @@ python engineV4.py \
 
 常用附加参数包括 `--test_amp`、`--test_cpu`、`--atol`、`--rtol`、`--manual_threshold_config_file`、`--bitwise_alignment`、`--timeout`、`--random_seed`、`--generate_failed_tests` 和 `--exit_on_error`。
 
-`--test_cpu=True` 唯一决定算子设备：Paddle 与 Torch 的框架输入和算子执行都切到 CPU。
-它不决定输入逻辑值的生成设备或结果比较设备，这两项只由 `--use_gpu_mode` 控制。
+`--test_cpu=True` 只将 Paddle 框架输入及前向、反向切到 CPU。Torch reference 始终在
+GPU 上执行；输入逻辑值生成设备和结果比较设备只由 `--use_gpu_mode` 控制。
 
 ## 引擎与运行入口
 
@@ -154,16 +154,16 @@ python run.py -c test_pipeline/run_config.yaml
 
 两个开关正交，四种组合的语义如下：
 
-| `test_cpu` | `use_gpu_mode` | Paddle/Torch 算子 | 输入生成与比较 |
-| --- | --- | --- | --- |
-| `False` | `False` | GPU | CPU |
-| `False` | `True` | GPU | GPU |
-| `True` | `False` | CPU | CPU |
-| `True` | `True` | CPU | GPU |
+| `test_cpu` | `use_gpu_mode` | Paddle kernel | Torch reference | 输入生成与比较 |
+| --- | --- | --- | --- | --- |
+| `False` | `False` | GPU | GPU | CPU |
+| `False` | `True` | GPU | GPU | GPU |
+| `True` | `False` | CPU | GPU | CPU |
+| `True` | `True` | CPU | GPU | GPU |
 
-组合模式 `test_cpu=True,use_gpu_mode=True` 会先在 GPU 生成逻辑输入，再物化为 CPU
-框架输入执行两侧算子，最后把结果送到 GPU 比较。纯 CPU 组合不要求 GPU；
-`accuracy_stable_dual_gpu` 仍不支持 `test_cpu=True`。
+组合模式 `test_cpu=True,use_gpu_mode=True` 会先在 GPU 生成逻辑输入，再分别物化为
+Paddle CPU 输入和 Torch GPU 输入，最后把结果送到 GPU 比较。accuracy/accuracy-stable
+始终需要 GPU 运行 Torch reference；`accuracy_stable_dual_gpu` 支持 `test_cpu=True`。
 
 GPU mode 会在输入生成前根据 TensorConfig 元数据和测试模式估算阶段存活集合。单 worker
 独占 GPU 时使用整卡容量，多 worker 共享时按 worker 数均分；只有通用下界已经超过容量的
@@ -204,10 +204,11 @@ python engineV4.py \
   --num_workers_per_gpu=1
 ```
 
-`test_cpu=True` 时两侧算子在 CPU 执行，GPU 0 仍按 GPU mode 生成逻辑输入，CPU 结果再
-搬到 GPU 1 比较。每侧 API 只执行一次；前向比较通过后才执行 Paddle backward。前向结果
-比较结束后立即释放，避免与后续双侧梯度长期重叠。该模式不进行 CPU spill、采样或跨卡
-autograd，也不能拆分单次 GPU 算子自身的 workspace 峰值。
+`test_cpu=True` 时 Paddle 在 CPU 执行，Torch reference 仍在 GPU 0 执行；GPU 0 同时按
+GPU mode 生成逻辑输入，Paddle CPU 结果再搬到 GPU 1 比较。每侧 API 只执行一次；前向
+比较通过后才执行 Paddle backward。前向结果比较结束后立即释放，避免与后续双侧梯度
+长期重叠。该模式不进行 CPU spill、采样或跨卡 autograd，也不能拆分单次 GPU kernel
+自身的 workspace 峰值。
 
 GPU 按规范化后的 `--gpu_ids` 顺序两两配对。模式要求至少两张且 GPU 总数为偶数，并要求
 `--num_workers_per_gpu=1`；单条配置默认使用 GPU 0/1。
