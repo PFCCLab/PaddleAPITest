@@ -767,11 +767,19 @@ class CrossEntropyRule(BaseRule):
         defaults_code, map_code = self.apply_generic()
         pre = """
 shp = label.shape
-if len(input.shape) > 2:
-    perm = [0] + [len(input.shape)-1]+ [i for i in range(1,len(input.shape)-1)]
-    input = input.permute(*perm)
-axis = locals().get('axis',-1)
-label = label.squeeze(-1)
+axis = locals().get('axis', -1)
+num_classes = input.shape[axis]
+if soft_label:
+    # soft label: 维持原 channels-first permute 逻辑
+    if len(input.shape) > 2:
+        perm = [0] + [len(input.shape)-1]+ [i for i in range(1,len(input.shape)-1)]
+        input = input.permute(*perm)
+    label = label.squeeze(-1)
+else:
+    # hard label: 展平成 2D [N, C], 让 torch 与 paddle 走相同的 cross_entropy kernel,
+    # 避免 [N, C, d...] 触发 torch spatial nll_loss 路径 (与 2D 路径差 ~1 ulp, 造成假 diff)
+    input = input.movedim(axis, -1).reshape(-1, num_classes)
+    label = label.reshape(-1)
 if weight is not None:
     weight.requires_grad = False
 if label.dtype == torch.int32:
