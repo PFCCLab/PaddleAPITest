@@ -8,9 +8,11 @@ import torch
 import yaml
 
 from .accuracy_common import process_grad_output, process_output
-from .base import APITestBase, gpu_mode_memory_decision
+from .base import CUDA_OOM, APITestBase, GpuMemoryGuardSkip, gpu_mode_memory_decision
 from .paddle_to_torch import ConversionKind, get_converter
 from .paddle_to_torch.arguments import bind_paddle_arguments
+
+_ACCURACY_COMPARISON_WORKSPACE_BYTES = 256 * 1024**2
 
 
 class APITestAccuracy(APITestBase):
@@ -25,6 +27,8 @@ class APITestAccuracy(APITestBase):
             "bitwise_alignment", self.runtime_config.bitwise_alignment
         )
         self.use_gpu_mode = self.gpu_mode_config.enabled
+        self.use_dual_gpu = self.use_gpu_mode and self.gpu_mode_config.dual_gpu
+        self.comparison_device_id = self.gpu_mode_config.comparison_device_id
         self.manual_threshold_config_file = kwargs.get("manual_threshold_config_file", "")
         self.manual_threshold_config = self._load_manual_threshold_config(
             self.manual_threshold_config_file
@@ -32,6 +36,89 @@ class APITestAccuracy(APITestBase):
         if self.test_tol:
             torch.set_printoptions(profile="short")
         self.converter = get_converter()
+
+    def _accuracy_comparison_memory_state(self):
+        return self.gpu_memory_state(
+            self.comparison_device_id,
+            budget_gib=self.gpu_mode_config.comparison_memory_budget,
+        )
+
+    def _release_accuracy_gpu_cache(self, device_id):
+        # accuracy 的清理边界覆盖两个 framework，避免一侧 allocator 阻塞另一侧后续分配。
+        self.release_framework_gpu_cache(device_id=device_id, collect_cycles=True)
+
+    def _ensure_accuracy_comparison_headroom(self, value):
+        # 已在比较卡上的叶子不产生新副本，预算只统计实际需要搬运的唯一 Tensor。
+        copy_leaves = tuple(
+            tensor
+            for tensor in self.iter_unique_tensor_tree_leaves(value)
+            if not self.tensor_is_gpu(tensor)
+            or self.tensor_gpu_device_id(tensor) != self.comparison_device_id
+        )
+        value_bytes = self.tensor_tree_nbytes(copy_leaves)
+        if value_bytes <= 0:
+            return 0
+
+        memory_state = self._accuracy_comparison_memory_state()
+        target_free_bytes = (
+            memory_state.reserve_bytes + value_bytes + _ACCURACY_COMPARISON_WORKSPACE_BYTES
+        )
+        if memory_state.free_bytes < target_free_bytes:
+            self._release_accuracy_gpu_cache(self.comparison_device_id)
+            memory_state = self._accuracy_comparison_memory_state()
+        if memory_state.free_bytes <= memory_state.reserve_bytes + value_bytes:
+            raise GpuMemoryGuardSkip(
+                "accuracy comparison GPU capacity guard: result copy would consume the safe reserve"
+            )
+        return value_bytes
+
+    def _move_accuracy_result_to_comparison_gpu(self, value):
+        """搬运一组 accuracy 结果；复制型 OOM 不应污染算子正确性分类。"""
+        if self._ensure_accuracy_comparison_headroom(value) <= 0:
+            return value
+        try:
+            return self.move_tensor_tree_to_gpu(value, self.comparison_device_id)
+        except Exception as err:
+            if not any(marker.lower() in str(err).lower() for marker in CUDA_OOM):
+                raise
+            try:
+                self._release_accuracy_gpu_cache(self.comparison_device_id)
+            except Exception:
+                pass
+            raise GpuMemoryGuardSkip(
+                "accuracy comparison GPU capacity guard: result copy failed after cache release"
+            ) from err
+
+    def _compare_accuracy_tree_on_comparison_gpu(self, actual, expected):
+        # Torch comparison kernel 的 current device 必须与结果卡一致，临时量才能落在正确预算中。
+        with torch.cuda.device(int(self.comparison_device_id)):
+            return self._compare_accuracy_tree(actual, expected)
+
+    def _cleanup_accuracy_dual_gpu(self, *, force_cache_release):
+        """清除单次 accuracy 的跨卡资源；终态日志仍由原执行路径负责。"""
+        for attr_name in ("torch_args", "torch_kwargs", "paddle_args", "paddle_kwargs"):
+            if hasattr(self, attr_name):
+                delattr(self, attr_name)
+        self.clear_output_grad_cache()
+        self.clear_generated_input_values()
+        gc.collect()
+
+        # 失败可能发生在部分搬运之后，必须强制归还两张卡的空闲 allocator block。
+        if force_cache_release:
+            for device_id in (0, self.comparison_device_id):
+                try:
+                    self._release_accuracy_gpu_cache(device_id)
+                except Exception:
+                    pass
+            return
+
+        # 成功路径仅在比较卡接近安全余量时清 cache，避免小 case 每轮都同步 allocator。
+        try:
+            memory_state = self._accuracy_comparison_memory_state()
+            if memory_state.free_bytes <= memory_state.reserve_bytes:
+                self._release_accuracy_gpu_cache(self.comparison_device_id)
+        except Exception:
+            pass
 
     def _load_manual_threshold_config(self, manual_threshold_config_file):
         if not manual_threshold_config_file:
@@ -198,6 +285,9 @@ class APITestAccuracy(APITestBase):
                         tensor_index=index,
                         tensor_count=count,
                     )
+                except GpuMemoryGuardSkip:
+                    # 比较卡容量不足属于资源准入结果，不能写成数值精度失败。
+                    raise
                 except Exception as err:
                     self._report_comparison_error(err, index, count)
                     return False
@@ -406,6 +496,26 @@ class APITestAccuracy(APITestBase):
         torch_grad_success,
         probe_bytes,
     ):
+        if self.use_dual_gpu:
+            # 双卡模式不走 CPU spill：Torch 完整结果迁到比较卡，计算卡只保留后续输入源。
+            torch_output = self._prepare_torch_result_tree(torch_output, keep_on_device=True)
+            if torch_grad_success:
+                torch_out_grads = self._prepare_torch_result_tree(
+                    torch_out_grads,
+                    keep_on_device=True,
+                )
+            torch_output, torch_out_grads = self._move_accuracy_result_to_comparison_gpu(
+                (torch_output, torch_out_grads)
+            )
+            gc.collect()
+            self.clear_torch_tensor(probe_bytes=probe_bytes)
+            gpu_mode_memory_decision(
+                self.gpu_mode_config,
+                probe_bytes=probe_bytes,
+                required_headroom_bytes=probe_bytes,
+            )
+            return torch_output, torch_out_grads
+
         spill_torch_outputs = False
         if self.use_gpu_mode:
             spill_torch_outputs = self._should_spill_torch_result_tree(
@@ -538,6 +648,18 @@ class APITestAccuracy(APITestBase):
         return True, paddle_out_grads
 
     def test(self):
+        dual_gpu_completed = False
+        try:
+            dual_gpu_completed = bool(self._test_accuracy())
+        except GpuMemoryGuardSkip as err:
+            self.report_case_result("skip", phase="memory_guard", message=str(err))
+            self.dump_finalize("skip", memory_guard=str(err))
+        finally:
+            # _test_accuracy 返回后局部结果引用已经销毁，此时才能可靠清理 allocator cache。
+            if self.use_dual_gpu:
+                self._cleanup_accuracy_dual_gpu(force_cache_release=not dual_gpu_completed)
+
+    def _test_accuracy(self):
         self.dump_event("api_analyze_start", mode="accuracy")
         if self.need_skip():
             self.report_case_result("skip")
@@ -553,7 +675,8 @@ class APITestAccuracy(APITestBase):
         convert_result = self._convert_api()
         if convert_result is None:
             return
-        if not self.run_gpu_memory_preflight("accuracy"):
+        memory_mode = "accuracy_dual_gpu" if self.use_dual_gpu else "accuracy"
+        if not self.run_gpu_memory_preflight(memory_mode):
             return
         if not self._generate_input_values():
             return
@@ -595,12 +718,26 @@ class APITestAccuracy(APITestBase):
                 self.gpu_mode_config,
                 probe_bytes=probe_bytes,
             )
-        if not self._compare_accuracy_tree(paddle_output, torch_output):
+        if self.use_dual_gpu:
+            # Paddle 原结果继续持有 backward graph；比较卡只接收 detached 快照。
+            paddle_compare_output = self._move_accuracy_result_to_comparison_gpu(
+                self.detach_tensor_tree(paddle_output)
+            )
+            if not self._compare_accuracy_tree_on_comparison_gpu(
+                paddle_compare_output,
+                torch_output,
+            ):
+                return
+            # 前向结果在 backward 前结束生命周期，比较卡只继续保留 Torch 输入梯度。
+            paddle_compare_output = None
+            torch_output = None
+            gc.collect()
+        elif not self._compare_accuracy_tree(paddle_output, torch_output):
             return
 
         # Forward check now pass.
         # Then do paddle backward and backward result check.
-        if self.use_gpu_mode:
+        if self.use_gpu_mode and not self.use_dual_gpu:
             del torch_output
             gpu_mode_memory_decision(
                 self.gpu_mode_config,
@@ -624,15 +761,29 @@ class APITestAccuracy(APITestBase):
                     raise
                 return
 
+            # Paddle backward 已完成，原输出 graph 不应与梯度比较副本同时占用计算卡。
+            if self.use_dual_gpu:
+                paddle_output = None
+                paddle_out_grads = self._move_accuracy_result_to_comparison_gpu(
+                    self.detach_tensor_tree(paddle_out_grads)
+                )
+                gc.collect()
             if self.use_gpu_mode:
                 gpu_mode_memory_decision(
                     self.gpu_mode_config,
                     probe_bytes=probe_bytes,
                 )
-            if not self._compare_accuracy_tree(paddle_out_grads, torch_out_grads):
+            if self.use_dual_gpu:
+                if not self._compare_accuracy_tree_on_comparison_gpu(
+                    paddle_out_grads,
+                    torch_out_grads,
+                ):
+                    return
+            elif not self._compare_accuracy_tree(paddle_out_grads, torch_out_grads):
                 return
 
         # backward compare 已经消费完两侧共享的 output-grad seed。
         self.clear_output_grad_cache()
         self.report_case_result("pass")
         self.dump_finalize("pass")
+        return True

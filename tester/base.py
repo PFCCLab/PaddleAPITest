@@ -1668,11 +1668,11 @@ class APITestBase:
 
     def _comparison_device(self, actual, expected, *, test_tol, dual_gpu):
         """解析比较设备；该策略独立于两侧算子的执行设备。"""
-        # test_tol 的诊断协议固定使用 CPU，便于输出完整误差信息。
-        # 常规非 GPU mode 同样回到 CPU compare，保持历史低显存路径。
+        # test_tol 只改变容差与日志，不得绕过 GPU mode 的比较设备协议。
+        # 非 GPU mode 回到 CPU compare，保持历史低显存路径。
         # 单卡 GPU mode 允许 CPU kernel 结果显式搬到 GPU 0 后比较。
         # 双卡模式必须从结果设备解析比较卡，不允许 CPU tensor 隐式降级。
-        if test_tol or not self.gpu_mode_config.enabled:
+        if not self.gpu_mode_config.enabled:
             return torch.device("cpu")
         if dual_gpu:
             device_id = self._comparison_cuda_device_id(actual)

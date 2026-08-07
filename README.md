@@ -53,7 +53,9 @@ python engineV4.py \
   --num_gpus=1
 ```
 
-配置包含双引号时用单引号包裹 `--api_config`。普通单配置模式最多使用一块 GPU；`accuracy_stable_dual_gpu` 单配置使用一对 GPU。未指定 `--gpu_ids` 和 `--num_gpus` 时，两种模式分别默认使用 GPU 0 和 GPU 0/1。
+配置包含双引号时用单引号包裹 `--api_config`。普通单配置模式最多使用一块 GPU；
+`accuracy_dual_gpu` 和 `accuracy_stable_dual_gpu` 单配置使用一对 GPU。未指定
+`--gpu_ids` 和 `--num_gpus` 时，两类模式分别默认使用 GPU 0 和 GPU 0/1。
 
 ### 批量运行
 
@@ -103,6 +105,7 @@ python engineV4.py \
 | --- | --- |
 | `--paddle_only=True` | 执行 Paddle API，检查配置解析和 Paddle 支持情况 |
 | `--accuracy=True` | 比较 Paddle 与等价 Torch API 的前向输出和梯度 |
+| `--accuracy_dual_gpu=True` | 与 accuracy 等价，每个 worker 使用一张输入/计算卡和一张全量比较卡 |
 | `--accuracy_stable=True` | Paddle/Torch 分别执行两轮，同时检查跨框架精度与框架内稳定性 |
 | `--accuracy_stable_dual_gpu=True` | 与 accuracy-stable 等价，每个 worker 使用一张计算卡和一张全量比较卡 |
 | `--paddle_cinn=True` | 比较 Paddle 动态图与 CINN；可配合 `--test_backward=True` |
@@ -125,7 +128,9 @@ python engineV4.py \
 
 ### engineV2
 
-`engineV2.py` 使用 Pebble `ProcessPool`。除调度方式和 engineV4 专属 compute-sanitizer 外，其测试模式、双卡 accuracy-stable、GPU mode、动态显存管理、dump 和主要参数与 engineV4 对齐。详见 [engineV2 文档](engineV2-README.md)。
+`engineV2.py` 使用 Pebble `ProcessPool`。除调度方式、engineV4 专属 compute-sanitizer
+和 `accuracy_dual_gpu` 外，其测试模式、双卡 accuracy-stable、GPU mode、动态显存管理、
+dump 和主要参数与 engineV4 对齐。详见 [engineV2 文档](engineV2-README.md)。
 
 ### 其他入口
 
@@ -169,6 +174,9 @@ GPU mode 不需要选择固定显存策略。框架会在 Torch/Paddle 阶段边
 框架的 allocator cache 并重新查询，只有 headroom 仍不足时才将第一轮结果逐棵转移到 CPU。
 小 shape 在显存充足时不会执行不必要的 D2H。
 
+`test_tol` 只将容差置零并记录误差诊断，不改变上述比较设备：启用 GPU mode 时仍在
+GPU 完成 Tensor 比较。
+
 ```bash
 python engineV4.py \
   --accuracy_stable=True \
@@ -180,6 +188,29 @@ python engineV4.py \
 ```
 
 该流程始终保留不可变 CPU 输入快照、四次真实执行、全部稳定性比较和大结果分块比较。
+
+### Accuracy 双卡模式
+
+`--accuracy_dual_gpu=True` 为每个 worker 原子分配一对 GPU，并隐式启用 accuracy 和
+GPU mode。逻辑 `gpu:0` 负责 GPU 输入生成；GPU 算子模式下也负责 Torch/Paddle 前后向，
+逻辑 `gpu:1` 保存完整输出和输入梯度并执行全量比较。
+
+```bash
+python engineV4.py \
+  --accuracy_dual_gpu=True \
+  --api_config='paddle.add(Tensor([2, 3],"float32"), Tensor([2, 3],"float32"), )' \
+  --gpu_ids=0,1 \
+  --num_gpus=2 \
+  --num_workers_per_gpu=1
+```
+
+`test_cpu=True` 时两侧算子在 CPU 执行，GPU 0 仍按 GPU mode 生成逻辑输入，CPU 结果再
+搬到 GPU 1 比较。每侧 API 只执行一次；前向比较通过后才执行 Paddle backward。前向结果
+比较结束后立即释放，避免与后续双侧梯度长期重叠。该模式不进行 CPU spill、采样或跨卡
+autograd，也不能拆分单次 GPU 算子自身的 workspace 峰值。
+
+GPU 按规范化后的 `--gpu_ids` 顺序两两配对。模式要求至少两张且 GPU 总数为偶数，并要求
+`--num_workers_per_gpu=1`；单条配置默认使用 GPU 0/1。
 
 ### Accuracy Stable 双卡模式
 

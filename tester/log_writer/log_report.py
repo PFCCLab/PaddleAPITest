@@ -88,7 +88,9 @@ def print_run_header(options, paddle_version):
         compute.append(("--gpu_ids", gpu_ids_display))
     if options.use_gpu_mode:
         compute.append(("--use_gpu_mode", True))
-        if getattr(options, "accuracy_stable_dual_gpu", False):
+        if getattr(options, "accuracy_dual_gpu", False):
+            compute.append(("--accuracy_dual_gpu", True))
+        elif getattr(options, "accuracy_stable_dual_gpu", False):
             compute.append(("--accuracy_stable_dual_gpu", True))
     elif options.use_cached_numpy:
         compute.append(("--use_cached_numpy", True))

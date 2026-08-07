@@ -37,7 +37,11 @@ class TestRuntimeConfig:
 
     @classmethod
     def from_options(cls, options):
-        dual_gpu = bool(getattr(options, "accuracy_stable_dual_gpu", False))
+        # 双卡是 worker 设备拓扑；具体结果生命周期仍由各 accuracy tester 自己管理。
+        dual_gpu = bool(
+            getattr(options, "accuracy_dual_gpu", False)
+            or getattr(options, "accuracy_stable_dual_gpu", False)
+        )
         gpu_mode = GpuModeConfig(
             enabled=bool(options.use_gpu_mode) or dual_gpu,
             dual_gpu=dual_gpu,

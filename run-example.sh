@@ -45,6 +45,8 @@ TIME_OUT=600
 TEST_MODE_ARGS=(
     # Paddle vs Torch 正确性对比
     --accuracy=True
+    # 双卡正确性对比；自身等价于 accuracy，并隐式启用 use_gpu_mode
+    # --accuracy_dual_gpu=True
     # Paddle 单框架执行
     # --paddle_only=True
     # Paddle 动态图 vs CINN；test_backward 仅此模式生效

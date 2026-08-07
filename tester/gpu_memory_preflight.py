@@ -19,6 +19,7 @@ _SUPPORTED_MODES = frozenset(
     {
         "paddle_only",
         "accuracy",
+        "accuracy_dual_gpu",
         "accuracy_stable",
         "accuracy_stable_dual_gpu",
     }
@@ -178,6 +179,16 @@ def _input_grad_bytes(configs, check_grad):
     )
 
 
+def _comparison_input_grad_bytes(configs, check_grad):
+    """统计最终会进入比较设备的逻辑梯度，不受算子执行设备或显式 place 影响。"""
+    if not check_grad:
+        return 0
+    # CPU kernel 梯度虽不占 compute GPU，H2D 后仍是 comparison 卡驻留项。
+    return sum(
+        _logical_nbytes(config) for config in configs if dtype_name(config.dtype) in AUTOGRAD_DTYPES
+    )
+
+
 def estimate_gpu_memory(
     api_config,
     mode,
@@ -248,7 +259,7 @@ def estimate_gpu_memory(
                 ),
             )
         )
-    elif mode == "accuracy":
+    elif mode in {"accuracy", "accuracy_dual_gpu"}:
         # Accuracy 先执行 Torch，生成源在 Paddle 输入取得所有权后才释放。
         stages.extend(
             (
@@ -315,11 +326,12 @@ def estimate_gpu_memory(
         ("framework_inputs", framework_input_bytes),
         ("input_grads", input_grad_bytes),
     )
+    comparison_input_grad_bytes = _comparison_input_grad_bytes(configs, check_grad)
     if mode == "paddle_only":
         stages.append(
             MemoryStageEstimate("paddle_forward_backward", "compute", framework_execution)
         )
-    elif mode == "accuracy":
+    elif mode in {"accuracy", "accuracy_dual_gpu"}:
         # Torch 结束前生成源仍供后续 Paddle 使用；Paddle 取得所有权后释放生成源。
         stages.extend(
             (
@@ -333,13 +345,25 @@ def estimate_gpu_memory(
                     ),
                 ),
                 MemoryStageEstimate("paddle_forward_backward", "compute", framework_execution),
+            )
+        )
+        if mode == "accuracy":
+            stages.append(
                 MemoryStageEstimate(
                     "accuracy_compare",
                     "compute",
                     (("input_grad_operand", input_grad_bytes),),
-                ),
+                )
             )
-        )
+        else:
+            # 输出大小依赖 API，运行时 copy guard 负责实测；这里只统计可确定的双侧输入梯度。
+            stages.append(
+                MemoryStageEstimate(
+                    "accuracy_dual_backward_compare",
+                    "comparison",
+                    (("input_grad_results", 2 * comparison_input_grad_bytes),),
+                )
+            )
     else:
         stages.append(
             MemoryStageEstimate("stable_forward_backward", "compute", framework_execution)

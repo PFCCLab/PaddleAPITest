@@ -93,6 +93,7 @@ retest:
 engine_args:
   # ========== 测试模式（engine 要求只启用一种主模式）==========
   accuracy: true
+  # accuracy_dual_gpu: true  # 隐式启用 accuracy 和 use_gpu_mode，支持 test_cpu
   # paddle_only: true
   # paddle_cinn: true
   # paddle_gpu_performance: true

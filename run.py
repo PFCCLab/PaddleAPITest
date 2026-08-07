@@ -49,6 +49,7 @@ ENGINE_ARG_TYPES = {
     "paddle_only": bool,
     "paddle_cinn": bool,
     "accuracy": bool,
+    "accuracy_dual_gpu": bool,
     "paddle_gpu_performance": bool,
     "torch_gpu_performance": bool,
     "paddle_torch_gpu_performance": bool,
