@@ -65,6 +65,9 @@ class APITestAccuracy(APITestBase):
     def _should_spill_torch_result_tree(
         self, convert_result, torch_output, torch_out_grads, probe_bytes
     ):
+        # CPU 算子结果不会占用 GPU allocator，不应触发 GPU mode 的输出迁移决策。
+        if not self.tensor_tree_has_gpu_tensor((torch_output, torch_out_grads)):
+            return False
         # 保留输出树与参考工作区的联合预算，避免比较阶段瞬时超出显存余量。
         retained_tree_bytes = self.tensor_tree_nbytes((torch_output, torch_out_grads))
         reference_workspace_bytes = self._reference_workspace_bytes(convert_result)
@@ -99,7 +102,10 @@ class APITestAccuracy(APITestBase):
             )
         if isinstance(value, dict):
             return type(value)(
-                (key, self._prepare_torch_result_tree(item, keep_on_device=keep_on_device))
+                (
+                    key,
+                    self._prepare_torch_result_tree(item, keep_on_device=keep_on_device),
+                )
                 for key, item in value.items()
             )
         return value
@@ -268,7 +274,7 @@ class APITestAccuracy(APITestBase):
 
     def get_torch_output(self, convert_result):
         try:
-            device = torch.device("cuda:0")
+            device = self.torch_operator_device()
             torch.set_default_device(device)
             self.dump_event("torch_input_start")
             if not self.build_torch_input():
@@ -296,7 +302,7 @@ class APITestAccuracy(APITestBase):
 
             def execute_core(compiled, exec_globals, exec_locals):
                 if self.test_amp:
-                    with torch.autocast(device_type="cuda"):
+                    with torch.autocast(device_type=device.type):
                         exec(compiled, exec_globals, exec_locals)
                 else:
                     exec(compiled, exec_globals, exec_locals)
@@ -331,7 +337,7 @@ class APITestAccuracy(APITestBase):
             # if (self.api_config.api_name[-1] == "_" and self.api_config.api_name[-2:] != "__") or self.api_config.api_name == "paddle.Tensor.__setitem__":
             #     torch_output = self.torch_args[0] if len(self.torch_args) > 0 else next(iter(self.torch_kwargs.values()))
 
-            paddle.base.core.eager._for_test_check_cuda_error()
+            self.check_operator_cuda_error()
         except Exception as err:
             _, fatal = self._report_runtime_error_and_finalize(err, "torch_error", "forward")
             if fatal:
@@ -347,9 +353,10 @@ class APITestAccuracy(APITestBase):
         try:
             self.dump_event("torch_backward_start")
             inputs_list = self.get_torch_input_list()
-            result_outputs, result_outputs_grads = self.gen_torch_output_and_output_grad(
-                torch_output
-            )
+            (
+                result_outputs,
+                result_outputs_grads,
+            ) = self.gen_torch_output_and_output_grad(torch_output)
             self.dump_save(
                 "torch_backward",
                 {
@@ -385,14 +392,19 @@ class APITestAccuracy(APITestBase):
                 raise
             return False, None, None, False
         try:
-            paddle.base.core.eager._for_test_check_cuda_error()
+            self.check_operator_cuda_error()
         except Exception as err:
             self._report_runtime_error_and_finalize(err, "torch_error", "backward cuda check")
             raise
         return True, torch_output, torch_out_grads, torch_grad_success
 
     def _prepare_torch_results_for_paddle(
-        self, convert_result, torch_output, torch_out_grads, torch_grad_success, probe_bytes
+        self,
+        convert_result,
+        torch_output,
+        torch_out_grads,
+        torch_grad_success,
+        probe_bytes,
     ):
         spill_torch_outputs = False
         if self.use_gpu_mode:
@@ -479,7 +491,7 @@ class APITestAccuracy(APITestBase):
         try:
             self.dump_save("paddle_forward_output", paddle_output, framework="paddle")
             self.dump_event("paddle_forward_done")
-            paddle.base.core.eager._for_test_check_cuda_error()
+            self.check_operator_cuda_error()
         except Exception as err:
             self._report_runtime_error_and_finalize(err, "paddle_cuda", "forward")
             raise
@@ -489,9 +501,10 @@ class APITestAccuracy(APITestBase):
         paddle_out_grads = None
         try:
             inputs_list = self.get_paddle_input_list()
-            result_outputs, result_outputs_grads = self.gen_paddle_output_and_output_grad(
-                paddle_output
-            )
+            (
+                result_outputs,
+                result_outputs_grads,
+            ) = self.gen_paddle_output_and_output_grad(paddle_output)
             del self.paddle_args, self.paddle_kwargs
             if inputs_list and result_outputs and result_outputs_grads:
                 paddle_out_grads = paddle.grad(
@@ -518,7 +531,7 @@ class APITestAccuracy(APITestBase):
             return False, None
 
         try:
-            paddle.base.core.eager._for_test_check_cuda_error()
+            self.check_operator_cuda_error()
         except Exception as err:
             self._report_runtime_error_and_finalize(err, "paddle_cuda", "backward cuda check")
             raise
@@ -546,9 +559,12 @@ class APITestAccuracy(APITestBase):
             return
         probe_bytes = self.estimate_input_bytes()
 
-        torch_success, torch_output, torch_out_grads, torch_grad_success = self.get_torch_output(
-            convert_result
-        )
+        (
+            torch_success,
+            torch_output,
+            torch_out_grads,
+            torch_grad_success,
+        ) = self.get_torch_output(convert_result)
         if not torch_success:
             return
         torch_output, torch_out_grads = self._prepare_torch_results_for_paddle(

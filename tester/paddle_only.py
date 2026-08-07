@@ -150,7 +150,7 @@ class APITestPaddleOnly(APITestBase):
             return
 
         try:
-            paddle.base.core.eager._for_test_check_cuda_error()
+            self.check_operator_cuda_error()
         except Exception as err:
             _, fatal = self._report_paddle_only_error(
                 err,

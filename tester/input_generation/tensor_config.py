@@ -78,7 +78,8 @@ def is_gpu_mode():
 
 
 def _torch_compute_device():
-    return torch.device("cuda:0") if torch.cuda.is_available() else torch.device("cpu")
+    # GPU 算子缺少 CUDA 时应显式失败，不能因环境差异静默改测 CPU kernel。
+    return torch.device("cuda:0")
 
 
 def _shape_tuple(shape):
@@ -257,12 +258,20 @@ class TensorConfig:
             raise ValueError(f"negative TensorConfig numel is invalid: {self.shape!r}")
         return numel * dtype_element_size(self.dtype)
 
-    def _use_gpu(self):
-        if not is_gpu_mode():
-            return False
+    def _operator_uses_gpu(self, api_config):
+        """判断当前配置的算子输入是否应物化到 GPU。"""
+        # 显式 CPU place 与 test_cpu 都可要求 CPU 输入；GPU mode 不出现在此判定中。
+        # 生成 backend 的源设备只影响搬运方向，不能覆盖框架输入的目标设备。
         if self.place is not None and "cpu" in str(self.place).lower():
             return False
+        if getattr(api_config, "test_cpu", False):
+            return False
         return "gpu" in paddle.device.get_device()
+
+    def _torch_operator_device(self, api_config):
+        if not self._operator_uses_gpu(api_config):
+            return torch.device("cpu")
+        return _torch_compute_device()
 
     def _requires_autograd(self, api_config):
         if self.dtype not in AUTOGRAD_DTYPES:
@@ -276,10 +285,7 @@ class TensorConfig:
     def _torch_device_for_paddle(self, api_config):
         if self.place is not None and "cpu" in str(self.place).lower():
             return torch.device("cpu")
-        paddle_device = paddle.device.get_device()
-        if "gpu" in paddle_device or "cuda" in paddle_device or self._use_gpu():
-            return _torch_compute_device()
-        return torch.device("cpu")
+        return self._torch_operator_device(api_config)
 
     def _missing_input_error(self, api_config, framework):
         return ValueError(
@@ -317,13 +323,28 @@ class TensorConfig:
     def _logical_paddle_tensor(self, api_config, dtype, place=None):
         value = read_input_value(api_config, self)
         backend = read_input_value_backend(api_config, self)
+        # 有效 place 在 backend 分支前统一解析，避免 NumPy 路径绕过 test_cpu 优先级。
+        operator_place = paddle.CPUPlace() if getattr(api_config, "test_cpu", False) else place
         if backend == "paddle" and isinstance(value, paddle.Tensor):
-            if place is not None:
-                if "cpu" in str(place).lower():
-                    value = value._copy_to(paddle.CPUPlace(), False)
-                elif "gpu" in str(place).lower():
-                    device_id = int(str(place).rsplit(":", 1)[-1]) if ":" in str(place) else 0
-                    value = value._copy_to(paddle.CUDAPlace(device_id), False)
+            # backend-native 逻辑值的设备属于生成策略；框架输入仍必须服从算子设备。
+            target_place = operator_place
+            if target_place is None:
+                target_place = (
+                    paddle.CUDAPlace(0)
+                    if self._operator_uses_gpu(api_config)
+                    else paddle.CPUPlace()
+                )
+            if "cpu" in str(target_place).lower():
+                value = value._copy_to(paddle.CPUPlace(), False)
+            elif "gpu" in str(target_place).lower() or isinstance(target_place, paddle.CUDAPlace):
+                device_id = (
+                    target_place.get_device_id()
+                    if isinstance(target_place, paddle.CUDAPlace)
+                    else int(str(target_place).rsplit(":", 1)[-1])
+                    if ":" in str(target_place)
+                    else 0
+                )
+                value = value._copy_to(paddle.CUDAPlace(device_id), False)
             if dtype is not None and str(value.dtype).split(".")[-1] != str(dtype):
                 value = paddle.cast(value, dtype=dtype)
             return value
@@ -335,13 +356,13 @@ class TensorConfig:
             if dtype is not None and str(paddle_tensor.dtype).split(".")[-1] != str(dtype):
                 paddle_tensor = paddle.cast(paddle_tensor, dtype=dtype)
             return paddle_tensor
-        return paddle.to_tensor(value, dtype=dtype, place=place)
+        return paddle.to_tensor(value, dtype=dtype, place=operator_place)
 
     def get_paddle_tensor(self, api_config):
         if self.paddle_tensor is None:
             if self.cpu_tensor is not None:
                 torch_tensor = self.cpu_tensor.to(
-                    device=torch.device("cuda:0") if self._use_gpu() else "cpu",
+                    device=self._torch_operator_device(api_config),
                     copy=True,
                 )
                 self.paddle_tensor = paddle.utils.dlpack.from_dlpack(
@@ -417,7 +438,7 @@ class TensorConfig:
             paddle.set_flags(original_flag)
 
     def get_torch_tensor(self, api_config):
-        device = _torch_compute_device() if self._use_gpu() else torch.device("cpu")
+        device = self._torch_operator_device(api_config)
         torch.set_default_device(device)
         if self.torch_tensor is None:
             if self.cpu_tensor is not None:
@@ -454,7 +475,7 @@ class TensorConfig:
 
     def _create_torch_strided(self, api_config):
         """基于共享逻辑输入创建非连续 Torch Tensor。"""
-        device = _torch_compute_device() if self._use_gpu() else torch.device("cpu")
+        device = self._torch_operator_device(api_config)
         intermediate_torch_dtype = self._torch_float8_intermediate_dtype()
 
         flat_tensor = torch.empty(
@@ -490,7 +511,7 @@ class TensorConfig:
             return tensor
         if backend == "paddle" and isinstance(value, paddle.Tensor):
             paddle_tensor = value.detach()
-            if self._use_gpu() and device.type == "cuda":
+            if self._operator_uses_gpu(api_config) and device.type == "cuda":
                 paddle_tensor = paddle_tensor._copy_to(paddle.CUDAPlace(device.index or 0), False)
             elif device.type == "cpu":
                 paddle_tensor = paddle_tensor._copy_to(paddle.CPUPlace(), False)

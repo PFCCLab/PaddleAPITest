@@ -532,11 +532,14 @@ class PaddleInputBackend(NumPyInputBackend):
         seed_material = f"{getattr(self.input_random_state, 'seed', 0)}:{getattr(self.input_random_state, 'config_fingerprint', '')}"
         seed = int(hashlib.sha256(seed_material.encode()).hexdigest()[:8], 16) % (2**31)
         paddle = self._paddle()
-        paddle.seed(seed)
         self._place = paddle.CPUPlace()
         if self.device.startswith(("gpu", "cuda")):
+            paddle.seed(seed)
             device_id = int(self.device.split(":", 1)[1]) if ":" in self.device else 0
             self._place = paddle.CUDAPlace(device_id)
+        else:
+            # CPU backend 不触碰 CUDA generator，保证纯 CPU 测试无需初始化 GPU runtime。
+            paddle.framework.core.default_cpu_generator().manual_seed(seed)
 
     def _paddle(self):
         import paddle

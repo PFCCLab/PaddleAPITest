@@ -114,7 +114,8 @@ python engineV4.py \
 
 常用附加参数包括 `--test_amp`、`--test_cpu`、`--atol`、`--rtol`、`--manual_threshold_config_file`、`--bitwise_alignment`、`--timeout`、`--random_seed`、`--generate_failed_tests` 和 `--exit_on_error`。
 
-`--test_cpu=True` 只用于验证 Paddle CPU kernel：Paddle 输入和执行切到 CPU；Torch reference 仍在 GPU 上生成和执行，用作稳定的对照实现。因此 CPU 测试仍允许也可能实际使用 GPU。
+`--test_cpu=True` 唯一决定算子设备：Paddle 与 Torch 的框架输入和算子执行都切到 CPU。
+它不决定输入逻辑值的生成设备或结果比较设备，这两项只由 `--use_gpu_mode` 控制。
 
 ## 引擎与运行入口
 
@@ -142,7 +143,22 @@ python run.py -c test_pipeline/run_config.yaml
 
 ## GPU Mode 与动态显存管理
 
-`--use_gpu_mode=True` 在 GPU 上生成 Tensor 并进行比较，复用 CUDA allocator，适用于大规模 `accuracy_stable` 测试。此模式会忽略 `--use_cached_numpy=True`。
+`--use_gpu_mode=True` 在 GPU 上生成 Tensor 逻辑值并进行结果比较，同时复用 CUDA allocator，
+适用于大规模 `accuracy_stable` 测试。它不改变算子设备；此模式会忽略
+`--use_cached_numpy=True`。
+
+两个开关正交，四种组合的语义如下：
+
+| `test_cpu` | `use_gpu_mode` | Paddle/Torch 算子 | 输入生成与比较 |
+| --- | --- | --- | --- |
+| `False` | `False` | GPU | CPU |
+| `False` | `True` | GPU | GPU |
+| `True` | `False` | CPU | CPU |
+| `True` | `True` | CPU | GPU |
+
+组合模式 `test_cpu=True,use_gpu_mode=True` 会先在 GPU 生成逻辑输入，再物化为 CPU
+框架输入执行两侧算子，最后把结果送到 GPU 比较。纯 CPU 组合不要求 GPU；
+`accuracy_stable_dual_gpu` 仍不支持 `test_cpu=True`。
 
 GPU mode 会在输入生成前根据 TensorConfig 元数据和测试模式估算阶段存活集合。单 worker
 独占 GPU 时使用整卡容量，多 worker 共享时按 worker 数均分；只有通用下界已经超过容量的

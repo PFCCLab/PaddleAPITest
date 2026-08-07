@@ -229,7 +229,8 @@ def write_case_begin(api_config_str, *, worker_pid, gpu, slot=None, paddle_versi
     fields = [f"{CASE_BEGIN_TAG} {case_id}", timestamp]
     if paddle_version is not None:
         fields.append(f"Paddle {paddle_version}")
-    fields.append(f"GPU {gpu}")
+    # gpu=None 表示纯 CPU worker，避免日志把调度占位误报为 GPU 设备。
+    fields.append(f"GPU {gpu}" if gpu is not None else "CPU")
     fields.append(f"PID {worker_pid}")
     if slot is not None:
         fields.append(f"Slot {slot}")

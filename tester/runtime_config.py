@@ -23,7 +23,17 @@ class TestRuntimeConfig:
     random_seed: int = 0
     bitwise_alignment: bool = False
     exit_on_error: bool = False
+    test_cpu: bool = False
     gpu_mode: GpuModeConfig = field(default_factory=GpuModeConfig)
+
+    @property
+    def operator_device_type(self):
+        """返回算子执行设备；GPU mode 不参与该决策。"""
+        # 设备协议刻意保持两个正交维度：
+        # test_cpu 只选择 Paddle/Torch kernel，
+        # gpu_mode 只选择逻辑输入、比较和显存治理，
+        # 调用方不能再由其中一个字段推导另一个字段。
+        return "cpu" if self.test_cpu else "cuda"
 
     @classmethod
     def from_options(cls, options):
@@ -37,6 +47,7 @@ class TestRuntimeConfig:
             random_seed=int(options.random_seed),
             bitwise_alignment=bool(options.bitwise_alignment),
             exit_on_error=bool(options.exit_on_error),
+            test_cpu=bool(options.test_cpu),
             gpu_mode=gpu_mode,
         )
 

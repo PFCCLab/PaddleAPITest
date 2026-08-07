@@ -457,6 +457,14 @@ def normalize_accuracy_stable_dual_gpu_options(options):
     options.accuracy_stable = True
 
 
+def _requires_gpu_runtime(options):
+    """GPU 算子或 GPU 生成/比较任一启用时，都必须准备 GPU 运行时。"""
+    # 该判定与 engineV4 保持一致，旧入口不能保留历史上的 Torch-GPU CPU 测试语义。
+    # test_cpu 与 use_gpu_mode 分别描述 kernel 设备和生成/比较设备。
+    # 纯 CPU 组合因此可以在 CUDA_VISIBLE_DEVICES 为空时运行。
+    return not getattr(options, "test_cpu", False) or getattr(options, "use_gpu_mode", False)
+
+
 def _resolve_dump_options(parser, options):
     try:
         options.use_dump, options.dump_dir = resolve_dump_options(
@@ -493,7 +501,7 @@ def _prepare_single_config_gpu(options):
     normalize_accuracy_stable_dual_gpu_options(options)
     if getattr(options, "accuracy_stable_dual_gpu", False) and getattr(options, "test_cpu", False):
         raise ValueError("--accuracy_stable_dual_gpu=True does not support --test_cpu=True")
-    if options.test_cpu:
+    if not _requires_gpu_runtime(options):
         options.gpu_workers_per_gpu_map = {}
         options.gpu_total_memory_map = {}
         options.runtime_config = TestRuntimeConfig.from_options(options)
@@ -616,20 +624,21 @@ def init_worker_gpu(gpu_worker_list, lock, available_gpus, max_workers_per_gpu, 
             return e.errno == errno.EPERM
 
     try:
-        with lock:
-            assigned_gpu, assigned_comparison_gpu = _assign_worker_gpus(
-                gpu_worker_list,
-                available_gpus,
-                max_workers_per_gpu,
-                options,
-                my_pid,
-                pid_exists,
+        assigned_gpu = assigned_comparison_gpu = None
+        if _requires_gpu_runtime(options):
+            with lock:
+                assigned_gpu, assigned_comparison_gpu = _assign_worker_gpus(
+                    gpu_worker_list,
+                    available_gpus,
+                    max_workers_per_gpu,
+                    options,
+                    my_pid,
+                    pid_exists,
+                )
+            os.environ["CUDA_VISIBLE_DEVICES"] = _visible_gpu_ids(
+                assigned_gpu,
+                assigned_comparison_gpu,
             )
-
-        os.environ["CUDA_VISIBLE_DEVICES"] = _visible_gpu_ids(
-            assigned_gpu,
-            assigned_comparison_gpu,
-        )
         with log_worker.suppress_startup_output():
             import paddle
 
@@ -650,7 +659,8 @@ def init_worker_gpu(gpu_worker_list, lock, available_gpus, max_workers_per_gpu, 
             globals().update(_load_test_classes(options))
 
             def signal_handler(*args):
-                _clear_device_cache(options)
+                if _requires_gpu_runtime(options):
+                    _clear_device_cache(options)
                 log_worker.restore_stdio()
                 log_runtime.close_process_files()
                 sys.exit(0)
@@ -669,10 +679,13 @@ def run_test_case(api_config_str, options):
     """Run a single test case for the given API configuration."""
     completion = [os.getpid(), None]
     started_at = time.monotonic()
-    visible_gpu_ids = tuple(
-        int(value) for value in os.environ.get("CUDA_VISIBLE_DEVICES", "0").split(",")
-    )
-    gpu_id = visible_gpu_ids[0]
+    # 纯 CPU 模式不构造虚拟 GPU id，显存状态和日志均保持 CPU 语义。
+    visible_gpu_ids = ()
+    if _requires_gpu_runtime(options):
+        visible_gpu_ids = tuple(
+            int(value) for value in os.environ.get("CUDA_VISIBLE_DEVICES", "0").split(",")
+        )
+    gpu_id = visible_gpu_ids[0] if visible_gpu_ids else None
     comparison_gpu_id = (
         visible_gpu_ids[1]
         if getattr(options, "accuracy_stable_dual_gpu", False) and len(visible_gpu_ids) > 1
@@ -691,7 +704,7 @@ def run_test_case(api_config_str, options):
     )
     case_status = "done"
     try:
-        if options.show_runtime_status:
+        if options.show_runtime_status and gpu_id is not None:
             total_memory, used_memory_before = get_memory_info(gpu_id)
             print(
                 f"{datetime.now()} GPU {gpu_id} memory before: used={used_memory_before:.1f} GB, "
@@ -770,16 +783,20 @@ def run_test_case(api_config_str, options):
             del test_class, api_config, case
             if not getattr(options, "use_gpu_mode", False):
                 gc.collect()
-            if not any(
-                getattr(options, opt)
-                for opt in (
-                    "paddle_gpu_performance",
-                    "torch_gpu_performance",
-                    "paddle_torch_gpu_performance",
+            if (
+                _requires_gpu_runtime(options)
+                and not any(
+                    getattr(options, opt)
+                    for opt in (
+                        "paddle_gpu_performance",
+                        "torch_gpu_performance",
+                        "paddle_torch_gpu_performance",
+                    )
                 )
-            ) and not getattr(options, "use_gpu_mode", False):
+                and not getattr(options, "use_gpu_mode", False)
+            ):
                 _clear_device_cache(options)
-            if options.show_runtime_status:
+            if options.show_runtime_status and gpu_id is not None:
                 try:
                     total_memory, used_memory_after = get_memory_info(gpu_id)
                     print(
@@ -929,7 +946,7 @@ def main():
         "--test_cpu",
         type=parse_bool,
         default=False,
-        help="Run Paddle in CPU mode only; Torch reference still runs on GPU.",
+        help="Run both Paddle and Torch operators on CPU; independent of --use_gpu_mode.",
     )
     parser.add_argument(
         "--use_cached_numpy",
@@ -941,7 +958,10 @@ def main():
         "--use_gpu_mode",
         type=parse_bool,
         default=False,
-        help="Enable GPU tensor generation, GPU compare, and CUDA allocator reuse for speed.",
+        help=(
+            "Enable GPU tensor generation, comparison, and allocator reuse; "
+            "operator device is controlled only by --test_cpu."
+        ),
     )
     parser.add_argument(
         "--log_dir",
@@ -1069,7 +1089,7 @@ def main():
         )
         return
     normalize_accuracy_stable_dual_gpu_options(options)
-    if options.api_config and not options.test_cpu:
+    if options.api_config and _requires_gpu_runtime(options):
         _apply_single_config_gpu_defaults(options)
 
     mode = [
@@ -1086,6 +1106,22 @@ def main():
     if len([m for m in mode if m is True]) != 1:
         _print_argument(ARGUMENT_ERROR_PREFIX, TEST_MODE_ERROR)
         return
+    # 固定 GPU/custom-device 协议的模式不能被 test_cpu 静默改成 CPU 调度。
+    cpu_incompatible_modes = (
+        "paddle_gpu_performance",
+        "torch_gpu_performance",
+        "paddle_torch_gpu_performance",
+        "paddle_custom_device",
+        "custom_device_vs_gpu",
+        "accuracy_stable_dual_gpu",
+    )
+    if options.test_cpu and any(getattr(options, mode, False) for mode in cpu_incompatible_modes):
+        _print_argument(
+            ARGUMENT_ERROR_PREFIX,
+            "--test_cpu=True is incompatible with GPU performance, custom-device, "
+            "and dual-GPU test modes",
+        )
+        return
     log_report.print_run_header(options, paddle_version)
     if options.use_dump:
         if not options.api_config or options.api_config_file or options.api_config_file_pattern:
@@ -1093,7 +1129,8 @@ def main():
             return
         if not (options.accuracy or options.paddle_only):
             _print_argument(
-                ARGUMENT_ERROR_PREFIX, "dump currently supports only --accuracy or --paddle_only"
+                ARGUMENT_ERROR_PREFIX,
+                "dump currently supports only --accuracy or --paddle_only",
             )
             return
 
@@ -1137,7 +1174,8 @@ def main():
         )
     if options.test_backward and not options.paddle_cinn:
         _print_argument(
-            ARGUMENT_WARNING_PREFIX, "--test_backward takes effect only when --paddle_cinn=True"
+            ARGUMENT_WARNING_PREFIX,
+            "--test_backward takes effect only when --paddle_cinn=True",
         )
     if options.use_gpu_mode and options.use_cached_numpy:
         _print_argument(
@@ -1311,30 +1349,52 @@ def main():
             )
             return
 
-        # validate GPU visibility and derive per-GPU worker counts
-        gpu_ids = validate_gpu_options(options)
-        available_gpus, max_workers_per_gpu = check_gpu_memory(gpu_ids, options.num_workers_per_gpu)
-        if not available_gpus:
-            print("No usable GPUs available.", flush=True)
-            return
+        available_gpus = []
+        max_workers_per_gpu = {}
         gpu_pairs = None
-        if options.accuracy_stable_dual_gpu:
-            if len(available_gpus) != len(gpu_ids):
-                print("Not all selected GPUs are usable; no complete dual-GPU layout.", flush=True)
+        if _requires_gpu_runtime(options):
+            # GPU 算子与 GPU mode 都使用真实 GPU slot，但二者的设备职责保持独立。
+            # ProcessPool 的 GPU 分配仅提供 runtime 可见性，不参与 kernel place 决策。
+            # test_cpu=True,use_gpu_mode=True 仍分配 GPU，但 worker 会设置 Paddle CPU place。
+            gpu_ids = validate_gpu_options(options)
+            available_gpus, max_workers_per_gpu = check_gpu_memory(
+                gpu_ids, options.num_workers_per_gpu
+            )
+            if not available_gpus:
+                print("No usable GPUs available.", flush=True)
                 return
-            available_gpus, max_workers_per_gpu = limit_dual_gpu_worker_layout(
-                available_gpus,
-                all_case,
+            if options.accuracy_stable_dual_gpu:
+                if len(available_gpus) != len(gpu_ids):
+                    print(
+                        "Not all selected GPUs are usable; no complete dual-GPU layout.",
+                        flush=True,
+                    )
+                    return
+                available_gpus, max_workers_per_gpu = limit_dual_gpu_worker_layout(
+                    available_gpus,
+                    all_case,
+                )
+                gpu_pairs = list(zip(available_gpus[::2], available_gpus[1::2], strict=True))
+            else:
+                available_gpus, max_workers_per_gpu = limit_worker_layout(
+                    available_gpus, max_workers_per_gpu, all_case
+                )
+            total_workers = (
+                len(gpu_pairs) if gpu_pairs is not None else sum(max_workers_per_gpu.values())
             )
-            gpu_pairs = list(zip(available_gpus[::2], available_gpus[1::2], strict=True))
         else:
-            available_gpus, max_workers_per_gpu = limit_worker_layout(
-                available_gpus, max_workers_per_gpu, all_case
+            # 纯 CPU batch 不创建 GPU manager entry，也不读取 NVML 显存。
+            # 旧参数名继续控制兼容入口的 CPU worker 数，避免改变 CLI 参数面。
+            requested_workers = (
+                1 if options.num_workers_per_gpu == -1 else options.num_workers_per_gpu
             )
-
-        total_workers = (
-            len(gpu_pairs) if gpu_pairs is not None else sum(max_workers_per_gpu.values())
-        )
+            if requested_workers <= 0:
+                _print_argument(
+                    ARGUMENT_ERROR_PREFIX,
+                    "--num_workers_per_gpu must be -1 or a positive integer",
+                )
+                return
+            total_workers = min(requested_workers, all_case)
         gpu_total_memory_map = {}
         for gpu_id in available_gpus:
             try:
@@ -1344,14 +1404,19 @@ def main():
         options.gpu_workers_per_gpu_map = dict(max_workers_per_gpu)
         options.gpu_total_memory_map = gpu_total_memory_map
         options.runtime_config = TestRuntimeConfig.from_options(options)
-        log_report.print_compute_summary(
-            available_gpus,
-            max_workers_per_gpu,
-            gpu_pairs=gpu_pairs,
+        if available_gpus:
+            log_report.print_compute_summary(
+                available_gpus,
+                max_workers_per_gpu,
+                gpu_pairs=gpu_pairs,
+            )
+        print(
+            f"Operators: {'CPU' if options.test_cpu else 'GPU'} | "
+            f"input/compare: {'GPU' if options.use_gpu_mode else 'CPU'}",
+            flush=True,
         )
-
-        if options.test_cpu:
-            print(f"CPU: {cpu_count()} available | Paddle CPU mode", flush=True)
+        if not available_gpus:
+            print(f"CPU: {cpu_count()} available | {total_workers} workers", flush=True)
 
         print("\n--- RUNNING")
 
@@ -1440,7 +1505,9 @@ def main():
                                     progress_detail = f"exit {err.exitcode}"
                             if worker_pid is not None:
                                 completed_offset = log_worker.append_case_end_to_worker_log(
-                                    worker_pid, expired_status, api_config_str=config
+                                    worker_pid,
+                                    expired_status,
+                                    api_config_str=config,
                                 )
                                 log_aggregation.mark_inorder_case_complete(
                                     worker_pid, completed_offset

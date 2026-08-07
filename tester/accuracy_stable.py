@@ -76,7 +76,7 @@ class APITestAccuracyStable(APITestBase):
         self.comparison_device_id = self.gpu_mode_config.comparison_device_id
         self.converter = get_converter()
         torch.set_printoptions(profile="short", edgeitems=2, threshold=100, linewidth=120)
-        torch.set_default_device("cuda")
+        torch.set_default_device(self.torch_operator_device())
 
     @staticmethod
     def _normalize_torch_result(value):
@@ -365,6 +365,16 @@ class APITestAccuracyStable(APITestBase):
                 comparison_executor.shutdown(wait=False)
 
     def _spill_first_iteration_if_needed(self, pairs, convert_result, probe_bytes, state):
+        # CPU 算子结果不占 GPU allocator；GPU mode 只负责稍后的 GPU 比较搬运。
+        if not self.tensor_tree_has_gpu_tensor(
+            (
+                pairs.torch_outputs[0],
+                pairs.torch_grads[0],
+                pairs.paddle_outputs[0],
+                pairs.paddle_grads[0],
+            )
+        ):
+            return
         torch_phase_bytes = self.tensor_tree_nbytes((pairs.torch_outputs[0], pairs.torch_grads[0]))
         paddle_phase_bytes = self.tensor_tree_nbytes(
             (pairs.paddle_outputs[0], pairs.paddle_grads[0])
@@ -626,21 +636,29 @@ class APITestAccuracyStable(APITestBase):
                 raise
             self._manage_compute_headroom(probe_bytes, "torch")
         elif self.use_gpu_mode:
-            torch_live_bytes = self.tensor_tree_nbytes((torch_output, torch_out_grads))
+            torch_results_on_gpu = self.tensor_tree_has_gpu_tensor((torch_output, torch_out_grads))
+            torch_live_bytes = (
+                self.tensor_tree_nbytes((torch_output, torch_out_grads))
+                if torch_results_on_gpu
+                else 0
+            )
             # Release idle Torch blocks before the next Paddle execution;
             # the two frameworks do not share caching allocators.
             decision = gpu_mode_memory_decision(
                 self.gpu_mode_config,
-                request_spill=iter_idx == 0,
+                request_spill=iter_idx == 0 and torch_results_on_gpu,
                 probe_bytes=probe_bytes,
                 retained_tree_bytes=torch_live_bytes,
                 required_headroom_bytes=(
                     probe_bytes
                     + torch_live_bytes
-                    + max(torch_live_bytes, self._reference_workspace_bytes(convert_result))
+                    + max(
+                        torch_live_bytes,
+                        self._reference_workspace_bytes(convert_result),
+                    )
                 ),
             )
-            if iter_idx == 0 and decision.should_spill:
+            if iter_idx == 0 and torch_results_on_gpu and decision.should_spill:
                 torch_output = self.move_tensor_tree_to_cpu(torch_output)
                 torch_out_grads = self.move_tensor_tree_to_cpu(torch_out_grads)
                 state.first_iteration_spilled = True
@@ -865,7 +883,7 @@ class APITestAccuracyStable(APITestBase):
 
             def execute_core(compiled, exec_globals, exec_locals):
                 if self.test_amp:
-                    with torch.autocast(device_type="cuda"):
+                    with torch.autocast(device_type=self.torch_operator_device().type):
                         exec(compiled, exec_globals, exec_locals)
                 else:
                     exec(compiled, exec_globals, exec_locals)
@@ -878,7 +896,7 @@ class APITestAccuracyStable(APITestBase):
                     execution_locals=self._torch_execution_locals(),
                     core_executor=execute_core,
                 )
-            paddle.base.core.eager._for_test_check_cuda_error()
+            self.check_operator_cuda_error()
         except Exception as err:
             _, fatal = self.report_runtime_error(
                 err,
@@ -895,9 +913,10 @@ class APITestAccuracyStable(APITestBase):
         if self.need_check_grad():
             try:
                 inputs_list = self.get_torch_input_list()
-                result_outputs, result_outputs_grads = self.gen_torch_output_and_output_grad(
-                    torch_output
-                )
+                (
+                    result_outputs,
+                    result_outputs_grads,
+                ) = self.gen_torch_output_and_output_grad(torch_output)
                 if inputs_list and result_outputs and result_outputs_grads:
                     torch_out_grads = torch.autograd.grad(
                         outputs=result_outputs,
@@ -946,7 +965,7 @@ class APITestAccuracyStable(APITestBase):
                 return None, None, None
 
             try:
-                paddle.base.core.eager._for_test_check_cuda_error()
+                self.check_operator_cuda_error()
             except Exception as err:
                 self.report_runtime_error(
                     err,
@@ -1026,7 +1045,7 @@ class APITestAccuracyStable(APITestBase):
             return None, None
 
         try:
-            paddle.base.core.eager._for_test_check_cuda_error()
+            self.check_operator_cuda_error()
         except Exception as err:
             self.report_runtime_error(
                 err,
@@ -1041,9 +1060,10 @@ class APITestAccuracyStable(APITestBase):
         if torch_grad_success:
             try:
                 inputs_list = self.get_paddle_input_list()
-                result_outputs, result_outputs_grads = self.gen_paddle_output_and_output_grad(
-                    paddle_output
-                )
+                (
+                    result_outputs,
+                    result_outputs_grads,
+                ) = self.gen_paddle_output_and_output_grad(paddle_output)
                 if inputs_list and result_outputs and result_outputs_grads:
                     paddle_out_grads = paddle.grad(
                         result_outputs,
@@ -1098,7 +1118,7 @@ class APITestAccuracyStable(APITestBase):
                 return None, None
 
             try:
-                paddle.base.core.eager._for_test_check_cuda_error()
+                self.check_operator_cuda_error()
             except Exception as err:
                 self.report_runtime_error(
                     err,

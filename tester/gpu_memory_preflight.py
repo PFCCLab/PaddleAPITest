@@ -178,7 +178,14 @@ def _input_grad_bytes(configs, check_grad):
     )
 
 
-def estimate_gpu_memory(api_config, mode, *, check_grad, input_backend="torch"):
+def estimate_gpu_memory(
+    api_config,
+    mode,
+    *,
+    check_grad,
+    input_backend="torch",
+    operator_on_gpu=True,
+):
     """按测试模式构造不依赖 API 名称的阶段存活集合。"""
     if mode not in _SUPPORTED_MODES:
         raise ValueError(f"unsupported GPU memory preflight mode: {mode}")
@@ -194,21 +201,33 @@ def estimate_gpu_memory(api_config, mode, *, check_grad, input_backend="torch"):
     )
     # 原地 API 的 clone 是框架输入生命周期的一部分，不能留给运行时未知项。
     force_input_copy = requires_inplace_input_copy(api_config)
-    torch_materialization_peak, torch_materialized_input_bytes = _framework_materialization(
-        configs,
-        input_backend,
-        "torch",
-        force_clone=force_input_copy,
-    )
-    paddle_materialization_peak, _ = _framework_materialization(
-        configs,
-        input_backend,
-        "paddle",
-        force_clone=force_input_copy,
-    )
-    # 执行阶段只保留最终框架输入；clone 的瞬时峰值已在 materialization stage 计入。
-    framework_input_bytes = sum(_framework_live_input_bytes(config) for config in configs)
-    input_grad_bytes = _input_grad_bytes(configs, check_grad)
+    if operator_on_gpu:
+        (
+            torch_materialization_peak,
+            torch_materialized_input_bytes,
+        ) = _framework_materialization(
+            configs,
+            input_backend,
+            "torch",
+            force_clone=force_input_copy,
+        )
+        paddle_materialization_peak, _ = _framework_materialization(
+            configs,
+            input_backend,
+            "paddle",
+            force_clone=force_input_copy,
+        )
+        # 执行阶段只保留最终框架输入；clone 的瞬时峰值已在 materialization stage 计入。
+        framework_input_bytes = sum(_framework_live_input_bytes(config) for config in configs)
+        input_grad_bytes = _input_grad_bytes(configs, check_grad)
+    else:
+        # CPU 算子只消费 GPU 生成源，不在设备上持有框架输入或输入梯度。
+        # 比较阶段的结果搬运由运行时按真实输出大小治理，不在输入下界中重复估算。
+        torch_materialization_peak = 0
+        torch_materialized_input_bytes = 0
+        paddle_materialization_peak = 0
+        framework_input_bytes = 0
+        input_grad_bytes = 0
 
     stages = [
         MemoryStageEstimate(
@@ -253,20 +272,26 @@ def estimate_gpu_memory(api_config, mode, *, check_grad, input_backend="torch"):
         )
     else:
         # stable 保存 CPU snapshot 时可能先经 Torch 物化；每个输入完成拷贝后即释放其 GPU target。
-        snapshot_extra_peak = max(
-            (
-                build_materialization_plan(config, input_backend, "torch").peak_bytes
-                for config in configs
-            ),
-            default=0,
+        snapshot_extra_peak = (
+            max(
+                (
+                    build_materialization_plan(config, input_backend, "torch").peak_bytes
+                    for config in configs
+                ),
+                default=0,
+            )
+            if operator_on_gpu
+            else 0
         )
         # stable 从 CPU snapshot 重建，使用 NumPy source 只模拟目标 GPU storage。
-        stable_framework_peak, _ = _framework_materialization(
-            configs,
-            "numpy",
-            "torch",
-            force_clone=force_input_copy,
-        )
+        stable_framework_peak = 0
+        if operator_on_gpu:
+            stable_framework_peak, _ = _framework_materialization(
+                configs,
+                "numpy",
+                "torch",
+                force_clone=force_input_copy,
+            )
         stages.append(
             MemoryStageEstimate(
                 "stable_input_snapshot",
@@ -358,7 +383,14 @@ def estimate_gpu_memory(api_config, mode, *, check_grad, input_backend="torch"):
     return GpuMemoryEstimate(mode, input_backend, tuple(stages))
 
 
-def decide_gpu_memory_preflight(api_config, mode, gpu_config, *, check_grad):
+def decide_gpu_memory_preflight(
+    api_config,
+    mode,
+    gpu_config,
+    *,
+    check_grad,
+    operator_on_gpu=True,
+):
     # 预检只做 admission decision，不分配测试 Tensor，失败结果由调用方转换为 skip。
     """仅当配置峰值下界明显超过设备容量时返回 skip。"""
     if not gpu_config.enabled:
@@ -376,6 +408,7 @@ def decide_gpu_memory_preflight(api_config, mode, gpu_config, *, check_grad):
             mode,
             check_grad=check_grad,
             input_backend=resolve_input_backend_name(),
+            operator_on_gpu=operator_on_gpu,
         )
     except (TypeError, ValueError, OverflowError) as err:
         # 配置合法性仍由原测试流程判断；预检失败不能改变原分类。

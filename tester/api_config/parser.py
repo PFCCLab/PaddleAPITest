@@ -27,6 +27,10 @@ class APIConfig:
         result.args = copy.deepcopy(self.args)
         result.kwargs = copy.deepcopy(self.kwargs)
         result.api_name = self.api_name
+        # 运行时设备语义随 case 副本传播，不能在稳定性或算子对比路径中退回默认设备。
+        result.config = self.config
+        if hasattr(self, "test_cpu"):
+            result.test_cpu = self.test_cpu
         return result
 
     def __init__(self, config):

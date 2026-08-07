@@ -85,11 +85,11 @@ TEST_MODE_ARGS=(
 TEST_PARAM_ARGS=(
     # 混合精度
     # --test_amp=True
-    # CPU 路径
+    # 两侧算子设备：开启后 Paddle/Torch 都在 CPU 执行
     # --test_cpu=True
     # CPU numpy 缓存；gpu_mode 下自动关闭
     # --use_cached_numpy=True
-    # GPU tensor 缓存 + GPU compare；增加显存驻留
+    # GPU 生成 + GPU compare；与 test_cpu 正交，不决定算子设备
     # --use_gpu_mode=True
     # 对比阈值；bitwise_alignment 会将阈值置 0
     # --atol=1e-2
