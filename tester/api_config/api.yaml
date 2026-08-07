@@ -1234,3 +1234,8 @@ apis:
  - paddle.triu_
  - paddle.trunc_
  - paddle.where_
+ - paddle.compat.max
+ - paddle.mul
+ - paddle.nn.functional.all_gather_gemm
+ - paddle.nn.functional.flux
+ - paddle.nn.functional.gemm_reduce_scatter
