@@ -8,7 +8,12 @@ from .base import APITestBase
 
 class APITestCINNVSDygraph(APITestBase):
     def __init__(self, api_config, **kwargs):
-        super().__init__(api_config)
+        # CINN 不执行 Torch reference；Torch 只作为统一比较实现，不能改变 GPU 调度语义。
+        super().__init__(
+            api_config,
+            use_torch=False,
+            runtime_config=kwargs.get("runtime_config"),
+        )
         self.test_amp = kwargs.get("test_amp", False)
         self.test_backward = kwargs.get("test_backward", False)
 

@@ -68,7 +68,7 @@ TEST_MODE_ARGS=(
 TEST_PARAM_ARGS=(
     # 混合精度
     # --test_amp=True
-    # 两侧算子设备：开启后 Paddle/Torch 都在 CPU 执行
+    # 仅 Paddle 前反向切到 CPU；Torch reference 仍在 GPU
     # --test_cpu=True
     # CPU numpy 缓存；gpu_mode 下自动关闭
     # --use_cached_numpy=True

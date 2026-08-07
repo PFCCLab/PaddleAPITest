@@ -896,12 +896,26 @@ class APITestAccuracyStable(APITestBase):
                     execution_locals=self._torch_execution_locals(),
                     core_executor=execute_core,
                 )
-            self.check_operator_cuda_error()
         except Exception as err:
             _, fatal = self.report_runtime_error(
                 err,
                 "torch_error",
                 "forward",
+                affected_comps=self._TORCH_AFFECTED_COMPS[iter_idx],
+            )
+            if fatal:
+                raise
+            return None, None, None
+
+        # forward 执行异常保留通用分类，只有 Torch stream 同步异常强制归属 Torch。
+        try:
+            self.check_torch_operator_cuda_error()
+        except Exception as err:
+            _, fatal = self.report_runtime_error(
+                err,
+                "torch_error",
+                "forward cuda check",
+                force_log_type="torch_error",
                 affected_comps=self._TORCH_AFFECTED_COMPS[iter_idx],
             )
             if fatal:
@@ -965,7 +979,7 @@ class APITestAccuracyStable(APITestBase):
                 return None, None, None
 
             try:
-                self.check_operator_cuda_error()
+                self.check_torch_operator_cuda_error()
             except Exception as err:
                 self.report_runtime_error(
                     err,
@@ -1045,7 +1059,7 @@ class APITestAccuracyStable(APITestBase):
             return None, None
 
         try:
-            self.check_operator_cuda_error()
+            self.check_paddle_kernel_cuda_error()
         except Exception as err:
             self.report_runtime_error(
                 err,
@@ -1118,7 +1132,7 @@ class APITestAccuracyStable(APITestBase):
                 return None, None
 
             try:
-                self.check_operator_cuda_error()
+                self.check_paddle_kernel_cuda_error()
             except Exception as err:
                 self.report_runtime_error(
                     err,

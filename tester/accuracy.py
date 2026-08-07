@@ -427,9 +427,22 @@ class APITestAccuracy(APITestBase):
             # if (self.api_config.api_name[-1] == "_" and self.api_config.api_name[-2:] != "__") or self.api_config.api_name == "paddle.Tensor.__setitem__":
             #     torch_output = self.torch_args[0] if len(self.torch_args) > 0 else next(iter(self.torch_kwargs.values()))
 
-            self.check_operator_cuda_error()
         except Exception as err:
             _, fatal = self._report_runtime_error_and_finalize(err, "torch_error", "forward")
+            if fatal:
+                raise
+            return False, None, None, False
+
+        # 单独同步才能把异步 Torch CUDA 错误归入正确的日志和重试分类。
+        try:
+            self.check_torch_operator_cuda_error()
+        except Exception as err:
+            _, fatal = self._report_runtime_error_and_finalize(
+                err,
+                "torch_error",
+                "forward cuda check",
+                force_log_type="torch_error",
+            )
             if fatal:
                 raise
             return False, None, None, False
@@ -482,9 +495,14 @@ class APITestAccuracy(APITestBase):
                 raise
             return False, None, None, False
         try:
-            self.check_operator_cuda_error()
+            self.check_torch_operator_cuda_error()
         except Exception as err:
-            self._report_runtime_error_and_finalize(err, "torch_error", "backward cuda check")
+            self._report_runtime_error_and_finalize(
+                err,
+                "torch_error",
+                "backward cuda check",
+                force_log_type="torch_error",
+            )
             raise
         return True, torch_output, torch_out_grads, torch_grad_success
 
@@ -601,7 +619,7 @@ class APITestAccuracy(APITestBase):
         try:
             self.dump_save("paddle_forward_output", paddle_output, framework="paddle")
             self.dump_event("paddle_forward_done")
-            self.check_operator_cuda_error()
+            self.check_paddle_kernel_cuda_error()
         except Exception as err:
             self._report_runtime_error_and_finalize(err, "paddle_cuda", "forward")
             raise
@@ -641,7 +659,7 @@ class APITestAccuracy(APITestBase):
             return False, None
 
         try:
-            self.check_operator_cuda_error()
+            self.check_paddle_kernel_cuda_error()
         except Exception as err:
             self._report_runtime_error_and_finalize(err, "paddle_cuda", "backward cuda check")
             raise

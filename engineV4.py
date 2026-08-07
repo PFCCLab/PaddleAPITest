@@ -1356,12 +1356,30 @@ def normalize_dual_gpu_options(options):
     normalize_accuracy_stable_dual_gpu_options(options)
 
 
+def _mode_runs_torch_gpu_reference(options):
+    """只有真实执行 Torch reference 的模式才要求为其保留计算卡。"""
+    # Paddle/CINN 等仅借用 Torch 工具的模式不属于 reference GPU 执行。
+    return any(
+        getattr(options, mode, False)
+        for mode in (
+            "accuracy",
+            "accuracy_stable",
+            "accuracy_dual_gpu",
+            "accuracy_stable_dual_gpu",
+            "torch_gpu_performance",
+            "paddle_torch_gpu_performance",
+        )
+    )
+
+
 def _requires_gpu_runtime(options):
     """GPU 算子或 GPU 生成/比较任一启用时，都必须准备 GPU 运行时。"""
-    # test_cpu=False: kernel 自身需要 GPU。
-    # use_gpu_mode=True: 即使 kernel 在 CPU，生成和比较仍需要 GPU。
-    # 两者都不满足时不得探测 GPU，也不得创建虚拟 GPU slot。
-    return not getattr(options, "test_cpu", False) or getattr(options, "use_gpu_mode", False)
+    # test_cpu 只移走 Paddle kernel；Torch reference、GPU 生成和比较仍各自需要 GPU。
+    return bool(
+        not getattr(options, "test_cpu", False)
+        or getattr(options, "use_gpu_mode", False)
+        or _mode_runs_torch_gpu_reference(options)
+    )
 
 
 def validate_gpu_options(options) -> tuple:
@@ -1392,10 +1410,6 @@ def validate_gpu_options(options) -> tuple:
         )
     if _dual_gpu_mode_enabled(options):
         # 一对卡是不可拆分的 worker slot，禁止共享其中任意一张卡。
-        if getattr(options, "accuracy_stable_dual_gpu", False) and getattr(
-            options, "test_cpu", False
-        ):
-            raise ValueError("--accuracy_stable_dual_gpu=True does not support --test_cpu=True")
         if options.num_gpus < 2 or options.num_gpus % 2:
             raise ValueError("dual-GPU accuracy modes require an even --num_gpus")
         if options.num_workers_per_gpu != 1:
@@ -1439,8 +1453,6 @@ def _apply_single_config_gpu_defaults(options):
 
 def _prepare_single_config_gpu(options):
     normalize_dual_gpu_options(options)
-    if getattr(options, "accuracy_stable_dual_gpu", False) and getattr(options, "test_cpu", False):
-        raise ValueError("--accuracy_stable_dual_gpu=True does not support --test_cpu=True")
     if not _requires_gpu_runtime(options):
         options.gpu_workers_per_gpu_map = {}
         options.gpu_total_memory_map = {}
@@ -2080,12 +2092,10 @@ def _validate_test_mode(options):
     cpu_incompatible_modes = GPU_PERFORMANCE_MODES + (
         "paddle_custom_device",
         "custom_device_vs_gpu",
-        "accuracy_stable_dual_gpu",
     )
     if options.test_cpu and any(getattr(options, mode, False) for mode in cpu_incompatible_modes):
         return _argument_error(
-            "--test_cpu=True is incompatible with GPU performance, custom-device, "
-            "and the accuracy-stable dual-GPU mode"
+            "--test_cpu=True is incompatible with GPU performance and custom-device modes"
         )
     return None
 
@@ -2522,7 +2532,8 @@ def _run_batch_case_mode(options, start_time):
             gpu_pairs=gpu_pairs,
         )
     print(
-        f"Operators: {'CPU' if options.test_cpu else 'GPU'} | "
+        f"Paddle kernels: {'CPU' if options.test_cpu else 'GPU'} | "
+        f"Torch reference: {'GPU' if _mode_runs_torch_gpu_reference(options) else 'N/A'} | "
         f"input/compare: {'GPU' if options.use_gpu_mode else 'CPU'}",
         flush=True,
     )
@@ -2661,7 +2672,7 @@ def _build_argument_parser():
         "--test_cpu",
         type=parse_bool,
         default=False,
-        help="Run both Paddle and Torch operators on CPU; independent of --use_gpu_mode.",
+        help="Run only Paddle forward/backward on CPU; Torch reference remains on GPU.",
     )
     parser.add_argument(
         "--use_cached_numpy",
@@ -2675,7 +2686,7 @@ def _build_argument_parser():
         default=False,
         help=(
             "Enable GPU tensor generation, comparison, and allocator reuse; "
-            "operator device is controlled only by --test_cpu."
+            "does not change the Paddle kernel or Torch reference devices."
         ),
     )
     parser.add_argument(

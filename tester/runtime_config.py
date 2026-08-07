@@ -27,13 +27,15 @@ class TestRuntimeConfig:
     gpu_mode: GpuModeConfig = field(default_factory=GpuModeConfig)
 
     @property
-    def operator_device_type(self):
-        """返回算子执行设备；GPU mode 不参与该决策。"""
-        # 设备协议刻意保持两个正交维度：
-        # test_cpu 只选择 Paddle/Torch kernel，
-        # gpu_mode 只选择逻辑输入、比较和显存治理，
-        # 调用方不能再由其中一个字段推导另一个字段。
+    def paddle_kernel_device_type(self):
+        """返回 Paddle 被测 kernel 的执行设备。"""
+        # 该属性刻意不读取 gpu_mode，防止生成/比较策略反向改写 kernel place。
         return "cpu" if self.test_cpu else "cuda"
+
+    @property
+    def torch_operator_device_type(self):
+        """Torch reference 固定使用 GPU，不受 Paddle CPU 测试开关影响。"""
+        return "cuda"
 
     @classmethod
     def from_options(cls, options):

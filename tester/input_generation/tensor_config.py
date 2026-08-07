@@ -258,10 +258,8 @@ class TensorConfig:
             raise ValueError(f"negative TensorConfig numel is invalid: {self.shape!r}")
         return numel * dtype_element_size(self.dtype)
 
-    def _operator_uses_gpu(self, api_config):
-        """判断当前配置的算子输入是否应物化到 GPU。"""
-        # 显式 CPU place 与 test_cpu 都可要求 CPU 输入；GPU mode 不出现在此判定中。
-        # 生成 backend 的源设备只影响搬运方向，不能覆盖框架输入的目标设备。
+    def _paddle_kernel_uses_gpu(self, api_config):
+        """判断 Paddle 被测 kernel 的输入是否应物化到 GPU。"""
         if self.place is not None and "cpu" in str(self.place).lower():
             return False
         if getattr(api_config, "test_cpu", False):
@@ -269,7 +267,8 @@ class TensorConfig:
         return "gpu" in paddle.device.get_device()
 
     def _torch_operator_device(self, api_config):
-        if not self._operator_uses_gpu(api_config):
+        # 配置显式 CPU place 仍是输入协议；除此之外 Torch reference 始终使用计算卡。
+        if self.place is not None and "cpu" in str(self.place).lower():
             return torch.device("cpu")
         return _torch_compute_device()
 
@@ -282,10 +281,15 @@ class TensorConfig:
             return False
         return getattr(api_config, "test_backward", True)
 
-    def _torch_device_for_paddle(self, api_config):
+    def _torch_source_device_for_paddle(self, api_config):
+        """返回 DLPack 转入 Paddle 前，Torch 源值需要到达的设备。"""
         if self.place is not None and "cpu" in str(self.place).lower():
             return torch.device("cpu")
-        return self._torch_operator_device(api_config)
+        if getattr(api_config, "test_cpu", False):
+            return torch.device("cpu")
+        if self._paddle_kernel_uses_gpu(api_config):
+            return _torch_compute_device()
+        return torch.device("cpu")
 
     def _missing_input_error(self, api_config, framework):
         return ValueError(
@@ -331,7 +335,7 @@ class TensorConfig:
             if target_place is None:
                 target_place = (
                     paddle.CUDAPlace(0)
-                    if self._operator_uses_gpu(api_config)
+                    if self._paddle_kernel_uses_gpu(api_config)
                     else paddle.CPUPlace()
                 )
             if "cpu" in str(target_place).lower():
@@ -349,7 +353,9 @@ class TensorConfig:
                 value = paddle.cast(value, dtype=dtype)
             return value
         if backend == "torch" and isinstance(value, torch.Tensor):
-            torch_tensor = value.detach().to(device=self._torch_device_for_paddle(api_config))
+            torch_tensor = value.detach().to(
+                device=self._torch_source_device_for_paddle(api_config)
+            )
             paddle_tensor = paddle.utils.dlpack.from_dlpack(
                 torch.utils.dlpack.to_dlpack(torch_tensor)
             )
@@ -362,7 +368,7 @@ class TensorConfig:
         if self.paddle_tensor is None:
             if self.cpu_tensor is not None:
                 torch_tensor = self.cpu_tensor.to(
-                    device=self._torch_operator_device(api_config),
+                    device=self._torch_source_device_for_paddle(api_config),
                     copy=True,
                 )
                 self.paddle_tensor = paddle.utils.dlpack.from_dlpack(
@@ -418,7 +424,9 @@ class TensorConfig:
             flat_tensor = paddle.zeros(
                 [storage_size],
                 dtype=intermediate_dtype,
-                device=self.place,
+                device=(
+                    paddle.CPUPlace() if getattr(api_config, "test_cpu", False) else self.place
+                ),
             )
             tensor = paddle.as_strided(flat_tensor, self.shape, self.strides)
             logical_value = read_input_value(api_config, self)
@@ -511,7 +519,7 @@ class TensorConfig:
             return tensor
         if backend == "paddle" and isinstance(value, paddle.Tensor):
             paddle_tensor = value.detach()
-            if self._operator_uses_gpu(api_config) and device.type == "cuda":
+            if device.type == "cuda":
                 paddle_tensor = paddle_tensor._copy_to(paddle.CUDAPlace(device.index or 0), False)
             elif device.type == "cpu":
                 paddle_tensor = paddle_tensor._copy_to(paddle.CPUPlace(), False)

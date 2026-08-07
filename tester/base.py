@@ -332,20 +332,26 @@ class APITestBase:
             torch.set_printoptions(threshold=100, linewidth=120)
 
     def torch_operator_device(self):
-        """由 test_cpu 唯一决定 Torch reference 的算子设备。"""
-        if self.runtime_config.test_cpu:
-            return torch.device("cpu")
-        # GPU 测试缺少 CUDA 时应由运行时明确失败，不能静默退化为 CPU kernel。
-        return torch.device("cuda:0")
+        """Torch reference 始终在 worker 绑定的计算卡执行。"""
+        return torch.device(f"{self.runtime_config.torch_operator_device_type}:0")
 
-    def check_operator_cuda_error(self):
-        """只为 GPU 算子查询 Paddle 的异步 CUDA 错误状态。"""
+    def check_paddle_kernel_cuda_error(self):
+        """只为 Paddle GPU kernel 查询异步 CUDA 错误状态。"""
         if not self.runtime_config.test_cpu:
             paddle.base.core.eager._for_test_check_cuda_error()
 
+    def check_torch_operator_cuda_error(self):
+        """同步 Torch reference 的计算流，使异步 CUDA 错误在所属阶段上报。"""
+        torch.cuda.synchronize(self.torch_operator_device())
+
+    def check_operator_cuda_error(self):
+        """兼容只执行 Paddle 算子的 tester。"""
+        self.check_paddle_kernel_cuda_error()
+
     def requires_gpu_runtime(self):
         """算子执行或 GPU mode 任一需要 GPU 时返回 True。"""
-        return not self.runtime_config.test_cpu or self.gpu_mode_config.enabled
+        # use_torch 表示 tester 会执行 Torch reference，而不是仅用 Torch 做 CPU 结果表示。
+        return self.use_torch or not self.runtime_config.test_cpu or self.gpu_mode_config.enabled
 
     def run_with_dump(self):
         """Execute the test with dump output capture and lifecycle reporting."""
@@ -457,7 +463,8 @@ class APITestBase:
             mode,
             self.gpu_mode_config,
             check_grad=self.need_check_grad(),
-            operator_on_gpu=not self.runtime_config.test_cpu,
+            paddle_kernel_on_gpu=not self.runtime_config.test_cpu,
+            torch_operator_on_gpu=self.use_torch,
         )
         if not decision.should_skip:
             # 预检按总容量准入；首次分配前按计算卡公共阶段峰值释放上个 case 的跨框架缓存。
@@ -1207,86 +1214,13 @@ class APITestBase:
     def paddle_assert_accuracy(
         self, actual_paddle_tensor, expected_paddle_tensor, atol=1e-2, rtol=1e-2
     ):
-        is_check_dtype = self.api_config.api_name not in not_check_dtype
-
-        if not actual_paddle_tensor.is_contiguous():
-            actual_paddle_tensor = actual_paddle_tensor.contiguous()
-        actual_paddle_tensor = actual_paddle_tensor.cpu().detach()
-
-        if not expected_paddle_tensor.is_contiguous():
-            expected_paddle_tensor = expected_paddle_tensor.contiguous()
-        expected_paddle_tensor = expected_paddle_tensor.cpu().detach()
-
-        actual_paddle_dlpack = paddle.utils.dlpack.to_dlpack(actual_paddle_tensor)  # type: ignore[reportGeneralTypeIssues]
-        converted_actual_tensor = torch.utils.dlpack.from_dlpack(actual_paddle_dlpack)  # type: ignore[reportGeneralTypeIssues]
-
-        expected_paddle_dlpack = paddle.utils.dlpack.to_dlpack(expected_paddle_tensor)  # type: ignore[reportGeneralTypeIssues]
-        converted_expected_tensor = torch.utils.dlpack.from_dlpack(expected_paddle_dlpack)  # type: ignore[reportGeneralTypeIssues]
-
-        def error_msg(msg):
-            return (
-                f"Not equal to tolerance rtol={rtol}, atol={atol}\n"
-                f"{msg}\n"
-                f"ACTUAL: (shape={converted_actual_tensor.shape}, dtype={converted_actual_tensor.dtype})\n"
-                f"{converted_actual_tensor}\n"
-                f"DESIRED: (shape={converted_expected_tensor.shape}, dtype={converted_expected_tensor.dtype})\n"
-                f"{converted_expected_tensor}"
-            )
-
-        bitwise_alignment = getattr(self, "bitwise_alignment", False)
-        if not bitwise_alignment and self.api_config.api_name in special_accuracy_atol_rtol:
-            atol, rtol = special_accuracy_atol_rtol[self.api_config.api_name]
-
-        try:
-            torch.testing.assert_close(
-                converted_actual_tensor,
-                converted_expected_tensor,
-                rtol=rtol,
-                atol=atol,
-                equal_nan=True,
-                check_dtype=is_check_dtype,
-                msg=error_msg,
-            )
-        except Exception as e:
-            error_str = str(e)
-            if error_str.startswith("Comparing"):
-                if os.environ.get("PADDLEAPITEST_NP_FALLBACK", "0") == "1":
-                    # torch_assert OOM or internal error, fallback to np_assert
-                    print(
-                        "[torch_assert_OOM] torch.testing.assert_close OOM, fallback to np_assert",
-                        flush=True,
-                    )
-                    # numpy does not support bfloat16/float8, cast to float32 for comparison
-                    actual_np = actual_paddle_tensor
-                    expected_np = expected_paddle_tensor
-                    if hasattr(actual_np, "dtype"):
-                        dtype_str = str(actual_np.dtype)
-                        if "bfloat16" in dtype_str or "float8" in dtype_str:
-                            actual_np = (
-                                actual_np.astype("float32")
-                                if hasattr(actual_np, "astype")
-                                else actual_np.float()
-                            )
-                    if hasattr(expected_np, "dtype"):
-                        dtype_str = str(expected_np.dtype)
-                        if "bfloat16" in dtype_str or "float8" in dtype_str:
-                            expected_np = (
-                                expected_np.astype("float32")
-                                if hasattr(expected_np, "astype")
-                                else expected_np.float()
-                            )
-                    self.np_assert_accuracy(
-                        actual_np.numpy() if hasattr(actual_np, "numpy") else actual_np,
-                        expected_np.numpy() if hasattr(expected_np, "numpy") else expected_np,
-                        atol,
-                        rtol,
-                    )
-                else:
-                    raise RuntimeError(
-                        "[torch_assert_OOM] torch.testing.assert_close OOM on large tensor comparison"
-                    )
-            else:
-                raise
+        # Paddle/Paddle 与 Paddle/Torch 共用同一比较设备协议，避免 CINN 固定退回 CPU。
+        return self.torch_assert_accuracy(
+            actual_paddle_tensor,
+            expected_paddle_tensor,
+            atol=atol,
+            rtol=rtol,
+        )
 
     def _torch_assert_accuracy_in_chunks(
         self, actual, expected, atol, rtol, error_msg, working_bytes

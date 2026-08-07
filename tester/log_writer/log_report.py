@@ -71,9 +71,21 @@ def print_run_header(options, paddle_version):
             )
         )
 
-    requires_gpu = not options.test_cpu or options.use_gpu_mode
+    torch_reference_gpu = any(
+        getattr(options, name, False)
+        for name in (
+            "accuracy",
+            "accuracy_stable",
+            "accuracy_dual_gpu",
+            "accuracy_stable_dual_gpu",
+            "torch_gpu_performance",
+            "paddle_torch_gpu_performance",
+        )
+    )
+    requires_gpu = not options.test_cpu or options.use_gpu_mode or torch_reference_gpu
     compute = [
-        ("operator_device", "CPU" if options.test_cpu else "GPU"),
+        ("paddle_kernel_device", "CPU" if options.test_cpu else "GPU"),
+        ("torch_reference_device", "GPU" if torch_reference_gpu else "N/A"),
         ("input_compare_device", "GPU" if options.use_gpu_mode else "CPU"),
     ]
     if options.test_cpu:
