@@ -104,6 +104,10 @@ PADDLEAPITEST_INPUT_BACKEND=paddle
 `paddle` backend 同样保存 backend-native `paddle.Tensor`；accuracy 模式下 Torch 输入由
 Paddle logical value 经 DLPack 生成，并在 Torch 侧 clone 为 Torch 自有存储。
 
+这里的 CPU/GPU 模式仅指 `use_gpu_mode` 控制的逻辑值生成设备。Paddle 框架输入和 kernel
+设备由 `test_cpu` 决定，Torch reference 输入和执行默认始终使用 GPU；因此 GPU logical value
+可以在 Paddle CPU kernel 执行前通过 DLPack/设备拷贝物化为 CPU Tensor。
+
 `USE_CACHED_NUMPY=True` 时固定使用 `numpy` backend。如果同时设置
 `PADDLEAPITEST_INPUT_BACKEND=torch` 或 `paddle`，框架会打印 warning 并忽略该 backend 请求。
 

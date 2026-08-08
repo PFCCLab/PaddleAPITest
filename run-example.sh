@@ -45,6 +45,8 @@ TIME_OUT=600
 TEST_MODE_ARGS=(
     # Paddle vs Torch 正确性对比
     --accuracy=True
+    # 双卡正确性对比；自身等价于 accuracy，并隐式启用 use_gpu_mode
+    # --accuracy_dual_gpu=True
     # Paddle 单框架执行
     # --paddle_only=True
     # Paddle 动态图 vs CINN；test_backward 仅此模式生效
@@ -66,11 +68,11 @@ TEST_MODE_ARGS=(
 TEST_PARAM_ARGS=(
     # 混合精度
     # --test_amp=True
-    # CPU 路径
+    # 仅 Paddle 前反向切到 CPU；Torch reference 仍在 GPU
     # --test_cpu=True
     # CPU numpy 缓存；gpu_mode 下自动关闭
     # --use_cached_numpy=True
-    # GPU tensor 缓存 + GPU compare；增加显存驻留
+    # GPU 生成 + GPU compare；与 test_cpu 正交，不决定算子设备
     # --use_gpu_mode=True
     # 对比阈值；bitwise_alignment 会将阈值置 0
     # --atol=1e-2

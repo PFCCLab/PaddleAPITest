@@ -57,7 +57,6 @@ from tester.gpu_memory_preflight import (
     estimate_gpu_memory,
     should_check_grad,
 )
-from tester.input_generation.backend import resolve_input_backend_name
 from tester.gpu_scheduler import (
     CaseGpuEstimate,
     GpuMemorySnapshot,
@@ -65,6 +64,7 @@ from tester.gpu_scheduler import (
     GpuWaveController,
     read_gpu_pressure_timeout,
 )
+from tester.input_generation.backend import resolve_input_backend_name
 from tester.log_writer import (
     init_log,
     log_aggregation,
@@ -110,6 +110,7 @@ SANITIZER_FORWARD_ARGS = {
     "torch_gpu_performance",
     "paddle_torch_gpu_performance",
     "accuracy_stable",
+    "accuracy_dual_gpu",
     "accuracy_stable_dual_gpu",
     "paddle_custom_device",
     "custom_device_vs_gpu",
@@ -161,6 +162,7 @@ GPU_PERFORMANCE_MODES = (
 TEST_CLASS_BY_OPTION = (
     ("paddle_only", "APITestPaddleOnly"),
     ("paddle_cinn", "APITestCINNVSDygraph"),
+    ("accuracy_dual_gpu", "APITestAccuracy"),
     ("accuracy", "APITestAccuracy"),
     ("paddle_gpu_performance", "APITestPaddleGPUPerformance"),
     ("torch_gpu_performance", "APITestTorchGPUPerformance"),
@@ -334,7 +336,7 @@ class WorkerSlot:
     """表示一个拥有独立输入队列的 worker 进程槽位。"""
 
     index: int
-    gpu_id: int
+    gpu_id: int | None
     comparison_gpu_id: int | None = None
     process: mp.Process | None = None
     input_queue: mp.Queue | None = None
@@ -547,9 +549,7 @@ def _sanitizer_child_environment(base_environment, task):
         # wrapper 不加载 GPU runtime；实际并发和两侧承诺必须随 case child 透传。
         child_environment["PADDLEAPITEST_WORKERS_ON_GPU"] = str(task.workers_on_gpu)
         child_environment[SANITIZER_COMPUTE_BUDGET_ENV] = str(task.compute_budget_gib)
-        child_environment[SANITIZER_COMPARISON_BUDGET_ENV] = str(
-            task.comparison_budget_gib
-        )
+        child_environment[SANITIZER_COMPARISON_BUDGET_ENV] = str(task.comparison_budget_gib)
     return child_environment
 
 
@@ -609,7 +609,9 @@ def _sanitizer_worker_loop(
         options.sanitizer_command
     )
     child_env = os.environ.copy()
-    child_env["CUDA_VISIBLE_DEVICES"] = _visible_gpu_ids(gpu_id, comparison_gpu_id)
+    visible_gpu_ids = _visible_gpu_ids(gpu_id, comparison_gpu_id)
+    if visible_gpu_ids is not None:
+        child_env["CUDA_VISIBLE_DEVICES"] = visible_gpu_ids
     child_env["PADDLEAPITEST_SUPPRESS_CASE_TAGS"] = "1"
 
     def terminate_child(*args):
@@ -654,7 +656,14 @@ def _sanitizer_worker_loop(
                 shutil.rmtree(case_log_dir, ignore_errors=True)
                 completed_offset = log_worker.write_case_end("error", api_config_str)
                 result_queue.put(
-                    ("error", slot_index, api_config_str, str(err), os.getpid(), completed_offset)
+                    (
+                        "error",
+                        slot_index,
+                        api_config_str,
+                        str(err),
+                        os.getpid(),
+                        completed_offset,
+                    )
                 )
                 continue
 
@@ -675,7 +684,14 @@ def _sanitizer_worker_loop(
                 shutil.rmtree(case_log_dir, ignore_errors=True)
                 completed_offset = log_worker.write_case_end("error", api_config_str)
                 result_queue.put(
-                    ("error", slot_index, api_config_str, str(err), os.getpid(), completed_offset)
+                    (
+                        "error",
+                        slot_index,
+                        api_config_str,
+                        str(err),
+                        os.getpid(),
+                        completed_offset,
+                    )
                 )
                 continue
             result_queue.put(("child", slot_index, os.getpid(), child_process.pid))
@@ -717,7 +733,13 @@ def _sanitizer_worker_loop(
                 if returncode == 0 or ignored:
                     completed_offset = log_worker.write_case_end("completed", api_config_str)
                     result_queue.put(
-                        ("done", slot_index, api_config_str, os.getpid(), completed_offset)
+                        (
+                            "done",
+                            slot_index,
+                            api_config_str,
+                            os.getpid(),
+                            completed_offset,
+                        )
                     )
                 elif returncode == 2:
                     completed_offset = log_worker.write_case_end("error", api_config_str)
@@ -765,7 +787,15 @@ def _sanitizer_worker_loop(
 class WorkerPool:
     """用于公平 GPU 调度的自定义进程池，每个 worker 对应一个队列。"""
 
-    def __init__(self, available_gpus, max_workers_per_gpu, options, *, gpu_total_memory_map=None):
+    def __init__(
+        self,
+        available_gpus,
+        max_workers_per_gpu,
+        options,
+        *,
+        gpu_total_memory_map=None,
+        cpu_worker_count=0,
+    ):
         # 将 argparse.Namespace 转成 SimpleNamespace，便于 worker 进程更干净地 pickle。
         if isinstance(options, argparse.Namespace):
             self.options = SimpleNamespace(**vars(options))
@@ -784,9 +814,13 @@ class WorkerPool:
         self._spawn_lock = threading.Lock()
         self._closed = False
 
-        # 构建 worker 槽位：按 GPU 或 GPU 对确定性分配。
+        # CPU worker 使用 gpu_id=None；只有需要 GPU 运行时时才建立 GPU 槽位。
         idx = 0
-        if getattr(self.options, "accuracy_stable_dual_gpu", False):
+        if cpu_worker_count:
+            for _ in range(cpu_worker_count):
+                self.slots.append(WorkerSlot(index=idx, gpu_id=None))
+                idx += 1
+        elif _dual_gpu_mode_enabled(self.options):
             for pair_index in range(0, len(available_gpus), 2):
                 slot = WorkerSlot(
                     index=idx,
@@ -807,11 +841,33 @@ class WorkerPool:
         return len(self.slots)
 
     def start(self):
-        """仅启动 watchdog；worker 在任务通过显存准入后按需创建。"""
+        """CPU worker 立即启动；GPU worker 等显存准入后按需创建。"""
+        # 纯 CPU 没有显存准入阶段，需要先建立进程再进入普通空闲队列派发。
+        for slot in self.slots:
+            if slot.gpu_id is None:
+                self._spawn_worker(slot)
         self._watchdog_thread = threading.Thread(
             target=self._watchdog_loop, daemon=True, name="pool-watchdog"
         )
         self._watchdog_thread.start()
+
+    def warmup_cpu_workers(self, timeout=None):
+        """等待纯 CPU worker 全部就绪，启动失败时保持批次级失败语义。"""
+        if timeout is None:
+            timeout = self._startup_timeout()
+        # CPU 批次没有后续显存状态机兜底，因此首轮派发前必须完成完整启动屏障。
+        # 任一 slot 进入 suspended 都表示初始化已经失败，继续等待不会增加 ready 数量。
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            ready_count = sum(slot.state == "idle" for slot in self.slots)
+            if ready_count == self.total_workers:
+                return ready_count
+            msg = self.collect_one(timeout=min(0.5, max(0.1, deadline - time.monotonic())))
+            if msg is not None:
+                self._handle_worker_control_message(msg)
+            if any(slot.state == "suspended" for slot in self.slots):
+                break
+        return sum(slot.state == "idle" for slot in self.slots)
 
     def _suspend_slot(self, slot):
         """挂起需要回收观察的 slot，后续只能由主调度循环恢复。"""
@@ -874,7 +930,10 @@ class WorkerPool:
             previous_visibility = os.environ.get("CUDA_VISIBLE_DEVICES")
             try:
                 # spawn 会先导入本模块；必须在 start 前让子解释器继承 slot 映射。
-                os.environ["CUDA_VISIBLE_DEVICES"] = inherited_visibility
+                if inherited_visibility is None:
+                    os.environ.pop("CUDA_VISIBLE_DEVICES", None)
+                else:
+                    os.environ["CUDA_VISIBLE_DEVICES"] = inherited_visibility
                 p.start()
             finally:
                 if previous_visibility is None:
@@ -1342,7 +1401,8 @@ TEST_MODE_ERROR = (
     "specify exactly one test mode: --accuracy, --paddle_only, --paddle_cinn, "
     "--paddle_gpu_performance, --torch_gpu_performance, "
     "--paddle_torch_gpu_performance, --accuracy_stable, "
-    "--accuracy_stable_dual_gpu, --paddle_custom_device, --custom_device_vs_gpu"
+    "--accuracy_dual_gpu, --accuracy_stable_dual_gpu, "
+    "--paddle_custom_device, --custom_device_vs_gpu"
 )
 
 
@@ -1361,6 +1421,7 @@ def _mode_uses_torch(options):
             "torch_gpu_performance",
             "paddle_torch_gpu_performance",
             "accuracy_stable",
+            "accuracy_dual_gpu",
             "accuracy_stable_dual_gpu",
             "paddle_custom_device",
             "custom_device_vs_gpu",
@@ -1437,23 +1498,73 @@ def _parse_gpu_ids(gpu_ids_arg, device_count):
     return tuple(sorted(gpu_ids))
 
 
-def normalize_accuracy_stable_dual_gpu_options(options):
-    """让双 GPU 标志自洽地进入 accuracy-stable GPU 模式。"""
-    if not getattr(options, "accuracy_stable_dual_gpu", False):
+def _dual_gpu_mode_enabled(options):
+    """双卡判断只属于引擎资源协议，不承载 tester 的显存治理策略。"""
+    return bool(
+        getattr(options, "accuracy_dual_gpu", False)
+        or getattr(options, "accuracy_stable_dual_gpu", False)
+    )
+
+
+def _normalize_dual_gpu_option(options, option_name, base_mode):
+    if not getattr(options, option_name, False):
         return
+    # 先把组合开关展开为既有主模式，再进入统一的模式互斥校验。
+    # dual 标志本身不作为第二个主模式重复计数。
     if not getattr(options, "use_gpu_mode", False):
         print(
             f"{ARGUMENT_WARNING_PREFIX} "
-            "--accuracy_stable_dual_gpu=True implies --use_gpu_mode=True; enabling GPU mode",
+            f"--{option_name}=True implies --use_gpu_mode=True; enabling GPU mode",
             flush=True,
         )
         options.use_gpu_mode = True
-    options.accuracy_stable = True
+    setattr(options, base_mode, True)
+
+
+def normalize_accuracy_stable_dual_gpu_options(options):
+    """兼容既有调用方，让 stable 双卡标志自洽地进入对应主模式。"""
+    _normalize_dual_gpu_option(options, "accuracy_stable_dual_gpu", "accuracy_stable")
+
+
+def normalize_accuracy_dual_gpu_options(options):
+    """让 accuracy 双卡标志自洽地进入 accuracy GPU mode。"""
+    _normalize_dual_gpu_option(options, "accuracy_dual_gpu", "accuracy")
+
+
+def normalize_dual_gpu_options(options):
+    normalize_accuracy_dual_gpu_options(options)
+    normalize_accuracy_stable_dual_gpu_options(options)
+
+
+def _mode_runs_torch_gpu_reference(options):
+    """只有真实执行 Torch reference 的模式才要求为其保留计算卡。"""
+    # Paddle/CINN 等仅借用 Torch 工具的模式不属于 reference GPU 执行。
+    return any(
+        getattr(options, mode, False)
+        for mode in (
+            "accuracy",
+            "accuracy_stable",
+            "accuracy_dual_gpu",
+            "accuracy_stable_dual_gpu",
+            "torch_gpu_performance",
+            "paddle_torch_gpu_performance",
+        )
+    )
+
+
+def _requires_gpu_runtime(options):
+    """GPU 算子或 GPU 生成/比较任一启用时，都必须准备 GPU 运行时。"""
+    # test_cpu 只移走 Paddle kernel；Torch reference、GPU 生成和比较仍各自需要 GPU。
+    return bool(
+        not getattr(options, "test_cpu", False)
+        or getattr(options, "use_gpu_mode", False)
+        or _mode_runs_torch_gpu_reference(options)
+    )
 
 
 def validate_gpu_options(options) -> tuple:
     """校验并规范化 GPU 相关参数。"""
-    normalize_accuracy_stable_dual_gpu_options(options)
+    normalize_dual_gpu_options(options)
     device_count = get_device_count()
     if device_count == 0:
         raise ValueError("no accelerator devices were found")
@@ -1477,13 +1588,12 @@ def validate_gpu_options(options) -> tuple:
             f"invalid --num_workers_per_gpu={options.num_workers_per_gpu}: "
             "expected -1 or a positive integer"
         )
-    if getattr(options, "accuracy_stable_dual_gpu", False):
-        if getattr(options, "test_cpu", False):
-            raise ValueError("--accuracy_stable_dual_gpu=True does not support --test_cpu=True")
+    if _dual_gpu_mode_enabled(options):
+        # 一对卡是不可拆分的 worker slot，禁止共享其中任意一张卡。
         if options.num_gpus < 2 or options.num_gpus % 2:
-            raise ValueError("--accuracy_stable_dual_gpu=True requires an even --num_gpus")
+            raise ValueError("dual-GPU accuracy modes require an even --num_gpus")
         if options.num_workers_per_gpu != 1:
-            raise ValueError("--accuracy_stable_dual_gpu=True requires --num_workers_per_gpu=1")
+            raise ValueError("dual-GPU accuracy modes require --num_workers_per_gpu=1")
     return tuple(gpu_ids)
 
 
@@ -1512,7 +1622,8 @@ def parse_bool(value):
 
 def _apply_single_config_gpu_defaults(options):
     if not options.gpu_ids and options.num_gpus == -1:
-        if getattr(options, "accuracy_stable_dual_gpu", False):
+        # 双卡单 case 必须形成完整 pair，不能沿用普通模式的一卡默认值。
+        if _dual_gpu_mode_enabled(options):
             options.gpu_ids = "0,1"
             options.num_gpus = 2
         else:
@@ -1521,17 +1632,15 @@ def _apply_single_config_gpu_defaults(options):
 
 
 def _prepare_single_config_gpu(options):
-    normalize_accuracy_stable_dual_gpu_options(options)
-    if getattr(options, "accuracy_stable_dual_gpu", False) and getattr(options, "test_cpu", False):
-        raise ValueError("--accuracy_stable_dual_gpu=True does not support --test_cpu=True")
-    if options.test_cpu:
+    normalize_dual_gpu_options(options)
+    if not _requires_gpu_runtime(options):
         options.gpu_workers_per_gpu_map = {}
         options.gpu_total_memory_map = {}
         return None
 
     _apply_single_config_gpu_defaults(options)
     gpu_ids = validate_gpu_options(options)
-    expected_gpu_count = 2 if getattr(options, "accuracy_stable_dual_gpu", False) else 1
+    expected_gpu_count = 2 if _dual_gpu_mode_enabled(options) else 1
     if len(gpu_ids) != expected_gpu_count:
         raise ValueError(
             f"single --api_config run requires exactly {expected_gpu_count} GPU(s); "
@@ -1728,6 +1837,47 @@ def resolve_batch_worker_layout(
     return available_gpus, max_workers_per_gpu, gpu_pairs
 
 
+def _resolve_cpu_worker_count(options, pending_cases):
+    """纯 CPU batch 沿用 worker 数参数，但不执行任何 GPU 探测或绑定。"""
+    requested = 1 if options.num_workers_per_gpu == -1 else options.num_workers_per_gpu
+    if requested <= 0:
+        raise ValueError("--num_workers_per_gpu must be -1 or a positive integer")
+    return min(requested, pending_cases, MAX_TOTAL_WORKERS)
+
+
+def _pop_ready_pending_case(pending_dispatch, now=None):
+    """从 pending 队列取出一个已到重试时间的 case。"""
+    if not pending_dispatch:
+        return None
+    now = time.monotonic() if now is None else now
+    # 延迟 case 轮转到队尾，避免一个退避任务阻塞后续已经可运行的配置。
+    # 若本轮没有 ready case，队列顺序仍保持循环稳定，不丢失重试状态。
+    for _ in range(len(pending_dispatch)):
+        pending = pending_dispatch.popleft()
+        if pending.ready_at <= now:
+            return pending.config
+        pending_dispatch.append(pending)
+    return None
+
+
+def _fill_idle_workers(pool, pending_dispatch, config_iter):
+    """优先用 pending 队列补满空闲 worker，再消费新的 case。"""
+    dispatched_count = 0
+    # 重试任务优先于新任务，保证外部 kill 或显存 defer 不会长期饥饿。
+    while True:
+        slot = next(pool.idle_slots(), None)
+        if slot is None:
+            break
+        config = _pop_ready_pending_case(pending_dispatch)
+        if config is None:
+            config = next(config_iter, None)
+        if config is None:
+            break
+        pool.dispatch(slot.index, config)
+        dispatched_count += 1
+    return dispatched_count
+
+
 def _build_gpu_wave_runtimes(pool):
     grouped_slots = {}
     for slot in pool.slots:
@@ -1753,6 +1903,7 @@ def _build_gpu_wave_runtimes(pool):
 def _gpu_memory_preflight_mode(options):
     for mode in (
         "accuracy_stable_dual_gpu",
+        "accuracy_dual_gpu",
         "accuracy_stable",
         "accuracy",
         "paddle_only",
@@ -1775,6 +1926,9 @@ def _estimate_case_gpu_memory(api_config_str, options):
             mode,
             check_grad=should_check_grad(api_config),
             input_backend=resolve_input_backend_name(),
+            # 执行设备分别建模，不能用 use_gpu_mode 代替 Paddle/Torch 的真实 place。
+            paddle_kernel_on_gpu=not options.test_cpu,
+            torch_operator_on_gpu=_mode_runs_torch_gpu_reference(options),
         )
     except Exception:
         # 配置解析和不支持 dtype 仍由 worker 分类；调度器使用最小准入成本兜底。
@@ -1941,11 +2095,7 @@ def _try_dispatch_planned_waves(
 
 def _runtime_for_slot(runtimes, slot_index):
     return next(
-        (
-            runtime
-            for runtime in runtimes.values()
-            if slot_index in runtime.slot_indices
-        ),
+        (runtime for runtime in runtimes.values() if slot_index in runtime.slot_indices),
         None,
     )
 
@@ -1992,8 +2142,7 @@ def _update_gpu_pressure_timeout(
     """仅在有 pending 且没有在途/启动中波次时累计批次无进展时间。"""
     now = time.monotonic() if now is None else now
     has_inflight_wave = any(
-        runtime.controller.state in {"planned", "running"}
-        for runtime in runtimes.values()
+        runtime.controller.state in {"planned", "running"} for runtime in runtimes.values()
     )
     # deferred 的 ready_at 只控制重派频率，其退避时间仍属于显存压力等待。
     has_pending = bool(pending_dispatch)
@@ -2015,8 +2164,7 @@ def _format_gpu_pressure_summary(runtimes, pool, *, snapshot_reader):
     for runtime in runtimes.values():
         snapshots = snapshot_reader(runtime.controller.device_ids)
         active_workers = sum(
-            pool.slots[index].state in {"starting", "busy"}
-            for index in runtime.slot_indices
+            pool.slots[index].state in {"starting", "busy"} for index in runtime.slot_indices
         )
         for gpu_id in runtime.controller.device_ids:
             snapshot = snapshots[gpu_id]
@@ -2092,7 +2240,10 @@ def _handle_batch_result(
     worker_reusable = msg_type in ("done", "error") or (
         msg_type == "crashed" and options.use_compute_sanitizer and crash_source == "child"
     )
-    external_kill = msg_type == "crashed" and exitcode in (-signal.SIGKILL, -signal.SIGTERM)
+    external_kill = msg_type == "crashed" and exitcode in (
+        -signal.SIGKILL,
+        -signal.SIGTERM,
+    )
     batch_state.active_tasks -= 1
 
     if external_kill:
@@ -2237,6 +2388,76 @@ def _restore_batch_signal_handlers(previous_handlers):
         signal.signal(sig, handler)
 
 
+def _run_cpu_batch_loop(
+    pool,
+    options,
+    api_configs,
+    all_case,
+    checkpointed_case,
+    batch_state,
+    retry_state,
+    max_total_external_kills,
+):
+    """运行不依赖 GPU 准入和显存回收状态机的纯 CPU 批处理。"""
+    ready_workers = pool.warmup_cpu_workers()
+    if ready_workers != pool.total_workers:
+        print(
+            "Workers: failed | CPU startup barrier incomplete; no cases will be dispatched",
+            flush=True,
+        )
+        batch_state.batch_exit_code = 1
+        batch_state.shutdown_force = True
+        batch_state.abort_run = True
+        return
+
+    pending_dispatch = deque(PendingCase(config) for config in api_configs)
+    # 所有首次任务也进入统一 pending 队列，使 retry 和普通任务共享同一公平规则。
+    empty_config_iter = iter(())
+
+    def refill_idle_workers():
+        if batch_state.abort_run:
+            return
+        dispatched = _fill_idle_workers(pool, pending_dispatch, empty_config_iter)
+        batch_state.active_tasks += dispatched
+        if dispatched and batch_state.test_started_at is None:
+            batch_state.test_started_at = time.monotonic()
+            batch_state.last_forecast_at = batch_state.test_started_at
+
+    refill_idle_workers()
+    # starting slot 纳入循环存活条件，避免重建进程的 ready 消息无人接收。
+    while (
+        batch_state.active_tasks > 0
+        or pending_dispatch
+        or any(slot.state == "starting" for slot in pool.slots)
+    ) and not batch_state.abort_run:
+        pending_delay = _next_pending_delay(pending_dispatch)
+        collect_timeout = 0.5
+        if pending_delay is not None:
+            collect_timeout = min(collect_timeout, max(0.1, pending_delay))
+        msg = pool.collect_one(timeout=collect_timeout)
+        if msg is not None and not pool._handle_worker_control_message(msg):
+            # 控制消息只改变 slot 生命周期；case 终态才允许推进计数和 checkpoint。
+            if msg[0] in ("done", "deferred", "error", "timeout", "crashed"):
+                _handle_batch_result(
+                    pool=pool,
+                    options=options,
+                    all_case=all_case,
+                    checkpointed_case=checkpointed_case,
+                    batch_state=batch_state,
+                    retry_state=retry_state,
+                    pending_dispatch=pending_dispatch,
+                    msg=msg,
+                    max_total_external_kills=max_total_external_kills,
+                )
+
+        # timeout、crash 和 deferred 会挂起原 slot；纯 CPU 可直接重建，无需等待显存回收。
+        if pending_dispatch and not batch_state.abort_run:
+            for slot in pool.slots:
+                if slot.state == "suspended":
+                    pool._spawn_worker(slot)
+        refill_idle_workers()
+
+
 def _run_batch_mode(
     *,
     options,
@@ -2245,6 +2466,8 @@ def _run_batch_mode(
     checkpointed_case,
     available_gpus,
     max_workers_per_gpu,
+    gpu_total_memory_map,
+    cpu_worker_count,
     start_time,
 ):
     batch_state = BatchRunState()
@@ -2257,14 +2480,12 @@ def _run_batch_mode(
         # batch 执行分为三段：
         # 启动 worker、处理结果、收尾日志和信号处理器。
         log_report.print_running_banner()
-        # 批量路径只在这里统一收集一次，避免池内再次探测同一批 GPU。
-        gpu_total_memory_map = _build_gpu_total_memory_map(available_gpus)
-
         pool = WorkerPool(
             available_gpus,
             max_workers_per_gpu,
             options,
             gpu_total_memory_map=gpu_total_memory_map,
+            cpu_worker_count=cpu_worker_count,
         )
 
         def cleanup_handler(*args):
@@ -2281,6 +2502,19 @@ def _run_batch_mode(
 
         print(f"Workers: lazy | {len(pool.slots)} logical slots", flush=True)
         pool.start()
+        if cpu_worker_count:
+            _run_cpu_batch_loop(
+                pool,
+                options,
+                api_configs,
+                all_case,
+                checkpointed_case,
+                batch_state,
+                retry_state,
+                max_total_external_kills,
+            )
+            return batch_state.batch_exit_code
+
         pending_dispatch = _build_pending_cases(api_configs, options)
         retry_state.case_memory_estimates = {
             pending.config: pending.gpu_estimate for pending in pending_dispatch
@@ -2410,14 +2644,15 @@ def _run_batch_mode(
 
 def _build_case_runtime_context(api_config_str, options):
     started_at = time.monotonic()
-    visible_gpu_ids = tuple(
-        int(value) for value in os.environ.get("CUDA_VISIBLE_DEVICES", "0").split(",")
-    )
-    gpu_id = visible_gpu_ids[0]
+    # 纯 CPU 模式不借用虚拟 GPU id，日志和显存预算也保持 CPU 语义。
+    visible_gpu_ids = ()
+    if _requires_gpu_runtime(options):
+        visible_gpu_ids = tuple(
+            int(value) for value in os.environ.get("CUDA_VISIBLE_DEVICES", "0").split(",")
+        )
+    gpu_id = visible_gpu_ids[0] if visible_gpu_ids else None
     comparison_gpu_id = (
-        visible_gpu_ids[1]
-        if getattr(options, "accuracy_stable_dual_gpu", False) and len(visible_gpu_ids) > 1
-        else None
+        visible_gpu_ids[1] if _dual_gpu_mode_enabled(options) and len(visible_gpu_ids) > 1 else None
     )
     suppress_case_tags = os.environ.get("PADDLEAPITEST_SUPPRESS_CASE_TAGS") == "1"
     if not suppress_case_tags:
@@ -2468,8 +2703,10 @@ def _handle_case_exception(api_config_str, err):
 def _cleanup_case_runtime(options):
     if not getattr(options, "use_gpu_mode", False):
         gc.collect()
-    if not any(getattr(options, opt) for opt in GPU_PERFORMANCE_MODES) and not getattr(
-        options, "use_gpu_mode", False
+    if (
+        _requires_gpu_runtime(options)
+        and not any(getattr(options, opt) for opt in GPU_PERFORMANCE_MODES)
+        and not getattr(options, "use_gpu_mode", False)
     ):
         _clear_device_cache(options)
 
@@ -2503,6 +2740,17 @@ def _validate_test_mode(options):
     ]
     if len([m for m in mode if m is True]) != 1:
         return _argument_error(TEST_MODE_ERROR)
+    # GPU 性能和自定义设备模式具有固定设备协议，不能被 test_cpu 改写为 CPU kernel。
+    # 对矛盾组合在参数层 fail fast，避免 worker 启动后才触发硬编码 CUDA 同步错误。
+    # accuracy/stable/paddle_only/CINN 未列入此集合，继续支持正交的四种设备组合。
+    cpu_incompatible_modes = GPU_PERFORMANCE_MODES + (
+        "paddle_custom_device",
+        "custom_device_vs_gpu",
+    )
+    if options.test_cpu and any(getattr(options, mode, False) for mode in cpu_incompatible_modes):
+        return _argument_error(
+            "--test_cpu=True is incompatible with GPU performance and custom-device modes"
+        )
     return None
 
 
@@ -2620,8 +2868,8 @@ def _prepare_common_options(options):
     except ValueError as err:
         return _argument_error(str(err))
 
-    normalize_accuracy_stable_dual_gpu_options(options)
-    if options.api_config and not options.test_cpu:
+    normalize_dual_gpu_options(options)
+    if options.api_config and _requires_gpu_runtime(options):
         _apply_single_config_gpu_defaults(options)
 
     common_error = _validate_input_sources(options)
@@ -2785,6 +3033,8 @@ def _run_single_case_mode(options, start_time):
     except ValueError as err:
         return _argument_error(str(err))
 
+    log_report.print_running_banner()
+
     # 单 case 执行与 worker 复用同样的静默 Paddle/bootstrap 路径。
     _init_runtime_modules(options)
     init_log(options.log_dir)
@@ -2884,25 +3134,50 @@ def _run_batch_case_mode(options, start_time):
     except ValueError as err:
         return _argument_error(str(err))
 
-    # 校验 GPU 可见性并推导每张 GPU 的 worker 数量。
-    gpu_ids = validate_gpu_options(options)
-    available_gpus, max_workers_per_gpu = check_gpu_memory(gpu_ids, options.num_workers_per_gpu)
-    if not available_gpus:
-        print("No usable GPUs available.", flush=True)
-        return 2
-    if options.accuracy_stable_dual_gpu and len(available_gpus) != len(gpu_ids):
-        print("Not all selected GPUs are usable; no complete dual-GPU layout.", flush=True)
-        return 2
-
-    try:
-        available_gpus, max_workers_per_gpu, gpu_pairs = resolve_batch_worker_layout(
-            available_gpus,
-            max_workers_per_gpu,
-            all_case,
-            dual_gpu=options.accuracy_stable_dual_gpu,
-        )
-    except ValueError as err:
-        return _argument_error(str(err))
+    available_gpus = []
+    max_workers_per_gpu = {}
+    gpu_pairs = None
+    gpu_total_memory_map = {}
+    cpu_worker_count = 0
+    if _requires_gpu_runtime(options):
+        # GPU 算子与 GPU mode 共用真实 GPU slot，但用途由各自配置独立决定。
+        # 此分支同时覆盖 GPU-kernel/CPU-compare 与 CPU-kernel/GPU-compare。
+        # GPU 可见性只负责生成、执行、比较所需的 CUDA runtime 边界。
+        # kernel 的最终 place 仍由 worker 内的 test_cpu 单独设置。
+        gpu_ids = validate_gpu_options(options)
+        available_gpus, max_workers_per_gpu = check_gpu_memory(gpu_ids, options.num_workers_per_gpu)
+        if not available_gpus:
+            print("No usable GPUs available.", flush=True)
+            return 2
+        if _dual_gpu_mode_enabled(options) and len(available_gpus) != len(gpu_ids):
+            print(
+                "Not all selected GPUs are usable; no complete dual-GPU layout.",
+                flush=True,
+            )
+            return 2
+        try:
+            (
+                available_gpus,
+                max_workers_per_gpu,
+                gpu_pairs,
+            ) = resolve_batch_worker_layout(
+                available_gpus,
+                max_workers_per_gpu,
+                all_case,
+                dual_gpu=_dual_gpu_mode_enabled(options),
+            )
+        except ValueError as err:
+            return _argument_error(str(err))
+        # 批量路径统一收集一次，避免 worker pool 再次探测同一批 GPU。
+        gpu_total_memory_map = _build_gpu_total_memory_map(available_gpus)
+    else:
+        # 纯 CPU 分支不调用 validate_gpu_options/check_gpu_memory。
+        # cpu_worker_count 直接生成 gpu_id=None 的 worker slot。
+        # 这样 runtime config、case tag 和显存预算都不会携带伪 GPU id。
+        try:
+            cpu_worker_count = _resolve_cpu_worker_count(options, all_case)
+        except ValueError as err:
+            return _argument_error(str(err))
 
     if options.use_compute_sanitizer:
         sanitizer_cmd = _validate_sanitizer_command(options.sanitizer_command)
@@ -2910,14 +3185,20 @@ def _run_batch_case_mode(options, start_time):
             return 2
         options.sanitizer_cmd = sanitizer_cmd
 
-    log_report.print_compute_summary(
-        available_gpus,
-        max_workers_per_gpu,
-        gpu_pairs=gpu_pairs,
+    if available_gpus:
+        log_report.print_compute_summary(
+            available_gpus,
+            max_workers_per_gpu,
+            gpu_pairs=gpu_pairs,
+        )
+    print(
+        f"Paddle kernels: {'CPU' if options.test_cpu else 'GPU'} | "
+        f"Torch reference: {'GPU' if _mode_runs_torch_gpu_reference(options) else 'N/A'} | "
+        f"input/compare: {'GPU' if options.use_gpu_mode else 'CPU'}",
+        flush=True,
     )
-
-    if options.test_cpu:
-        print(f"CPU: {cpu_count()} available | Paddle CPU mode", flush=True)
+    if cpu_worker_count:
+        print(f"CPU: {cpu_count()} available | {cpu_worker_count} workers", flush=True)
 
     return _run_batch_mode(
         options=options,
@@ -2926,6 +3207,8 @@ def _run_batch_case_mode(options, start_time):
         checkpointed_case=batch_configs.finish_case,
         available_gpus=available_gpus,
         max_workers_per_gpu=max_workers_per_gpu,
+        gpu_total_memory_map=gpu_total_memory_map,
+        cpu_worker_count=cpu_worker_count,
         start_time=start_time,
     )
 
@@ -2950,7 +3233,7 @@ def _build_argument_parser():
         default="",
         help=(
             "Run one API config string directly. Single-case mode uses one GPU, or one "
-            "GPU pair with --accuracy_stable_dual_gpu=True."
+            "GPU pair with a dual-GPU accuracy mode."
         ),
     )
     parser.add_argument(
@@ -2978,6 +3261,12 @@ def _build_argument_parser():
         type=parse_bool,
         default=False,
         help="Run Paddle vs corresponding Torch accuracy checks.",
+    )
+    parser.add_argument(
+        "--accuracy_dual_gpu",
+        type=parse_bool,
+        default=False,
+        help="Use one input/compute GPU and one full-result comparison GPU per accuracy worker.",
     )
     parser.add_argument(
         "--paddle_gpu_performance",
@@ -3043,7 +3332,7 @@ def _build_argument_parser():
         "--test_cpu",
         type=parse_bool,
         default=False,
-        help="Run Paddle in CPU mode only; Torch reference still runs on GPU.",
+        help="Run only Paddle forward/backward on CPU; Torch reference remains on GPU.",
     )
     parser.add_argument(
         "--use_cached_numpy",
@@ -3055,7 +3344,10 @@ def _build_argument_parser():
         "--use_gpu_mode",
         type=parse_bool,
         default=False,
-        help="Enable GPU tensor generation, GPU compare, and CUDA allocator reuse for speed.",
+        help=(
+            "Enable GPU tensor generation, comparison, and allocator reuse; "
+            "does not change the Paddle kernel or Torch reference devices."
+        ),
     )
     parser.add_argument(
         "--log_dir",

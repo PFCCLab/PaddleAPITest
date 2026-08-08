@@ -21,6 +21,7 @@ _SUPPORTED_MODES = frozenset(
     {
         "paddle_only",
         "accuracy",
+        "accuracy_dual_gpu",
         "accuracy_stable",
         "accuracy_stable_dual_gpu",
     }
@@ -200,7 +201,25 @@ def _input_grad_bytes(configs, check_grad):
     )
 
 
-def estimate_gpu_memory(api_config, mode, *, check_grad, input_backend="torch"):
+def _comparison_input_grad_bytes(configs, check_grad):
+    """统计最终会进入比较设备的逻辑梯度，不受算子执行设备或显式 place 影响。"""
+    if not check_grad:
+        return 0
+    # CPU kernel 梯度虽不占 compute GPU，H2D 后仍是 comparison 卡驻留项。
+    return sum(
+        _logical_nbytes(config) for config in configs if dtype_name(config.dtype) in AUTOGRAD_DTYPES
+    )
+
+
+def estimate_gpu_memory(
+    api_config,
+    mode,
+    *,
+    check_grad,
+    input_backend="torch",
+    paddle_kernel_on_gpu=True,
+    torch_operator_on_gpu=True,
+):
     """按测试模式构造不依赖 API 名称的阶段存活集合。"""
     if mode not in _SUPPORTED_MODES:
         raise ValueError(f"unsupported GPU memory preflight mode: {mode}")
@@ -216,21 +235,39 @@ def estimate_gpu_memory(api_config, mode, *, check_grad, input_backend="torch"):
     )
     # 原地 API 的 clone 是框架输入生命周期的一部分，不能留给运行时未知项。
     force_input_copy = requires_inplace_input_copy(api_config)
-    torch_materialization_peak, torch_materialized_input_bytes = _framework_materialization(
-        configs,
-        input_backend,
-        "torch",
-        force_clone=force_input_copy,
-    )
-    paddle_materialization_peak, _ = _framework_materialization(
-        configs,
-        input_backend,
-        "paddle",
-        force_clone=force_input_copy,
-    )
-    # 执行阶段只保留最终框架输入；clone 的瞬时峰值已在 materialization stage 计入。
-    framework_input_bytes = sum(_framework_live_input_bytes(config) for config in configs)
-    input_grad_bytes = _input_grad_bytes(configs, check_grad)
+    if torch_operator_on_gpu:
+        (
+            torch_materialization_peak,
+            torch_materialized_input_bytes,
+        ) = _framework_materialization(
+            configs,
+            input_backend,
+            "torch",
+            force_clone=force_input_copy,
+        )
+        torch_framework_input_bytes = sum(_framework_live_input_bytes(config) for config in configs)
+        torch_input_grad_bytes = _input_grad_bytes(configs, check_grad)
+    else:
+        torch_materialization_peak = 0
+        torch_materialized_input_bytes = 0
+        torch_framework_input_bytes = 0
+        torch_input_grad_bytes = 0
+
+    if paddle_kernel_on_gpu:
+        paddle_materialization_peak, _ = _framework_materialization(
+            configs,
+            input_backend,
+            "paddle",
+            force_clone=force_input_copy,
+        )
+        paddle_framework_input_bytes = sum(
+            _framework_live_input_bytes(config) for config in configs
+        )
+        paddle_input_grad_bytes = _input_grad_bytes(configs, check_grad)
+    else:
+        paddle_materialization_peak = 0
+        paddle_framework_input_bytes = 0
+        paddle_input_grad_bytes = 0
 
     stages = [
         MemoryStageEstimate(
@@ -251,7 +288,7 @@ def estimate_gpu_memory(api_config, mode, *, check_grad, input_backend="torch"):
                 ),
             )
         )
-    elif mode == "accuracy":
+    elif mode in {"accuracy", "accuracy_dual_gpu"}:
         # Accuracy 先执行 Torch，生成源在 Paddle 输入取得所有权后才释放。
         stages.extend(
             (
@@ -275,20 +312,34 @@ def estimate_gpu_memory(api_config, mode, *, check_grad, input_backend="torch"):
         )
     else:
         # stable 保存 CPU snapshot 时可能先经 Torch 物化；每个输入完成拷贝后即释放其 GPU target。
-        snapshot_extra_peak = max(
-            (
-                build_materialization_plan(config, input_backend, "torch").peak_bytes
-                for config in configs
-            ),
-            default=0,
+        snapshot_extra_peak = (
+            max(
+                (
+                    build_materialization_plan(config, input_backend, "torch").peak_bytes
+                    for config in configs
+                ),
+                default=0,
+            )
+            if torch_operator_on_gpu
+            else 0
         )
-        # stable 从 CPU snapshot 重建，使用 NumPy source 只模拟目标 GPU storage。
-        stable_framework_peak, _ = _framework_materialization(
-            configs,
-            "numpy",
-            "torch",
-            force_clone=force_input_copy,
-        )
+        # 两侧从同一 CPU snapshot 顺序重建，分别统计才能表达 Paddle CPU + Torch GPU。
+        stable_torch_framework_peak = 0
+        if torch_operator_on_gpu:
+            stable_torch_framework_peak, _ = _framework_materialization(
+                configs,
+                "numpy",
+                "torch",
+                force_clone=force_input_copy,
+            )
+        stable_paddle_framework_peak = 0
+        if paddle_kernel_on_gpu:
+            stable_paddle_framework_peak, _ = _framework_materialization(
+                configs,
+                "numpy",
+                "paddle",
+                force_clone=force_input_copy,
+            )
         stages.append(
             MemoryStageEstimate(
                 "stable_input_snapshot",
@@ -300,23 +351,33 @@ def estimate_gpu_memory(api_config, mode, *, check_grad, input_backend="torch"):
             )
         )
         # stable 从已落盘的 CPU 精确 dtype 副本重建，只分配最终框架输入。
-        stages.append(
-            MemoryStageEstimate(
-                "framework_input_materialization",
-                "compute",
-                (("framework_inputs", stable_framework_peak),),
+        stages.extend(
+            (
+                MemoryStageEstimate(
+                    "torch_framework_input_materialization",
+                    "compute",
+                    (("framework_inputs", stable_torch_framework_peak),),
+                ),
+                MemoryStageEstimate(
+                    "paddle_framework_input_materialization",
+                    "compute",
+                    (("framework_inputs", stable_paddle_framework_peak),),
+                ),
             )
         )
 
-    framework_execution = (
-        ("framework_inputs", framework_input_bytes),
-        ("input_grads", input_grad_bytes),
+    torch_execution = (
+        ("framework_inputs", torch_framework_input_bytes),
+        ("input_grads", torch_input_grad_bytes),
     )
+    paddle_execution = (
+        ("framework_inputs", paddle_framework_input_bytes),
+        ("input_grads", paddle_input_grad_bytes),
+    )
+    comparison_input_grad_bytes = _comparison_input_grad_bytes(configs, check_grad)
     if mode == "paddle_only":
-        stages.append(
-            MemoryStageEstimate("paddle_forward_backward", "compute", framework_execution)
-        )
-    elif mode == "accuracy":
+        stages.append(MemoryStageEstimate("paddle_forward_backward", "compute", paddle_execution))
+    elif mode in {"accuracy", "accuracy_dual_gpu"}:
         # Torch 结束前生成源仍供后续 Paddle 使用；Paddle 取得所有权后释放生成源。
         stages.extend(
             (
@@ -326,47 +387,81 @@ def estimate_gpu_memory(api_config, mode, *, check_grad, input_backend="torch"):
                     (
                         ("generated_inputs", generated_input_bytes),
                         ("materialized_inputs", torch_materialized_input_bytes),
-                        ("input_grads", input_grad_bytes),
+                        ("input_grads", torch_input_grad_bytes),
                     ),
                 ),
-                MemoryStageEstimate("paddle_forward_backward", "compute", framework_execution),
+                MemoryStageEstimate("paddle_forward_backward", "compute", paddle_execution),
+            )
+        )
+        if mode == "accuracy":
+            stages.append(
                 MemoryStageEstimate(
                     "accuracy_compare",
                     "compute",
-                    (("input_grad_operand", input_grad_bytes),),
-                ),
+                    (("input_grad_operands", 2 * comparison_input_grad_bytes),),
+                )
+            )
+        else:
+            # 输出大小依赖 API，运行时 copy guard 负责实测；这里只统计可确定的双侧输入梯度。
+            stages.append(
+                MemoryStageEstimate(
+                    "accuracy_dual_backward_compare",
+                    "comparison",
+                    (("input_grad_results", 2 * comparison_input_grad_bytes),),
+                )
+            )
+    else:
+        stages.extend(
+            (
+                MemoryStageEstimate("stable_torch_forward_backward", "compute", torch_execution),
+                MemoryStageEstimate("stable_paddle_forward_backward", "compute", paddle_execution),
             )
         )
-    else:
-        stages.append(
-            MemoryStageEstimate("stable_forward_backward", "compute", framework_execution)
-        )
         if mode == "accuracy_stable":
+            # GPU 侧保留两轮梯度；CPU 侧逐轮搬运，比较峰值只增加一轮梯度。
+            stable_comparison_grad_sets = 2 + int(torch_operator_on_gpu) + int(paddle_kernel_on_gpu)
             stages.append(
                 MemoryStageEstimate(
                     "stable_compare",
                     "compute",
-                    (("input_grad_operand", input_grad_bytes),),
+                    (
+                        (
+                            "input_grad_results",
+                            stable_comparison_grad_sets * comparison_input_grad_bytes,
+                        ),
+                    ),
                 )
             )
         else:
-            # 双卡固定使用分阶段流式搬运，调度与 worker 不再维护 full 备选路径。
-            execution_bytes = sum(value for _, value in framework_execution)
+            # 双卡可选择全驻留或分阶段流式搬运；任一完整路径可行即可运行。
+            torch_execution_bytes = sum(value for _, value in torch_execution)
+            paddle_execution_bytes = sum(value for _, value in paddle_execution)
+            execution_bytes = max(torch_execution_bytes, paddle_execution_bytes)
+            retained_input_grad_bytes = max(
+                torch_input_grad_bytes,
+                paddle_input_grad_bytes,
+            )
             stages.extend(
                 (
+                    MemoryStageEstimate(
+                        "dual_full_comparison_residency",
+                        "comparison",
+                        (("input_grad_results", 4 * comparison_input_grad_bytes),),
+                        plan="full_residency",
+                    ),
                     MemoryStageEstimate(
                         "dual_phased_compute_execution",
                         "compute",
                         (
                             ("framework_execution", execution_bytes),
-                            ("retained_input_grads", input_grad_bytes),
+                            ("retained_input_grads", retained_input_grad_bytes),
                         ),
                         plan="phased_residency",
                     ),
                     MemoryStageEstimate(
                         "dual_phased_comparison_stream",
                         "comparison",
-                        (("input_grad_results", 3 * input_grad_bytes),),
+                        (("input_grad_results", 3 * comparison_input_grad_bytes),),
                         plan="phased_residency",
                     ),
                 )
@@ -374,7 +469,15 @@ def estimate_gpu_memory(api_config, mode, *, check_grad, input_backend="torch"):
     return GpuMemoryEstimate(mode, input_backend, tuple(stages))
 
 
-def decide_gpu_memory_preflight(api_config, mode, gpu_config, *, check_grad):
+def decide_gpu_memory_preflight(
+    api_config,
+    mode,
+    gpu_config,
+    *,
+    check_grad,
+    paddle_kernel_on_gpu=True,
+    torch_operator_on_gpu=True,
+):
     # 预检只做 admission decision，不分配测试 Tensor，失败结果由调用方转换为 skip。
     """仅当配置峰值下界明显超过设备容量时返回 skip。"""
     if not gpu_config.enabled:
@@ -392,6 +495,8 @@ def decide_gpu_memory_preflight(api_config, mode, gpu_config, *, check_grad):
             mode,
             check_grad=check_grad,
             input_backend=resolve_input_backend_name(),
+            paddle_kernel_on_gpu=paddle_kernel_on_gpu,
+            torch_operator_on_gpu=torch_operator_on_gpu,
         )
     except (TypeError, ValueError, OverflowError) as err:
         # 配置合法性仍由原测试流程判断；预检失败不能改变原分类。

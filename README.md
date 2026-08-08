@@ -53,7 +53,9 @@ python engineV4.py \
   --num_gpus=1
 ```
 
-配置包含双引号时用单引号包裹 `--api_config`。普通单配置模式最多使用一块 GPU；`accuracy_stable_dual_gpu` 单配置使用一对 GPU。未指定 `--gpu_ids` 和 `--num_gpus` 时，两种模式分别默认使用 GPU 0 和 GPU 0/1。
+配置包含双引号时用单引号包裹 `--api_config`。普通单配置模式最多使用一块 GPU；
+`accuracy_dual_gpu` 和 `accuracy_stable_dual_gpu` 单配置使用一对 GPU。未指定
+`--gpu_ids` 和 `--num_gpus` 时，两类模式分别默认使用 GPU 0 和 GPU 0/1。
 
 ### 批量运行
 
@@ -103,6 +105,7 @@ python engineV4.py \
 | --- | --- |
 | `--paddle_only=True` | 执行 Paddle API，检查配置解析和 Paddle 支持情况 |
 | `--accuracy=True` | 比较 Paddle 与等价 Torch API 的前向输出和梯度 |
+| `--accuracy_dual_gpu=True` | 与 accuracy 等价，每个 worker 使用一张输入/计算卡和一张全量比较卡 |
 | `--accuracy_stable=True` | Paddle/Torch 分别执行两轮，同时检查跨框架精度与框架内稳定性 |
 | `--accuracy_stable_dual_gpu=True` | 与 accuracy-stable 等价，每个 worker 使用一张计算卡和一张全量比较卡 |
 | `--paddle_cinn=True` | 比较 Paddle 动态图与 CINN；可配合 `--test_backward=True` |
@@ -114,7 +117,8 @@ python engineV4.py \
 
 常用附加参数包括 `--test_amp`、`--test_cpu`、`--atol`、`--rtol`、`--manual_threshold_config_file`、`--bitwise_alignment`、`--timeout`、`--random_seed`、`--generate_failed_tests` 和 `--exit_on_error`。
 
-`--test_cpu=True` 只用于验证 Paddle CPU kernel：Paddle 输入和执行切到 CPU；Torch reference 仍在 GPU 上生成和执行，用作稳定的对照实现。因此 CPU 测试仍允许也可能实际使用 GPU。
+`--test_cpu=True` 只将 Paddle 框架输入及前向、反向切到 CPU。Torch reference 始终在
+GPU 上执行；输入逻辑值生成设备和结果比较设备只由 `--use_gpu_mode` 控制。
 
 ## 引擎与运行入口
 
@@ -124,7 +128,9 @@ python engineV4.py \
 
 ### engineV2
 
-`engineV2.py` 使用 Pebble `ProcessPool`。除调度方式和 engineV4 专属 compute-sanitizer 外，其测试模式、双卡 accuracy-stable、GPU mode、动态显存管理、dump 和主要参数与 engineV4 对齐。详见 [engineV2 文档](engineV2-README.md)。
+`engineV2.py` 使用 Pebble `ProcessPool`。除调度方式、engineV4 专属 compute-sanitizer
+和 `accuracy_dual_gpu` 外，其测试模式、双卡 accuracy-stable、GPU mode、动态显存管理、
+dump 和主要参数与 engineV4 对齐。详见 [engineV2 文档](engineV2-README.md)。
 
 ### 其他入口
 
@@ -142,7 +148,22 @@ python run.py -c test_pipeline/run_config.yaml
 
 ## GPU Mode 与动态显存管理
 
-`--use_gpu_mode=True` 在 GPU 上生成 Tensor 并进行比较，复用 CUDA allocator，适用于大规模 `accuracy_stable` 测试。此模式会忽略 `--use_cached_numpy=True`。
+`--use_gpu_mode=True` 在 GPU 上生成 Tensor 逻辑值并进行结果比较，同时复用 CUDA allocator，
+适用于大规模 `accuracy_stable` 测试。它不改变算子设备；此模式会忽略
+`--use_cached_numpy=True`。
+
+两个开关正交，四种组合的语义如下：
+
+| `test_cpu` | `use_gpu_mode` | Paddle kernel | Torch reference | 输入生成与比较 |
+| --- | --- | --- | --- | --- |
+| `False` | `False` | GPU | GPU | CPU |
+| `False` | `True` | GPU | GPU | GPU |
+| `True` | `False` | CPU | GPU | CPU |
+| `True` | `True` | CPU | GPU | GPU |
+
+组合模式 `test_cpu=True,use_gpu_mode=True` 会先在 GPU 生成逻辑输入，再分别物化为
+Paddle CPU 输入和 Torch GPU 输入，最后把结果送到 GPU 比较。accuracy/accuracy-stable
+始终需要 GPU 运行 Torch reference；`accuracy_stable_dual_gpu` 支持 `test_cpu=True`。
 
 GPU mode 会在输入生成前根据 TensorConfig 元数据和测试模式估算阶段存活集合。单 worker
 独占 GPU 时使用整卡容量，多 worker 共享时按 worker 数均分；只有通用下界已经超过容量的
@@ -152,6 +173,9 @@ GPU mode 不需要选择固定显存策略。框架会在 Torch/Paddle 阶段边
 按下一阶段输入、已观测输出/梯度和 reference workspace 估算 headroom；有压力时先释放两个
 框架的 allocator cache 并重新查询，只有 headroom 仍不足时才将第一轮结果逐棵转移到 CPU。
 小 shape 在显存充足时不会执行不必要的 D2H。
+
+`test_tol` 只将容差置零并记录误差诊断，不改变上述比较设备：启用 GPU mode 时仍在
+GPU 完成 Tensor 比较。
 
 ```bash
 python engineV4.py \
@@ -164,6 +188,30 @@ python engineV4.py \
 ```
 
 该流程始终保留不可变 CPU 输入快照、四次真实执行、全部稳定性比较和大结果分块比较。
+
+### Accuracy 双卡模式
+
+`--accuracy_dual_gpu=True` 为每个 worker 原子分配一对 GPU，并隐式启用 accuracy 和
+GPU mode。逻辑 `gpu:0` 负责 GPU 输入生成；GPU 算子模式下也负责 Torch/Paddle 前后向，
+逻辑 `gpu:1` 保存完整输出和输入梯度并执行全量比较。
+
+```bash
+python engineV4.py \
+  --accuracy_dual_gpu=True \
+  --api_config='paddle.add(Tensor([2, 3],"float32"), Tensor([2, 3],"float32"), )' \
+  --gpu_ids=0,1 \
+  --num_gpus=2 \
+  --num_workers_per_gpu=1
+```
+
+`test_cpu=True` 时 Paddle 在 CPU 执行，Torch reference 仍在 GPU 0 执行；GPU 0 同时按
+GPU mode 生成逻辑输入，Paddle CPU 结果再搬到 GPU 1 比较。每侧 API 只执行一次；前向
+比较通过后才执行 Paddle backward。前向结果比较结束后立即释放，避免与后续双侧梯度
+长期重叠。该模式不进行 CPU spill、采样或跨卡 autograd，也不能拆分单次 GPU kernel
+自身的 workspace 峰值。
+
+GPU 按规范化后的 `--gpu_ids` 顺序两两配对。模式要求至少两张且 GPU 总数为偶数，并要求
+`--num_workers_per_gpu=1`；单条配置默认使用 GPU 0/1。
 
 ### Accuracy Stable 双卡模式
 

@@ -71,23 +71,42 @@ def print_run_header(options, paddle_version):
             )
         )
 
+    torch_reference_gpu = any(
+        getattr(options, name, False)
+        for name in (
+            "accuracy",
+            "accuracy_stable",
+            "accuracy_dual_gpu",
+            "accuracy_stable_dual_gpu",
+            "torch_gpu_performance",
+            "paddle_torch_gpu_performance",
+        )
+    )
+    requires_gpu = not options.test_cpu or options.use_gpu_mode or torch_reference_gpu
+    compute = [
+        ("paddle_kernel_device", "CPU" if options.test_cpu else "GPU"),
+        ("torch_reference_device", "GPU" if torch_reference_gpu else "N/A"),
+        ("input_compare_device", "GPU" if options.use_gpu_mode else "CPU"),
+    ]
     if options.test_cpu:
-        compute = [("--test_cpu", True)]
-    else:
+        compute.append(("--test_cpu", True))
+    if requires_gpu:
         if not options.gpu_ids:
             gpu_ids_display = "all visible"
         elif options.gpu_ids == "-1":
             gpu_ids_display = "-1 (all visible)"
         else:
             gpu_ids_display = options.gpu_ids
-        compute = [("--gpu_ids", gpu_ids_display)]
-        if options.use_gpu_mode:
-            compute.append(("--use_gpu_mode", True))
-            if getattr(options, "accuracy_stable_dual_gpu", False):
-                compute.append(("--accuracy_stable_dual_gpu", True))
-        elif options.use_cached_numpy:
-            compute.append(("--use_cached_numpy", True))
-        compute.append(("--num_workers_per_gpu", options.num_workers_per_gpu))
+        compute.append(("--gpu_ids", gpu_ids_display))
+    if options.use_gpu_mode:
+        compute.append(("--use_gpu_mode", True))
+        if getattr(options, "accuracy_dual_gpu", False):
+            compute.append(("--accuracy_dual_gpu", True))
+        elif getattr(options, "accuracy_stable_dual_gpu", False):
+            compute.append(("--accuracy_stable_dual_gpu", True))
+    elif options.use_cached_numpy:
+        compute.append(("--use_cached_numpy", True))
+    compute.append(("--num_workers_per_gpu", options.num_workers_per_gpu))
     groups.append(("Compute", compute))
     for group_name, group_options in groups:
         print(group_name)

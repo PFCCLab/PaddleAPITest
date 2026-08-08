@@ -8,7 +8,12 @@ from .base import APITestBase
 
 class APITestCINNVSDygraph(APITestBase):
     def __init__(self, api_config, **kwargs):
-        super().__init__(api_config)
+        # CINN 不执行 Torch reference；Torch 只作为统一比较实现，不能改变 GPU 调度语义。
+        super().__init__(
+            api_config,
+            use_torch=False,
+            runtime_config=kwargs.get("runtime_config"),
+        )
         self.test_amp = kwargs.get("test_amp", False)
         self.test_backward = kwargs.get("test_backward", False)
 
@@ -71,7 +76,7 @@ class APITestCINNVSDygraph(APITestBase):
             return
 
         try:
-            paddle.base.core.eager._for_test_check_cuda_error()
+            self.check_operator_cuda_error()
         except Exception as err:
             self.report_runtime_error(err, "paddle_cuda", "dynamic forward cuda check")
             raise
@@ -81,9 +86,10 @@ class APITestCINNVSDygraph(APITestBase):
             try:
                 dynamic_bwd_output = None
                 dynamic_inputs_list = self.get_paddle_input_list()
-                dynamic_outputs_list, dynamic_grads_input_list = (
-                    self.gen_paddle_output_and_output_grad(dynamic_fwd_output)
-                )
+                (
+                    dynamic_outputs_list,
+                    dynamic_grads_input_list,
+                ) = self.gen_paddle_output_and_output_grad(dynamic_fwd_output)
                 if (
                     not dynamic_inputs_list
                     or not dynamic_outputs_list
@@ -116,7 +122,7 @@ class APITestCINNVSDygraph(APITestBase):
                 return
 
             try:
-                paddle.base.core.eager._for_test_check_cuda_error()
+                self.check_operator_cuda_error()
             except Exception as err:
                 self.report_runtime_error(err, "paddle_cuda", "dynamic backward cuda check")
                 raise
@@ -216,7 +222,7 @@ class APITestCINNVSDygraph(APITestBase):
             return
 
         try:
-            paddle.base.core.eager._for_test_check_cuda_error()
+            self.check_operator_cuda_error()
         except Exception as err:
             self.report_runtime_error(err, "paddle_cuda", "static cuda check")
             raise

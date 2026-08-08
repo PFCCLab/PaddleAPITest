@@ -23,11 +23,27 @@ class TestRuntimeConfig:
     random_seed: int = 0
     bitwise_alignment: bool = False
     exit_on_error: bool = False
+    test_cpu: bool = False
     gpu_mode: GpuModeConfig = field(default_factory=GpuModeConfig)
+
+    @property
+    def paddle_kernel_device_type(self):
+        """返回 Paddle 被测 kernel 的执行设备。"""
+        # 该属性刻意不读取 gpu_mode，防止生成/比较策略反向改写 kernel place。
+        return "cpu" if self.test_cpu else "cuda"
+
+    @property
+    def torch_operator_device_type(self):
+        """Torch reference 固定使用 GPU，不受 Paddle CPU 测试开关影响。"""
+        return "cuda"
 
     @classmethod
     def from_options(cls, options):
-        dual_gpu = bool(getattr(options, "accuracy_stable_dual_gpu", False))
+        # 双卡是 worker 设备拓扑；具体结果生命周期仍由各 accuracy tester 自己管理。
+        dual_gpu = bool(
+            getattr(options, "accuracy_dual_gpu", False)
+            or getattr(options, "accuracy_stable_dual_gpu", False)
+        )
         gpu_mode = GpuModeConfig(
             enabled=bool(options.use_gpu_mode) or dual_gpu,
             dual_gpu=dual_gpu,
@@ -37,6 +53,7 @@ class TestRuntimeConfig:
             random_seed=int(options.random_seed),
             bitwise_alignment=bool(options.bitwise_alignment),
             exit_on_error=bool(options.exit_on_error),
+            test_cpu=bool(options.test_cpu),
             gpu_mode=gpu_mode,
         )
 

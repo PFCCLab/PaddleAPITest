@@ -313,10 +313,13 @@ class APITestBase:
         self.use_torch = bool(use_torch)
         self.runtime_config = runtime_config or TestRuntimeConfig()
         self.gpu_mode_config = self.runtime_config.gpu_mode
+        # TensorConfig 通过 case 配置读取算子设备，避免把 GPU mode 当成执行设备开关。
+        self.api_config.test_cpu = self.runtime_config.test_cpu
         self.memory_governance_metrics = collections.Counter()
         self.dump_context = (
             DumpContext(
-                os.environ.get("DUMP_DIR") or DEFAULT_DUMP_DIR, api_config=api_config.config
+                os.environ.get("DUMP_DIR") or DEFAULT_DUMP_DIR,
+                api_config=api_config.config,
             )
             if dump_enabled()
             else None
@@ -328,6 +331,28 @@ class APITestBase:
         if use_torch:
             torch.set_num_threads(8)
             torch.set_printoptions(threshold=100, linewidth=120)
+
+    def torch_operator_device(self):
+        """Torch reference 始终在 worker 绑定的计算卡执行。"""
+        return torch.device(f"{self.runtime_config.torch_operator_device_type}:0")
+
+    def check_paddle_kernel_cuda_error(self):
+        """只为 Paddle GPU kernel 查询异步 CUDA 错误状态。"""
+        if not self.runtime_config.test_cpu:
+            paddle.base.core.eager._for_test_check_cuda_error()
+
+    def check_torch_operator_cuda_error(self):
+        """同步 Torch reference 的计算流，使异步 CUDA 错误在所属阶段上报。"""
+        torch.cuda.synchronize(self.torch_operator_device())
+
+    def check_operator_cuda_error(self):
+        """兼容只执行 Paddle 算子的 tester。"""
+        self.check_paddle_kernel_cuda_error()
+
+    def requires_gpu_runtime(self):
+        """算子执行或 GPU mode 任一需要 GPU 时返回 True。"""
+        # use_torch 表示 tester 会执行 Torch reference，而不是仅用 Torch 做 CPU 结果表示。
+        return self.use_torch or not self.runtime_config.test_cpu or self.gpu_mode_config.enabled
 
     def run_with_dump(self):
         """Execute the test with dump output capture and lifecycle reporting."""
@@ -439,6 +464,8 @@ class APITestBase:
             mode,
             self.gpu_mode_config,
             check_grad=self.need_check_grad(),
+            paddle_kernel_on_gpu=not self.runtime_config.test_cpu,
+            torch_operator_on_gpu=self.use_torch,
         )
         if not decision.should_skip:
             # 预检按总容量准入；首次分配前按计算卡公共阶段峰值释放上个 case 的跨框架缓存。
@@ -492,8 +519,12 @@ class APITestBase:
         seed = int(seed)
         numpy.random.seed(seed)
         try:
-            paddle.seed(seed)
-            if paddle.device.is_compiled_with_cuda():
+            if self.requires_gpu_runtime():
+                paddle.seed(seed)
+            else:
+                # paddle.seed 会遍历所有 CUDA generator；纯 CPU 路径只播种 CPU generator。
+                paddle.framework.core.default_cpu_generator().manual_seed(seed)
+            if self.requires_gpu_runtime() and paddle.device.is_compiled_with_cuda():
                 try:
                     for device_id in range(paddle.device.cuda.device_count()):
                         paddle.framework.core.default_cuda_generator(device_id).manual_seed(seed)
@@ -503,8 +534,12 @@ class APITestBase:
             pass
         if self.use_torch:
             try:
-                torch.manual_seed(seed)
-                if torch.cuda.is_available():
+                if self.requires_gpu_runtime():
+                    torch.manual_seed(seed)
+                else:
+                    # torch.manual_seed 覆盖全部设备，纯 CPU 路径只更新默认 CPU generator。
+                    torch.random.default_generator.manual_seed(seed)
+                if self.requires_gpu_runtime() and torch.cuda.is_available():
                     torch.cuda.manual_seed_all(seed)
             except Exception:
                 pass
@@ -543,6 +578,8 @@ class APITestBase:
         """Release idle allocator blocks for one or both framework runtimes."""
         if framework not in (None, "torch", "paddle"):
             raise ValueError(f"Unsupported framework for GPU cache release: {framework!r}")
+        if not self.requires_gpu_runtime():
+            return
         self.record_memory_governance_metric("cache_release")
         if collect_cycles:
             gc.collect()
@@ -1003,7 +1040,8 @@ class APITestBase:
                 and (output._is_initialized() or output.numel() == 0)
             ]
         elif isinstance(
-            outputs, (paddle.autograd.autograd.Hessian, paddle.autograd.autograd.Jacobian)
+            outputs,
+            (paddle.autograd.autograd.Hessian, paddle.autograd.autograd.Jacobian),
         ):
             result_outputs.append(outputs[:])
         elif isinstance(outputs, tuple):
@@ -1020,7 +1058,11 @@ class APITestBase:
                         if isinstance(item, paddle.Tensor):
                             result_outputs.append(item)
                 elif isinstance(
-                    output, (paddle.autograd.autograd.Hessian, paddle.autograd.autograd.Jacobian)
+                    output,
+                    (
+                        paddle.autograd.autograd.Hessian,
+                        paddle.autograd.autograd.Jacobian,
+                    ),
                 ):
                     result_outputs.extend(output[:])
                 elif (
@@ -1147,86 +1189,13 @@ class APITestBase:
     def paddle_assert_accuracy(
         self, actual_paddle_tensor, expected_paddle_tensor, atol=1e-2, rtol=1e-2
     ):
-        is_check_dtype = self.api_config.api_name not in not_check_dtype
-
-        if not actual_paddle_tensor.is_contiguous():
-            actual_paddle_tensor = actual_paddle_tensor.contiguous()
-        actual_paddle_tensor = actual_paddle_tensor.cpu().detach()
-
-        if not expected_paddle_tensor.is_contiguous():
-            expected_paddle_tensor = expected_paddle_tensor.contiguous()
-        expected_paddle_tensor = expected_paddle_tensor.cpu().detach()
-
-        actual_paddle_dlpack = paddle.utils.dlpack.to_dlpack(actual_paddle_tensor)  # type: ignore[reportGeneralTypeIssues]
-        converted_actual_tensor = torch.utils.dlpack.from_dlpack(actual_paddle_dlpack)  # type: ignore[reportGeneralTypeIssues]
-
-        expected_paddle_dlpack = paddle.utils.dlpack.to_dlpack(expected_paddle_tensor)  # type: ignore[reportGeneralTypeIssues]
-        converted_expected_tensor = torch.utils.dlpack.from_dlpack(expected_paddle_dlpack)  # type: ignore[reportGeneralTypeIssues]
-
-        def error_msg(msg):
-            return (
-                f"Not equal to tolerance rtol={rtol}, atol={atol}\n"
-                f"{msg}\n"
-                f"ACTUAL: (shape={converted_actual_tensor.shape}, dtype={converted_actual_tensor.dtype})\n"
-                f"{converted_actual_tensor}\n"
-                f"DESIRED: (shape={converted_expected_tensor.shape}, dtype={converted_expected_tensor.dtype})\n"
-                f"{converted_expected_tensor}"
-            )
-
-        bitwise_alignment = getattr(self, "bitwise_alignment", False)
-        if not bitwise_alignment and self.api_config.api_name in special_accuracy_atol_rtol:
-            atol, rtol = special_accuracy_atol_rtol[self.api_config.api_name]
-
-        try:
-            torch.testing.assert_close(
-                converted_actual_tensor,
-                converted_expected_tensor,
-                rtol=rtol,
-                atol=atol,
-                equal_nan=True,
-                check_dtype=is_check_dtype,
-                msg=error_msg,
-            )
-        except Exception as e:
-            error_str = str(e)
-            if error_str.startswith("Comparing"):
-                if os.environ.get("PADDLEAPITEST_NP_FALLBACK", "0") == "1":
-                    # torch_assert OOM or internal error, fallback to np_assert
-                    print(
-                        "[torch_assert_OOM] torch.testing.assert_close OOM, fallback to np_assert",
-                        flush=True,
-                    )
-                    # numpy does not support bfloat16/float8, cast to float32 for comparison
-                    actual_np = actual_paddle_tensor
-                    expected_np = expected_paddle_tensor
-                    if hasattr(actual_np, "dtype"):
-                        dtype_str = str(actual_np.dtype)
-                        if "bfloat16" in dtype_str or "float8" in dtype_str:
-                            actual_np = (
-                                actual_np.astype("float32")
-                                if hasattr(actual_np, "astype")
-                                else actual_np.float()
-                            )
-                    if hasattr(expected_np, "dtype"):
-                        dtype_str = str(expected_np.dtype)
-                        if "bfloat16" in dtype_str or "float8" in dtype_str:
-                            expected_np = (
-                                expected_np.astype("float32")
-                                if hasattr(expected_np, "astype")
-                                else expected_np.float()
-                            )
-                    self.np_assert_accuracy(
-                        actual_np.numpy() if hasattr(actual_np, "numpy") else actual_np,
-                        expected_np.numpy() if hasattr(expected_np, "numpy") else expected_np,
-                        atol,
-                        rtol,
-                    )
-                else:
-                    raise RuntimeError(
-                        "[torch_assert_OOM] torch.testing.assert_close OOM on large tensor comparison"
-                    )
-            else:
-                raise
+        # Paddle/Paddle 与 Paddle/Torch 共用同一比较设备协议，避免 CINN 固定退回 CPU。
+        return self.torch_assert_accuracy(
+            actual_paddle_tensor,
+            expected_paddle_tensor,
+            atol=atol,
+            rtol=rtol,
+        )
 
     def _torch_assert_accuracy_in_chunks(
         self, actual, expected, atol, rtol, error_msg, working_bytes
@@ -1424,16 +1393,18 @@ class APITestBase:
         return getattr(torch, dtype_name)
 
     @staticmethod
-    def _logical_slab_to_torch(value, index, compare_on_cpu):
+    def _logical_slab_to_torch(value, index, comparison_device):
         slab = value[index].detach()
         if not slab.is_contiguous():
             slab = slab.contiguous()
-        if compare_on_cpu:
+        if comparison_device.type == "cpu":
             slab = slab.cpu()
         if isinstance(slab, paddle.Tensor):
-            return torch.utils.dlpack.from_dlpack(
+            slab = torch.utils.dlpack.from_dlpack(
                 paddle.utils.dlpack.to_dlpack(slab)  # type: ignore[reportGeneralTypeIssues]
             )
+        if slab.device != comparison_device:
+            slab = slab.to(device=comparison_device)
         return slab
 
     def _torch_assert_accuracy_in_logical_slabs(
@@ -1444,7 +1415,7 @@ class APITestBase:
         rtol,
         error_msg,
         working_bytes,
-        compare_on_cpu,
+        comparison_device,
         check_dtype,
     ):
         actual_dtype = self._framework_tensor_torch_dtype(actual)
@@ -1459,10 +1430,8 @@ class APITestBase:
 
         if not check_dtype and actual_dtype != expected_dtype:
             for index in self._logical_slab_indices(shape, max_numel):
-                actual_chunk = self._logical_slab_to_torch(actual, index, compare_on_cpu)
-                expected_chunk = self._logical_slab_to_torch(expected, index, compare_on_cpu)
-                if actual_chunk.device != expected_chunk.device:
-                    expected_chunk = expected_chunk.to(device=actual_chunk.device)
+                actual_chunk = self._logical_slab_to_torch(actual, index, comparison_device)
+                expected_chunk = self._logical_slab_to_torch(expected, index, comparison_device)
 
                 def slab_error_msg(msg, *, slab_index=index):
                     return error_msg(f"logical slab {slab_index}: {msg}")
@@ -1482,14 +1451,12 @@ class APITestBase:
         def chunks():
             offset = 0
             for index in self._logical_slab_indices(shape, max_numel):
-                actual_chunk = self._logical_slab_to_torch(actual, index, compare_on_cpu).reshape(
-                    -1
-                )
-                expected_chunk = self._logical_slab_to_torch(
-                    expected, index, compare_on_cpu
+                actual_chunk = self._logical_slab_to_torch(
+                    actual, index, comparison_device
                 ).reshape(-1)
-                if actual_chunk.device != expected_chunk.device:
-                    expected_chunk = expected_chunk.to(device=actual_chunk.device)
+                expected_chunk = self._logical_slab_to_torch(
+                    expected, index, comparison_device
+                ).reshape(-1)
                 yield offset, actual_chunk, expected_chunk
                 offset += actual_chunk.numel()
 
@@ -1521,10 +1488,19 @@ class APITestBase:
             4 * max(_tensor_element_size(actual), _tensor_element_size(expected)) + 16,
         )
 
-    def _resolve_comparison_workspace(self, actual, estimated_temp_bytes, dual_gpu):
+    def _resolve_comparison_workspace(
+        self,
+        actual,
+        estimated_temp_bytes,
+        dual_gpu,
+        *,
+        comparison_device_id=None,
+    ):
         """按实际比较设备解析并缓存 bounded compare 工作区。"""
         estimated_temp_bytes = max(0, int(estimated_temp_bytes))
-        device_id = self._comparison_cuda_device_id(actual)
+        device_id = comparison_device_id
+        if device_id is None:
+            device_id = self._comparison_cuda_device_id(actual)
         if device_id is None:
             return DEFAULT_COMPARISON_WORKSPACE_BYTES
         if estimated_temp_bytes <= COMPARISON_WORKSPACE_FAST_PATH_BYTES:
@@ -1599,6 +1575,24 @@ class APITestBase:
         cache[cache_key] = working_bytes
         return working_bytes
 
+    def _comparison_device(self, actual, expected, *, test_tol, dual_gpu):
+        """解析比较设备；该策略独立于两侧算子的执行设备。"""
+        # test_tol 只改变容差与日志，不得绕过 GPU mode 的比较设备协议。
+        # 非 GPU mode 回到 CPU compare，保持历史低显存路径。
+        # 单卡 GPU mode 允许 CPU kernel 结果显式搬到 GPU 0 后比较。
+        # 双卡模式必须从结果设备解析比较卡，不允许 CPU tensor 隐式降级。
+        if not self.gpu_mode_config.enabled:
+            return torch.device("cpu")
+        if dual_gpu:
+            device_id = self._comparison_cuda_device_id(actual)
+            if device_id is None:
+                device_id = self._comparison_cuda_device_id(expected)
+            if device_id is None:
+                raise RuntimeError("dual GPU comparisons require CUDA tensors on both sides")
+            return torch.device("cuda", device_id)
+        device_id = self.gpu_mode_config.comparison_device_id
+        return torch.device("cuda", 0 if device_id is None else int(device_id))
+
     def torch_assert_accuracy(
         self,
         actual,
@@ -1634,12 +1628,6 @@ class APITestBase:
             return False
 
         dual_gpu = bool(getattr(self.gpu_mode_config, "dual_gpu", False))
-        compare_on_cpu = not dual_gpu and (
-            test_tol
-            or not self.gpu_mode_config.enabled
-            or is_cpu_tensor(actual)
-            or is_cpu_tensor(expected)
-        )
         tensor_types = (paddle.Tensor, torch.Tensor)
         if not isinstance(actual, tensor_types):
             raise TypeError(f"Expected Paddle or Torch tensor, but got {type(actual)}")
@@ -1647,6 +1635,16 @@ class APITestBase:
             raise TypeError(f"Expected Paddle or Torch tensor, but got {type(expected)}")
         if dual_gpu and (is_cpu_tensor(actual) or is_cpu_tensor(expected)):
             raise RuntimeError("dual GPU comparisons require CUDA tensors on both sides")
+        comparison_device = self._comparison_device(
+            actual,
+            expected,
+            test_tol=test_tol,
+            dual_gpu=dual_gpu,
+        )
+        comparison_device_id = comparison_device.index if comparison_device.type == "cuda" else None
+
+        # DLPack 只负责跨框架表示转换，转换后的 Tensor 还要统一搬到比较设备。
+        # 因此 CPU kernel 与 GPU compare 的组合不会因源 Tensor 在 CPU 而退回 CPU compare。
 
         if not actual.is_contiguous() or not expected.is_contiguous():
             actual_shape = tuple(actual.shape)
@@ -1680,6 +1678,7 @@ class APITestBase:
                     actual,
                     estimated_temp_bytes,
                     dual_gpu,
+                    comparison_device_id=comparison_device_id,
                 )
                 self._torch_assert_accuracy_in_logical_slabs(
                     actual,
@@ -1688,7 +1687,7 @@ class APITestBase:
                     rtol,
                     slab_error_msg,
                     working_bytes,
-                    compare_on_cpu,
+                    comparison_device,
                     is_check_dtype,
                 )
                 if test_tol:
@@ -1725,7 +1724,7 @@ class APITestBase:
             if not actual.is_contiguous():
                 actual = actual.contiguous()
             actual = actual.detach()
-            if compare_on_cpu:
+            if comparison_device.type == "cpu":
                 actual = actual.cpu()
             actual_tensor = torch.utils.dlpack.from_dlpack(
                 paddle.utils.dlpack.to_dlpack(actual)  # type: ignore[reportGeneralTypeIssues]
@@ -1734,7 +1733,7 @@ class APITestBase:
             if not actual.is_contiguous():
                 actual = actual.contiguous()
             actual_tensor = actual.detach()
-            if compare_on_cpu:
+            if comparison_device.type == "cpu":
                 actual_tensor = actual_tensor.cpu()
         else:
             raise TypeError(f"Expected Paddle or Torch tensor, but got {type(actual)}")
@@ -1743,7 +1742,7 @@ class APITestBase:
             if not expected.is_contiguous():
                 expected = expected.contiguous()
             expected = expected.detach()
-            if compare_on_cpu:
+            if comparison_device.type == "cpu":
                 expected = expected.cpu()
             expected_tensor = torch.utils.dlpack.from_dlpack(
                 paddle.utils.dlpack.to_dlpack(expected)  # type: ignore[reportGeneralTypeIssues]
@@ -1752,13 +1751,15 @@ class APITestBase:
             if not expected.is_contiguous():
                 expected = expected.contiguous()
             expected_tensor = expected.detach()
-            if compare_on_cpu:
+            if comparison_device.type == "cpu":
                 expected_tensor = expected_tensor.cpu()
         else:
             raise TypeError(f"Expected Paddle or Torch tensor, but got {type(expected)}")
 
-        if actual_tensor.device != expected_tensor.device:
-            expected_tensor = expected_tensor.to(device=actual_tensor.device)
+        if actual_tensor.device != comparison_device:
+            actual_tensor = actual_tensor.to(device=comparison_device)
+        if expected_tensor.device != comparison_device:
+            expected_tensor = expected_tensor.to(device=comparison_device)
 
         if actual_tensor.shape != expected_tensor.shape:
             raise AssertionError(
@@ -1790,6 +1791,7 @@ class APITestBase:
                 actual_tensor,
                 estimated_temp_bytes,
                 dual_gpu,
+                comparison_device_id=comparison_device_id,
             )
             if self._should_chunk_accuracy_compare(estimated_temp_bytes, working_bytes):
                 self.record_memory_governance_metric("chunk_compare")
