@@ -7,6 +7,8 @@ from dataclasses import dataclass
 from .input_generation.backend import resolve_input_backend_name
 from .input_generation.tensor_config import (
     AUTOGRAD_DTYPES,
+    FLOAT8_DTYPES,
+    FORWARD_ONLY_APIS,
     build_materialization_plan,
     dtype_element_size,
     dtype_name,
@@ -91,6 +93,26 @@ def _format_bytes(value):
 
 def _tensor_configs(api_config):
     return tuple(iter_unique_tensor_configs(api_config.args, api_config.kwargs))
+
+
+def should_check_grad(api_config):
+    """按配置静态信息返回 worker 是否会执行输入梯度检查。"""
+    api_name = getattr(api_config, "api_name", "")
+    short_name = api_name.rsplit(".", 1)[-1]
+    if short_name in FORWARD_ONLY_APIS:
+        return False
+    # float8 autograd / NumPy grad 路径在当前 Torch 工具链中不受支持。
+    if any(dtype_name(config.dtype) in FLOAT8_DTYPES for config in _tensor_configs(api_config)):
+        return False
+    if api_name == "paddle.assign":
+        args = getattr(api_config, "args", ())
+        kwargs = getattr(api_config, "kwargs", {})
+        has_list_arg = bool(args) and isinstance(args[0], list)
+        has_second_arg = len(args) > 1 and args[1] is not None
+        has_output_kwarg = kwargs.get("output") is not None
+        if has_list_arg or has_second_arg or has_output_kwarg:
+            return False
+    return True
 
 
 def _logical_nbytes(config):
@@ -328,16 +350,10 @@ def estimate_gpu_memory(api_config, mode, *, check_grad, input_backend="torch"):
                 )
             )
         else:
-            # 双卡可选择全驻留或分阶段流式搬运；任一完整路径可行即可运行。
+            # 双卡固定使用分阶段流式搬运，调度与 worker 不再维护 full 备选路径。
             execution_bytes = sum(value for _, value in framework_execution)
             stages.extend(
                 (
-                    MemoryStageEstimate(
-                        "dual_full_comparison_residency",
-                        "comparison",
-                        (("input_grad_results", 4 * input_grad_bytes),),
-                        plan="full_residency",
-                    ),
                     MemoryStageEstimate(
                         "dual_phased_compute_execution",
                         "compute",

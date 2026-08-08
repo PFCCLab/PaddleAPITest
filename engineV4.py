@@ -4,6 +4,7 @@ import argparse
 import atexit
 import gc
 import importlib
+import math
 import multiprocessing as mp
 import os
 import queue
@@ -51,7 +52,12 @@ from tester.dump_writer import (
     record_dump_terminal_status,
     resolve_dump_options,
 )
-from tester.gpu_memory_preflight import GpuMemoryDeferred, estimate_gpu_memory
+from tester.gpu_memory_preflight import (
+    GpuMemoryDeferred,
+    estimate_gpu_memory,
+    should_check_grad,
+)
+from tester.input_generation.backend import resolve_input_backend_name
 from tester.gpu_scheduler import (
     CaseGpuEstimate,
     GpuMemorySnapshot,
@@ -190,6 +196,8 @@ FORECAST_TARGET_CASES = 100
 FORECAST_INITIAL_MAX_WAIT_SECONDS = 5 * 60
 GPU_MEMORY_DEFER_INITIAL_BACKOFF_SECONDS = 1.0
 GPU_MEMORY_DEFER_MAX_BACKOFF_SECONDS = 30.0
+SANITIZER_COMPUTE_BUDGET_ENV = "PADDLEAPITEST_WAVE_COMPUTE_BUDGET_GIB"
+SANITIZER_COMPARISON_BUDGET_ENV = "PADDLEAPITEST_WAVE_COMPARISON_BUDGET_GIB"
 
 
 @dataclass
@@ -536,9 +544,53 @@ def _sanitizer_child_environment(base_environment, task):
     """为 sanitizer case child 构造本波独立环境。"""
     child_environment = dict(base_environment)
     if isinstance(task, WorkerTask):
-        # wrapper 不加载 GPU runtime；实际并发必须在创建 case child 时透传。
+        # wrapper 不加载 GPU runtime；实际并发和两侧承诺必须随 case child 透传。
         child_environment["PADDLEAPITEST_WORKERS_ON_GPU"] = str(task.workers_on_gpu)
+        child_environment[SANITIZER_COMPUTE_BUDGET_ENV] = str(task.compute_budget_gib)
+        child_environment[SANITIZER_COMPARISON_BUDGET_ENV] = str(
+            task.comparison_budget_gib
+        )
     return child_environment
+
+
+def _apply_sanitizer_child_wave_budget(options, environ=None):
+    """从内部环境恢复 wrapper 为本 case 选择的波次预算。"""
+    source = os.environ if environ is None else environ
+    if SANITIZER_COMPUTE_BUDGET_ENV not in source:
+        return False
+
+    def read_nonnegative_float(name):
+        try:
+            value = float(source[name])
+        except (KeyError, TypeError, ValueError) as err:
+            raise ValueError(f"invalid internal sanitizer budget {name}") from err
+        if not math.isfinite(value) or value < 0:
+            raise ValueError(f"invalid internal sanitizer budget {name}")
+        return value
+
+    try:
+        workers_on_gpu = int(source["PADDLEAPITEST_WORKERS_ON_GPU"])
+    except (KeyError, TypeError, ValueError) as err:
+        raise ValueError("invalid internal sanitizer worker count") from err
+    if workers_on_gpu <= 0:
+        raise ValueError("invalid internal sanitizer worker count")
+
+    visible_gpu_ids = tuple(int(value) for value in source["CUDA_VISIBLE_DEVICES"].split(","))
+    if not visible_gpu_ids:
+        raise ValueError("sanitizer child requires a visible compute GPU")
+    compute_budget_gib = read_nonnegative_float(SANITIZER_COMPUTE_BUDGET_ENV)
+    comparison_budget_gib = read_nonnegative_float(SANITIZER_COMPARISON_BUDGET_ENV)
+    compute_gpu_id = visible_gpu_ids[0]
+    workers_map = dict(getattr(options, "gpu_workers_per_gpu_map", {}) or {})
+    total_memory_map = dict(getattr(options, "gpu_total_memory_map", {}) or {})
+    workers_map[compute_gpu_id] = workers_on_gpu
+    # runtime_config_for_gpu 会按 worker 数切分，因此这里恢复整波计算卡总承诺。
+    total_memory_map[compute_gpu_id] = compute_budget_gib * workers_on_gpu
+    if len(visible_gpu_ids) > 1:
+        total_memory_map[visible_gpu_ids[1]] = comparison_budget_gib
+    options.gpu_workers_per_gpu_map = workers_map
+    options.gpu_total_memory_map = total_memory_map
+    return True
 
 
 def _sanitizer_worker_loop(
@@ -1717,10 +1769,12 @@ def _estimate_case_gpu_memory(api_config_str, options):
     try:
         from tester import APIConfig
 
+        api_config = APIConfig(api_config_str)
         estimate = estimate_gpu_memory(
-            APIConfig(api_config_str),
+            api_config,
             mode,
-            check_grad=True,
+            check_grad=should_check_grad(api_config),
+            input_backend=resolve_input_backend_name(),
         )
     except Exception:
         # 配置解析和不支持 dtype 仍由 worker 分类；调度器使用最小准入成本兜底。
@@ -2608,6 +2662,7 @@ def _prepare_common_options(options):
 
 def _run_sanitizer_child_mode(options):
     try:
+        _apply_sanitizer_child_wave_budget(options)
         _init_worker_runtime(None, None, None, options, redirect_output=False)
         options.api_config = options.api_config.strip()
         defer_retry_count = 0

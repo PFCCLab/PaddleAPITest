@@ -78,6 +78,10 @@ class APITestAccuracyStable(APITestBase):
         torch.set_printoptions(profile="short", edgeitems=2, threshold=100, linewidth=120)
         torch.set_default_device("cuda")
 
+    def _new_execution_state(self):
+        """双 GPU 从首轮开始固定采用 phased 驻留协议。"""
+        return _StableExecutionState(phased_result_residency=self.use_dual_gpu)
+
     @staticmethod
     def _normalize_torch_result(value):
         if isinstance(value, (torch.return_types.max, torch.return_types.min)):
@@ -192,16 +196,6 @@ class APITestAccuracyStable(APITestBase):
                 delattr(self, attr_name)
         self.clear_output_grad_cache()
         self.clear_original_cpu_inputs()
-
-    def _projected_results_need_phasing(self, projected_bytes):
-        if not self.use_dual_gpu:
-            return False
-        memory_state = self._comparison_gpu_memory_state()
-        allocator_margin = max(_GIB, int(projected_bytes) // 20)
-        return (
-            int(projected_bytes) + allocator_margin + _RESULT_STREAM_WORKSPACE_BYTES
-            > memory_state.live_budget_bytes
-        )
 
     def _prepare_second_torch_results(self, state, torch_result_bytes):
         """Reserve comparison-card space before copying the T2 result family."""
@@ -711,18 +705,9 @@ class APITestAccuracyStable(APITestBase):
         if self.use_dual_gpu:
             try:
                 if iter_idx == 0:
-                    first_result_bytes = self.tensor_tree_nbytes(
-                        (
-                            pairs.torch_outputs[0],
-                            pairs.torch_grads[0],
-                            pairs.paddle_outputs[0],
-                            pairs.paddle_grads[0],
-                        )
-                    )
-                    projected_phased = self._projected_results_need_phasing(2 * first_result_bytes)
-                    if projected_phased and not state.phased_result_residency:
+                    if not state.phased_result_residency:
                         self.record_memory_governance_metric("phased_result_residency")
-                    state.phased_result_residency = projected_phased
+                    state.phased_result_residency = True
                 else:
                     # P2 backward is the last consumer of the shared output-grad
                     # seeds. Release them before summary streams second results.
@@ -800,7 +785,7 @@ class APITestAccuracyStable(APITestBase):
         probe_bytes = self.estimate_input_bytes()
 
         pairs = _StableResultPairs()
-        execution_state = _StableExecutionState()
+        execution_state = self._new_execution_state()
 
         # Every execution recreates its input from the same immutable CPU copy.
         try:

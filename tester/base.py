@@ -16,6 +16,7 @@ from .gpu_memory_preflight import (
     GpuMemoryDeferred,
     decide_gpu_memory_preflight,
     requires_inplace_input_copy,
+    should_check_grad,
 )
 from .input_generation.binding import bind_input_parameters
 from .input_generation.tensor_config import (
@@ -594,40 +595,9 @@ class APITestBase:
 
         return False
 
-    def _has_float8_tensor_config(self):
-        """True if any TensorConfig arg/kwarg uses float8 dtype."""
-        float8 = ("float8_e5m2", "float8_e4m3fn")
-
-        def _check(obj):
-            if isinstance(obj, TensorConfig):
-                return obj.dtype in float8
-            if isinstance(obj, (list, tuple)):
-                return any(_check(x) for x in obj)
-            return False
-
-        if any(_check(a) for a in self.api_config.args):
-            return True
-        return any(_check(v) for v in self.api_config.kwargs.values())
-
     def need_check_grad(self):
-        if self.is_forward_only():
-            return False
-        # float8 autograd / numpy grad path is unsupported in current torch tooling
-        if self._has_float8_tensor_config():
-            return False
-
-        if self.api_config.api_name == "paddle.assign":
-            has_list_arg = len(self.paddle_args_config) and isinstance(
-                self.paddle_args_config[0], list
-            )
-            has_second_arg = (
-                len(self.paddle_args_config) > 1 and self.paddle_args_config[1] is not None
-            )
-            has_output_kwarg = self.paddle_kwargs_config.get("output") is not None
-            if has_list_arg or has_second_arg or has_output_kwarg:
-                return False
-
-        return True
+        # 主调度与 worker 共用纯配置判定，不能在两个生命周期各维护一份规则。
+        return should_check_grad(self.api_config)
 
     def ana_api_info(self):
         return self.ana_paddle_api_info() and self.ana_torch_api_info()
@@ -2038,15 +2008,27 @@ class APITestBase:
             for tensor in self.iter_unique_tensor_tree_leaves(tree):
                 if not self.tensor_is_gpu(tensor):
                     continue
-                try:
-                    pointer = int(tensor.data_ptr())
-                except (AttributeError, TypeError, ValueError):
-                    pointer = id(tensor)
                 framework = "paddle" if isinstance(tensor, paddle.Tensor) else "torch"
+                try:
+                    if isinstance(tensor, paddle.Tensor):
+                        # Paddle offset 以字节表示；holder 基址在非零 offset view 间保持一致。
+                        pointer = int(tensor.data_ptr()) - int(tensor._offset())
+                        allocated_bytes = int(tensor._holder_size())
+                    else:
+                        storage = tensor.untyped_storage()
+                        pointer = int(storage.data_ptr())
+                        allocated_bytes = int(storage.nbytes())
+                    if allocated_bytes < 0:
+                        raise ValueError("negative tensor storage size")
+                except (AttributeError, RuntimeError, TypeError, ValueError):
+                    # 非标准 Tensor 不一定暴露 storage；降级时不推断未知 view 关系。
+                    try:
+                        pointer = int(tensor.data_ptr())
+                    except (AttributeError, RuntimeError, TypeError, ValueError):
+                        pointer = id(tensor)
+                    allocated_bytes = int(tensor.numel()) * _tensor_element_size(tensor)
                 key = (framework, self.tensor_gpu_device_id(tensor), pointer)
-                logical_bytes = int(tensor.numel()) * _tensor_element_size(tensor)
-                # view 共享起始地址时只保留较大的可见范围，避免输入/输出重复计数。
-                storage_bytes[key] = max(storage_bytes.get(key, 0), logical_bytes)
+                storage_bytes[key] = max(storage_bytes.get(key, 0), allocated_bytes)
         return sum(storage_bytes.values())
 
     def enforce_paddle_backward_capacity(self, inputs, outputs, output_grads):
@@ -2064,7 +2046,8 @@ class APITestBase:
         live_bytes = self._unique_gpu_storage_bytes(inputs, outputs, output_grads)
         output_grad_bytes = self._unique_gpu_storage_bytes(output_grads)
         input_sizes = [
-            self._unique_gpu_storage_bytes(input_tensor)
+            # 新输入梯度只覆盖当前 view 的逻辑元素，不会复制完整 backing storage。
+            self.tensor_tree_nbytes(input_tensor)
             for input_tensor in inputs
             if self.tensor_is_gpu(input_tensor)
         ]
