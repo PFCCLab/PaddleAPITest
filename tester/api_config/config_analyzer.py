@@ -315,11 +315,30 @@ class TensorConfig:
         return get_cached_numpy_array(dtype, shape, generation_kind=generation_kind, scale=scale)
 
     def _use_gpu(self, api_config=None, dtype=None):
+        """判断是否启用 GPU tensor 生成；不代表 Paddle kernel 的 place。"""
         if not is_gpu_mode():
             return False
         if self.place is not None and "cpu" in str(self.place).lower():
             return False
         return "gpu" in paddle.device.get_device()
+
+    def _paddle_kernel_uses_gpu(self, api_config):
+        """test_cpu 只决定 Paddle kernel，不能被 use_gpu_mode 覆盖。"""
+        if self.place is not None and "cpu" in str(self.place).lower():
+            return False
+        if getattr(api_config, "test_cpu", False):
+            return False
+        return "gpu" in paddle.device.get_device()
+
+    def _torch_source_device_for_paddle(self, api_config):
+        """返回送入 Paddle 前的 Torch 源设备，遵守 Paddle kernel place。"""
+        if self.place is not None and "cpu" in str(self.place).lower():
+            return torch.device("cpu")
+        if getattr(api_config, "test_cpu", False):
+            return torch.device("cpu")
+        if self._paddle_kernel_uses_gpu(api_config):
+            return torch.device("cuda", torch.cuda.current_device())
+        return torch.device("cpu")
 
     def _supports_autograd(self, dtype=None):
         dtype = dtype or self.dtype
@@ -3433,10 +3452,12 @@ class TensorConfig:
                 and self._use_gpu(api_config)
             ):
                 self.paddle_tensor = self._make_gpu_paddle_tensor(api_config)
+                if getattr(api_config, "test_cpu", False):
+                    self.paddle_tensor = self.paddle_tensor._copy_to(paddle.CPUPlace(), False)
                 return self.paddle_tensor
             if self.cpu_tensor is not None:
                 torch_tensor = self.cpu_tensor.to(
-                    device=torch.device("cuda:0") if self._use_gpu(api_config) else "cpu",
+                    device=self._torch_source_device_for_paddle(api_config),
                     copy=True,
                 )
                 self.paddle_tensor = paddle.utils.dlpack.from_dlpack(
@@ -3445,7 +3466,10 @@ class TensorConfig:
                 self.paddle_tensor.stop_gradient = not self._requires_autograd(api_config)
                 return self.paddle_tensor
             if self.numpy_tensor is None and self._use_gpu(api_config):
-                return self.get_gpu_paddle_tensor(api_config)
+                tensor = self.get_gpu_paddle_tensor(api_config)
+                if getattr(api_config, "test_cpu", False):
+                    self.paddle_tensor = tensor._copy_to(paddle.CPUPlace(), False)
+                return self.paddle_tensor
             if not self.is_contiguous and self.strides is not None:
                 self.paddle_tensor = self._create_strided_paddle_tensor(api_config)
                 print(
@@ -3462,10 +3486,11 @@ class TensorConfig:
                     if self.dtype == "bfloat16"
                     else ("float16" if self.dtype in FLOAT8_DTYPES else self.dtype)
                 )
+                operator_place = paddle.CPUPlace() if getattr(api_config, "test_cpu", False) else self.place
                 self.paddle_tensor = paddle.to_tensor(
                     self.get_numpy_tensor(api_config),
                     dtype=intermediate_dtype,
-                    place=self.place,
+                    place=operator_place,
                 )
 
                 if self.dtype == "bfloat16":
@@ -3497,10 +3522,11 @@ class TensorConfig:
         try:
             intermediate_dtype = "float16" if self.dtype in FLOAT8_DTYPES else self.dtype
             storage_size = self._strided_storage_size()
+            operator_place = paddle.CPUPlace() if getattr(api_config, "test_cpu", False) else self.place
             flat_tensor = paddle.zeros(
                 [storage_size],
                 dtype=intermediate_dtype,
-                device=self.place,
+                device=operator_place,
             )
             tensor = paddle.as_strided(flat_tensor, self.shape, self.strides)
             logical_tensor = self.get_numpy_tensor(api_config)
@@ -3508,7 +3534,7 @@ class TensorConfig:
                 tensor[...] = paddle.to_tensor(
                     logical_tensor,
                     dtype=intermediate_dtype,
-                    place=self.place,
+                    place=operator_place,
                 )
             if self.dtype in FLOAT8_DTYPES:
                 flat_tensor = paddle.cast(flat_tensor, dtype=self.dtype)

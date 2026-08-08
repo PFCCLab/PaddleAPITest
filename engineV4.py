@@ -1135,6 +1135,29 @@ def normalize_accuracy_stable_dual_gpu_options(options):
     options.accuracy_stable = True
 
 
+def _mode_runs_torch_gpu_reference(options):
+    """只有执行 Torch reference 的模式才要求保留 GPU 运行时。"""
+    return any(
+        getattr(options, mode, False)
+        for mode in (
+            "accuracy",
+            "accuracy_stable",
+            "accuracy_stable_dual_gpu",
+            "torch_gpu_performance",
+            "paddle_torch_gpu_performance",
+        )
+    )
+
+
+def _requires_gpu_runtime(options):
+    """test_cpu 与 use_gpu_mode 正交地决定 GPU 运行时需求。"""
+    return bool(
+        not getattr(options, "test_cpu", False)
+        or getattr(options, "use_gpu_mode", False)
+        or _mode_runs_torch_gpu_reference(options)
+    )
+
+
 def validate_gpu_options(options) -> tuple:
     """Validate and normalize GPU-related options."""
     normalize_accuracy_stable_dual_gpu_options(options)
@@ -1162,8 +1185,6 @@ def validate_gpu_options(options) -> tuple:
             "expected -1 or a positive integer"
         )
     if getattr(options, "accuracy_stable_dual_gpu", False):
-        if getattr(options, "test_cpu", False):
-            raise ValueError("--accuracy_stable_dual_gpu=True does not support --test_cpu=True")
         if options.num_gpus < 2 or options.num_gpus % 2:
             raise ValueError("--accuracy_stable_dual_gpu=True requires an even --num_gpus")
         if options.num_workers_per_gpu != 1:
@@ -1205,9 +1226,7 @@ def _apply_single_config_gpu_defaults(options):
 
 def _prepare_single_config_gpu(options):
     normalize_accuracy_stable_dual_gpu_options(options)
-    if getattr(options, "accuracy_stable_dual_gpu", False) and getattr(options, "test_cpu", False):
-        raise ValueError("--accuracy_stable_dual_gpu=True does not support --test_cpu=True")
-    if options.test_cpu:
+    if not _requires_gpu_runtime(options):
         options.gpu_workers_per_gpu_map = {}
         options.gpu_total_memory_map = {}
         options.runtime_config = TestRuntimeConfig.from_options(options)
@@ -1745,7 +1764,7 @@ def main():
         )
         return
     normalize_accuracy_stable_dual_gpu_options(options)
-    if options.api_config and not options.test_cpu:
+    if options.api_config and _requires_gpu_runtime(options):
         _apply_single_config_gpu_defaults(options)
 
     mode = [

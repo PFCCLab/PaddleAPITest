@@ -23,7 +23,18 @@ class TestRuntimeConfig:
     random_seed: int = 0
     bitwise_alignment: bool = False
     exit_on_error: bool = False
+    # test_cpu 只控制 Paddle kernel；GPU mode 另行控制输入和比较策略。
+    test_cpu: bool = False
     gpu_mode: GpuModeConfig = field(default_factory=GpuModeConfig)
+
+    @property
+    def paddle_kernel_device_type(self):
+        return "cpu" if self.test_cpu else "cuda"
+
+    @property
+    def torch_operator_device_type(self):
+        # accuracy 模式始终执行 GPU Torch reference，即使 Paddle kernel 在 CPU。
+        return "cuda"
 
     @classmethod
     def from_options(cls, options):
@@ -37,6 +48,7 @@ class TestRuntimeConfig:
             random_seed=int(options.random_seed),
             bitwise_alignment=bool(options.bitwise_alignment),
             exit_on_error=bool(options.exit_on_error),
+            test_cpu=bool(getattr(options, "test_cpu", False)),
             gpu_mode=gpu_mode,
         )
 

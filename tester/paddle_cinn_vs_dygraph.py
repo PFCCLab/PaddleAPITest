@@ -9,7 +9,12 @@ from .log_writer.log_worker import write_to_log
 
 class APITestCINNVSDygraph(APITestBase):
     def __init__(self, api_config, **kwargs):
-        super().__init__(api_config)
+        # CINN 只执行 Paddle kernel，不应丢失 worker 的 test_cpu 设备协议。
+        super().__init__(
+            api_config,
+            use_torch=False,
+            runtime_config=kwargs.get("runtime_config"),
+        )
         self.test_amp = kwargs.get("test_amp", False)
         self.test_backward = kwargs.get("test_backward", False)
 

@@ -493,8 +493,11 @@ class APITestBase:
     def __init__(self, api_config, use_torch=True, runtime_config=None):
         self.api_config = api_config
         self.api_config.use_torch = use_torch
+        self.use_torch = bool(use_torch)
         self.runtime_config = runtime_config or TestRuntimeConfig()
         self.gpu_mode_config = self.runtime_config.gpu_mode
+        # TensorConfig 需要知道 kernel place，不能从 GPU mode 反推。
+        self.api_config.test_cpu = self.runtime_config.test_cpu
         self.dump_context = (
             DumpContext(
                 os.environ.get("DUMP_DIR") or DEFAULT_DUMP_DIR, api_config=api_config.config
@@ -507,6 +510,14 @@ class APITestBase:
         if use_torch:
             torch.set_num_threads(8)
             torch.set_printoptions(threshold=100, linewidth=120)
+
+    def torch_operator_device(self):
+        """返回当前 worker 的 Torch reference 设备。"""
+        return torch.device(f"{self.runtime_config.torch_operator_device_type}:0")
+
+    def requires_gpu_runtime(self):
+        """算子执行或 GPU mode 任一需要 GPU 时返回 True。"""
+        return self.use_torch or not self.runtime_config.test_cpu or self.gpu_mode_config.enabled
 
     def run_with_dump(self):
         """Execute the test with dump output capture and lifecycle reporting."""
