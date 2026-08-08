@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import paddle
 
-from .base import APITestBase
+from .base import APITestBase, GpuMemoryGuardSkip
 
 # from func_timeout import func_set_timeout
 
@@ -54,6 +54,11 @@ class APITestPaddleOnly(APITestBase):
         self.dump_event("paddle_backward_start")
         inputs_list = self.get_paddle_input_list()
         result_outputs, result_outputs_grads = self.gen_paddle_output_and_output_grad(paddle_output)
+        self.enforce_paddle_backward_capacity(
+            inputs_list,
+            result_outputs,
+            result_outputs_grads,
+        )
         self.dump_save(
             "paddle_backward",
             {
@@ -138,6 +143,10 @@ class APITestPaddleOnly(APITestBase):
 
             paddle_output = self._run_paddle_forward()
             self._run_paddle_backward(paddle_output)
+        except GpuMemoryGuardSkip as err:
+            self.report_case_result("skip", phase="memory_guard", message=str(err))
+            self._finalize_paddle_only("skip")
+            return
         except Exception as err:
             _, fatal = self._report_paddle_only_error(
                 err,

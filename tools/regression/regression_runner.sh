@@ -37,11 +37,11 @@ COMMON_ARGS=(
   --log_dir="${LOG_ROOT}/accuracy" \
   "${COMMON_ARGS[@]}"
 
-"${PYTHON_BIN}" tools/error_stat/error_stat.py \
+"${PYTHON_BIN}" -m tools.error_stat.error_stat \
   --input "${LOG_ROOT}/paddle_only" \
   --output "${LOG_ROOT}/paddle_only" \
   --split-errors
-"${PYTHON_BIN}" tools/error_stat/error_stat.py \
+"${PYTHON_BIN}" -m tools.error_stat.error_stat \
   --input "${LOG_ROOT}/accuracy" \
   --output "${LOG_ROOT}/accuracy" \
   --split-errors

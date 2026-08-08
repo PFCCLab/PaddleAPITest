@@ -894,7 +894,15 @@ class APITestBase:
             return (real_part + 1j * imag_part).cast(dtype)
         else:
             base_dtype = dtype
-        return (paddle.rand(tuple(shape), dtype=base_dtype, device=place) - 0.5).cast(dtype)
+        output_grad = paddle.uniform(
+            tuple(shape),
+            min=-0.5,
+            max=0.5,
+            dtype=base_dtype,
+            device=place,
+        )
+        # 同 dtype cast 不改变 seed，却会在大输出上再申请一份完整 GPU storage。
+        return output_grad.cast(dtype) if base_dtype != dtype else output_grad
 
     def _use_gpu_output_grad(self, output):
         if not self.gpu_mode_config.enabled:
@@ -938,13 +946,10 @@ class APITestBase:
             dtype,
             device=output.device,
         ).detach()
-        paddle_grad = paddle.utils.dlpack.from_dlpack(
-            torch.utils.dlpack.to_dlpack(torch_grad.clone())
-        )
-        paddle_grad.stop_gradient = False
+        # Paddle seed 由消费路径通过 DLPack 延迟共享，避免 Torch backward 前常驻等大 clone。
         return OutputGradSlot(
             seed_numpy=None,
-            paddle_grad=paddle_grad,
+            paddle_grad=None,
             torch_grad=torch_grad,
         )
 
@@ -2024,6 +2029,56 @@ class APITestBase:
         return sum(
             int(tensor.numel()) * _tensor_element_size(tensor)
             for tensor in self.iter_unique_tensor_tree_leaves(value)
+        )
+
+    def _unique_gpu_storage_bytes(self, *trees):
+        """返回多棵运行时 Tensor 树当前实际占用的唯一 GPU storage 下界。"""
+        storage_bytes = {}
+        for tree in trees:
+            for tensor in self.iter_unique_tensor_tree_leaves(tree):
+                if not self.tensor_is_gpu(tensor):
+                    continue
+                try:
+                    pointer = int(tensor.data_ptr())
+                except (AttributeError, TypeError, ValueError):
+                    pointer = id(tensor)
+                framework = "paddle" if isinstance(tensor, paddle.Tensor) else "torch"
+                key = (framework, self.tensor_gpu_device_id(tensor), pointer)
+                logical_bytes = int(tensor.numel()) * _tensor_element_size(tensor)
+                # view 共享起始地址时只保留较大的可见范围，避免输入/输出重复计数。
+                storage_bytes[key] = max(storage_bytes.get(key, 0), logical_bytes)
+        return sum(storage_bytes.values())
+
+    def enforce_paddle_backward_capacity(self, inputs, outputs, output_grads):
+        """在真实输出 shape 已知后拒绝物理容量必然无法完成的 Paddle backward。"""
+        if not self.gpu_mode_config.enabled or not inputs or not outputs or not output_grads:
+            return
+        memory = _query_gpu_memory(None)
+        if memory is None:
+            return
+        _, total_bytes = memory
+        capacity_bytes = max(
+            0,
+            int(total_bytes) - self._gpu_safety_reserve_bytes(total_bytes, 0),
+        )
+        live_bytes = self._unique_gpu_storage_bytes(inputs, outputs, output_grads)
+        output_grad_bytes = self._unique_gpu_storage_bytes(output_grads)
+        input_sizes = [
+            self._unique_gpu_storage_bytes(input_tensor)
+            for input_tensor in inputs
+            if self.tensor_is_gpu(input_tensor)
+        ]
+        if not input_sizes:
+            return
+        # GradTensorHolder 会复制 seed，且有效 backward 至少形成一个输入梯度 storage。
+        required_bytes = live_bytes + output_grad_bytes + min(input_sizes)
+        if required_bytes <= capacity_bytes:
+            return
+        raise GpuMemoryGuardSkip(
+            "Paddle backward protocol exceeds physical GPU capacity: "
+            f"required={required_bytes / _GIB:.2f} GiB, "
+            f"capacity={capacity_bytes / _GIB:.2f} GiB, "
+            "basis=actual_input_output_grad_storage"
         )
 
     @staticmethod

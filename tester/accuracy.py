@@ -8,7 +8,7 @@ import torch
 import yaml
 
 from .accuracy_common import process_grad_output, process_output
-from .base import APITestBase, gpu_mode_memory_decision
+from .base import APITestBase, GpuMemoryGuardSkip, gpu_mode_memory_decision
 from .paddle_to_torch import ConversionKind, get_converter
 from .paddle_to_torch.arguments import bind_paddle_arguments
 
@@ -492,6 +492,11 @@ class APITestAccuracy(APITestBase):
             result_outputs, result_outputs_grads = self.gen_paddle_output_and_output_grad(
                 paddle_output
             )
+            self.enforce_paddle_backward_capacity(
+                inputs_list,
+                result_outputs,
+                result_outputs_grads,
+            )
             del self.paddle_args, self.paddle_kwargs
             if inputs_list and result_outputs and result_outputs_grads:
                 paddle_out_grads = paddle.grad(
@@ -501,6 +506,12 @@ class APITestAccuracy(APITestBase):
                     allow_unused=True,
                 )
             del inputs_list, result_outputs, result_outputs_grads
+        except GpuMemoryGuardSkip as err:
+            self.report_case_result("skip", phase="memory_guard", message=str(err))
+            self.clear_runtime_inputs("paddle")
+            self.clear_output_grad_cache()
+            self.dump_finalize("skip", memory_guard=str(err))
+            return False, None
         except Exception as err:
             if str(err).startswith("Too large tensor to get cached numpy: "):
                 self._report_runtime_error_and_finalize(
@@ -558,6 +569,9 @@ class APITestAccuracy(APITestBase):
             torch_grad_success,
             probe_bytes,
         )
+        if self.use_gpu_mode:
+            # 调用者完成结果重绑定后旧 GPU 树才真正失去引用，此时才能释放 Torch cache。
+            gpu_mode_memory_decision(self.gpu_mode_config, force=True)
 
         paddle_success, paddle_output = self.get_paddle_output()
         if not paddle_success:

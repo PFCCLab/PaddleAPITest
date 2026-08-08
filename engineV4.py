@@ -51,7 +51,14 @@ from tester.dump_writer import (
     record_dump_terminal_status,
     resolve_dump_options,
 )
-from tester.gpu_memory_preflight import GpuMemoryDeferred
+from tester.gpu_memory_preflight import GpuMemoryDeferred, estimate_gpu_memory
+from tester.gpu_scheduler import (
+    CaseGpuEstimate,
+    GpuMemorySnapshot,
+    GpuPressureTimeout,
+    GpuWaveController,
+    read_gpu_pressure_timeout,
+)
 from tester.log_writer import (
     init_log,
     log_aggregation,
@@ -189,6 +196,7 @@ GPU_MEMORY_DEFER_MAX_BACKOFF_SECONDS = 30.0
 class BatchRetryState:
     per_case_external_kill_retries: dict[str, int] = field(default_factory=dict)
     per_case_memory_defer_retries: dict[str, int] = field(default_factory=dict)
+    case_memory_estimates: dict[str, CaseGpuEstimate] = field(default_factory=dict)
     total_external_kills: int = 0
     unsafe_environment: bool = False
 
@@ -211,6 +219,35 @@ class PendingCase:
 
     config: str
     ready_at: float = 0.0
+    compute_estimate_bytes: int = 0
+    comparison_estimate_bytes: int = 0
+
+    @property
+    def gpu_estimate(self):
+        return CaseGpuEstimate(self.compute_estimate_bytes, self.comparison_estimate_bytes)
+
+
+@dataclass
+class GpuWaveRuntime:
+    """连接纯调度策略与 WorkerPool slot 的批次级运行状态。"""
+
+    controller: GpuWaveController
+    slot_indices: tuple[int, ...]
+    planned_cases: list[PendingCase] = field(default_factory=list)
+    planned_slot_indices: tuple[int, ...] = ()
+    active_slot_indices: set[int] = field(default_factory=set)
+    active_task_tokens: dict[int, tuple[int | None, str]] = field(default_factory=dict)
+    pressure_reported: bool = False
+
+
+@dataclass(frozen=True)
+class WorkerTask:
+    """主调度器传给 worker 的 case 及本波实际显存预算。"""
+
+    config: str
+    workers_on_gpu: int
+    compute_budget_gib: float
+    comparison_budget_gib: float = 0.0
 
 
 @dataclass
@@ -266,6 +303,9 @@ class BatchMessage:
             message.reason = msg[3] if len(msg) > 3 else ""
             message.worker_pid = msg[4] if len(msg) > 4 else None
             message.completed_offset = msg[5] if len(msg) > 5 else None
+        elif message.msg_type == "timeout":
+            message.worker_pid = msg[3] if len(msg) > 3 else None
+            message.completed_offset = msg[4] if len(msg) > 4 else None
         elif message.msg_type == "crashed":
             message.exitcode = msg[3] if len(msg) > 3 else None
             if len(msg) > 5 and msg[5] == "child":
@@ -274,6 +314,7 @@ class BatchMessage:
                 message.completed_offset = msg[7] if len(msg) > 7 else None
             else:
                 message.worker_pid = msg[4] if len(msg) > 4 else None
+                message.completed_offset = msg[5] if len(msg) > 5 else None
         return message
 
 
@@ -293,7 +334,7 @@ class WorkerSlot:
     task_start_time: float | None = None
     child_pid: int | None = None
     started_at: float | None = None
-    state: str = "dead"  # dead、starting、idle、busy
+    state: str = "dead"  # dead、starting、idle、busy、suspended
 
 
 def _import_optional_runtime_module(module_name):
@@ -353,6 +394,21 @@ def _init_worker_runtime(
         os.environ["PADDLEAPITEST_WORKER_SLOT"] = str(slot_index)
 
 
+def _apply_worker_task_runtime_budget(options, task, gpu_id, comparison_gpu_id=None):
+    """让 worker 内预检使用本波实际预算，而不是配置的最大逻辑并发。"""
+    # 旧预检会再除以 workers_on_gpu，因此计算卡保存整波总承诺。
+    workers_on_gpu = max(1, int(task.workers_on_gpu))
+    workers_map = dict(getattr(options, "gpu_workers_per_gpu_map", {}) or {})
+    total_memory_map = dict(getattr(options, "gpu_total_memory_map", {}) or {})
+    workers_map[gpu_id] = workers_on_gpu
+    total_memory_map[gpu_id] = max(0.0, float(task.compute_budget_gib)) * workers_on_gpu
+    if comparison_gpu_id is not None:
+        total_memory_map[comparison_gpu_id] = max(0.0, float(task.comparison_budget_gib))
+    options.gpu_workers_per_gpu_map = workers_map
+    options.gpu_total_memory_map = total_memory_map
+    os.environ["PADDLEAPITEST_WORKERS_ON_GPU"] = str(workers_on_gpu)
+
+
 def _worker_loop(
     slot_index,
     gpu_id,
@@ -367,13 +423,12 @@ def _worker_loop(
         - Normal exit: receives None, releases device resources, and returns gracefully.
         - Fatal CUDA/OOM/Torch errors: run_test_case exits with the centralized fatal protocol.
           The code identifies the result type and whether the worker already wrote it. This
-          bypasses Python cleanup; the watchdog detects and respawns the dead worker.
+          bypasses Python cleanup; the watchdog detects and suspends the dead worker.
         - Other crashes: any unhandled signal (SIGSEGV etc.) or SIGKILL from Watchdog timeout
-          terminates the process. Watchdog detects exitcode != 0 and respawns.
+          terminates the process. Watchdog detects exitcode != 0 and suspends the slot.
 
-    The main process never dispatches to a dead/restarting worker — upon detecting crash or
-    timeout, the next task goes to `pending_dispatch` and is sent after the new worker reports
-    "ready".
+    The main process never dispatches to a dead/starting worker. After a crash or timeout, the
+    case returns to `pending_dispatch`; a later admitted wave may create a replacement worker.
     """
     # ── GPU 初始化（等价于 init_worker_gpu） ──
     try:
@@ -385,11 +440,11 @@ def _worker_loop(
             redirect_output=True,
         )
     except Exception as e:
-        result_queue.put(("init_failed", slot_index, str(e)))
+        result_queue.put(("init_failed", slot_index, os.getpid(), str(e)))
         return
 
     # ── 通知主进程：ready ──
-    result_queue.put(("ready", slot_index))
+    result_queue.put(("ready", slot_index, os.getpid()))
 
     # ── 任务循环 ──
     while True:
@@ -400,8 +455,12 @@ def _worker_loop(
         if task is None:  # 毒丸
             break
 
-        api_config_str = task
-        result_queue.put(("ack", slot_index, api_config_str))
+        if isinstance(task, WorkerTask):
+            _apply_worker_task_runtime_budget(options, task, gpu_id, comparison_gpu_id)
+            api_config_str = task.config
+        else:
+            api_config_str = task
+        result_queue.put(("ack", slot_index, os.getpid(), api_config_str))
 
         try:
             run_test_case(api_config_str, options)
@@ -473,6 +532,15 @@ def _build_sanitizer_case_command(api_config_str, options, sanitizer_cmd):
     return cmd
 
 
+def _sanitizer_child_environment(base_environment, task):
+    """为 sanitizer case child 构造本波独立环境。"""
+    child_environment = dict(base_environment)
+    if isinstance(task, WorkerTask):
+        # wrapper 不加载 GPU runtime；实际并发必须在创建 case child 时透传。
+        child_environment["PADDLEAPITEST_WORKERS_ON_GPU"] = str(task.workers_on_gpu)
+    return child_environment
+
+
 def _sanitizer_worker_loop(
     slot_index,
     gpu_id,
@@ -504,7 +572,7 @@ def _sanitizer_worker_loop(
     signal.signal(signal.SIGTERM, terminate_child)
 
     try:
-        result_queue.put(("ready", slot_index))
+        result_queue.put(("ready", slot_index, os.getpid()))
 
         while True:
             try:
@@ -514,8 +582,8 @@ def _sanitizer_worker_loop(
             if task is None:
                 break
 
-            api_config_str = task
-            result_queue.put(("ack", slot_index, api_config_str))
+            api_config_str = task.config if isinstance(task, WorkerTask) else task
+            result_queue.put(("ack", slot_index, os.getpid(), api_config_str))
             log_worker.write_case_begin(
                 api_config_str,
                 worker_pid=os.getpid(),
@@ -539,9 +607,10 @@ def _sanitizer_worker_loop(
                 continue
 
             try:
+                case_child_env = _sanitizer_child_environment(child_env, task)
                 child_process = subprocess.Popen(
                     cmd,
-                    env=child_env,
+                    env=case_child_env,
                     stdout=subprocess.PIPE,
                     stderr=subprocess.STDOUT,
                     text=True,
@@ -557,7 +626,7 @@ def _sanitizer_worker_loop(
                     ("error", slot_index, api_config_str, str(err), os.getpid(), completed_offset)
                 )
                 continue
-            result_queue.put(("child", slot_index, child_process.pid))
+            result_queue.put(("child", slot_index, os.getpid(), child_process.pid))
             output_tail = deque(maxlen=40)
             with tempfile.TemporaryFile(
                 mode="w+t", encoding="utf-8", errors="replace"
@@ -686,13 +755,19 @@ class WorkerPool:
         return len(self.slots)
 
     def start(self):
-        """并行启动所有 worker 进程，然后启动 watchdog 线程。"""
-        for slot in self.slots:
-            self._spawn_worker(slot)
+        """仅启动 watchdog；worker 在任务通过显存准入后按需创建。"""
         self._watchdog_thread = threading.Thread(
             target=self._watchdog_loop, daemon=True, name="pool-watchdog"
         )
         self._watchdog_thread.start()
+
+    def _suspend_slot(self, slot):
+        """挂起需要回收观察的 slot，后续只能由主调度循环恢复。"""
+        slot.state = "suspended"
+        slot.current_task = None
+        slot.task_start_time = None
+        slot.child_pid = None
+        slot.started_at = None
 
     def _close_queue(self, q, *, cancel_join=False):
         """关闭 multiprocessing 队列，避免清理错误掩盖测试结果。"""
@@ -716,6 +791,7 @@ class WorkerPool:
     def _spawn_worker(self, slot):
         """为指定 slot 拉起一个新的 worker 进程。"""
         with self._spawn_lock:
+            # 只有主调度线程在显存准入后调用；锁只防止关闭流程并发穿透。
             if self._closed or self._shutdown_event.is_set():
                 return False
             if slot.process is not None and slot.process.is_alive():
@@ -729,6 +805,7 @@ class WorkerPool:
                 if getattr(self.options, "use_compute_sanitizer", False)
                 else _worker_loop
             )
+            # sanitizer wrapper 也是 slot 的 worker，本层不额外预建其 CUDA child。
             p = mp.Process(
                 target=worker_target,
                 args=(
@@ -741,7 +818,17 @@ class WorkerPool:
                 ),
                 daemon=True,
             )
-            p.start()
+            inherited_visibility = _visible_gpu_ids(slot.gpu_id, slot.comparison_gpu_id)
+            previous_visibility = os.environ.get("CUDA_VISIBLE_DEVICES")
+            try:
+                # spawn 会先导入本模块；必须在 start 前让子解释器继承 slot 映射。
+                os.environ["CUDA_VISIBLE_DEVICES"] = inherited_visibility
+                p.start()
+            finally:
+                if previous_visibility is None:
+                    os.environ.pop("CUDA_VISIBLE_DEVICES", None)
+                else:
+                    os.environ["CUDA_VISIBLE_DEVICES"] = previous_visibility
             slot.process = p
             slot.state = "starting"
             slot.current_task = None
@@ -750,11 +837,32 @@ class WorkerPool:
             slot.started_at = time.monotonic()
             return True
 
+    def retire_slots(self, slot_indices):
+        """停止空闲或启动中的进程；显存是否回收由 GPU 波次控制器另行确认。"""
+        for slot_index in slot_indices:
+            slot = self.slots[slot_index]
+            # child 可能持有主要 CUDA context，必须先于 wrapper worker 终止。
+            self._kill_slot_child(slot)
+            process = slot.process
+            if process is not None and process.is_alive():
+                if slot.state == "idle" and slot.input_queue is not None:
+                    slot.input_queue.put(None)
+                    self._join_process(process, timeout=2)
+                if process.is_alive():
+                    self._kill_process(process)
+            elif process is not None:
+                self._join_process(process, timeout=1)
+            self._close_queue(slot.input_queue, cancel_join=True)
+            # 进程退出只结束生命周期，不能据此宣告物理显存已经恢复。
+            slot.input_queue = None
+            slot.process = None
+            self._suspend_slot(slot)
+
     def _startup_timeout(self):
         return getattr(self.options, "worker_startup_timeout", WORKER_STARTUP_TIMEOUT)
 
     def _check_starting_worker(self, slot, *, now=None):
-        """重启一个在启动阶段失败或卡住的 worker。"""
+        """终止并挂起一个在启动阶段失败或卡住的 worker。"""
         if slot.state != "starting" or slot.process is None or slot.started_at is None:
             return False
         now = time.monotonic() if now is None else now
@@ -772,72 +880,53 @@ class WorkerPool:
                 flush=True,
             )
             self._join_process(slot.process, timeout=1)
-        self._spawn_worker(slot)
+        self._suspend_slot(slot)
+        # 不在 watchdog 内重建；下一轮要先取消波次并观察显存稳定。
         return True
 
-    def warmup(self, timeout=None):
-        """等待所有 worker 就绪，或直到启动超时。"""
-        if timeout is None:
-            timeout = self._startup_timeout()
-        ready_slots = {slot.index for slot in self.slots if slot.state == "idle"}
-        deadline = time.monotonic() + timeout
-
-        while len(ready_slots) < self.total_workers and time.monotonic() < deadline:
-            try:
-                remaining = max(0.1, deadline - time.monotonic())
-                msg = self.result_queue.get(timeout=min(5.0, remaining))
-                if self._handle_worker_control_message(msg):
-                    if msg[0] == "ready" and self.slots[msg[1]].state == "idle":
-                        ready_slots.add(msg[1])
-                    continue
-            except queue.Empty:
-                now = time.monotonic()
-                for slot in self.slots:
-                    self._check_starting_worker(slot, now=now)
-
-        ready_count = sum(slot.state == "idle" for slot in self.slots)
-        if ready_count != self.total_workers:
-            print(
-                f"[workers] READY_TIMEOUT | {ready_count}/{self.total_workers} ready | "
-                f"timeout {timeout} s",
-                flush=True,
-            )
-        return ready_count
-
     def _handle_worker_control_message(self, msg):
-        """处理来自 worker 的 ready、init_failed 和 child 账务消息。"""
+        """处理来自 worker 的生命周期、任务确认和 child 账务消息。"""
         msg_type = msg[0]
-        if msg_type == "ready":
-            slot_idx = msg[1]
-            with self._lock:
-                slot = self.slots[slot_idx]
+        if msg_type not in {"ready", "init_failed", "ack", "child"}:
+            return False
+        slot_idx = msg[1]
+        worker_pid = msg[2]
+        with self._lock:
+            slot = self.slots[slot_idx]
+            # 共享结果队列可能晚到已回收 worker 的消息，PID 是 slot 生命周期令牌。
+            if slot.process is None or slot.process.pid != worker_pid:
+                return True
+            if msg_type == "ready":
                 slot.state = "idle"
                 slot.started_at = None
-            return True
+                return True
+            if msg_type == "ack":
+                config = msg[3]
+                if slot.state == "busy" and slot.current_task == config:
+                    slot.task_start_time = time.time()
+                return True
+            if msg_type == "child":
+                slot.child_pid = msg[3]
+                return True
+
         if msg_type == "init_failed":
-            slot_idx = msg[1]
-            error_msg = msg[2]
+            error_msg = msg[3]
             print(
                 f"[worker] INIT_FAILED | slot {slot_idx} | {error_msg}",
                 flush=True,
             )
-            slot = self.slots[slot_idx]
             self._join_process(slot.process, timeout=1)
-            self._spawn_worker(slot)
+            # init_failed 常见于 bootstrap OOM，slot 必须退出 planned 启动屏障。
+            self._suspend_slot(slot)
             return True
-        if msg_type == "child":
-            slot_idx = msg[1]
-            child_pid = msg[2]
-            with self._lock:
-                self.slots[slot_idx].child_pid = child_pid
-            return True
-        return False
+        return True
 
     def dispatch(self, slot_index, config):
         """向指定 worker slot 派发任务。"""
         slot = self.slots[slot_index]
+        accounting_config = config.config if isinstance(config, WorkerTask) else config
         with self._lock:
-            slot.current_task = config
+            slot.current_task = accounting_config
             slot.task_start_time = None  # 在 ack 到来时再记录
             slot.state = "busy"
         slot.input_queue.put(config)
@@ -855,15 +944,24 @@ class WorkerPool:
             if slot.state == "idle":
                 yield slot
 
-    def mark_idle(self, slot_index):
-        """在任务完成后将 worker slot 标记为空闲。"""
+    def mark_idle(self, slot_index, *, worker_pid):
+        """仅在终态仍属于当前存活 worker 时把 busy slot 标记为空闲。"""
         with self._lock:
             slot = self.slots[slot_index]
+            if (
+                slot.state != "busy"
+                or slot.process is None
+                or slot.process.pid != worker_pid
+                or not slot.process.is_alive()
+            ):
+                # watchdog 已挂起或 slot 已换代时，迟到结果不能复活旧进程。
+                return False
             slot.state = "idle"
             slot.current_task = None
             slot.task_start_time = None
             slot.child_pid = None
             slot.started_at = None
+            return True
 
     def _watchdog_loop(self):
         """周期性检查超时和非预期死亡的 worker。"""
@@ -906,17 +1004,15 @@ class WorkerPool:
             return
         config = slot.current_task
         old_pid = slot.process.pid if slot.process else None
+        # timeout 路径先清 child，避免 sanitizer wrapper 退出后 child 继续占卡。
         self._kill_slot_child(slot)
         self._kill_process(slot.process)
-        if old_pid is not None and config is not None:
-            completed_offset = log_worker.append_case_end_to_worker_log(
-                old_pid, "timeout", api_config_str=config
-            )
-            log_aggregation.mark_inorder_case_complete(old_pid, completed_offset)
         if self._closed or self._shutdown_event.is_set():
             return
-        self.result_queue.put(("timeout", slot.index, config))
-        self._spawn_worker(slot)
+        # watchdog 只上报候选终态，日志边界必须等主循环成功认领后再写。
+        self.result_queue.put(("timeout", slot.index, config, old_pid))
+        # 主循环收到终态后才会关闭整波并开始物理 free 稳定采样。
+        self._suspend_slot(slot)
 
     def _handle_crash(self, slot):
         """处理非预期死亡的 worker。"""
@@ -927,17 +1023,14 @@ class WorkerPool:
         if self._closed or self._shutdown_event.is_set():
             return
         if config is not None:
-            completed_offset = log_worker.append_case_end_to_worker_log(
-                slot.process.pid, "crashed", api_config_str=config
-            )
-            log_aggregation.mark_inorder_case_complete(slot.process.pid, completed_offset)
-            self.result_queue.put(("crashed", slot.index, config, exitcode))
+            # 与 timeout 相同，crash 日志边界只能由胜出的终态消息写入。
+            self.result_queue.put(("crashed", slot.index, config, exitcode, slot.process.pid))
         else:
             print(
                 f"[worker] PADDLE_CRASH | slot {slot.index} | exit {exitcode}",
                 flush=True,
             )
-        self._spawn_worker(slot)
+        self._suspend_slot(slot)
 
     def _kill_process_group(self, pid):
         try:
@@ -1167,6 +1260,18 @@ def get_memory_info(gpu_id):
         return _MEM_SNAPSHOT[gpu_id]
 
     raise RuntimeError("No supported accelerator (GPU / XPU / Iluvatar) detected.")
+
+
+def _read_gpu_memory_snapshots(gpu_ids):
+    snapshots = {}
+    for gpu_id in gpu_ids:
+        # 始终重新读取物理 used；外部进程和退出进程的遗留显存都会反映在 free。
+        total_gib, used_gib = get_memory_info(gpu_id)
+        snapshots[gpu_id] = GpuMemorySnapshot(
+            total_bytes=int(total_gib * 1024**3),
+            free_bytes=max(0, int((total_gib - used_gib) * 1024**3)),
+        )
+    return snapshots
 
 
 def _build_gpu_total_memory_map(available_gpus):
@@ -1510,24 +1615,21 @@ def _handle_external_kill_retry(
     retry_count = retry_state.per_case_external_kill_retries.get(api_config_str, 0)
     if retry_count < max_case_retries:
         retry_state.per_case_external_kill_retries[api_config_str] = retry_count + 1
-        pending_dispatch.appendleft(PendingCase(api_config_str))
+        pending_dispatch.appendleft(_pending_case_for_retry(retry_state, api_config_str))
         return True
 
     retry_state.unsafe_environment = True
     return False
 
 
-def _pop_ready_pending_case(pending_dispatch, now=None):
-    """从 pending 队列取出一个已到重试时间的 case。"""
-    if not pending_dispatch:
-        return None
-    now = time.monotonic() if now is None else now
-    for _ in range(len(pending_dispatch)):
-        pending = pending_dispatch.popleft()
-        if pending.ready_at <= now:
-            return pending.config
-        pending_dispatch.append(pending)
-    return None
+def _pending_case_for_retry(retry_state, config, *, ready_at=0.0):
+    estimate = retry_state.case_memory_estimates.get(config, CaseGpuEstimate())
+    return PendingCase(
+        config=config,
+        ready_at=ready_at,
+        compute_estimate_bytes=estimate.compute_bytes,
+        comparison_estimate_bytes=estimate.comparison_bytes,
+    )
 
 
 def _next_pending_delay(pending_dispatch, now=None):
@@ -1574,21 +1676,324 @@ def resolve_batch_worker_layout(
     return available_gpus, max_workers_per_gpu, gpu_pairs
 
 
-def _fill_idle_workers(pool, pending_dispatch, config_iter):
-    """优先用 pending 队列补满空闲 worker，再消费新的 case。"""
+def _build_gpu_wave_runtimes(pool):
+    grouped_slots = {}
+    for slot in pool.slots:
+        # 双卡 slot 以有序设备对分组，确保两侧显存由同一控制器原子管理。
+        device_ids = (
+            (slot.gpu_id, slot.comparison_gpu_id)
+            if slot.comparison_gpu_id is not None
+            else (slot.gpu_id,)
+        )
+        grouped_slots.setdefault(device_ids, []).append(slot.index)
+    return {
+        device_ids: GpuWaveRuntime(
+            controller=GpuWaveController(
+                device_ids=device_ids,
+                max_workers=len(slot_indices),
+            ),
+            slot_indices=tuple(slot_indices),
+        )
+        for device_ids, slot_indices in grouped_slots.items()
+    }
+
+
+def _gpu_memory_preflight_mode(options):
+    for mode in (
+        "accuracy_stable_dual_gpu",
+        "accuracy_stable",
+        "accuracy",
+        "paddle_only",
+    ):
+        if getattr(options, mode, False):
+            return mode
+    return None
+
+
+def _estimate_case_gpu_memory(api_config_str, options):
+    mode = _gpu_memory_preflight_mode(options)
+    if mode is None:
+        return CaseGpuEstimate()
+    try:
+        from tester import APIConfig
+
+        estimate = estimate_gpu_memory(
+            APIConfig(api_config_str),
+            mode,
+            check_grad=True,
+        )
+    except Exception:
+        # 配置解析和不支持 dtype 仍由 worker 分类；调度器使用最小准入成本兜底。
+        return CaseGpuEstimate()
+    compute_bytes = max(
+        # 多阶段执行采用峰值而非求和；阶段之间不会同时持有全部临时张量。
+        (stage.total_bytes for stage in estimate.stages if stage.device == "compute"),
+        default=0,
+    )
+    comparison_bytes = max(
+        (stage.total_bytes for stage in estimate.stages if stage.device == "comparison"),
+        default=0,
+    )
+    return CaseGpuEstimate(compute_bytes, comparison_bytes)
+
+
+def _build_pending_cases(api_configs, options):
+    pending_cases = deque()
+    for config in api_configs:
+        estimate = _estimate_case_gpu_memory(config, options)
+        pending_cases.append(
+            PendingCase(
+                config=config,
+                compute_estimate_bytes=estimate.compute_bytes,
+                comparison_estimate_bytes=estimate.comparison_bytes,
+            )
+        )
+    return pending_cases
+
+
+def _ready_pending_candidates(pending_dispatch, *, now=None):
+    now = time.monotonic() if now is None else now
+    return [
+        (index, pending)
+        for index, pending in enumerate(pending_dispatch)
+        if pending.ready_at <= now
+    ]
+
+
+def _remove_pending_cases(pending_dispatch, selected_positions):
+    # 一次重建 deque 保持未选 case 顺序，并让已选集合从队列中原子消失。
+    selected_positions = set(selected_positions)
+    selected = []
+    retained = []
+    for index, pending in enumerate(pending_dispatch):
+        (selected if index in selected_positions else retained).append(pending)
+    pending_dispatch.clear()
+    pending_dispatch.extend(retained)
+    return selected
+
+
+def _try_plan_gpu_waves(
+    pool,
+    runtimes,
+    pending_dispatch,
+    *,
+    snapshot_reader,
+    now=None,
+):
+    """为当前 ready GPU 规划整波任务；此阶段只按需创建进程，不派发 case。"""
+    if not pending_dispatch:
+        return 0
+    for runtime in runtimes.values():
+        if runtime.controller.state not in {"ready", "pressure"}:
+            continue
+        candidates = _ready_pending_candidates(pending_dispatch, now=now)
+        if not candidates:
+            continue
+        snapshots = snapshot_reader(runtime.controller.device_ids)
+        admission = runtime.controller.plan(
+            [pending.gpu_estimate for _, pending in candidates],
+            snapshots,
+        )
+        if not admission.selected_indices:
+            continue
+        selected_positions = [candidates[index][0] for index in admission.selected_indices]
+        runtime.planned_cases = _remove_pending_cases(pending_dispatch, selected_positions)
+
+        # 优先复用已经空闲的常驻 worker，再为本波缺口延迟创建进程。
+        candidate_slots = sorted(
+            (pool.slots[index] for index in runtime.slot_indices),
+            key=lambda slot: slot.state != "idle",
+        )
+        selected_slots = candidate_slots[: len(runtime.planned_cases)]
+        runtime.planned_slot_indices = tuple(slot.index for slot in selected_slots)
+        for slot in selected_slots:
+            if slot.state != "idle":
+                pool._spawn_worker(slot)
+    return 0
+
+
+def _requeue_planned_wave(runtime, pending_dispatch):
+    for pending in reversed(runtime.planned_cases):
+        pending_dispatch.appendleft(pending)
+    runtime.planned_cases.clear()
+    runtime.planned_slot_indices = ()
+
+
+def _cancel_unstartable_planned_waves(pool, runtimes, pending_dispatch):
+    cancelled_count = 0
+    for runtime in runtimes.values():
+        if runtime.controller.state != "planned":
+            continue
+        slots = [pool.slots[index] for index in runtime.planned_slot_indices]
+        if slots and all(slot.state in {"starting", "idle"} for slot in slots):
+            continue
+        # 任一 slot 启动失败都会破坏整波屏障，不能只缩小已承诺的波次。
+        runtime.controller.cancel_planned_wave()
+        pool.retire_slots(runtime.planned_slot_indices)
+        _requeue_planned_wave(runtime, pending_dispatch)
+        cancelled_count += 1
+    return cancelled_count
+
+
+def _try_dispatch_planned_waves(
+    pool,
+    runtimes,
+    pending_dispatch,
+    *,
+    snapshot_reader,
+):
+    """仅当本波全部 worker ready 且二次显存检查通过时原子派发。"""
     dispatched_count = 0
-    while True:
-        slot = next(pool.idle_slots(), None)
-        if slot is None:
-            break
-        config = _pop_ready_pending_case(pending_dispatch)
-        if config is None:
-            config = next(config_iter, None)
-        if config is None:
-            break
-        pool.dispatch(slot.index, config)
-        dispatched_count += 1
+    for runtime in runtimes.values():
+        if runtime.controller.state != "planned":
+            continue
+        slots = [pool.slots[index] for index in runtime.planned_slot_indices]
+        if not slots or any(slot.state != "idle" for slot in slots):
+            continue
+        snapshots = snapshot_reader(runtime.controller.device_ids)
+        if not runtime.controller.confirm_planned_wave(snapshots):
+            pool.retire_slots(runtime.planned_slot_indices)
+            _requeue_planned_wave(runtime, pending_dispatch)
+            continue
+
+        runtime.controller.mark_dispatched(len(runtime.planned_cases))
+        runtime.active_slot_indices = set(runtime.planned_slot_indices)
+        runtime.active_task_tokens.clear()
+        workers_on_gpu = len(runtime.planned_cases)
+        for slot, pending in zip(slots, runtime.planned_cases, strict=True):
+            policy = runtime.controller.policy
+            pool.dispatch(
+                slot.index,
+                WorkerTask(
+                    config=pending.config,
+                    workers_on_gpu=workers_on_gpu,
+                    compute_budget_gib=(
+                        policy.case_admission_bytes(pending.compute_estimate_bytes) / 1024**3
+                    ),
+                    comparison_budget_gib=(
+                        policy.case_admission_bytes(pending.comparison_estimate_bytes) / 1024**3
+                        if len(runtime.controller.device_ids) == 2
+                        else 0.0
+                    ),
+                ),
+            )
+            worker_pid = slot.process.pid if slot.process is not None else None
+            runtime.active_task_tokens[slot.index] = (worker_pid, pending.config)
+            dispatched_count += 1
+        runtime.planned_cases.clear()
+        runtime.planned_slot_indices = ()
     return dispatched_count
+
+
+def _runtime_for_slot(runtimes, slot_index):
+    return next(
+        (
+            runtime
+            for runtime in runtimes.values()
+            if slot_index in runtime.slot_indices
+        ),
+        None,
+    )
+
+
+def _claim_gpu_wave_terminal(runtimes, msg):
+    """按 slot、worker PID 和配置认领一次且仅一次的 case 终态。"""
+    message = BatchMessage.from_raw(msg)
+    slot_index = message.slot_index
+    runtime = _runtime_for_slot(runtimes, slot_index)
+    if runtime is None:
+        return False
+    expected_token = runtime.active_task_tokens.get(slot_index)
+    actual_token = (message.worker_pid, message.config)
+    # timeout/done 竞争及旧进程迟到消息都不能消费新一代 active task。
+    if expected_token is None or expected_token != actual_token:
+        return False
+    runtime.active_task_tokens.pop(slot_index, None)
+    runtime.active_slot_indices.remove(slot_index)
+    runtime.controller.mark_completed()
+    return True
+
+
+def _observe_gpu_reclaim(runtimes, *, snapshot_reader, now=None):
+    now = time.monotonic() if now is None else now
+    ready_count = 0
+    for runtime in runtimes.values():
+        if runtime.controller.state != "reclaim_pending":
+            continue
+        # reclaim 期间只采样，不创建进程；ready 转换由控制器稳定窗口决定。
+        snapshots = snapshot_reader(runtime.controller.device_ids)
+        if runtime.controller.observe_reclaim(snapshots, now=now):
+            ready_count += 1
+    return ready_count
+
+
+def _update_gpu_pressure_timeout(
+    pressure_timeout,
+    batch_state,
+    pending_dispatch,
+    runtimes,
+    *,
+    now=None,
+):
+    """仅在有 pending 且没有在途/启动中波次时累计批次无进展时间。"""
+    now = time.monotonic() if now is None else now
+    has_inflight_wave = any(
+        runtime.controller.state in {"planned", "running"}
+        for runtime in runtimes.values()
+    )
+    # deferred 的 ready_at 只控制重派频率，其退避时间仍属于显存压力等待。
+    has_pending = bool(pending_dispatch)
+    blocked = has_pending and batch_state.active_tasks == 0 and not has_inflight_wave
+    if not blocked:
+        # planned/running 只暂停观察；必须由配置终态明确重置既有压力窗口。
+        return False
+    if not pressure_timeout.update(blocked=True, now=now):
+        return False
+    # 超时只改变批次终止状态，不消费 pending，也不伪造任何 case 终态。
+    # finally 仍会汇总现有日志，因此已写入 checkpoint 的配置可供下次续跑。
+    batch_state.batch_exit_code = 1
+    batch_state.abort_run = True
+    return True
+
+
+def _format_gpu_pressure_summary(runtimes, pool, *, snapshot_reader):
+    lines = []
+    for runtime in runtimes.values():
+        snapshots = snapshot_reader(runtime.controller.device_ids)
+        active_workers = sum(
+            pool.slots[index].state in {"starting", "busy"}
+            for index in runtime.slot_indices
+        )
+        for gpu_id in runtime.controller.device_ids:
+            snapshot = snapshots[gpu_id]
+            reserve = runtime.controller.policy.safety_reserve_bytes(snapshot)
+            lines.append(
+                f"GPU {gpu_id} | total={snapshot.total_bytes / 1024**3:.2f} GiB | "
+                f"free={snapshot.free_bytes / 1024**3:.2f} GiB | "
+                f"reserve={reserve / 1024**3:.2f} GiB | state={runtime.controller.state} | "
+                f"active_workers={active_workers}"
+            )
+    return lines
+
+
+def _collect_gpu_pressure_transitions(runtimes, pool, *, snapshot_reader):
+    """只生成 pressure 进入/解除日志，避免显存轮询重复刷屏。"""
+    lines = []
+    for runtime in runtimes.values():
+        under_pressure = runtime.controller.state == "pressure"
+        if under_pressure == runtime.pressure_reported:
+            continue
+        runtime.pressure_reported = under_pressure
+        event = "PRESSURE" if under_pressure else "PRESSURE_CLEARED"
+        reason = "no admissible pending case" if under_pressure else "wave capacity available"
+        for summary in _format_gpu_pressure_summary(
+            {runtime.controller.device_ids: runtime},
+            pool,
+            snapshot_reader=snapshot_reader,
+        ):
+            # summary 保持与最终超时摘要相同字段，便于日志工具统一解析。
+            lines.append(f"{event} | {summary} | reason={reason}")
+    return lines
 
 
 def _handle_batch_result(
@@ -1612,13 +2017,25 @@ def _handle_batch_result(
     crash_source = message.crash_source
     reason = message.reason
 
+    if (
+        msg_type in {"timeout", "crashed"}
+        and crash_source == "worker"
+        and message.worker_pid is not None
+        and message.completed_offset is None
+    ):
+        # 认领完成后才补 abrupt exit 日志，迟到的竞争终态不会产生第二个边界。
+        message.completed_offset = log_worker.append_case_end_to_worker_log(
+            message.worker_pid,
+            msg_type,
+            api_config_str=config,
+        )
     if message.worker_pid is not None:
         log_aggregation.mark_inorder_case_complete(
             message.worker_pid,
             message.completed_offset,
         )
 
-    worker_reusable = msg_type in ("done", "error", "deferred") or (
+    worker_reusable = msg_type in ("done", "error") or (
         msg_type == "crashed" and options.use_compute_sanitizer and crash_source == "child"
     )
     external_kill = msg_type == "crashed" and exitcode in (-signal.SIGKILL, -signal.SIGTERM)
@@ -1634,7 +2051,7 @@ def _handle_batch_result(
         ):
             log_report.print_case_notice("RETRY", config, f"exit {exitcode}")
             if worker_reusable:
-                pool.mark_idle(slot_index)
+                pool.mark_idle(slot_index, worker_pid=message.worker_pid)
         else:
             log_report.print_case_notice(
                 "ABORT",
@@ -1648,16 +2065,25 @@ def _handle_batch_result(
         return
 
     if worker_reusable:
-        pool.mark_idle(slot_index)
+        pool.mark_idle(slot_index, worker_pid=message.worker_pid)
 
     if msg_type == "deferred":
+        # runtime headroom 不足可能留下无法跨进程复用的 allocator 缓存。
+        pool.mark_idle(slot_index, worker_pid=message.worker_pid)
+        pool.retire_slots((slot_index,))
         retry_count = retry_state.per_case_memory_defer_retries.get(config, 0)
         retry_state.per_case_memory_defer_retries[config] = retry_count + 1
         delay = min(
             GPU_MEMORY_DEFER_MAX_BACKOFF_SECONDS,
             GPU_MEMORY_DEFER_INITIAL_BACKOFF_SECONDS * (2 ** min(retry_count, 5)),
         )
-        pending_dispatch.append(PendingCase(config=config, ready_at=time.monotonic() + delay))
+        pending_dispatch.append(
+            _pending_case_for_retry(
+                retry_state,
+                config,
+                ready_at=time.monotonic() + delay,
+            )
+        )
         log_report.print_case_notice(
             "DEFER",
             config,
@@ -1799,67 +2225,104 @@ def _run_batch_mode(
 
         previous_signal_handlers = _install_batch_signal_handlers(cleanup_handler)
 
-        worker_start_time = time.monotonic()
-        print(f"Workers: starting | {len(pool.slots)} requested", flush=True)
+        print(f"Workers: lazy | {len(pool.slots)} logical slots", flush=True)
         pool.start()
-        ready_workers = pool.warmup()
-        print(
-            f"Workers: ready | {ready_workers} online | {len(pool.slots)} requested | "
-            f"{log_report.format_duration(time.monotonic() - worker_start_time)}",
-            flush=True,
-        )
+        pending_dispatch = _build_pending_cases(api_configs, options)
+        retry_state.case_memory_estimates = {
+            pending.config: pending.gpu_estimate for pending in pending_dispatch
+        }
+        gpu_runtimes = _build_gpu_wave_runtimes(pool)
+        pressure_timeout = GpuPressureTimeout(options.gpu_pressure_timeout)
 
-        if ready_workers != len(pool.slots):
-            print(
-                "Workers: failed | startup barrier incomplete; no cases will be dispatched",
-                flush=True,
+        # 每轮只推进一次状态转换，确保同一 GPU 不会在波次中途补入新任务。
+        while batch_state.tested_case < all_case and not batch_state.abort_run:
+            now = time.monotonic()
+            _observe_gpu_reclaim(
+                gpu_runtimes,
+                snapshot_reader=_read_gpu_memory_snapshots,
+                now=now,
             )
-            batch_state.batch_exit_code = 1
-            batch_state.shutdown_force = True
-            batch_state.abort_run = True
+            _cancel_unstartable_planned_waves(pool, gpu_runtimes, pending_dispatch)
+            _try_plan_gpu_waves(
+                pool,
+                gpu_runtimes,
+                pending_dispatch,
+                snapshot_reader=_read_gpu_memory_snapshots,
+                now=now,
+            )
+            dispatched = _try_dispatch_planned_waves(
+                pool,
+                gpu_runtimes,
+                pending_dispatch,
+                snapshot_reader=_read_gpu_memory_snapshots,
+            )
+            for transition_line in _collect_gpu_pressure_transitions(
+                gpu_runtimes,
+                pool,
+                snapshot_reader=_read_gpu_memory_snapshots,
+            ):
+                print(f"[gpu] {transition_line}", flush=True)
+            if dispatched:
+                batch_state.active_tasks += dispatched
+                if batch_state.test_started_at is None:
+                    batch_state.test_started_at = now
+                    batch_state.last_forecast_at = now
 
-        config_iter = iter(api_configs)
-        pending_dispatch = deque()
-
-        def refill_idle_workers():
-            if not batch_state.abort_run:
-                batch_state.active_tasks += _fill_idle_workers(
-                    pool,
-                    pending_dispatch,
-                    config_iter,
+            if _update_gpu_pressure_timeout(
+                pressure_timeout,
+                batch_state,
+                pending_dispatch,
+                gpu_runtimes,
+                now=now,
+            ):
+                print(
+                    f"[gpu] PRESSURE_TIMEOUT | {options.gpu_pressure_timeout:.1f} s without "
+                    f"checkpoint progress | {len(pending_dispatch)} pending",
+                    flush=True,
                 )
+                for summary_line in _format_gpu_pressure_summary(
+                    gpu_runtimes,
+                    pool,
+                    snapshot_reader=_read_gpu_memory_snapshots,
+                ):
+                    print(f"[gpu] {summary_line}", flush=True)
+                break
 
-        # 先把当前已经空闲的 worker 填满，让首轮尽快开始。
-        if not batch_state.abort_run:
-            refill_idle_workers()
-            if batch_state.active_tasks:
-                batch_state.test_started_at = time.monotonic()
-                batch_state.last_forecast_at = batch_state.test_started_at
-
-        # 主循环只负责收消息、补空闲 worker、以及把结果交给专门的处理逻辑。
-        while (batch_state.active_tasks > 0 or pending_dispatch) and not batch_state.abort_run:
             pending_delay = _next_pending_delay(pending_dispatch)
-            timeout = 5.0 if pending_delay is None else min(5.0, max(0.1, pending_delay))
-            msg = pool.collect_one(timeout=timeout)
-            if msg is not None and not pool._handle_worker_control_message(msg):
-                msg_type = msg[0]
-                if msg_type == "ack":
-                    slot_idx = msg[1]
-                    with pool._lock:
-                        pool.slots[slot_idx].task_start_time = time.time()
-                elif msg_type in ("done", "deferred", "error", "timeout", "crashed"):
-                    _handle_batch_result(
-                        pool=pool,
-                        options=options,
-                        all_case=all_case,
-                        checkpointed_case=checkpointed_case,
-                        batch_state=batch_state,
-                        retry_state=retry_state,
-                        pending_dispatch=pending_dispatch,
-                        msg=msg,
-                        max_total_external_kills=max_total_external_kills,
-                    )
-            refill_idle_workers()
+            collect_timeout = 0.5
+            if pending_delay is not None:
+                collect_timeout = min(collect_timeout, max(0.1, pending_delay))
+            msg = pool.collect_one(timeout=collect_timeout)
+            if msg is None:
+                continue
+            handled_control = pool._handle_worker_control_message(msg)
+            if handled_control:
+                continue
+            msg_type = msg[0]
+            if msg_type not in ("done", "deferred", "error", "timeout", "crashed"):
+                continue
+            # 终态认领必须先于计数、日志和 checkpoint，失败消息没有任何批次副作用。
+            if not _claim_gpu_wave_terminal(gpu_runtimes, msg):
+                continue
+            tested_case_before = batch_state.tested_case
+            _handle_batch_result(
+                pool=pool,
+                options=options,
+                all_case=all_case,
+                checkpointed_case=checkpointed_case,
+                batch_state=batch_state,
+                retry_state=retry_state,
+                pending_dispatch=pending_dispatch,
+                msg=msg,
+                max_total_external_kills=max_total_external_kills,
+            )
+            result_now = time.monotonic()
+            if batch_state.tested_case > tested_case_before:
+                # 只有形成 checkpoint 的配置终态才算批次取得持久进展。
+                pressure_timeout.update(blocked=False, now=result_now)
+            elif msg_type == "deferred":
+                # runtime headroom 不足从首次 deferred 起累计，避免重派永久续期。
+                pressure_timeout.update(blocked=True, now=result_now)
 
     except Exception as e:
         print(f"Unexpected error: {e}", flush=True)
@@ -2360,6 +2823,11 @@ def _run_batch_case_mode(options, start_time):
             options.log_dir,
         )
         return 0
+
+    try:
+        options.gpu_pressure_timeout = read_gpu_pressure_timeout()
+    except ValueError as err:
+        return _argument_error(str(err))
 
     # 校验 GPU 可见性并推导每张 GPU 的 worker 数量。
     gpu_ids = validate_gpu_options(options)
