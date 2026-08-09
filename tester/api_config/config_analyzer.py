@@ -3486,7 +3486,9 @@ class TensorConfig:
                     if self.dtype == "bfloat16"
                     else ("float16" if self.dtype in FLOAT8_DTYPES else self.dtype)
                 )
-                operator_place = paddle.CPUPlace() if getattr(api_config, "test_cpu", False) else self.place
+                operator_place = (
+                    paddle.CPUPlace() if getattr(api_config, "test_cpu", False) else self.place
+                )
                 self.paddle_tensor = paddle.to_tensor(
                     self.get_numpy_tensor(api_config),
                     dtype=intermediate_dtype,
@@ -3522,7 +3524,9 @@ class TensorConfig:
         try:
             intermediate_dtype = "float16" if self.dtype in FLOAT8_DTYPES else self.dtype
             storage_size = self._strided_storage_size()
-            operator_place = paddle.CPUPlace() if getattr(api_config, "test_cpu", False) else self.place
+            operator_place = (
+                paddle.CPUPlace() if getattr(api_config, "test_cpu", False) else self.place
+            )
             flat_tensor = paddle.zeros(
                 [storage_size],
                 dtype=intermediate_dtype,
