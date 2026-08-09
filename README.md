@@ -2,6 +2,8 @@
 
 PaddleAPITest 是面向 PaddlePaddle API 的配置驱动测试框架。它将真实业务、Paddle CI/CE 和专项场景中的 API 调用序列化为 `api config`，统一执行 API 可用性、Paddle/Torch 精度、重复稳定性、CINN、性能、大 Tensor、0-size Tensor 和自定义设备测试。
 
+完整的命令行参数、YAML 配置键、用户可配置环境变量和内部变量边界见 [CLI 参考](docs/CLI_REFERENCE.md)。
+
 一条配置包含 API、参数、Tensor shape、dtype、place 等执行信息，例如：
 
 ```text
@@ -130,7 +132,7 @@ GPU 上执行；输入逻辑值生成设备和结果比较设备只由 `--use_gp
 
 `engineV2.py` 使用 Pebble `ProcessPool`。除调度方式、engineV4 专属 compute-sanitizer
 和 `accuracy_dual_gpu` 外，其测试模式、双卡 accuracy-stable、GPU mode、动态显存管理、
-dump 和主要参数与 engineV4 对齐。详见 [engineV2 文档](engineV2-README.md)。
+dump 和主要参数与 engineV4 对齐。详见 [engineV2 文档](docs/engineV2-README.md)。
 
 ### 其他入口
 
@@ -144,7 +146,7 @@ python run.py -c test_pipeline/run_config.yaml --dry-run
 python run.py -c test_pipeline/run_config.yaml
 ```
 
-模型配置集可以使用 `${APITEST_MODEL}` 占位，示例见 [generic configs 文档](test_pipeline/generic_configs/README.md)。
+模型配置集可以使用 `${APITEST_MODEL}` 占位，示例见 [generic configs 文档](test_pipeline/generic_configs/README.md)。`run.py` 会对 YAML 中所有字符串展开 `${VAR}` 和 `$VAR`，`APITEST_MODEL` 只是项目约定的模型目录变量。
 
 ## GPU Mode 与动态显存管理
 
@@ -242,7 +244,8 @@ python engineV4.py \
 - `--timeout` 是单 case 超时时间，单位为秒。
 - `--show_runtime_status=True` 输出实时进度和运行状态。
 
-`--log_dir` 中会保存：
+未指定 `--log_dir` 时，批量运行默认写入 `logs/test_log_<timestamp>`，单条 `--api_config` 默认写入
+`logs/test_log_single_<timestamp>`。目录中会保存：
 
 - `checkpoint.txt`：已完成配置，用于续跑时跳过。
 - `log_inorder.log`：按完成顺序聚合的 case 日志。

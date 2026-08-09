@@ -77,7 +77,7 @@ paddle.concat(tuple(Tensor([31376, 768],"float32"),Tensor([1, 768],"float32"),),
      * big_and_0size 为含有大形状张量和 0-size 张量使用的配置集。
      * CI_CE_config 为 CI，CE 抓取的配置集。
      * 脚本工具
-       * parser.py 与 tester/input_generation/ 负责配置解析和针对 API 初始化合适张量
+       * config_analyzer.py 是引擎对配置解析并针对 api 初始化合适张量的代码（引擎补齐任务产物）
        * log_writer.py 是 engine 写入日志的工具
        * to_0_size*.py 是篡改为 0-size 配置的工具
        * to_big_size\*.py 是篡改为大形状张量的配置的工具。 
