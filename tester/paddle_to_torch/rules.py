@@ -5657,6 +5657,36 @@ result = x
         )
 
 
+class TensorToRule(BaseRule):
+    PADDLE_APIS = ("paddle.Tensor.to",)
+
+    def apply(self, paddle_api: str) -> ConvertResult:
+        # Paddle 使用 gpu/cpu 设备名，Torch 需要 cuda/cpu；其余参数保持原始顺序。
+        core = """
+to_args = list(args)
+to_kwargs = dict(kwargs)
+if to_args and isinstance(to_args[0], str) and to_args[0] == "gpu":
+    to_args[0] = "cuda"
+elif to_args and isinstance(to_args[0], str) and to_args[0] in {
+    "bool", "float16", "float32", "float64", "bfloat16",
+    "int8", "int16", "int32", "int64", "uint8", "complex64", "complex128",
+}:
+    # Paddle 的字符串 dtype 不能直接交给 Torch，否则会被解释成设备名。
+    to_args[0] = getattr(torch, to_args[0])
+if isinstance(to_kwargs.get("device"), str) and to_kwargs["device"] == "gpu":
+    to_kwargs["device"] = "cuda"
+if to_args or to_kwargs:
+    result = x.to(*to_args, **to_kwargs)
+else:
+    result = x
+"""
+        return self.build_result(
+            paddle_api,
+            kind=ConversionKind.DIRECT,
+            core=core,
+        )
+
+
 class PutAlongAxisRule(BaseRule):
     PADDLE_APIS = (
         "paddle.put_along_axis",
@@ -8192,7 +8222,7 @@ else:
 
 
 class CopsFlattenRule(BaseRule):
-    PADDLE_APIS = ("paddle._C_ops.flatten_",)
+    PADDLE_APIS = ("paddle._C_ops.flatten_", "paddle.Tensor.flatten_")
 
     """paddle._C_ops.flatten_(x, start_axis, stop_axis) -> torch.flatten in-place.
 
@@ -8219,7 +8249,7 @@ result = x
 
 
 class CopsSubtractRule(BaseRule):
-    PADDLE_APIS = ("paddle._C_ops.subtract_",)
+    PADDLE_APIS = ("paddle._C_ops.subtract_", "paddle.Tensor.subtract_")
 
     """paddle._C_ops.subtract_(x, y) -> in-place x -= y.
 
@@ -8232,8 +8262,9 @@ class CopsSubtractRule(BaseRule):
         core = """
 x = x
 y = y
+alpha = locals().get("alpha", 1)
 with torch.no_grad():
-    x.sub_(y)
+    x.sub_(y.to(x.dtype), alpha=alpha)
 result = x
 """
         return self.build_result(
@@ -8244,7 +8275,7 @@ result = x
 
 
 class CopsAddRule(BaseRule):
-    PADDLE_APIS = ("paddle._C_ops.add_",)
+    PADDLE_APIS = ("paddle._C_ops.add_", "paddle.Tensor.add_")
 
     """paddle._C_ops.add_(x, y) -> in-place x += y.
 
@@ -8258,8 +8289,9 @@ class CopsAddRule(BaseRule):
         core = """
 x = x
 y = y
+alpha = locals().get("alpha", 1)
 with torch.no_grad():
-    x.add_(y.to(x.dtype))
+    x.add_(y.to(x.dtype), alpha=alpha)
 result = x
 """
         return self.build_result(
@@ -8270,7 +8302,7 @@ result = x
 
 
 class CopsMultiplyRule(BaseRule):
-    PADDLE_APIS = ("paddle._C_ops.multiply_",)
+    PADDLE_APIS = ("paddle._C_ops.multiply_", "paddle.Tensor.multiply_")
 
     """paddle._C_ops.multiply_(x, y) -> in-place x *= y.
 
@@ -8372,7 +8404,7 @@ result = torch.tensor(x.numel(), dtype=torch.int64)
 
 
 class CopsPutAlongAxisRule(BaseRule):
-    PADDLE_APIS = ("paddle._C_ops.put_along_axis_",)
+    PADDLE_APIS = ("paddle._C_ops.put_along_axis_", "paddle.Tensor.put_along_axis_")
 
     """paddle._C_ops.put_along_axis_(arr, indices, values, axis, reduce, include_self, broadcast)
     → torch.scatter / torch.scatter_reduce (in-place on arr)
@@ -8380,7 +8412,7 @@ class CopsPutAlongAxisRule(BaseRule):
 
     def apply(self, paddle_api: str) -> ConvertResult:
         core = """
-arr          = arr
+arr          = locals().get("arr", x)
 indices      = indices
 values       = values
 axis         = axis
@@ -8456,7 +8488,7 @@ result = torch.reshape(x, shape)
 
 
 class CopsScaleRule(BaseRule):
-    PADDLE_APIS = ("paddle._C_ops.scale_",)
+    PADDLE_APIS = ("paddle._C_ops.scale_", "paddle.Tensor.scale_")
 
     """paddle._C_ops.scale_(x, scale, bias, bias_after_scale) → in-place scale+bias on x
 

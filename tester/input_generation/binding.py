@@ -51,6 +51,8 @@ INPUT_SINGLE_OP_PARAMETER_NAMES = {
 # 手工参数名只覆盖 inspect.signature 不可靠的 API；正常公共 API 仍应走运行时绑定。
 INPUT_MANUAL_PARAMETER_NAMES = {
     **INPUT_SINGLE_OP_PARAMETER_NAMES,
+    # copy_ 没有可反射签名，保留目标 Tensor 作为第一个位置输入。
+    "paddle.Tensor.copy_": ("self", "other", "blocking"),
     "paddle.Tensor.clone": ("self",),
     "paddle.Tensor.detach": ("self",),
     "paddle.Tensor.__getitem__": ("self", "item"),
@@ -115,7 +117,7 @@ INPUT_MANUAL_PARAMETER_NAMES = {
         "use_global_beta_pow",
         "amsgrad",
     ),
-    "paddle._C_ops.full_": ("x", "shape", "value", "dtype"),
+    "paddle._C_ops.full_": ("x", "shape", "value", "dtype", "place"),
     "paddle._C_ops.fused_linear_param_grad_add": (
         "x",
         "dout",
@@ -124,11 +126,34 @@ INPUT_MANUAL_PARAMETER_NAMES = {
         "multi_precision",
         "has_bias",
     ),
-    "paddle._C_ops.gaussian": ("shape", "mean", "std", "seed", "dtype"),
+    "paddle._C_ops.gaussian": ("shape", "mean", "std", "seed", "dtype", "place"),
     "paddle._C_ops.matmul_grad": ("x", "y", "dout", "transpose_x", "transpose_y"),
     "paddle._C_ops.squared_l2_norm": ("x",),
     "paddle._C_ops.swiglu_grad": ("x", "y", "dout"),
     "paddle._C_ops._run_custom_op": ("op_name", "arg1", "arg2", "arg3", "arg4"),
+    "paddle._C_ops.uniform": ("shape", "dtype", "min", "max", "seed", "place"),
+}
+
+# 默认值与手工参数名共同构成无签名 API 的唯一调用契约。
+# 输入生成阶段不展开这些默认值，以便缺失参数仍由后续执行阶段准确分类。
+# 执行阶段显式展开默认值，使规则侧获得与真实 Paddle 调用一致的完整参数集。
+INPUT_MANUAL_PARAMETER_DEFAULTS = {
+    "paddle.Tensor.copy_": {"blocking": True},
+    "paddle._C_ops._run_custom_op": {
+        "arg1": None,
+        "arg2": None,
+        "arg3": None,
+        "arg4": None,
+    },
+    "paddle._C_ops.full_": {"place": None},
+    "paddle._C_ops.gaussian": {"place": None},
+    "paddle._C_ops.uniform": {
+        "dtype": None,
+        "min": 0,
+        "max": 1.0,
+        "seed": 0,
+        "place": None,
+    },
 }
 
 
@@ -245,15 +270,63 @@ def resolve_input_signature(api_name, api=None):
     return InputSignatureResult(signature=signature, source=source)
 
 
-def _bind_manual_input_arguments(args, kwargs, parameter_names):
-    # 只记录调用实际提供的值，不能把缺失参数伪装成显式 None。
-    arguments = collections.OrderedDict()
-    for position, name in enumerate(parameter_names):
-        if position < len(args):
-            arguments[name] = args[position]
-        elif name in kwargs:
-            arguments[name] = kwargs[name]
-    return arguments
+def _bind_manual_input_arguments(api_name, args, kwargs, parameter_names, *, apply_defaults):
+    defaults = INPUT_MANUAL_PARAMETER_DEFAULTS.get(api_name, {})
+    signature = inspect.Signature(
+        parameters=[
+            inspect.Parameter(
+                name,
+                inspect.Parameter.POSITIONAL_OR_KEYWORD,
+                default=defaults.get(name, inspect.Parameter.empty),
+            )
+            for name in parameter_names
+        ]
+    )
+    # 输入生成允许不完整配置留给执行层分类；Torch 执行必须验证完整调用。
+    bind = signature.bind if apply_defaults else signature.bind_partial
+    bound = bind(*args, **kwargs)
+    if apply_defaults:
+        bound.apply_defaults()
+    return collections.OrderedDict(bound.arguments)
+
+
+def _canonicalize_tensor_receiver(api_name, arguments, parameter_names):
+    # Paddle 的方法签名会把接收者命名为 self、x 或其他首参名。
+    # 规则协议固定使用 x，统一后下游无需再次猜测接收者名称。
+    parameter_names = tuple(parameter_names)
+    if not api_name.startswith("paddle.Tensor.") or not parameter_names:
+        return arguments, parameter_names
+    receiver_name = parameter_names[0]
+    if receiver_name in arguments and receiver_name != "x":
+        items = [
+            ("x" if name == receiver_name else name, value) for name, value in arguments.items()
+        ]
+        arguments = collections.OrderedDict(items)
+    if receiver_name != "x":
+        parameter_names = ("x", *parameter_names[1:])
+    return arguments, parameter_names
+
+
+def _validate_variadic_shape_kwargs(kwargs):
+    # 可变 shape 分支绕过 inspect.bind，因此必须在此保留完整绑定的失败语义。
+    unexpected = set(kwargs) - {"name"}
+    if unexpected:
+        names = ", ".join(sorted(unexpected))
+        raise TypeError(f"got unexpected keyword arguments: {names}")
+
+
+def split_tensor_method_arguments(api_name, arguments):
+    """Restore a bound Tensor method invocation without depending on receiver spelling."""
+    # 接收者必须恢复为首个位置参数，供 GenericRule 按 Tensor 方法协议调用。
+    # inspect 绑定生成的 args/kwargs 容器需要展开，不能作为普通关键字传入算子。
+    call_args = []
+    call_kwargs = collections.OrderedDict(arguments)
+    if api_name.startswith("paddle.Tensor.") and "x" in call_kwargs:
+        call_args.append(call_kwargs.pop("x"))
+    call_args.extend(call_kwargs.pop("args", ()))
+    variadic_kwargs = call_kwargs.pop("kwargs", {})
+    call_kwargs.update(variadic_kwargs)
+    return call_args, call_kwargs
 
 
 def bind_input_parameters(
@@ -263,11 +336,22 @@ def bind_input_parameters(
     *,
     api=None,
     include_name_parameter=False,
+    apply_defaults=False,
 ):
     if api_name in INPUT_MANUAL_PARAMETER_NAMES:
         parameter_names = INPUT_MANUAL_PARAMETER_NAMES[api_name]
+        arguments = _bind_manual_input_arguments(
+            api_name,
+            args,
+            kwargs,
+            parameter_names,
+            apply_defaults=apply_defaults,
+        )
+        arguments, parameter_names = _canonicalize_tensor_receiver(
+            api_name, arguments, parameter_names
+        )
         return InputParameterBindingResult(
-            arguments=_bind_manual_input_arguments(args, kwargs, parameter_names),
+            arguments=arguments,
             source="manual",
             parameter_names=parameter_names,
         )
@@ -275,6 +359,8 @@ def bind_input_parameters(
         # view/reshape 接受可变长 shape，这里归一成一个参数名。
         rest = args[1:]
         if len(rest) > 1 and all(isinstance(arg, int) for arg in rest):
+            if apply_defaults:
+                _validate_variadic_shape_kwargs(kwargs)
             return InputParameterBindingResult(
                 arguments=collections.OrderedDict([("x", args[0]), ("shape_or_dtype", list(rest))]),
                 source="variadic-view",
@@ -284,6 +370,8 @@ def bind_input_parameters(
         # reshape 和 view 一样有可变长 shape 问题。
         rest = args[1:]
         if rest and all(isinstance(arg, int) for arg in rest):
+            if apply_defaults:
+                _validate_variadic_shape_kwargs(kwargs)
             return InputParameterBindingResult(
                 arguments=collections.OrderedDict([("x", args[0]), ("shape", list(rest))]),
                 source="variadic-reshape",
@@ -312,21 +400,26 @@ def bind_input_parameters(
     else:
         bound = signature.bind(*args, **kwargs)
 
+    # 只有执行侧需要完整默认参数；输入生成仍保留用户实际提供的参数集合。
+    if apply_defaults:
+        bound.apply_defaults()
     arguments = collections.OrderedDict(bound.arguments)
     if not include_name_parameter:
         arguments.pop("name", None)
-    if api_name == "paddle.arange" and "end" not in arguments:
+    if api_name == "paddle.arange" and arguments.get("end") is None:
         # `paddle.arange(start)` 的语义等价于 `arange(0, start)`。
         arguments["end"] = arguments["start"]
         arguments["start"] = 0
     if api_name in {"paddle.Tensor.unflatten", "paddle.unflatten"}:
         arguments["name"] = None
+    parameter_names = tuple(
+        name for name in signature.parameters if include_name_parameter or name != "name"
+    )
+    arguments, parameter_names = _canonicalize_tensor_receiver(api_name, arguments, parameter_names)
     return InputParameterBindingResult(
         arguments=arguments,
         source=signature_result.source,
-        parameter_names=tuple(
-            name for name in signature.parameters if include_name_parameter or name != "name"
-        ),
+        parameter_names=parameter_names,
         unresolved_reason=signature_result.unresolved_reason,
     )
 

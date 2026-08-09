@@ -18,7 +18,7 @@ from .gpu_memory_preflight import (
     requires_inplace_input_copy,
     should_check_grad,
 )
-from .input_generation.binding import bind_input_parameters
+from .input_generation.binding import bind_input_parameters, split_tensor_method_arguments
 from .input_generation.tensor_config import (
     AUTOGRAD_DTYPES,
     TensorConfig,
@@ -657,10 +657,6 @@ class APITestBase:
             return True
 
         api_name = self.api_config.api_name
-        if api_name in ("paddle.Tensor.__getitem__", "paddle.Tensor.__setitem__"):
-            self.torch_args_config = self.api_config.args
-            return True
-
         parameter_binding = bind_input_parameters(
             api_name,
             self.api_config.args,
@@ -669,7 +665,10 @@ class APITestBase:
         )
         if parameter_binding.source == "unresolved":
             return True
-        return finish(parameter_binding.arguments)
+        arguments = parameter_binding.arguments
+        if api_name.startswith("paddle.Tensor."):
+            self.torch_args_config, arguments = split_tensor_method_arguments(api_name, arguments)
+        return finish(arguments)
 
     def generate_input_values(self):
         from .input_generation.dispatcher import dispatch_input_generation
