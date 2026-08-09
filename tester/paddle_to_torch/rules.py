@@ -7400,8 +7400,9 @@ class CopsSubtract_Rule(BaseRule):
         core = """
 x = locals().get("x")
 y = locals().get("y")
+alpha = locals().get("alpha", 1)
 with torch.no_grad():
-    x.sub_(y)
+    x.sub_(y.to(x.dtype), alpha=alpha)
 result = x
 """
         code = Code(core=core.splitlines())
@@ -7421,8 +7422,9 @@ class CopsAdd_Rule(BaseRule):
         core = """
 x = locals().get("x")
 y = locals().get("y")
+alpha = locals().get("alpha", 1)
 with torch.no_grad():
-    x.add_(y.to(x.dtype))
+    x.add_(y.to(x.dtype), alpha=alpha)
 result = x
 """
         code = Code(core=core.splitlines())
@@ -7513,7 +7515,7 @@ class CopsPutAlongAxis_Rule(BaseRule):
 
     def apply(self, paddle_api: str) -> ConvertResult:
         core = """
-arr          = locals().get("arr")
+arr          = locals().get("arr", locals().get("x"))
 indices      = locals().get("indices")
 values       = locals().get("values")
 axis         = locals().get("axis")
@@ -7604,6 +7606,41 @@ result = x
 """
         code = Code(core=core.splitlines())
         return ConvertResult.success(paddle_api, code, is_torch_corresponding=False)
+
+
+class TensorToRule(BaseRule):
+    """Translate Paddle Tensor.to device and dtype values for Torch."""
+
+    def apply(self, paddle_api: str) -> ConvertResult:
+        core = """
+tensor = locals().get("self")
+to_args = list(locals().get("args", ()))
+to_kwargs = dict(locals().get("kwargs", {}))
+to_kwargs.pop("self", None)
+to_kwargs.pop("args", None)
+dtype_names = {
+    "bool", "float16", "float32", "float64", "bfloat16",
+    "int8", "int16", "int32", "int64", "uint8", "complex64", "complex128",
+}
+
+def _translate_to_value(value, dtype_names=dtype_names):
+    if isinstance(value, str) and value.startswith("gpu"):
+        return "cuda" + value[3:]
+    dtype_name = str(value).split(".")[-1]
+    if dtype_name in dtype_names:
+        return getattr(torch, dtype_name)
+    return value
+
+if to_args:
+    to_args[0] = _translate_to_value(to_args[0])
+if "device" in to_kwargs:
+    to_kwargs["device"] = _translate_to_value(to_kwargs["device"])
+if "dtype" in to_kwargs:
+    to_kwargs["dtype"] = _translate_to_value(to_kwargs["dtype"])
+result = tensor.to(*to_args, **to_kwargs) if to_args or to_kwargs else tensor
+"""
+        code = Code(core=core.splitlines())
+        return ConvertResult.success(paddle_api, code)
 
 
 class CopsTransposeRule(BaseRule):

@@ -173,6 +173,7 @@ handle_axes_api:
 
 forward_only_apis:
   - _run_custom_op
+  - copy_
   - moe_permute
   - moe_unpermute
   - fp8_quant_blockwise

@@ -406,6 +406,12 @@ _COPS_API_PUBLIC_ALIAS: dict[str, str] = {
 # differs materially from any public API.
 no_signature_api_mappings.update(
     {
+        # copy_ 是内建方法，无法通过 inspect 获取签名。
+        "paddle.Tensor.copy_": {
+            "self": lambda cfg: get_arg(cfg, 0, "self"),
+            "other": lambda cfg: get_arg(cfg, 1, "other"),
+            "blocking": lambda cfg: get_arg(cfg, 2, "blocking", True),
+        },
         # adamw_(param, grad, lr, moment1, moment2, moment2_max,
         #        beta1_pow, beta2_pow, master_param, skip_update,
         #        beta1, beta2, epsilon, lr_ratio, coeff, with_decay,

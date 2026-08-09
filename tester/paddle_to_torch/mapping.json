@@ -5049,5 +5049,48 @@
     },
     "paddle._C_ops._run_custom_op": {
         "Rule": "CopsRunCustomOpRule"
+    },
+    "paddle.Tensor.add_": {
+        "Rule": "CopsAdd_Rule"
+    },
+    "paddle.Tensor.contiguous": {
+        "torch_api": "torch.Tensor.contiguous"
+    },
+    "paddle.Tensor.copy_": {
+        "torch_api": "torch.Tensor.copy_",
+        "torch_args": [],
+        "torch_kwargs": {
+            "other": "other",
+            "non_blocking": "not blocking"
+        }
+    },
+    "paddle.Tensor.flatten_": {
+        "Rule": "CopsFlatten_Rule"
+    },
+    "paddle.Tensor.multiply_": {
+        "Rule": "CopsMultiply_Rule"
+    },
+    "paddle.Tensor.put_along_axis_": {
+        "Rule": "CopsPutAlongAxis_Rule"
+    },
+    "paddle.Tensor.scale_": {
+        "Rule": "CopsScale_Rule"
+    },
+    "paddle.Tensor.subtract_": {
+        "Rule": "CopsSubtract_Rule"
+    },
+    "paddle.Tensor.to": {
+        "Rule": "TensorToRule"
+    },
+    "paddle.randint": {
+        "torch_api": "torch.randint",
+        "torch_args": [
+            "low",
+            "high",
+            "tuple(shape) if isinstance(shape, list) else shape"
+        ],
+        "torch_kwargs": {
+            "dtype": "locals().get(\"dtype\") if locals().get(\"dtype\") is not None else torch.int64"
+        }
     }
 }
