@@ -7,8 +7,15 @@ from .base import APITestBase
 
 
 class APITestCINNVSDygraph(APITestBase):
+    input_operation_mode = "paddle_cinn"
+
     def __init__(self, api_config, **kwargs):
-        super().__init__(api_config)
+        # CINN 对比只消费 Paddle Tensor，不应因输入生成默认值初始化 Torch runtime。
+        super().__init__(
+            api_config,
+            use_torch=False,
+            runtime_config=kwargs.get("runtime_config"),
+        )
         self.test_amp = kwargs.get("test_amp", False)
         self.test_backward = kwargs.get("test_backward", False)
 

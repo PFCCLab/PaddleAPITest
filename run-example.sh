@@ -70,7 +70,7 @@ TEST_PARAM_ARGS=(
     # --test_amp=True
     # 两侧算子设备：开启后 Paddle/Torch 都在 CPU 执行
     # --test_cpu=True
-    # CPU numpy 缓存；gpu_mode 下自动关闭
+    # forward/backward NumPy 输入缓存；仅非 gpu_mode 生效
     # --use_cached_numpy=True
     # GPU 生成 + GPU compare；与 test_cpu 正交，不决定算子设备
     # --use_gpu_mode=True

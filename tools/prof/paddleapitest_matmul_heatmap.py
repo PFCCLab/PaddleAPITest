@@ -492,7 +492,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--use-cached-numpy",
         action="store_true",
-        help="set USE_CACHED_NUMPY=True before importing PaddleAPITest modules",
+        help="reuse cached NumPy generated inputs when available",
     )
     parser.add_argument(
         "--use-gpu-cache-mode",

@@ -61,6 +61,8 @@ from tester.log_writer import (
     log_worker,
 )
 from tester.runtime_config import (
+    NUMPY_CACHE_ENV_VAR,
+    TestRuntimeConfig,
     limit_worker_layout,
     runtime_config_for_gpu,
 )
@@ -1236,8 +1238,6 @@ def _mode_uses_torch(options):
         getattr(options, opt, False)
         for opt in (
             "accuracy",
-            "paddle_cinn",
-            "paddle_gpu_performance",
             "torch_gpu_performance",
             "paddle_torch_gpu_performance",
             "accuracy_stable",
@@ -2117,15 +2117,15 @@ def _load_custom_device_options(options):
 
 
 def _apply_runtime_environment_flags(options):
+    # 旧开关只控制 NumPy 输入值缓存，不改变 backend 的长期命名契约。
     if options.use_gpu_mode and options.use_cached_numpy:
         print(
-            f"{ARGUMENT_WARNING_PREFIX} "
-            "--use_cached_numpy=True is ignored because --use_gpu_mode=True uses GPU "
-            "tensor generation",
+            f"{ARGUMENT_WARNING_PREFIX} --use_cached_numpy=True is ignored because "
+            "--use_gpu_mode=True uses GPU-native input generation",
             flush=True,
         )
         options.use_cached_numpy = False
-    os.environ["USE_CACHED_NUMPY"] = str(options.use_cached_numpy)
+    os.environ[NUMPY_CACHE_ENV_VAR] = str(options.use_cached_numpy)
     os.environ["USE_GPU_MODE"] = str(options.use_gpu_mode)
     if options.bitwise_alignment:
         options.atol = 0.0
@@ -2216,9 +2216,6 @@ def _prepare_common_options(options):
     if mode_error is not None:
         return mode_error
 
-    if not options._sanitizer_child:
-        log_report.print_run_header(options, options.paddle_version)
-
     if options.use_dump:
         if not options.api_config or options.api_config_file or options.api_config_file_pattern:
             return _argument_error("dump only supports single --api_config runs")
@@ -2241,6 +2238,13 @@ def _prepare_common_options(options):
             flush=True,
         )
     _apply_runtime_environment_flags(options)
+    try:
+        # backend override、模式默认值和逻辑设备只在主进程规范化一次。
+        options.runtime_config = TestRuntimeConfig.from_options(options)
+    except ValueError as err:
+        return _argument_error(str(err))
+    if not options._sanitizer_child:
+        log_report.print_run_header(options, options.paddle_version)
     return None
 
 
@@ -2667,7 +2671,7 @@ def _build_argument_parser():
         "--use_cached_numpy",
         type=parse_bool,
         default=False,
-        help="Reuse cached NumPy inputs when available.",
+        help="Reuse cached NumPy generated inputs and reverse input values when available.",
     )
     parser.add_argument(
         "--use_gpu_mode",

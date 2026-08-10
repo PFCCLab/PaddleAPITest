@@ -2,14 +2,15 @@
 
 from .backend import (
     InputBackend,
+    InputBackendPolicy,
     NumPyInputBackend,
     PaddleInputBackend,
     TorchInputBackend,
     create_input_backend,
     resolve_input_backend_name,
+    resolve_input_backend_policy,
 )
 from .tensor_config import (
-    USE_CACHED_NUMPY,
     TensorConfig,
     cached_numpy,
     get_cached_numpy_array,
@@ -21,11 +22,21 @@ __all__ = [
     "TensorConfig",
     "InputValue",
     "InputBackend",
+    "InputBackendPolicy",
     "NumPyInputBackend",
     "PaddleInputBackend",
     "TorchInputBackend",
     "create_input_backend",
     "resolve_input_backend_name",
+    "resolve_input_backend_policy",
     "cached_numpy",
     "get_cached_numpy_array",
 ]
+
+
+def __getattr__(name):
+    if name == "USE_CACHED_NUMPY":
+        from ..runtime_config import numpy_cache_enabled
+
+        return numpy_cache_enabled()
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

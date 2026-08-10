@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import hashlib
+
 import numpy
 
 from .tensor_spec import InputTensorSpec
@@ -16,8 +18,16 @@ _INPUT_INTERMEDIATE_DTYPES = {
 }
 
 
+def derive_input_stream_seed(seed, config_fingerprint, stream_kind="input", *, modulus=2**32):
+    """将运行 seed、配置身份和流类型派生为 backend 可接受的整数 seed。"""
+    # 稳定文本协议不能使用 Python hash；其进程级随机盐会破坏 worker 间复现。
+    seed_material = f"{stream_kind}:{int(seed)}:{config_fingerprint}"
+    derived = int.from_bytes(hashlib.sha256(seed_material.encode("utf-8")).digest()[:8], "big")
+    return derived % modulus
+
+
 class InputNumPyRandomState:
-    """全局 NumPy backend RNG 适配器。"""
+    """NumPy backend RNG 适配器。"""
 
     def random(self, shape=None):
         return numpy.random.random(shape)
@@ -56,19 +66,22 @@ INPUT_NUMPY_RANDOM_STATE = InputNumPyRandomState()
 
 
 class InputConfigRandomState(InputNumPyRandomState):
-    """基于独立 RandomState 副本的单 config RNG。"""
+    """由 seed 和配置身份直接派生的单 config RNG。"""
 
     def __init__(self, seed, config_fingerprint):
-        # 配置级状态复制全局序列，但在规则成功前不会反向提交任何随机消耗。
-        # seed/指纹由 Torch、Paddle backend 消费，不能视作 NumPy 冗余字段删除。
+        # 直接派生流，不读取全局状态，避免 worker 数量和前序 case 改变输入。
         self.seed = seed
         self.config_fingerprint = config_fingerprint
-        self._state = numpy.random.RandomState()
-        self._state.set_state(numpy.random.get_state())
+        derived_seed = derive_input_stream_seed(
+            seed,
+            config_fingerprint,
+            modulus=2**32,
+        )
+        self._state = numpy.random.RandomState(derived_seed)
 
     def commit(self):
-        # 仅成功规则调用 commit，从而保持失败前后的全局随机状态一致。
-        numpy.random.set_state(self._state.get_state())
+        # 配置 RNG 不拥有全局状态，提交接口仅为 InputBackend 协议保留兼容性。
+        return None
 
     def random(self, shape=None):
         return self._state.random(shape)

@@ -17,7 +17,15 @@ def dispatch_input_generation(api_test_case) -> bool:
 
     input_rule = input_rules.resolve(api_name)
 
+    # dispatcher 只传递已解析策略，规则不再拥有 backend 选择权。
     input_generation_context = build_input_generation_context(
-        api_config, seed=api_test_case.runtime_config.random_seed
+        api_config,
+        seed=api_test_case.runtime_config.random_seed,
+        input_backend_policy=api_test_case.runtime_config.input_backend,
+        # 旧开关在非 GPU mode 下缓存 NumPy canonical input；GPU-native 生成保持原语义。
+        cache_enabled=(
+            api_test_case.runtime_config.use_cached_numpy
+            and not api_test_case.runtime_config.gpu_mode.enabled
+        ),
     )
     return input_rule.generate(input_generation_context, api_config)

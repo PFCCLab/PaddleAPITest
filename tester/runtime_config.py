@@ -1,6 +1,64 @@
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass, field, replace
+
+from .input_generation.backend import (
+    INPUT_BACKEND_ENV_VAR,
+    InputBackendPolicy,
+    resolve_input_backend_policy,
+)
+
+NUMPY_CACHE_ENV_VAR = "USE_CACHED_NUMPY"
+_TRUE_ENV_VALUES = {"true", "1", "yes", "y"}
+
+_RUNTIME_OPERATION_MODES = (
+    "accuracy_dual_gpu",
+    "accuracy_stable_dual_gpu",
+    "paddle_only",
+    "paddle_cinn",
+    "accuracy",
+    "paddle_gpu_performance",
+    "torch_gpu_performance",
+    "paddle_torch_gpu_performance",
+    "accuracy_stable",
+    "paddle_custom_device",
+    "custom_device_vs_gpu",
+)
+
+
+def numpy_cache_enabled(environ=None):
+    """解析旧开关的输入生成缓存语义。"""
+    env = os.environ if environ is None else environ
+    value = env.get(NUMPY_CACHE_ENV_VAR, "False")
+    return str(value).lower() in _TRUE_ENV_VALUES
+
+
+def resolve_operation_mode(options):
+    """返回参数规范化后的唯一主模式。"""
+    modes = tuple(name for name in _RUNTIME_OPERATION_MODES if getattr(options, name, False))
+    # dual flag 会同时展开基础模式，报告和策略优先保留更具体的 dual 身份。
+    dual_modes = tuple(name for name in modes if name.endswith("_dual_gpu"))
+    if dual_modes:
+        return dual_modes[0]
+    return modes[0] if modes else None
+
+
+def _default_input_backend_policy():
+    return InputBackendPolicy(requested=None, resolved="numpy", device="cpu")
+
+
+def _resolve_runtime_input_backend(use_gpu_mode, operation_mode, use_cached_numpy):
+    requested = os.environ.get(INPUT_BACKEND_ENV_VAR)
+    validated = resolve_input_backend_policy(
+        use_gpu_mode=use_gpu_mode,
+        operation_mode=operation_mode,
+        requested=requested,
+    )
+    if use_cached_numpy and not use_gpu_mode:
+        # cache 固定 NumPy 真源，但不能借此掩盖非法的显式 backend 配置。
+        return InputBackendPolicy(requested=validated.requested, resolved="numpy", device="cpu")
+    return validated
 
 
 @dataclass(frozen=True)
@@ -25,6 +83,10 @@ class TestRuntimeConfig:
     exit_on_error: bool = False
     test_cpu: bool = False
     gpu_mode: GpuModeConfig = field(default_factory=GpuModeConfig)
+    operation_mode: str | None = None
+    input_backend: InputBackendPolicy = field(default_factory=_default_input_backend_policy)
+    # 追加在末尾，保持历史 positional 构造参数的顺序。
+    use_cached_numpy: bool = False
 
     @property
     def operator_device_type(self):
@@ -47,12 +109,42 @@ class TestRuntimeConfig:
             dual_gpu=dual_gpu,
             comparison_device_id=1 if dual_gpu else None,
         )
+        operation_mode = resolve_operation_mode(options)
+        use_cached_numpy = bool(getattr(options, "use_cached_numpy", False))
+        input_backend = _resolve_runtime_input_backend(
+            gpu_mode.enabled,
+            operation_mode,
+            use_cached_numpy,
+        )
         return cls(
             random_seed=int(options.random_seed),
+            use_cached_numpy=use_cached_numpy,
             bitwise_alignment=bool(options.bitwise_alignment),
             exit_on_error=bool(options.exit_on_error),
             test_cpu=bool(options.test_cpu),
             gpu_mode=gpu_mode,
+            operation_mode=operation_mode,
+            input_backend=input_backend,
+        )
+
+    @classmethod
+    def from_environment(cls, operation_mode=None, *, test_cpu=False):
+        """为未经过 engine 的直接 tester 调用构造兼容运行策略。"""
+        # 直接调用没有 options 快照，只读取一次环境并固化 policy。
+        use_gpu_mode = os.getenv("USE_GPU_MODE", "False").lower() in {"true", "1", "yes", "y"}
+        gpu_mode = GpuModeConfig(enabled=use_gpu_mode)
+        use_cached_numpy = numpy_cache_enabled()
+        input_backend = _resolve_runtime_input_backend(
+            use_gpu_mode,
+            operation_mode,
+            use_cached_numpy,
+        )
+        return cls(
+            use_cached_numpy=use_cached_numpy,
+            test_cpu=bool(test_cpu),
+            gpu_mode=gpu_mode,
+            operation_mode=operation_mode,
+            input_backend=input_backend,
         )
 
     def for_gpu(

@@ -8,6 +8,8 @@ from .base import APITestBase
 
 
 class APITestPaddleOnly(APITestBase):
+    input_operation_mode = "paddle_only"
+
     def __init__(self, api_config, **kwargs):
         super().__init__(
             api_config,

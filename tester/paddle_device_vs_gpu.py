@@ -13,6 +13,8 @@ from .paddle_device_vs_cpu import APITestCustomDeviceVSCPU
 
 
 class APITestPaddleDeviceVSGPU(APITestCustomDeviceVSCPU):
+    input_operation_mode = "custom_device_vs_gpu"
+
     def __init__(self, api_config, **kwargs):
         # 继承 CustomDevice vs CPU 的基本功能
         super().__init__(api_config, **kwargs)

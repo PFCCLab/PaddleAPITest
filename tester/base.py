@@ -23,7 +23,7 @@ from .input_generation.tensor_config import (
     TensorConfig,
     dtype_element_size,
     dtype_name,
-    get_cached_numpy_array,
+    generate_numpy_output_grad,
     iter_unique_tensor_configs,
     tensor_config_tree_nbytes,
 )
@@ -306,14 +306,23 @@ def classify_runtime_error(error_msg):
 
 
 class APITestBase:
+    input_operation_mode = None
+
     def __init__(self, api_config, use_torch=True, runtime_config=None):
         self.api_config = api_config
         self.api_config.use_torch = use_torch
         self.use_torch = bool(use_torch)
-        self.runtime_config = runtime_config or TestRuntimeConfig()
+        if runtime_config is None:
+            # 兼容旧模块入口，同时避免每次生成输入时重新解析环境变量。
+            runtime_config = TestRuntimeConfig.from_environment(
+                operation_mode=self.input_operation_mode,
+                test_cpu=getattr(api_config, "test_cpu", False),
+            )
+        self.runtime_config = runtime_config
         self.gpu_mode_config = self.runtime_config.gpu_mode
         # TensorConfig 通过 case 配置读取算子设备，避免把 GPU mode 当成执行设备开关。
         self.api_config.test_cpu = self.runtime_config.test_cpu
+        self.api_config.input_backend = self.runtime_config.input_backend.resolved
         self.memory_governance_metrics = collections.Counter()
         self.dump_context = (
             DumpContext(
@@ -457,6 +466,7 @@ class APITestBase:
             mode,
             self.gpu_mode_config,
             check_grad=self.need_check_grad(),
+            input_backend=self.runtime_config.input_backend.resolved,
             operator_on_gpu=not self.runtime_config.test_cpu,
         )
         if not decision.should_skip:
@@ -517,13 +527,13 @@ class APITestBase:
                 # paddle.seed 会遍历所有 CUDA generator；纯 CPU 路径只播种 CPU generator。
                 paddle.framework.core.default_cpu_generator().manual_seed(seed)
             if self.requires_gpu_runtime() and paddle.device.is_compiled_with_cuda():
-                try:
-                    for device_id in range(paddle.device.cuda.device_count()):
-                        paddle.framework.core.default_cuda_generator(device_id).manual_seed(seed)
-                except Exception:
-                    pass
-        except Exception:
-            pass
+                for device_id in range(paddle.device.cuda.device_count()):
+                    paddle.framework.core.default_cuda_generator(device_id).manual_seed(seed)
+        except Exception as error:
+            # 执行复现依赖框架播种；失败后继续会产生看似有效但不可复现的结果。
+            raise RuntimeError(
+                f"failed to seed Paddle random generators with seed={seed}"
+            ) from error
         if self.use_torch:
             try:
                 if self.requires_gpu_runtime():
@@ -533,8 +543,10 @@ class APITestBase:
                     torch.random.default_generator.manual_seed(seed)
                 if self.requires_gpu_runtime() and torch.cuda.is_available():
                     torch.cuda.manual_seed_all(seed)
-            except Exception:
-                pass
+            except Exception as error:
+                raise RuntimeError(
+                    f"failed to seed Torch random generators with seed={seed}"
+                ) from error
 
     def clear_runtime_inputs(self, framework):
         """Release one framework's generated inputs after an execution."""
@@ -837,23 +849,15 @@ class APITestBase:
 
         return [t for t in result if t.requires_grad]
 
-    def get_cached_numpy(self, dtype, shape, generation_kind="output_grad", scale=1.0):
-        return get_cached_numpy_array(dtype, shape, generation_kind=generation_kind, scale=scale)
-
     def _make_numpy_output_grad(self, output):
         dtype = _dtype_name(output.dtype)
-        if os.getenv("USE_CACHED_NUMPY", "False").lower() in {"true", "1", "yes", "y"}:
-            dtype = "float32" if dtype == "bfloat16" else dtype
-            return self.get_cached_numpy(dtype, output.shape)
-        if "int" in dtype:
-            return numpy.random.randint(-65535, 65535, size=output.shape).astype(dtype)
-        if dtype in ["float8_e5m2", "float8_e4m3fn"]:
-            numpy_dtype = "float16"
-        elif dtype == "bfloat16":
-            numpy_dtype = "float32"
-        else:
-            numpy_dtype = dtype
-        return (numpy.random.random(output.shape) - 0.5).astype(numpy_dtype)
+        return generate_numpy_output_grad(
+            dtype,
+            output.shape,
+            use_cache=(self.runtime_config.use_cached_numpy and not self.gpu_mode_config.enabled),
+            seed=getattr(self.runtime_config, "random_seed", 0),
+            config_fingerprint=self.api_config.config,
+        )
 
     @staticmethod
     def _output_grad_intermediate_dtype(dtype):

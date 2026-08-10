@@ -15,7 +15,10 @@ from .binding import InputApiBinding, InputGenerationContext
 from .tensor_config import (
     CAST_THROUGH_INTERMEDIATE_DTYPES,
     TensorConfig,
+    get_cached_input_values,
+    input_cache_key,
     not_zero_apis,
+    put_cached_input_values,
     shape_numel,
 )
 from .tensor_spec import InputTensorSpec
@@ -126,15 +129,39 @@ class InputRule:
     def generate(
         self, input_generation_context: InputGenerationContext, api_config: object
     ) -> bool:
+        cache_key = None
+        if input_generation_context.cache_enabled:
+            # cache key 在规则执行前冻结，不能依赖规则可能修改的 TensorConfig 字段。
+            cache_key = input_cache_key(input_generation_context, self.api_names)
+            cached_values = get_cached_input_values(cache_key)
+            if cached_values is not None:
+                # 命中回放沿用原始 update_config 决策，shape 参数等 preserving-spec 输入不能改写规格。
+                replayed_values = []
+                for path, value, backend_name, update_config in cached_values:
+                    input_value = InputValue(path, value, backend_name)
+                    _apply_input_value(api_config, input_value, update_config)
+                    replayed_values.append(input_value)
+                attach_input_values(api_config, replayed_values)
+                return True
         # 每个配置持有独立 RNG 副本；只有整条规则成功后才提交状态。
         input_random_state = create_input_config_random_state(input_generation_context)
-        input_backend = create_input_backend(input_random_state)
+        input_backend = create_input_backend(
+            input_random_state,
+            policy=input_generation_context.input_backend_policy,
+        )
         input_rule_context = InputRuleContext(
             input_generation_context.input_binding, api_config, input_backend
         )
         self.function(input_rule_context)
         # finish 先检查遗漏，再一次性同步 TensorConfig 元数据和逻辑值。
-        attach_input_values(api_config, input_rule_context._finish())
+        input_values = input_rule_context._finish()
+        attach_input_values(api_config, input_values)
+        if input_generation_context.cache_enabled:
+            # 只有完整性检查和事务提交成功后才能发布缓存，失败规则不留下半成品。
+            put_cached_input_values(
+                cache_key,
+                input_rule_context._cache_entries(),
+            )
         input_backend.commit()
         return True
 
@@ -165,6 +192,12 @@ class _InputValueWriter:
                 update_config=self._update_config_by_path[path],
             )
         return tuple(self._input_value_by_path.values())
+
+    def cache_entries(self):
+        return tuple(
+            (input_value, self._update_config_by_path[path])
+            for path, input_value in self._input_value_by_path.items()
+        )
 
     def is_generated(self, input_binding):
         return input_binding.path in self._generated_paths
@@ -380,6 +413,9 @@ class InputRuleContext:
 
     def _finish(self):
         return self._input_value_writer.finish(self)
+
+    def _cache_entries(self):
+        return self._input_value_writer.cache_entries()
 
 
 def _generate_input_binding_value(

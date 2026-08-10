@@ -72,9 +72,21 @@ def print_run_header(options, paddle_version):
         )
 
     requires_gpu = not options.test_cpu or options.use_gpu_mode
+    # 运行头部记录 policy 真值，便于区分 requested override 与最终执行 backend。
+    runtime_config = getattr(options, "runtime_config", None)
+    if runtime_config is None:
+        # 兼容旧的报告调用方；engineV4 正常路径总是传入已解析快照。
+        from ..runtime_config import TestRuntimeConfig
+
+        runtime_config = TestRuntimeConfig.from_environment(test_cpu=options.test_cpu)
+    input_backend = runtime_config.input_backend
     compute = [
         ("operator_device", "CPU" if options.test_cpu else "GPU"),
         ("input_compare_device", "GPU" if options.use_gpu_mode else "CPU"),
+        ("input_backend_requested", input_backend.requested or "mode default"),
+        ("input_backend_resolved", input_backend.resolved),
+        ("input_logical_device", input_backend.logical_device),
+        ("random_seed", runtime_config.random_seed),
     ]
     if options.test_cpu:
         compute.append(("--test_cpu", True))
@@ -92,7 +104,7 @@ def print_run_header(options, paddle_version):
             compute.append(("--accuracy_dual_gpu", True))
         elif getattr(options, "accuracy_stable_dual_gpu", False):
             compute.append(("--accuracy_stable_dual_gpu", True))
-    elif options.use_cached_numpy:
+    if runtime_config.use_cached_numpy:
         compute.append(("--use_cached_numpy", True))
     compute.append(("--num_workers_per_gpu", options.num_workers_per_gpu))
     groups.append(("Compute", compute))

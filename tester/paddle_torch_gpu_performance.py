@@ -624,8 +624,10 @@ api_loop = {
 
 
 class APITestPaddleTorchGPUPerformance(APITestBase):
+    input_operation_mode = "paddle_torch_gpu_performance"
+
     def __init__(self, api_config, **kwargs):
-        super().__init__(api_config)
+        super().__init__(api_config, runtime_config=kwargs.get("runtime_config"))
         self.test_amp = kwargs.get("test_amp", False)
         self.converter = get_converter()
 

@@ -9,8 +9,15 @@ from .input_generation.tensor_config import tensor_config_tree_numel
 
 
 class APITestPaddleGPUPerformance(APITestBase):
+    input_operation_mode = "paddle_gpu_performance"
+
     def __init__(self, api_config, **kwargs):
-        super().__init__(api_config)
+        # Paddle 性能模式不建立 Torch reference，保持依赖边界与 backend 策略一致。
+        super().__init__(
+            api_config,
+            use_torch=False,
+            runtime_config=kwargs.get("runtime_config"),
+        )
         self.test_amp = kwargs.get("test_amp", False)
 
     def test(self):

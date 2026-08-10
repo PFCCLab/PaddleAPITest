@@ -1,6 +1,5 @@
 # tester/__init__.py
 
-import os
 from typing import TYPE_CHECKING, Any
 
 __all__ = [
@@ -23,11 +22,12 @@ __all__ = [
 ]
 
 if TYPE_CHECKING:
+    USE_CACHED_NUMPY: bool
+
     from . import paddle_to_torch
     from .accuracy import APITestAccuracy
     from .accuracy_stable import APITestAccuracyStable
     from .api_config import (
-        USE_CACHED_NUMPY,
         APIConfig,
         TensorConfig,
         analyse_configs,
@@ -104,7 +104,9 @@ def __getattr__(name: str) -> Any:
 
         return analyse_configs
     elif name == "USE_CACHED_NUMPY":
-        return os.getenv("USE_CACHED_NUMPY", "False").lower() in {"true", "1", "yes", "y"}
+        from .runtime_config import numpy_cache_enabled
+
+        return numpy_cache_enabled()
     elif name == "cached_numpy":
         from .api_config import cached_numpy
 

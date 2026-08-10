@@ -179,6 +179,9 @@ class InputGenerationContext:
     input_binding: InputApiBinding
     config_fingerprint: str
     seed: int
+    input_backend_policy: object | None = None
+    cache_enabled: bool = False
+    stream_kind: str = "forward"
 
 
 @dataclass(frozen=True)
@@ -429,10 +432,20 @@ def bind_api_inputs(api_config):
     )
 
 
-def build_input_generation_context(api_config, seed):
+def build_input_generation_context(
+    api_config,
+    seed,
+    input_backend_policy=None,
+    *,
+    cache_enabled=False,
+    stream_kind="forward",
+):
     # 配置文本指纹使不同调用在原生 backend 中获得稳定且隔离的随机流。
     return InputGenerationContext(
         input_binding=bind_api_inputs(api_config),
         config_fingerprint=hashlib.sha256(api_config.config.encode()).hexdigest(),
         seed=seed,
+        input_backend_policy=input_backend_policy,
+        cache_enabled=cache_enabled,
+        stream_kind=stream_kind,
     )

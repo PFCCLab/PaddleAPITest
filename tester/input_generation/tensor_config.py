@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import hashlib
 import os
 import random
 from dataclasses import dataclass
@@ -10,7 +11,7 @@ import paddle
 import yaml
 from tester.dtype_utils import to_torch_dtype
 
-from .backend import create_input_backend
+from .backend import resolve_input_backend_name
 from .value import clear_input_value, read_input_value, read_input_value_backend
 
 # 优化器的零填充位置属于物化层专用数据。
@@ -31,7 +32,6 @@ class _LazyTorch:
 
 torch = _LazyTorch()
 
-USE_CACHED_NUMPY = os.getenv("USE_CACHED_NUMPY", "False").lower() == "true"
 TEST_NON_CONTIGUOUS = os.getenv("TEST_NON_CONTIGUOUS", "0").lower() in ("true", "1")
 USE_GPU_MODE = os.getenv("USE_GPU_MODE", "False").lower() == "true"
 cached_numpy = {}
@@ -151,24 +151,120 @@ def get_cached_numpy_array(
     scale=1.2,
     int_low=-65535,
     int_high=65535,
+    seed=0,
+    config_fingerprint="",
 ):
     dtype = _normalize_cache_dtype(dtype)
     shape = _shape_tuple(shape)
-    key = (dtype, shape, generation_kind, float(scale), int(int_low), int(int_high))
+    # seed 是 cache 身份的一部分，避免同进程切换随机种子后复用旧输入数据。
+    key = (
+        int(seed),
+        str(config_fingerprint),
+        dtype,
+        shape,
+        generation_kind,
+        float(scale),
+        int(int_low),
+        int(int_high),
+    )
     if key in cached_numpy:
-        return cached_numpy[key]
+        # 缓存真源不可被规则或框架物化原地修改。
+        return numpy.array(cached_numpy[key], copy=True)
 
+    # cache miss 使用私有流，不能改变规则或算子 RNG。
+    cache_seed = int.from_bytes(hashlib.sha256(repr(key).encode("utf-8")).digest()[:4], "big")
+    cache_rng = numpy.random.RandomState(cache_seed)
     if "int" in dtype:
-        tensor = numpy.random.randint(int_low, int_high, size=shape, dtype="int64").astype(dtype)
+        tensor = cache_rng.randint(int_low, int_high, size=shape, dtype="int64").astype(dtype)
     elif dtype.startswith("complex"):
         real_dtype = "float32" if dtype == "complex64" else "float64"
-        real_part = ((numpy.random.random(shape) - 0.5) * scale).astype(real_dtype)
-        imag_part = ((numpy.random.random(shape) - 0.5) * scale).astype(real_dtype)
+        real_part = ((cache_rng.random(shape) - 0.5) * scale).astype(real_dtype)
+        imag_part = ((cache_rng.random(shape) - 0.5) * scale).astype(real_dtype)
         tensor = (real_part + 1j * imag_part).astype(dtype)
     else:
-        tensor = ((numpy.random.random(shape) - 0.5) * scale).astype(dtype)
-    cached_numpy[key] = tensor
-    return tensor
+        tensor = ((cache_rng.random(shape) - 0.5) * scale).astype(dtype)
+    cached_numpy[key] = numpy.array(tensor, copy=True)
+    return numpy.array(tensor, copy=True)
+
+
+def generate_numpy_output_grad(
+    dtype,
+    shape,
+    *,
+    use_cache=False,
+    seed=0,
+    config_fingerprint="",
+):
+    """生成反向输入；cache 开启时使用 backward 专属的 NumPy 流。"""
+    normalized_dtype = _normalize_cache_dtype(dtype)
+    shape = _shape_tuple(shape)
+    if use_cache:
+        return get_cached_numpy_array(
+            normalized_dtype,
+            shape,
+            generation_kind="backward",
+            seed=seed,
+            config_fingerprint=config_fingerprint,
+        )
+    if "int" in normalized_dtype:
+        return numpy.random.randint(-65535, 65535, size=shape).astype(normalized_dtype)
+    if normalized_dtype.startswith("complex"):
+        real_dtype = "float32" if normalized_dtype == "complex64" else "float64"
+        real = (numpy.random.random(shape) - 0.5).astype(real_dtype)
+        imag = (numpy.random.random(shape) - 0.5).astype(real_dtype)
+        return (real + 1j * imag).astype(normalized_dtype)
+    return (numpy.random.random(shape) - 0.5).astype(normalized_dtype)
+
+
+def input_cache_key(context, rule_identity):
+    """构造 forward input cache key，区分配置、规则、绑定和随机流。"""
+    # config fingerprint 覆盖 API 参数和值域参数，binding snapshot 覆盖逻辑 Tensor 规格。
+    # 两者同时进入 key，避免不同规则路径仅因 shape/dtype 相同而错误复用。
+    bindings = tuple(
+        (
+            str(binding.path),
+            binding.parameter_name,
+            binding.shape,
+            binding.dtype,
+            binding.place,
+            binding.is_contiguous,
+            binding.strides,
+        )
+        for binding in context.input_binding.tensor_bindings
+    )
+    return (
+        "input",
+        context.stream_kind,
+        int(context.seed),
+        str(context.config_fingerprint),
+        tuple(rule_identity),
+        bindings,
+        getattr(context.input_backend_policy, "resolved", "numpy"),
+    )
+
+
+def get_cached_input_values(key):
+    cached = cached_numpy.get(key)
+    if cached is None:
+        return None
+    # 规则可能对返回数组执行原地操作，命中时必须提供独立副本。
+    return tuple(
+        (path, numpy.array(value, copy=True), backend_name, update_config)
+        for path, value, backend_name, update_config in cached
+    )
+
+
+def put_cached_input_values(key, entries):
+    # update_config 是回放协议的一部分，不能只缓存数组本身。
+    cached_numpy[key] = tuple(
+        (
+            input_value.path,
+            numpy.array(input_value.generated_value, copy=True),
+            input_value.backend_name,
+            update_config,
+        )
+        for input_value, update_config in entries
+    )
 
 
 not_zero_apis = frozenset(
@@ -288,11 +384,12 @@ class TensorConfig:
         return self._torch_operator_device(api_config)
 
     def _missing_input_error(self, api_config, framework):
+        backend = getattr(api_config, "input_backend", None) or resolve_input_backend_name()
         return ValueError(
             f"TensorConfig has no generated input value before {framework} materialization: "
             f"api={getattr(api_config, 'api_name', '<unknown>')}, "
             f"shape={self.shape}, dtype={self.dtype}, "
-            f"backend={create_input_backend().name}"
+            f"backend={backend}"
         )
 
     def _cast_intermediate_dtype(self):

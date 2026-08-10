@@ -4,7 +4,6 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from .input_generation.backend import resolve_input_backend_name
 from .input_generation.tensor_config import (
     AUTOGRAD_DTYPES,
     build_materialization_plan,
@@ -413,6 +412,7 @@ def decide_gpu_memory_preflight(
     gpu_config,
     *,
     check_grad,
+    input_backend="torch",
     operator_on_gpu=True,
 ):
     # 预检只做 admission decision，不分配测试 Tensor，失败结果由调用方转换为 skip。
@@ -431,7 +431,7 @@ def decide_gpu_memory_preflight(
             api_config,
             mode,
             check_grad=check_grad,
-            input_backend=resolve_input_backend_name(),
+            input_backend=input_backend,
             operator_on_gpu=operator_on_gpu,
         )
     except (TypeError, ValueError, OverflowError) as err:
