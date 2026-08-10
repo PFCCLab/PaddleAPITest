@@ -2,6 +2,7 @@
 
 from .backend import (
     InputBackend,
+    InputBackendCapabilityError,
     InputBackendPolicy,
     NumPyInputBackend,
     PaddleInputBackend,
@@ -22,6 +23,7 @@ __all__ = [
     "TensorConfig",
     "InputValue",
     "InputBackend",
+    "InputBackendCapabilityError",
     "InputBackendPolicy",
     "NumPyInputBackend",
     "PaddleInputBackend",

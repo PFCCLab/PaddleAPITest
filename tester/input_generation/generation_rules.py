@@ -148,6 +148,7 @@ class InputRule:
         input_backend = create_input_backend(
             input_random_state,
             policy=input_generation_context.input_backend_policy,
+            rule_context=input_generation_context.input_binding.api_name,
         )
         input_rule_context = InputRuleContext(
             input_generation_context.input_binding, api_config, input_backend

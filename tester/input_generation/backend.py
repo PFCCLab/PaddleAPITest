@@ -13,8 +13,13 @@ from tester.dtype_utils import to_torch_dtype
 from .value_generators import (
     INPUT_NUMPY_RANDOM_STATE,
     derive_input_stream_seed,
+    normalize_input_dtype,
     resolve_input_dtype,
 )
+
+
+class InputBackendCapabilityError(ValueError):
+    """输入规则请求 backend 无法等价实现的 dtype/原语组合。"""
 
 
 class InputBackend(Protocol):
@@ -25,6 +30,8 @@ class InputBackend(Protocol):
     def commit(self) -> None: ...
 
     def resolve_input_dtype(self, dtype: str) -> str: ...
+
+    def validate_dtype(self, operation: str, dtype: str | None) -> str | None: ...
 
     def random(self, shape=None, dtype=None): ...
 
@@ -104,6 +111,7 @@ class NumPyInputBackend:
     """NumPy implementation of the input-generation backend."""
 
     input_random_state: object = INPUT_NUMPY_RANDOM_STATE
+    rule_context: str = "<unknown>"
 
     name = "numpy"
 
@@ -115,46 +123,102 @@ class NumPyInputBackend:
     def resolve_input_dtype(self, dtype: str) -> str:
         return resolve_input_dtype(dtype)
 
-    def _storage_dtype(self, dtype):
-        if dtype is None:
+    def _capability_error(self, operation, logical_dtype, reason):
+        # 错误在规则边界统一成稳定协议，调用方不需要解析 NumPy/Torch/Paddle 文本。
+        # rule_context 使用 API 名，能定位关系规则而不暴露 backend 内部栈结构。
+        return InputBackendCapabilityError(
+            "input backend capability error: "
+            f"backend={self.name}, rule={self.rule_context}, operation={operation}, "
+            f"logical_dtype={logical_dtype}, reason={reason}"
+        )
+
+    def validate_dtype(self, operation: str, dtype: str | None) -> str | None:
+        """在调用底层原语前冻结 dtype 协议，避免依赖 kernel 报错文本。"""
+        logical_dtype = normalize_input_dtype(dtype)
+        if logical_dtype is None:
             return None
-        if isinstance(dtype, str):
-            dtype_name = dtype.replace("paddle.", "")
-        else:
-            try:
-                dtype_name = numpy.dtype(dtype).name
-            except TypeError:
-                dtype_name = str(dtype).split(".")[-1]
-        return resolve_input_dtype(dtype_name)
+        # finfo 只对浮点逻辑 dtype 有定义，BF16/FP8 仍按生成阶段中间 dtype 处理。
+        # 整数、布尔和 unsigned 的范围由 dtype_min/dtype_max 负责，不伪造 finfo 结果。
+        if operation == "finfo" and logical_dtype not in {
+            "float16",
+            "float32",
+            "float64",
+            "bfloat16",
+            "float8_e4m3fn",
+            "float8_e5m2",
+        }:
+            raise self._capability_error(operation, logical_dtype, "dtype has no floating limits")
+        # view_dtype 依赖字节布局，特殊逻辑 dtype 不能静默改成不同宽度的 storage。
+        if operation == "view_dtype" and logical_dtype in {
+            "bfloat16",
+            "float8_e4m3fn",
+            "float8_e5m2",
+        }:
+            raise self._capability_error(
+                operation,
+                logical_dtype,
+                "view requires a backend-native byte dtype; use an explicit intermediate dtype",
+            )
+        # 原生 backend 的少数 arange 组合没有等价 kernel，先按协议拒绝再触发底层调用。
+        unsupported = {
+            "torch": {"arange": {"bool", "uint16", "uint32", "uint64", "complex64", "complex128"}},
+            "paddle": {"arange": {"bool", "uint16", "uint32", "uint64", "complex64", "complex128"}},
+        }.get(self.name, {}).get(operation, set())
+        if logical_dtype in unsupported:
+            raise self._capability_error(
+                operation,
+                logical_dtype,
+                "backend protocol does not provide an equivalent arange dtype",
+            )
+        return logical_dtype if operation == "view_dtype" else resolve_input_dtype(logical_dtype)
+
+    def _dtype_for(self, operation, dtype):
+        # 所有 dtype 原语都从同一入口取得 storage dtype，规则层只传逻辑名称。
+        logical_dtype = self.validate_dtype(operation, dtype)
+        if logical_dtype is None:
+            return None
+        storage_dtype = (
+            logical_dtype if operation == "view_dtype" else resolve_input_dtype(logical_dtype)
+        )
+        # NumPy 可识别性只验证 storage 名称，不让特殊逻辑名泄漏到数组构造器。
+        try:
+            numpy.dtype(storage_dtype)
+        except (TypeError, ValueError) as exc:
+            # 这里在 backend 边界失败，避免把同一问题变成不同框架的异常类型。
+            raise self._capability_error(
+                operation, logical_dtype, f"storage dtype {storage_dtype!r} is unavailable"
+            ) from exc
+        return storage_dtype
 
     def random(self, shape=None, dtype=None):
         value = self.input_random_state.random(shape)
-        storage_dtype = self._storage_dtype(dtype)
+        # 随机原语先生成可写 storage，再由框架物化层完成逻辑 dtype cast。
+        storage_dtype = self._dtype_for("random", dtype)
         return numpy.asarray(value).astype(storage_dtype) if storage_dtype is not None else value
 
     def uniform(self, low=0.0, high=1.0, shape=None, dtype=None):
         value = self.input_random_state.uniform(low=low, high=high, shape=shape)
-        storage_dtype = self._storage_dtype(dtype)
+        storage_dtype = self._dtype_for("uniform", dtype)
         return numpy.asarray(value).astype(storage_dtype) if storage_dtype is not None else value
 
     def randint(self, low, high=None, shape=None, dtype=None):
         value = self.input_random_state.randint(low, high, shape=shape)
-        storage_dtype = self._storage_dtype(dtype)
+        storage_dtype = self._dtype_for("randint", dtype)
         return numpy.asarray(value).astype(storage_dtype) if storage_dtype is not None else value
 
     def randn(self, *shape, dtype=None):
         value = self.input_random_state.randn(*shape)
-        storage_dtype = self._storage_dtype(dtype)
+        storage_dtype = self._dtype_for("randn", dtype)
         return numpy.asarray(value).astype(storage_dtype) if storage_dtype is not None else value
 
     def choice(self, values, shape=None, replace=True, p=None):
         return self.input_random_state.choice(values, shape=shape, replace=replace, p=p)
 
     def asarray(self, value, dtype=None, copy=True):
-        return numpy.array(value, dtype=self._storage_dtype(dtype), copy=copy)
+        return numpy.array(value, dtype=self._dtype_for("asarray", dtype), copy=copy)
 
     def cast(self, value, dtype):
-        return numpy.asarray(value).astype(self._storage_dtype(dtype))
+        return numpy.asarray(value).astype(self._dtype_for("cast", dtype))
 
     def reshape(self, value, shape):
         return numpy.reshape(value, shape)
@@ -163,19 +227,19 @@ class NumPyInputBackend:
         return numpy.reshape(value, -1)
 
     def view_dtype(self, value, dtype):
-        return numpy.asarray(value).view(dtype)
+        return numpy.asarray(value).view(self._dtype_for("view_dtype", dtype))
 
     def arange(self, *args, dtype=None):
-        return numpy.arange(*args, dtype=self._storage_dtype(dtype))
+        return numpy.arange(*args, dtype=self._dtype_for("arange", dtype))
 
     def zeros(self, shape, dtype=None):
-        return numpy.zeros(shape, dtype=self._storage_dtype(dtype))
+        return numpy.zeros(shape, dtype=self._dtype_for("zeros", dtype))
 
     def ones(self, shape, dtype=None):
-        return numpy.ones(shape, dtype=self._storage_dtype(dtype))
+        return numpy.ones(shape, dtype=self._dtype_for("ones", dtype))
 
     def full(self, shape, fill_value, dtype=None):
-        return numpy.full(shape, fill_value, dtype=self._storage_dtype(dtype))
+        return numpy.full(shape, fill_value, dtype=self._dtype_for("full", dtype))
 
     def where(self, condition, x, y):
         return numpy.where(condition, x, y)
@@ -235,13 +299,13 @@ class NumPyInputBackend:
         return numpy.conj(value)
 
     def eye(self, size, dtype=None):
-        return numpy.eye(size, dtype=self._storage_dtype(dtype))
+        return numpy.eye(size, dtype=self._dtype_for("eye", dtype))
 
     def ascontiguousarray(self, value):
         return numpy.ascontiguousarray(value)
 
     def finfo(self, dtype):
-        return numpy.finfo(self._storage_dtype(dtype))
+        return numpy.finfo(self._dtype_for("finfo", dtype))
 
 
 @dataclass
@@ -271,24 +335,41 @@ class TorchInputBackend(NumPyInputBackend):
     def _torch_shape(self, shape):
         return _normalize_shape(shape, scalar_empty=False)
 
-    def _torch_dtype(self, dtype):
-        if isinstance(dtype, str):
+    def _torch_dtype(self, dtype, operation="cast"):
+        logical_dtype = normalize_input_dtype(dtype)
+        storage_dtype = self._dtype_for(operation, dtype)
+        # Torch unsigned dtype 不能走历史 dtype_utils 的 uint16 -> BF16 兼容映射。
+        if logical_dtype in {"uint16", "uint32", "uint64"}:
             torch = self._torch()
-            unsigned_dtype = {
-                "uint16": torch.uint16,
-                "uint32": torch.uint32,
-                "uint64": torch.uint64,
-            }.get(dtype.replace("paddle.", ""))
-            if unsigned_dtype is not None:
+            try:
+                unsigned_dtype = {
+                    "uint16": torch.uint16,
+                    "uint32": torch.uint32,
+                    "uint64": torch.uint64,
+                }[logical_dtype]
+            except AttributeError as exc:
+                raise self._capability_error(
+                    operation,
+                    logical_dtype,
+                    "Torch runtime has no matching unsigned storage dtype",
+                ) from exc
+            if operation in {"asarray", "cast"}:
                 return unsigned_dtype
-        storage_dtype = self._storage_dtype(dtype)
+        # 其余逻辑 dtype 使用统一 storage 名称映射到 Torch dtype。
         if storage_dtype is None:
             return None
-        return to_torch_dtype(storage_dtype)
+        try:
+            return to_torch_dtype(storage_dtype)
+        except (TypeError, ValueError) as exc:
+            raise self._capability_error(
+                operation,
+                logical_dtype,
+                f"Torch runtime cannot represent storage dtype {storage_dtype!r}",
+            ) from exc
 
     def _resolve_torch_float_dtype(self, dtype):
         torch = self._torch()
-        storage_dtype = self._storage_dtype(dtype)
+        storage_dtype = self._dtype_for("uniform", dtype)
         if storage_dtype == "float64":
             return torch.float64
         return torch.float32
@@ -383,7 +464,7 @@ class TorchInputBackend(NumPyInputBackend):
 
     def asarray(self, value, dtype=None, copy=True):
         torch = self._torch()
-        torch_dtype = self._torch_dtype(dtype)
+        torch_dtype = self._torch_dtype(dtype, operation="asarray")
         if isinstance(value, torch.Tensor):
             tensor = value.to(device=self._device, dtype=torch_dtype)
             return tensor.clone() if copy else tensor
@@ -391,7 +472,7 @@ class TorchInputBackend(NumPyInputBackend):
         return tensor.clone() if copy else tensor
 
     def cast(self, value, dtype):
-        torch_dtype = self._torch_dtype(dtype)
+        torch_dtype = self._torch_dtype(dtype, operation="cast")
         if torch_dtype is None:
             return value
         return self.asarray(value, copy=False).to(dtype=torch_dtype)
@@ -403,17 +484,23 @@ class TorchInputBackend(NumPyInputBackend):
         return self.asarray(value, copy=False).flatten()
 
     def view_dtype(self, value, dtype):
-        return self.asarray(value, copy=False).view(self._torch_dtype(dtype))
+        return self.asarray(value, copy=False).view(
+            self._torch_dtype(dtype, operation="view_dtype")
+        )
 
     def arange(self, *args, dtype=None):
         torch = self._torch()
-        return torch.arange(*args, dtype=self._torch_dtype(dtype), device=self._device)
+        return torch.arange(
+            *args,
+            dtype=self._torch_dtype(dtype, operation="arange"),
+            device=self._device,
+        )
 
     def zeros(self, shape, dtype=None):
         torch = self._torch()
         return torch.zeros(
             self._torch_shape(shape),
-            dtype=self._torch_dtype(dtype),
+            dtype=self._torch_dtype(dtype, operation="zeros"),
             device=self._device,
         )
 
@@ -421,7 +508,7 @@ class TorchInputBackend(NumPyInputBackend):
         torch = self._torch()
         return torch.ones(
             self._torch_shape(shape),
-            dtype=self._torch_dtype(dtype),
+            dtype=self._torch_dtype(dtype, operation="ones"),
             device=self._device,
         )
 
@@ -430,7 +517,7 @@ class TorchInputBackend(NumPyInputBackend):
         return torch.full(
             self._torch_shape(shape),
             fill_value,
-            dtype=self._torch_dtype(dtype),
+            dtype=self._torch_dtype(dtype, operation="full"),
             device=self._device,
         )
 
@@ -519,14 +606,18 @@ class TorchInputBackend(NumPyInputBackend):
 
     def eye(self, size, dtype=None):
         torch = self._torch()
-        return torch.eye(size, dtype=self._torch_dtype(dtype), device=self._device)
+        return torch.eye(
+            size,
+            dtype=self._torch_dtype(dtype, operation="eye"),
+            device=self._device,
+        )
 
     def ascontiguousarray(self, value):
         return self.asarray(value, copy=False).contiguous()
 
     def finfo(self, dtype):
         torch = self._torch()
-        return torch.finfo(self._torch_dtype(dtype))
+        return torch.finfo(self._torch_dtype(dtype, operation="finfo"))
 
 
 @dataclass
@@ -552,11 +643,19 @@ class PaddleInputBackend(NumPyInputBackend):
     def _paddle_shape(self, shape):
         return _normalize_shape(shape, scalar_empty=True)
 
-    def _paddle_dtype(self, dtype):
-        storage_dtype = self._storage_dtype(dtype)
+    def _paddle_dtype(self, dtype, operation="cast"):
+        # Paddle 只接收解析后的 storage dtype；属性缺失会转换为统一能力错误。
+        storage_dtype = self._dtype_for(operation, dtype)
         if storage_dtype is None:
             return None
-        return getattr(self._paddle(), storage_dtype)
+        try:
+            return getattr(self._paddle(), storage_dtype)
+        except AttributeError as exc:
+            raise self._capability_error(
+                operation,
+                normalize_input_dtype(dtype),
+                f"Paddle runtime has no matching storage dtype {storage_dtype!r}",
+            ) from exc
 
     def random(self, shape=None, dtype=None):
         return self.asarray(super().random(shape=shape, dtype=dtype), dtype=dtype, copy=False)
@@ -584,7 +683,7 @@ class PaddleInputBackend(NumPyInputBackend):
 
     def asarray(self, value, dtype=None, copy=True):
         paddle = self._paddle()
-        paddle_dtype = self._paddle_dtype(dtype)
+        paddle_dtype = self._paddle_dtype(dtype, operation="asarray")
         if isinstance(value, paddle.Tensor):
             tensor = value._copy_to(self._place, False)
             if paddle_dtype is not None and tensor.dtype != paddle_dtype:
@@ -594,7 +693,7 @@ class PaddleInputBackend(NumPyInputBackend):
         return tensor.clone() if copy else tensor
 
     def cast(self, value, dtype):
-        paddle_dtype = self._paddle_dtype(dtype)
+        paddle_dtype = self._paddle_dtype(dtype, operation="cast")
         if paddle_dtype is None:
             return value
         return self._paddle().cast(self.asarray(value, copy=False), dtype=paddle_dtype)
@@ -606,22 +705,28 @@ class PaddleInputBackend(NumPyInputBackend):
         return self._paddle().flatten(self.asarray(value, copy=False))
 
     def view_dtype(self, value, dtype):
-        return self.asarray(value, copy=False).view(self._paddle_dtype(dtype))
+        return self.asarray(value, copy=False).view(
+            self._paddle_dtype(dtype, operation="view_dtype")
+        )
 
     def arange(self, *args, dtype=None):
-        return self._paddle().arange(*args, dtype=self._paddle_dtype(dtype), device=self.device)
+        return self._paddle().arange(
+            *args,
+            dtype=self._paddle_dtype(dtype, operation="arange"),
+            device=self.device,
+        )
 
     def zeros(self, shape, dtype=None):
         return self._paddle().zeros(
             self._paddle_shape(shape),
-            dtype=self._paddle_dtype(dtype),
+            dtype=self._paddle_dtype(dtype, operation="zeros"),
             device=self.device,
         )
 
     def ones(self, shape, dtype=None):
         return self._paddle().ones(
             self._paddle_shape(shape),
-            dtype=self._paddle_dtype(dtype),
+            dtype=self._paddle_dtype(dtype, operation="ones"),
             device=self.device,
         )
 
@@ -629,7 +734,7 @@ class PaddleInputBackend(NumPyInputBackend):
         return self._paddle().full(
             self._paddle_shape(shape),
             fill_value,
-            dtype=self._paddle_dtype(dtype),
+            dtype=self._paddle_dtype(dtype, operation="full"),
             device=self.device,
         )
 
@@ -732,13 +837,17 @@ class PaddleInputBackend(NumPyInputBackend):
         return self._paddle().conj(self.asarray(value, copy=False))
 
     def eye(self, size, dtype=None):
-        return self._paddle().eye(size, dtype=self._paddle_dtype(dtype), device=self.device)
+        return self._paddle().eye(
+            size,
+            dtype=self._paddle_dtype(dtype, operation="eye"),
+            device=self.device,
+        )
 
     def ascontiguousarray(self, value):
         return self.asarray(value, copy=False).contiguous()
 
     def finfo(self, dtype):
-        return numpy.finfo(self._storage_dtype(dtype))
+        return numpy.finfo(self._dtype_for("finfo", dtype))
 
 
 INPUT_BACKEND_ENV_VAR = "PADDLEAPITEST_INPUT_BACKEND"
@@ -818,8 +927,10 @@ def resolve_input_backend_name() -> str:
 def create_input_backend(
     input_random_state=INPUT_NUMPY_RANDOM_STATE,
     policy: InputBackendPolicy | None = None,
+    rule_context: str | None = None,
 ) -> InputBackend:
     # 无 policy 只服务历史直接调用；engine 路径必须传入 runtime config 的最终策略。
+    # rule_context 仅用于错误定位，不参与随机流和 backend 实例缓存 key。
     policy = policy or resolve_input_backend_policy(
         use_gpu_mode=_env_flag("USE_GPU_MODE"),
         requested=os.environ.get(INPUT_BACKEND_ENV_VAR),
@@ -832,11 +943,19 @@ def create_input_backend(
         return _DEFAULT_INPUT_BACKENDS[cache_key]
 
     if normalized == "numpy":
-        input_backend = NumPyInputBackend(input_random_state)
+        input_backend = NumPyInputBackend(input_random_state, rule_context or "<unknown>")
     elif normalized == "torch":
-        input_backend = TorchInputBackend(input_random_state, device=device)
+        input_backend = TorchInputBackend(
+            input_random_state,
+            rule_context or "<unknown>",
+            device=device,
+        )
     else:
-        input_backend = PaddleInputBackend(input_random_state, device=device)
+        input_backend = PaddleInputBackend(
+            input_random_state,
+            rule_context or "<unknown>",
+            device=device,
+        )
 
     if input_random_state is INPUT_NUMPY_RANDOM_STATE:
         _DEFAULT_INPUT_BACKENDS[cache_key] = input_backend

@@ -18,6 +18,20 @@ _INPUT_INTERMEDIATE_DTYPES = {
 }
 
 
+def normalize_input_dtype(dtype) -> str | None:
+    """将配置、Paddle/Torch 名称统一成逻辑 dtype 名。"""
+    # 逻辑名是规则协议，避免不同框架的 dtype repr 进入 storage 映射表。
+    if dtype is None:
+        return None
+    if isinstance(dtype, str):
+        return dtype.replace("paddle.", "").replace("torch.", "").split(".")[-1]
+    try:
+        return numpy.dtype(dtype).name
+    except TypeError:
+        pass
+    return str(dtype).replace("paddle.", "").replace("torch.", "").split(".")[-1]
+
+
 def derive_input_stream_seed(seed, config_fingerprint, stream_kind="input", *, modulus=2**32):
     """将运行 seed、配置身份和流类型派生为 backend 可接受的整数 seed。"""
     # 稳定文本协议不能使用 Python hash；其进程级随机盐会破坏 worker 间复现。
@@ -112,7 +126,9 @@ def create_input_config_random_state(
 
 def resolve_input_dtype(dtype: str) -> str:
     # 返回值是生成阶段的存储 dtype，规则声明的逻辑 dtype 仍保留在 TensorConfig。
-    return _INPUT_INTERMEDIATE_DTYPES.get(dtype, dtype)
+    # BF16/FP8 的中间类型集中在此处，三个 backend 不再各自复制特殊分支。
+    logical_dtype = normalize_input_dtype(dtype)
+    return _INPUT_INTERMEDIATE_DTYPES.get(logical_dtype, logical_dtype)
 
 
 def _complex_parts(dtype, shape, rng, *, low=None, high=None, offset=0.0, scale=1.0):
