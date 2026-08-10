@@ -2671,7 +2671,8 @@ def _build_argument_parser():
         "--use_cached_numpy",
         type=parse_bool,
         default=False,
-        help="Reuse cached NumPy generated inputs and reverse input values when available.",
+        # help 文案必须与 input_generation 的 forward/backward cache 契约一致。
+        help="Reuse cached NumPy forward/backward input values when available.",
     )
     parser.add_argument(
         "--use_gpu_mode",
