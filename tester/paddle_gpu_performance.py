@@ -10,7 +10,11 @@ from .input_generation.tensor_config import tensor_config_tree_numel
 
 class APITestPaddleGPUPerformance(APITestBase):
     def __init__(self, api_config, **kwargs):
-        super().__init__(api_config)
+        super().__init__(
+            api_config,
+            use_torch=False,
+            runtime_config=kwargs.get("runtime_config"),
+        )
         self.test_amp = kwargs.get("test_amp", False)
 
     def test(self):

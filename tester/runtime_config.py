@@ -24,6 +24,12 @@ class TestRuntimeConfig:
     bitwise_alignment: bool = False
     exit_on_error: bool = False
     test_cpu: bool = False
+    input_backend_requested: str | None = None
+    input_backend_resolved: str | None = None
+    input_logical_device: str | None = None
+    cache_numpy_auxiliary: bool | None = None
+    input_use_gpu_mode: bool = False
+    input_backend_policy: object | None = None
     gpu_mode: GpuModeConfig = field(default_factory=GpuModeConfig)
 
     @property
@@ -39,6 +45,8 @@ class TestRuntimeConfig:
 
     @classmethod
     def from_options(cls, options):
+        from .input_generation.backend import resolve_input_backend_policy
+
         # 双卡是 worker 设备拓扑；具体结果生命周期仍由各 accuracy tester 自己管理。
         dual_gpu = bool(
             getattr(options, "accuracy_dual_gpu", False)
@@ -49,11 +57,47 @@ class TestRuntimeConfig:
             dual_gpu=dual_gpu,
             comparison_device_id=1 if dual_gpu else None,
         )
+        # options 通常已由 engine 规范化；这里保留解析能力供直接构造 runtime config 的入口使用。
+        policy = resolve_input_backend_policy(
+            requested=getattr(options, "input_backend_requested", None),
+            use_gpu_mode=bool(getattr(options, "use_gpu_mode", False)),
+            use_cached_numpy=bool(
+                getattr(options, "cache_numpy_auxiliary", False)
+                or getattr(options, "use_cached_numpy", False)
+            ),
+            mode=next(
+                (
+                    name
+                    for name in (
+                        "accuracy",
+                        "accuracy_dual_gpu",
+                        "paddle_only",
+                        "paddle_cinn",
+                        "paddle_gpu_performance",
+                        "torch_gpu_performance",
+                        "paddle_torch_gpu_performance",
+                        "accuracy_stable",
+                        "accuracy_stable_dual_gpu",
+                        "paddle_custom_device",
+                        "custom_device_vs_gpu",
+                    )
+                    if getattr(options, name, False)
+                ),
+                None,
+            ),
+        )
+        # 请求值和终态同时保存，日志可以区分默认选择与用户显式覆盖。
         return cls(
             random_seed=int(options.random_seed),
             bitwise_alignment=bool(options.bitwise_alignment),
             exit_on_error=bool(options.exit_on_error),
             test_cpu=bool(options.test_cpu),
+            input_backend_requested=policy.requested,
+            input_backend_resolved=policy.resolved,
+            input_logical_device=policy.logical_device,
+            cache_numpy_auxiliary=policy.cache_numpy_auxiliary,
+            input_use_gpu_mode=policy.use_gpu_mode,
+            input_backend_policy=policy,
             gpu_mode=gpu_mode,
         )
 
@@ -64,6 +108,7 @@ class TestRuntimeConfig:
         total_memory_per_gpu,
         comparison_gpu_id=None,
     ):
+        # 每个 worker 只更新容量拓扑；输入 backend policy 在整次运行内保持不变。
         workers_on_gpu = max(1, int(workers_per_gpu.get(gpu_id, self.gpu_mode.workers_on_gpu) or 1))
         total_memory = float(total_memory_per_gpu.get(gpu_id, self.gpu_mode.total_memory) or 0.0)
         memory_budget = (

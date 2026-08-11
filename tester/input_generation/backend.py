@@ -2,18 +2,20 @@
 
 from __future__ import annotations
 
-import hashlib
 import numbers
 import os
-import sys
-import warnings
 from dataclasses import dataclass, field
 from typing import Protocol
 
 import numpy
 from tester.dtype_utils import to_torch_dtype
 
-from .value_generators import INPUT_NUMPY_RANDOM_STATE, resolve_input_dtype
+from .value_generators import (
+    INPUT_NUMPY_RANDOM_STATE,
+    InputConfigRandomState,
+    derive_input_seed,
+    resolve_input_dtype,
+)
 
 
 class InputBackend(Protocol):
@@ -98,6 +100,10 @@ class InputBackend(Protocol):
     def finfo(self, dtype): ...
 
 
+class InputBackendCapabilityError(ValueError):
+    """输入 backend 无法按协议物化某个逻辑 dtype 或原语。"""
+
+
 @dataclass
 class NumPyInputBackend:
     """NumPy implementation of the input-generation backend."""
@@ -115,6 +121,9 @@ class NumPyInputBackend:
         return resolve_input_dtype(dtype)
 
     def _storage_dtype(self, dtype):
+        # 逻辑 dtype 属于配置协议，生成原语只接收 backend 能稳定构造的 storage dtype。
+        # BF16、FP8 和宽无符号整数因此必须在这一层统一降级，不能由各条规则自行判断。
+        # 映射后的 dtype 仍需显式校验，避免把底层库偶然抛出的错误当作协议定义。
         if dtype is None:
             return None
         if isinstance(dtype, str):
@@ -124,32 +133,44 @@ class NumPyInputBackend:
                 dtype_name = numpy.dtype(dtype).name
             except TypeError:
                 dtype_name = str(dtype).split(".")[-1]
-        return resolve_input_dtype(dtype_name)
+        storage_dtype = resolve_input_dtype(dtype_name)
+        try:
+            numpy.dtype(storage_dtype)
+        except TypeError as err:
+            raise InputBackendCapabilityError(
+                f"{self.name} backend does not support input dtype {dtype_name!r} "
+                f"(storage dtype {storage_dtype!r})"
+            ) from err
+        return storage_dtype
 
     def random(self, shape=None, dtype=None):
         value = self.input_random_state.random(shape)
-        return numpy.asarray(value).astype(dtype) if dtype is not None else value
+        storage_dtype = self._storage_dtype(dtype)
+        return numpy.asarray(value).astype(storage_dtype) if storage_dtype is not None else value
 
     def uniform(self, low=0.0, high=1.0, shape=None, dtype=None):
         value = self.input_random_state.uniform(low=low, high=high, shape=shape)
-        return numpy.asarray(value).astype(dtype) if dtype is not None else value
+        storage_dtype = self._storage_dtype(dtype)
+        return numpy.asarray(value).astype(storage_dtype) if storage_dtype is not None else value
 
     def randint(self, low, high=None, shape=None, dtype=None):
         value = self.input_random_state.randint(low, high, shape=shape)
-        return numpy.asarray(value).astype(dtype) if dtype is not None else value
+        storage_dtype = self._storage_dtype(dtype)
+        return numpy.asarray(value).astype(storage_dtype) if storage_dtype is not None else value
 
     def randn(self, *shape, dtype=None):
         value = self.input_random_state.randn(*shape)
-        return numpy.asarray(value).astype(dtype) if dtype is not None else value
+        storage_dtype = self._storage_dtype(dtype)
+        return numpy.asarray(value).astype(storage_dtype) if storage_dtype is not None else value
 
     def choice(self, values, shape=None, replace=True, p=None):
         return self.input_random_state.choice(values, shape=shape, replace=replace, p=p)
 
     def asarray(self, value, dtype=None, copy=True):
-        return numpy.array(value, dtype=dtype, copy=copy)
+        return numpy.array(value, dtype=self._storage_dtype(dtype), copy=copy)
 
     def cast(self, value, dtype):
-        return numpy.asarray(value).astype(dtype)
+        return numpy.asarray(value).astype(self._storage_dtype(dtype))
 
     def reshape(self, value, shape):
         return numpy.reshape(value, shape)
@@ -158,19 +179,19 @@ class NumPyInputBackend:
         return numpy.reshape(value, -1)
 
     def view_dtype(self, value, dtype):
-        return numpy.asarray(value).view(dtype)
+        return numpy.asarray(value).view(self._storage_dtype(dtype))
 
     def arange(self, *args, dtype=None):
-        return numpy.arange(*args, dtype=dtype)
+        return numpy.arange(*args, dtype=self._storage_dtype(dtype))
 
     def zeros(self, shape, dtype=None):
-        return numpy.zeros(shape, dtype=dtype)
+        return numpy.zeros(shape, dtype=self._storage_dtype(dtype))
 
     def ones(self, shape, dtype=None):
-        return numpy.ones(shape, dtype=dtype)
+        return numpy.ones(shape, dtype=self._storage_dtype(dtype))
 
     def full(self, shape, fill_value, dtype=None):
-        return numpy.full(shape, fill_value, dtype=dtype)
+        return numpy.full(shape, fill_value, dtype=self._storage_dtype(dtype))
 
     def where(self, condition, x, y):
         return numpy.where(condition, x, y)
@@ -230,13 +251,13 @@ class NumPyInputBackend:
         return numpy.conj(value)
 
     def eye(self, size, dtype=None):
-        return numpy.eye(size, dtype=dtype)
+        return numpy.eye(size, dtype=self._storage_dtype(dtype))
 
     def ascontiguousarray(self, value):
         return numpy.ascontiguousarray(value)
 
     def finfo(self, dtype):
-        return numpy.finfo(dtype)
+        return numpy.finfo(self._storage_dtype(dtype))
 
 
 @dataclass
@@ -248,8 +269,12 @@ class TorchInputBackend(NumPyInputBackend):
     _generator: object = field(init=False, repr=False)
 
     def __post_init__(self):
-        seed_material = f"{getattr(self.input_random_state, 'seed', 0)}:{getattr(self.input_random_state, 'config_fingerprint', '')}"
-        seed = int(hashlib.sha256(seed_material.encode()).hexdigest()[:16], 16) % (2**63)
+        # Torch 私有 Generator 只消费本 backend 的 stream，不触碰默认 generator。
+        seed = derive_input_seed(
+            getattr(self.input_random_state, "seed", 0),
+            getattr(self.input_random_state, "config_fingerprint", ""),
+            "torch",
+        )
         torch = self._torch()
         self._device = torch.device(self.device)
         self._generator = torch.Generator(device=self._device)
@@ -264,19 +289,15 @@ class TorchInputBackend(NumPyInputBackend):
         return _normalize_shape(shape, scalar_empty=False)
 
     def _torch_dtype(self, dtype):
-        if isinstance(dtype, str):
-            torch = self._torch()
-            unsigned_dtype = {
-                "uint16": torch.uint16,
-                "uint32": torch.uint32,
-                "uint64": torch.uint64,
-            }.get(dtype.replace("paddle.", ""))
-            if unsigned_dtype is not None:
-                return unsigned_dtype
         storage_dtype = self._storage_dtype(dtype)
         if storage_dtype is None:
             return None
-        return to_torch_dtype(storage_dtype)
+        try:
+            return to_torch_dtype(storage_dtype)
+        except (AttributeError, TypeError, ValueError) as err:
+            raise InputBackendCapabilityError(
+                f"{self.name} backend does not support storage dtype {storage_dtype!r}"
+            ) from err
 
     def _resolve_torch_float_dtype(self, dtype):
         torch = self._torch()
@@ -529,17 +550,18 @@ class PaddleInputBackend(NumPyInputBackend):
     name = "paddle"
 
     def __post_init__(self):
-        seed_material = f"{getattr(self.input_random_state, 'seed', 0)}:{getattr(self.input_random_state, 'config_fingerprint', '')}"
-        seed = int(hashlib.sha256(seed_material.encode()).hexdigest()[:8], 16) % (2**31)
+        # Paddle 无稳定的逐实例 Generator；随机值改由独立 NumPy stream 生成。
+        # 这里绝不能播种 Paddle 全局 generator，避免规则失败污染后续配置。
+        self._random_source = InputConfigRandomState(
+            getattr(self.input_random_state, "seed", 0),
+            getattr(self.input_random_state, "config_fingerprint", ""),
+            stream_kind="paddle",
+        )
         paddle = self._paddle()
         self._place = paddle.CPUPlace()
         if self.device.startswith(("gpu", "cuda")):
-            paddle.seed(seed)
             device_id = int(self.device.split(":", 1)[1]) if ":" in self.device else 0
             self._place = paddle.CUDAPlace(device_id)
-        else:
-            # CPU backend 不触碰 CUDA generator，保证纯 CPU 测试无需初始化 GPU runtime。
-            paddle.framework.core.default_cpu_generator().manual_seed(seed)
 
     def _paddle(self):
         import paddle
@@ -553,7 +575,12 @@ class PaddleInputBackend(NumPyInputBackend):
         storage_dtype = self._storage_dtype(dtype)
         if storage_dtype is None:
             return None
-        return getattr(self._paddle(), storage_dtype)
+        try:
+            return getattr(self._paddle(), storage_dtype)
+        except AttributeError as err:
+            raise InputBackendCapabilityError(
+                f"{self.name} backend does not support storage dtype {storage_dtype!r}"
+            ) from err
 
     def _resolve_paddle_float_dtype(self, dtype):
         storage_dtype = self._storage_dtype(dtype)
@@ -562,86 +589,63 @@ class PaddleInputBackend(NumPyInputBackend):
         return "float32"
 
     def random(self, shape=None, dtype=None):
-        paddle = self._paddle()
-        value = paddle.rand(
-            self._paddle_shape(shape),
-            dtype="float32",
-            device=self.device,
-        )
+        value = self.asarray(self._random_source.random(shape), dtype="float32", copy=False)
         return self.cast(value, dtype) if dtype is not None else value
 
     def uniform(self, low=0.0, high=1.0, shape=None, dtype=None):
-        paddle = self._paddle()
-        value = paddle.uniform(
-            self._paddle_shape(shape),
+        value = self.asarray(
+            self._random_source.uniform(low=float(low), high=float(high), shape=shape),
             dtype=self._resolve_paddle_float_dtype(dtype),
-            min=float(low),
-            max=float(high),
-            device=self.device,
+            copy=False,
         )
         return self.cast(value, dtype) if dtype is not None else value
 
     def randint(self, low, high=None, shape=None, dtype=None):
-        paddle = self._paddle()
         if high is None:
             low, high = 0, low
-        value = paddle.randint(
-            int(low),
-            int(high),
-            self._paddle_shape(shape),
+        value = self.asarray(
+            self._random_source.randint(int(low), int(high), shape=shape),
             dtype="int64",
-            device=self.device,
+            copy=False,
         )
         return self.cast(value, dtype) if dtype is not None else value
 
     def randn(self, *shape, dtype=None):
-        paddle = self._paddle()
-        value = paddle.randn(
-            self._paddle_shape(shape),
-            dtype="float32",
-            device=self.device,
-        )
+        value = self.asarray(self._random_source.randn(*shape), dtype="float32", copy=False)
         return self.cast(value, dtype) if dtype is not None else value
 
     def choice(self, values, shape=None, replace=True, p=None):
+        # choice 也只能消费局部 NumPy stream，禁止 multinomial/randperm 隐式播种。
         paddle = self._paddle()
-        scalar, paddle_shape, num_samples = _choice_shape(shape, scalar_empty=True)
-
         if isinstance(values, numbers.Integral):
-            population = paddle.arange(int(values), dtype="int64", device=self.device)
+            population = int(values)
         else:
-            population = self.asarray(values, copy=False).flatten()
-
-        if p is not None:
-            weights = self.asarray(p, dtype="float64", copy=False).flatten()
-            indices = paddle.multinomial(weights, num_samples, replacement=replace)
-        elif replace:
-            indices = paddle.randint(
-                0,
-                int(population.shape[0]),
-                [num_samples],
-                dtype="int64",
-                device=self.device,
-            )
-        else:
-            if num_samples > int(population.shape[0]):
-                raise ValueError("Cannot take a larger sample than population when replace=False")
-            indices = paddle.randperm(
-                int(population.shape[0]),
-                dtype="int64",
-                device=self.device,
-            )[:num_samples]
-
-        result = paddle.gather(population, indices)
-        if scalar:
-            return result.item()
-        return self.reshape(result, paddle_shape)
+            if isinstance(values, paddle.Tensor):
+                # GPU Tensor 先复制到 CPU；该复制是数据搬运，不会触发随机算子。
+                values = values.cpu() if "gpu" in str(values.place).lower() else values
+                population = values.numpy()
+            else:
+                population = numpy.asarray(values)
+        if p is not None and hasattr(p, "cpu"):
+            p = p.cpu() if "gpu" in str(p.place).lower() else p
+            if isinstance(p, paddle.Tensor):
+                p = p.numpy()
+        result = self._random_source.choice(
+            population,
+            shape=shape,
+            replace=replace,
+            p=None if p is None else numpy.asarray(p),
+        )
+        if shape is None:
+            return result.item() if hasattr(result, "item") else result
+        return self.asarray(result, copy=False)
 
     def asarray(self, value, dtype=None, copy=True):
         paddle = self._paddle()
         paddle_dtype = self._paddle_dtype(dtype)
         if isinstance(value, paddle.Tensor):
-            tensor = value._copy_to(self._place, False)
+            same_place = str(value.place).lower() == str(self._place).lower()
+            tensor = value if same_place else value._copy_to(self._place, False)
             if paddle_dtype is not None and tensor.dtype != paddle_dtype:
                 tensor = paddle.cast(tensor, dtype=paddle_dtype)
             return tensor.clone() if copy else tensor
@@ -797,14 +801,106 @@ class PaddleInputBackend(NumPyInputBackend):
 
 
 INPUT_BACKEND_ENV_VAR = "PADDLEAPITEST_INPUT_BACKEND"
+NUMPY_AUXILIARY_CACHE_ENV_VAR = "PADDLEAPITEST_CACHE_NUMPY_AUXILIARY"
 # Only used when no config-local RNG is available, such as legacy TensorConfig helpers.
 _DEFAULT_INPUT_BACKENDS = {}
-_WARNED_CACHED_INPUT_BACKEND = False
 _TRUE_VALUES = {"true", "1", "yes", "y"}
+_VALID_INPUT_BACKENDS = frozenset({"numpy", "torch", "paddle"})
+# 模式默认值由 policy 唯一拥有，worker 和物化层只能消费解析结果。
+# cache 只控制辅助 NumPy 数据，不得再参与 backend 选择。
+# 未声明模式的直接模块调用保留 NumPy/CPU 的历史默认行为。
+_MODE_DEFAULT_BACKENDS = {
+    "paddle_only": "paddle",
+    "paddle_cinn": "paddle",
+    "paddle_gpu_performance": "paddle",
+    "paddle_custom_device": "paddle",
+    "custom_device_vs_gpu": "paddle",
+    "torch_gpu_performance": "torch",
+    "paddle_torch_gpu_performance": "torch",
+    "accuracy": "torch",
+    "accuracy_dual_gpu": "torch",
+    "accuracy_stable": "torch",
+    "accuracy_stable_dual_gpu": "torch",
+}
+_GPU_NATIVE_MODES = frozenset(
+    {
+        "paddle_gpu_performance",
+        "torch_gpu_performance",
+        "paddle_torch_gpu_performance",
+    }
+)
 
 
 def _env_flag(name, default="False") -> bool:
     return os.getenv(name, default).lower() in _TRUE_VALUES
+
+
+def _cache_numpy_auxiliary_enabled() -> bool:
+    """读取辅助 NumPy cache 开关；旧变量只作为兼容输入。"""
+    return _env_flag(
+        NUMPY_AUXILIARY_CACHE_ENV_VAR,
+        os.getenv("USE_CACHED_NUMPY", "False"),
+    )
+
+
+@dataclass(frozen=True)
+class InputBackendPolicy:
+    """一次运行内共享的输入 backend 请求、解析结果和逻辑值设备。"""
+
+    requested: str | None
+    resolved: str
+    logical_device: str
+    use_gpu_mode: bool
+    cache_numpy_auxiliary: bool
+    mode: str | None = None
+
+
+def resolve_input_backend_policy(
+    *,
+    requested=None,
+    use_gpu_mode=None,
+    use_cached_numpy=None,
+    mode=None,
+) -> InputBackendPolicy:
+    """一次性解析 backend、模式默认值和逻辑值设备。"""
+    # requested 表示用户覆盖，resolved 表示本次运行不可再变的最终选择。
+    if requested is None:
+        requested = os.environ.get(INPUT_BACKEND_ENV_VAR)
+    normalized_requested = (requested or "").strip().lower() or None
+    # 显式请求必须先校验，不能被 cache 或默认分支静默覆盖。
+    if normalized_requested is not None and normalized_requested not in _VALID_INPUT_BACKENDS:
+        raise ValueError(f"unsupported input generation backend: {requested!r}")
+    if use_gpu_mode is None:
+        use_gpu_mode = _env_flag("USE_GPU_MODE")
+    else:
+        use_gpu_mode = bool(use_gpu_mode)
+    if use_cached_numpy is None:
+        use_cached_numpy = _cache_numpy_auxiliary_enabled()
+    else:
+        use_cached_numpy = bool(use_cached_numpy)
+    mode = mode or os.environ.get("PADDLEAPITEST_TEST_MODE") or None
+    # 模式默认值只在没有显式请求时生效，保证命令行报告能解释覆盖关系。
+    resolved = normalized_requested or _MODE_DEFAULT_BACKENDS.get(mode)
+    if resolved is None:
+        resolved = "torch" if use_gpu_mode else "numpy"
+    # 性能模式本身要求 GPU-native 输入；显式 NumPy 仍是可见的 CPU 降级。
+    effective_gpu_mode = use_gpu_mode or (
+        mode in _GPU_NATIVE_MODES and normalized_requested != "numpy"
+    )
+    # logical_device 描述生成值的位置，不等同于 Paddle/Torch 算子的执行设备。
+    logical_device = {
+        "numpy": "cpu",
+        "torch": "cuda:0" if effective_gpu_mode else "cpu",
+        "paddle": "gpu:0" if effective_gpu_mode else "cpu",
+    }[resolved]
+    return InputBackendPolicy(
+        requested=normalized_requested,
+        resolved=resolved,
+        logical_device=logical_device,
+        use_gpu_mode=effective_gpu_mode,
+        cache_numpy_auxiliary=use_cached_numpy,
+        mode=mode,
+    )
 
 
 def _normalize_shape(shape, *, scalar_empty):
@@ -821,49 +917,21 @@ def _choice_shape(shape, *, scalar_empty):
     return scalar, normalized, 1 if scalar else int(numpy.prod(normalized))
 
 
-def resolve_input_backend_name() -> str:
-    """返回环境配置最终选择的输入 backend 名称。"""
-    # 解析逻辑独立于 backend 实例创建，供输入生成和分配前显存预检共享。
-    # cached NumPy 的契约优先级最高，不能让显式原生 backend 绕过缓存语义。
-    requested = os.environ.get(INPUT_BACKEND_ENV_VAR)
-    normalized_requested = (requested or "numpy").strip().lower()
-    if _env_flag("USE_CACHED_NUMPY"):
-        normalized = "numpy"
-    elif _env_flag("USE_GPU_MODE") and requested is None:
-        # GPU mode 的默认 Torch backend 是零拷贝物化模型成立的协议前提。
-        normalized = "torch"
-    else:
-        normalized = normalized_requested
-    if normalized not in {"numpy", "torch", "paddle"}:
-        raise ValueError(f"unsupported input generation backend: {requested!r}")
-    return normalized
+def resolve_input_backend_name(**kwargs) -> str:
+    """兼容旧调用方，只返回已解析的 backend 名称。"""
+    return resolve_input_backend_policy(**kwargs).resolved
 
 
-def create_input_backend(input_random_state=INPUT_NUMPY_RANDOM_STATE) -> InputBackend:
-    global _WARNED_CACHED_INPUT_BACKEND
+def create_input_backend(
+    input_random_state=INPUT_NUMPY_RANDOM_STATE,
+    *,
+    policy: InputBackendPolicy | None = None,
+) -> InputBackend:
+    policy = policy or resolve_input_backend_policy()
+    normalized = policy.resolved
+    device = policy.logical_device
 
-    requested = os.environ.get(INPUT_BACKEND_ENV_VAR)
-    normalized_requested = (requested or "numpy").strip().lower()
-    use_cached_numpy = _env_flag("USE_CACHED_NUMPY")
-    use_gpu_mode = _env_flag("USE_GPU_MODE")
-
-    if use_cached_numpy:
-        if normalized_requested in {"torch", "paddle"} and not _WARNED_CACHED_INPUT_BACKEND:
-            message = (
-                "USE_CACHED_NUMPY=True requires the numpy input backend; "
-                f"ignoring {INPUT_BACKEND_ENV_VAR}={normalized_requested}."
-            )
-            warnings.warn(message, RuntimeWarning, stacklevel=2)
-            print(f"[WARNING] {message}", file=sys.stderr, flush=True)
-            _WARNED_CACHED_INPUT_BACKEND = True
-    normalized = resolve_input_backend_name()
-
-    device = {
-        "numpy": "cpu",
-        "torch": "cuda:0" if use_gpu_mode else "cpu",
-        "paddle": "gpu:0" if use_gpu_mode else "cpu",
-    }[normalized]
-
+    # 只有无 config-local RNG 的兼容调用可以复用实例，避免随机流在配置之间共享。
     cache_key = (normalized, device)
     if input_random_state is INPUT_NUMPY_RANDOM_STATE and cache_key in _DEFAULT_INPUT_BACKENDS:
         return _DEFAULT_INPUT_BACKENDS[cache_key]

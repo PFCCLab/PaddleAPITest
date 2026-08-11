@@ -26,10 +26,7 @@ class APITestPaddleDeviceVSGPU(APITestCustomDeviceVSCPU):
         self.bcecmd_path = Path(kwargs.get("bcecmd_path", "./bcecmd")).resolve()
         self.bos_conf_path = kwargs.get("bos_conf_path", "./conf")
 
-        # 设置随机种子确保一致性
-        if self.random_seed != 0:
-            np.random.seed(self.random_seed)
-            paddle.seed(self.random_seed)
+        # 随机状态由 APITestBase 的 config-local policy 管理，避免构造阶段污染全局 RNG。
 
     def _get_config_hash(self):
         """生成API配置的哈希值，用于文件名"""

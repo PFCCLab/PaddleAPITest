@@ -477,6 +477,7 @@ def decide_gpu_memory_preflight(
     check_grad,
     paddle_kernel_on_gpu=True,
     torch_operator_on_gpu=True,
+    input_backend=None,
 ):
     # 预检只做 admission decision，不分配测试 Tensor，失败结果由调用方转换为 skip。
     """仅当配置峰值下界明显超过设备容量时返回 skip。"""
@@ -494,7 +495,7 @@ def decide_gpu_memory_preflight(
             api_config,
             mode,
             check_grad=check_grad,
-            input_backend=resolve_input_backend_name(),
+            input_backend=input_backend or resolve_input_backend_name(),
             paddle_kernel_on_gpu=paddle_kernel_on_gpu,
             torch_operator_on_gpu=torch_operator_on_gpu,
         )

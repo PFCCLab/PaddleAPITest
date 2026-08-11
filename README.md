@@ -151,8 +151,8 @@ python run.py -c test_pipeline/run_config.yaml
 ## GPU Mode 与动态显存管理
 
 `--use_gpu_mode=True` 在 GPU 上生成 Tensor 逻辑值并进行结果比较，同时复用 CUDA allocator，
-适用于大规模 `accuracy_stable` 测试。它不改变算子设备；此模式会忽略
-`--use_cached_numpy=True`。
+适用于大规模 `accuracy_stable` 测试。它不改变算子设备。`--cache_numpy_auxiliary=True` 仍可
+缓存 output grad 等辅助 NumPy 数据，但不再改变 input backend。
 
 两个开关正交，四种组合的语义如下：
 

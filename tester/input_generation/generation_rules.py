@@ -106,8 +106,8 @@ _INPUT_VALUE_GENERATORS: dict[str, InputValueGenerator] = {
 
 # 规则执行分为“生成”和“提交”两个阶段。
 # 规则函数只向暂存 writer 写值，不能直接修改原始 APIConfig。
-# 完整性校验通过后才挂载 InputValue 并推进全局 NumPy RNG。
-# 这条边界保证规则抛错时不会留下半生成输入或消耗后续随机序列。
+# 完整性校验通过后才挂载 InputValue；配置级 RNG 始终独立于全局状态。
+# 这条边界保证规则抛错时不会留下半生成输入或消耗后续配置随机流。
 # backend 的 seed 与配置指纹则由 InputGenerationContext 传入，供原生 generator 使用。
 # InputRuleContext 是规则作者唯一需要接触的接口，底层对象保持私有。
 # InputRule 负责一次规则执行的生命周期，InputRuleContext 负责作者侧查询与生成。
@@ -128,7 +128,10 @@ class InputRule:
     ) -> bool:
         # 每个配置持有独立 RNG 副本；只有整条规则成功后才提交状态。
         input_random_state = create_input_config_random_state(input_generation_context)
-        input_backend = create_input_backend(input_random_state)
+        input_backend = create_input_backend(
+            input_random_state,
+            policy=input_generation_context.backend_policy,
+        )
         input_rule_context = InputRuleContext(
             input_generation_context.input_binding, api_config, input_backend
         )
@@ -996,7 +999,8 @@ def generate_moe_permute_inputs(rule: InputRuleContext):
         routemap_binding = rule.tensor("expert_routemap_topk")
         probs = rule.ops.zeros(input_binding.shape, dtype="float32")
         if routemap_binding is not None and rule.value(routemap_binding) is not None:
-            mask = rule.value(routemap_binding) >= 0
+            # Paddle 不对 float 与 bool 做隐式类型提升，路由掩码在规则层明确转为概率 dtype。
+            mask = rule.ops.cast(rule.value(routemap_binding) >= 0, "float32")
             raw = rule.ops.cast(rule.ops.random(input_binding.shape), "float32") * mask
             row_sums = rule.ops.sum(raw, axis=1, keepdims=True)
             row_sums[row_sums == 0] = 1.0

@@ -13,7 +13,7 @@ from .paddle_to_torch.arguments import bind_paddle_arguments
 
 class APITestTorchGPUPerformance(APITestBase):
     def __init__(self, api_config, **kwargs):
-        super().__init__(api_config)
+        super().__init__(api_config, runtime_config=kwargs.get("runtime_config"))
         self.test_amp = kwargs.get("test_amp", False)
         self.converter = get_converter()
 

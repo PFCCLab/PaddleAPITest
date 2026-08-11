@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import hashlib
+
 import numpy
 
 from .tensor_spec import InputTensorSpec
@@ -13,7 +15,19 @@ _INPUT_INTERMEDIATE_DTYPES = {
     "bfloat16": "float32",
     "float8_e4m3fn": "float16",
     "float8_e5m2": "float16",
+    "uint16": "int32",
+    "uint32": "int64",
+    "uint64": "int64",
 }
+
+
+def derive_input_seed(seed, config_fingerprint, stream_kind):
+    """Derive one stable 32-bit seed from the complete input stream identity."""
+    # seed=0 是有效配置；不能用 ``seed or default`` 破坏零 seed 的可复现性。
+    identity = f"{int(seed)}\x1f{str(config_fingerprint)}\x1f{str(stream_kind)}"
+    return int.from_bytes(hashlib.sha256(identity.encode("utf-8")).digest()[:8], "big") % (
+        2**32
+    )
 
 
 class InputNumPyRandomState:
@@ -56,19 +70,20 @@ INPUT_NUMPY_RANDOM_STATE = InputNumPyRandomState()
 
 
 class InputConfigRandomState(InputNumPyRandomState):
-    """基于独立 RandomState 副本的单 config RNG。"""
+    """基于 stream identity 的独立 NumPy RNG，不拥有全局状态。"""
 
-    def __init__(self, seed, config_fingerprint):
-        # 配置级状态复制全局序列，但在规则成功前不会反向提交任何随机消耗。
-        # seed/指纹由 Torch、Paddle backend 消费，不能视作 NumPy 冗余字段删除。
+    def __init__(self, seed, config_fingerprint, stream_kind="numpy"):
+        # 每个 backend 使用独立 stream；失败或成功都不能影响进程级 NumPy 状态。
         self.seed = seed
         self.config_fingerprint = config_fingerprint
-        self._state = numpy.random.RandomState()
-        self._state.set_state(numpy.random.get_state())
+        self.stream_kind = stream_kind
+        self._state = numpy.random.RandomState(
+            derive_input_seed(seed, config_fingerprint, stream_kind)
+        )
 
     def commit(self):
-        # 仅成功规则调用 commit，从而保持失败前后的全局随机状态一致。
-        numpy.random.set_state(self._state.get_state())
+        # 保留兼容 API；配置随机流从未借用全局状态，因此提交是有意空操作。
+        return None
 
     def random(self, shape=None):
         return self._state.random(shape)
