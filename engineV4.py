@@ -200,6 +200,7 @@ GPU_MEMORY_DEFER_INITIAL_BACKOFF_SECONDS = 1.0
 GPU_MEMORY_DEFER_MAX_BACKOFF_SECONDS = 30.0
 SANITIZER_COMPUTE_BUDGET_ENV = "PADDLEAPITEST_WAVE_COMPUTE_BUDGET_GIB"
 SANITIZER_COMPARISON_BUDGET_ENV = "PADDLEAPITEST_WAVE_COMPARISON_BUDGET_GIB"
+WORKER_PREPARE_RUNTIME = "prepare_runtime"
 
 
 @dataclass
@@ -344,7 +345,7 @@ class WorkerSlot:
     task_start_time: float | None = None
     child_pid: int | None = None
     started_at: float | None = None
-    state: str = "dead"  # dead、starting、idle、busy、suspended
+    state: str = "dead"  # dead、starting、loaded、preparing、idle、busy、suspended
 
 
 def _import_optional_runtime_module(module_name):
@@ -354,7 +355,7 @@ def _import_optional_runtime_module(module_name):
         pass
 
 
-def _init_runtime_modules(options):
+def _init_runtime_modules(options, *, prepare_runtime=True):
     with log_worker.suppress_startup_output():
         import paddle
 
@@ -368,10 +369,12 @@ def _init_runtime_modules(options):
         _import_optional_runtime_module("FusedQuantOps")
         import tester
 
-        # ready 必须覆盖输入 backend 的首次真实物化，避免首个 case 承担进程初始化。
-        tester.prepare_process_runtime(options)
+        if prepare_runtime:
+            # 单 case 入口没有主进程握手，仍在模块加载后立即完成通用 preparation。
+            tester.prepare_process_runtime(options)
         test_class = _select_test_class(options)
         globals().update({"APIConfig": tester.APIConfig, test_class.__name__: test_class})
+        return tester
 
 
 def _visible_gpu_ids(gpu_id, comparison_gpu_id=None):
@@ -388,7 +391,8 @@ def _init_worker_runtime(
     comparison_gpu_id,
     options,
     *,
-    redirect_output,
+    prepare_runtime=True,
+    redirect_output=False,
 ):
     init_log(options.log_dir)
 
@@ -400,10 +404,21 @@ def _init_worker_runtime(
         # backend 导入和准备阶段即可读取稳定 slot，复活 worker 也遵循同一初始化协议。
         os.environ["PADDLEAPITEST_WORKER_SLOT"] = str(slot_index)
 
-    _init_runtime_modules(options)
+    tester = _init_runtime_modules(options, prepare_runtime=prepare_runtime)
 
     if redirect_output:
         log_worker.redirect_stdio()
+    return tester
+
+
+def _await_runtime_preparation(input_queue):
+    """等待主进程放行 preparation；None 表示 slot 已被正常回收。"""
+    command = input_queue.get()
+    if command is None:
+        return False
+    if command != WORKER_PREPARE_RUNTIME:
+        raise RuntimeError(f"unexpected worker initialization command: {command!r}")
+    return True
 
 
 def _apply_worker_task_runtime_budget(options, task, gpu_id, comparison_gpu_id=None):
@@ -442,20 +457,31 @@ def _worker_loop(
     The main process never dispatches to a dead/starting worker. After a crash or timeout, the
     case returns to `pending_dispatch`; a later admitted wave may create a replacement worker.
     """
-    # ── GPU 初始化（等价于 init_worker_gpu） ──
+    # 模块加载与设备 preparation 分成两个阶段，主进程据 slot 拓扑控制第二阶段并发。
     try:
-        _init_worker_runtime(
+        tester_module = _init_worker_runtime(
             slot_index,
             gpu_id,
             comparison_gpu_id,
             options,
-            redirect_output=True,
+            prepare_runtime=False,
         )
     except Exception as e:
-        result_queue.put(("init_failed", slot_index, os.getpid(), str(e)))
+        result_queue.put(("init_failed", slot_index, os.getpid(), "module_load", str(e)))
         return
 
-    # ── 通知主进程：ready ──
+    result_queue.put(("loaded", slot_index, os.getpid()))
+    try:
+        if not _await_runtime_preparation(input_queue):
+            return
+        with log_worker.suppress_startup_output():
+            tester_module.prepare_process_runtime(options)
+        log_worker.redirect_stdio()
+    except Exception as e:
+        result_queue.put(("init_failed", slot_index, os.getpid(), "preparation", str(e)))
+        return
+
+    # ready 只表示模块、设备 context 和输入 backend 物化通道均已可用。
     result_queue.put(("ready", slot_index, os.getpid()))
 
     # ── 任务循环 ──
@@ -628,6 +654,10 @@ def _sanitizer_worker_loop(
     signal.signal(signal.SIGTERM, terminate_child)
 
     try:
+        result_queue.put(("loaded", slot_index, os.getpid()))
+        if not _await_runtime_preparation(input_queue):
+            return
+        # wrapper 不加载框架；握手只保持与普通 worker 相同的 slot 生命周期。
         result_queue.put(("ready", slot_index, os.getpid()))
 
         while True:
@@ -861,16 +891,23 @@ class WorkerPool:
         """等待纯 CPU worker 全部就绪，启动失败时保持批次级失败语义。"""
         if timeout is None:
             timeout = self._startup_timeout()
-        # CPU 批次没有后续显存状态机兜底，因此首轮派发前必须完成完整启动屏障。
-        # 任一 slot 进入 suspended 都表示初始化已经失败，继续等待不会增加 ready 数量。
+        # CPU 首次启动也保留模块加载屏障，避免部分进程提前 preparation 争抢主机资源。
         deadline = time.monotonic() + timeout
+        preparation_released = False
         while time.monotonic() < deadline:
             ready_count = sum(slot.state == "idle" for slot in self.slots)
             if ready_count == self.total_workers:
                 return ready_count
+            if all(slot.state in {"loaded", "preparing", "idle"} for slot in self.slots):
+                if not preparation_released:
+                    # 模块加载与 preparation 各自拥有完整 startup timeout。
+                    deadline = time.monotonic() + timeout
+                    preparation_released = True
+                self.start_loaded_preparations(range(self.total_workers))
             msg = self.collect_one(timeout=min(0.5, max(0.1, deadline - time.monotonic())))
             if msg is not None:
                 self._handle_worker_control_message(msg)
+            # 任一 slot 进入 suspended 都表示初始化已经失败，继续等待不会增加 ready 数量。
             if any(slot.state == "suspended" for slot in self.slots):
                 break
         return sum(slot.state == "idle" for slot in self.slots)
@@ -954,6 +991,34 @@ class WorkerPool:
             slot.started_at = time.monotonic()
             return True
 
+    def start_loaded_preparations(self, slot_indices):
+        """按物理设备放行已完成模块加载的 worker preparation。"""
+        started_count = 0
+        with self._lock:
+            # 同卡 preparation 串行，双卡 slot 必须同时占住其计算与对比设备。
+            preparing_gpu_ids = {
+                gpu_id
+                for slot in self.slots
+                if slot.state == "preparing"
+                for gpu_id in (slot.gpu_id, slot.comparison_gpu_id)
+                if gpu_id is not None
+            }
+            for slot_index in slot_indices:
+                slot = self.slots[slot_index]
+                if slot.state != "loaded" or slot.input_queue is None:
+                    continue
+                slot_gpu_ids = {
+                    gpu_id for gpu_id in (slot.gpu_id, slot.comparison_gpu_id) if gpu_id is not None
+                }
+                if slot_gpu_ids & preparing_gpu_ids:
+                    continue
+                slot.state = "preparing"
+                slot.started_at = time.monotonic()
+                slot.input_queue.put(WORKER_PREPARE_RUNTIME)
+                preparing_gpu_ids.update(slot_gpu_ids)
+                started_count += 1
+        return started_count
+
     def retire_slots(self, slot_indices):
         """停止空闲或启动中的进程；显存是否回收由 GPU 波次控制器另行确认。"""
         for slot_index in slot_indices:
@@ -978,25 +1043,32 @@ class WorkerPool:
     def _startup_timeout(self):
         return getattr(self.options, "worker_startup_timeout", WORKER_STARTUP_TIMEOUT)
 
-    def _check_starting_worker(self, slot, *, now=None):
-        """终止并挂起一个在启动阶段失败或卡住的 worker。"""
-        if slot.state != "starting" or slot.process is None or slot.started_at is None:
+    def _check_initializing_worker(self, slot, *, now=None):
+        """终止并挂起一个在模块加载或 preparation 阶段失败的 worker。"""
+        if slot.state not in {"starting", "loaded", "preparing"} or slot.process is None:
             return False
         now = time.monotonic() if now is None else now
-        if now - slot.started_at < self._startup_timeout():
-            return False
-        if slot.process.is_alive():
+        phase = "module_load" if slot.state == "starting" else "preparation"
+        if not slot.process.is_alive():
             print(
-                f"[worker] INIT_TIMEOUT | slot {slot.index} | timeout {self._startup_timeout()} s",
-                flush=True,
-            )
-            self._kill_process(slot.process)
-        else:
-            print(
-                f"[worker] INIT_CRASH | slot {slot.index} | exit {slot.process.exitcode}",
+                f"[worker] INIT_CRASH | slot {slot.index} | phase {phase} | "
+                f"exit {slot.process.exitcode}",
                 flush=True,
             )
             self._join_process(slot.process, timeout=1)
+            self._suspend_slot(slot)
+            return True
+        # loaded 表示 worker 正等待主进程按设备调度，不应消耗 preparation 超时。
+        if slot.state == "loaded" or slot.started_at is None:
+            return False
+        if now - slot.started_at < self._startup_timeout():
+            return False
+        print(
+            f"[worker] INIT_TIMEOUT | slot {slot.index} | phase {phase} | "
+            f"timeout {self._startup_timeout()} s",
+            flush=True,
+        )
+        self._kill_process(slot.process)
         self._suspend_slot(slot)
         # 不在 watchdog 内重建；下一轮要先取消波次并观察显存稳定。
         return True
@@ -1004,7 +1076,7 @@ class WorkerPool:
     def _handle_worker_control_message(self, msg):
         """处理来自 worker 的生命周期、任务确认和 child 账务消息。"""
         msg_type = msg[0]
-        if msg_type not in {"ready", "init_failed", "ack", "child"}:
+        if msg_type not in {"loaded", "ready", "init_failed", "ack", "child"}:
             return False
         slot_idx = msg[1]
         worker_pid = msg[2]
@@ -1013,9 +1085,15 @@ class WorkerPool:
             # 共享结果队列可能晚到已回收 worker 的消息，PID 是 slot 生命周期令牌。
             if slot.process is None or slot.process.pid != worker_pid:
                 return True
+            if msg_type == "loaded":
+                if slot.state == "starting":
+                    slot.state = "loaded"
+                    slot.started_at = None
+                return True
             if msg_type == "ready":
-                slot.state = "idle"
-                slot.started_at = None
+                if slot.state == "preparing":
+                    slot.state = "idle"
+                    slot.started_at = None
                 return True
             if msg_type == "ack":
                 config = msg[3]
@@ -1026,15 +1104,22 @@ class WorkerPool:
                 slot.child_pid = msg[3]
                 return True
 
+            if msg_type == "init_failed":
+                phase = msg[3]
+                error_msg = msg[4]
+                expected_state = "starting" if phase == "module_load" else "preparing"
+                if slot.state != expected_state:
+                    return True
+                process = slot.process
+                self._suspend_slot(slot)
+
         if msg_type == "init_failed":
-            error_msg = msg[3]
             print(
-                f"[worker] INIT_FAILED | slot {slot_idx} | {error_msg}",
+                f"[worker] INIT_FAILED | slot {slot_idx} | phase {phase} | {error_msg}",
                 flush=True,
             )
-            self._join_process(slot.process, timeout=1)
+            self._join_process(process, timeout=1)
             # init_failed 常见于 bootstrap OOM，slot 必须退出 planned 启动屏障。
-            self._suspend_slot(slot)
             return True
         return True
 
@@ -1098,8 +1183,8 @@ class WorkerPool:
             if self._shutdown_event.is_set():
                 return
             # 在 slot 快照仍然一致时直接执行恢复动作。
-            if slot.state == "starting":
-                self._check_starting_worker(slot, now=time.monotonic())
+            if slot.state in {"starting", "loaded", "preparing"}:
+                self._check_initializing_worker(slot, now=time.monotonic())
                 return
             if (
                 slot.state == "busy"
@@ -2044,7 +2129,9 @@ def _cancel_unstartable_planned_waves(pool, runtimes, pending_dispatch):
         if runtime.controller.state != "planned":
             continue
         slots = [pool.slots[index] for index in runtime.planned_slot_indices]
-        if slots and all(slot.state in {"starting", "idle"} for slot in slots):
+        if slots and all(
+            slot.state in {"starting", "loaded", "preparing", "idle"} for slot in slots
+        ):
             continue
         # 任一 slot 启动失败都会破坏整波屏障，不能只缩小已承诺的波次。
         runtime.controller.cancel_planned_wave()
@@ -2052,6 +2139,20 @@ def _cancel_unstartable_planned_waves(pool, runtimes, pending_dispatch):
         _requeue_planned_wave(runtime, pending_dispatch)
         cancelled_count += 1
     return cancelled_count
+
+
+def _start_planned_wave_preparations(pool, runtimes):
+    """模块加载屏障完成后，按物理设备推进 planned wave preparation。"""
+    started_count = 0
+    for runtime in runtimes.values():
+        if runtime.controller.state != "planned":
+            continue
+        slots = [pool.slots[index] for index in runtime.planned_slot_indices]
+        if not slots or any(slot.state not in {"loaded", "preparing", "idle"} for slot in slots):
+            continue
+        # pool 统一维护跨 runtime 的设备占用，engine 不感知具体输入 backend。
+        started_count += pool.start_loaded_preparations(runtime.planned_slot_indices)
+    return started_count
 
 
 def _try_dispatch_planned_waves(
@@ -2175,7 +2276,8 @@ def _format_gpu_pressure_summary(runtimes, pool, *, snapshot_reader):
     for runtime in runtimes.values():
         snapshots = snapshot_reader(runtime.controller.device_ids)
         active_workers = sum(
-            pool.slots[index].state in {"starting", "busy"} for index in runtime.slot_indices
+            pool.slots[index].state in {"starting", "loaded", "preparing", "busy"}
+            for index in runtime.slot_indices
         )
         for gpu_id in runtime.controller.device_ids:
             snapshot = snapshots[gpu_id]
@@ -2435,11 +2537,11 @@ def _run_cpu_batch_loop(
             batch_state.last_forecast_at = batch_state.test_started_at
 
     refill_idle_workers()
-    # starting slot 纳入循环存活条件，避免重建进程的 ready 消息无人接收。
+    # 初始化中 slot 纳入循环存活条件，避免重建进程的生命周期消息无人接收。
     while (
         batch_state.active_tasks > 0
         or pending_dispatch
-        or any(slot.state == "starting" for slot in pool.slots)
+        or any(slot.state in {"starting", "loaded", "preparing"} for slot in pool.slots)
     ) and not batch_state.abort_run:
         pending_delay = _next_pending_delay(pending_dispatch)
         collect_timeout = 0.5
@@ -2466,6 +2568,8 @@ def _run_cpu_batch_loop(
             for slot in pool.slots:
                 if slot.state == "suspended":
                     pool._spawn_worker(slot)
+        # CPU replacement 不再参与首次全量屏障，模块加载完成后即可独立 preparation。
+        pool.start_loaded_preparations(range(pool.total_workers))
         refill_idle_workers()
 
 
@@ -2549,6 +2653,7 @@ def _run_batch_mode(
                 snapshot_reader=_read_gpu_memory_snapshots,
                 now=now,
             )
+            _start_planned_wave_preparations(pool, gpu_runtimes)
             dispatched = _try_dispatch_planned_waves(
                 pool,
                 gpu_runtimes,

@@ -18,13 +18,13 @@ from .value_generators import (
     resolve_input_dtype,
 )
 
+_PREPARED_INPUT_BACKENDS = {}
+
 
 class InputBackend(Protocol):
     """Value construction interface used by input-generation rules."""
 
     name: str
-
-    def commit(self) -> None: ...
 
     def resolve_input_dtype(self, dtype: str) -> str: ...
 
@@ -112,11 +112,6 @@ class NumPyInputBackend:
     input_random_state: object = INPUT_NUMPY_RANDOM_STATE
 
     name = "numpy"
-
-    def commit(self) -> None:
-        commit = getattr(self.input_random_state, "commit", None)
-        if commit is not None:
-            commit()
 
     def resolve_input_dtype(self, dtype: str) -> str:
         return resolve_input_dtype(dtype)
@@ -270,6 +265,14 @@ class TorchInputBackend(NumPyInputBackend):
     _generator: object = field(init=False, repr=False)
 
     def __post_init__(self):
+        prepared = _PREPARED_INPUT_BACKENDS.get((self.name, self.device))
+        if prepared is None:
+            self._torch_module = self._torch()
+            self._device = self._torch_module.device(self.device)
+        else:
+            # preparation 只提供进程级不可变句柄；config generator 仍在下方独立创建。
+            self._torch_module = prepared._torch_module
+            self._device = prepared._device
         # Torch 私有 Generator 只消费本 backend 的 stream，不触碰默认 generator。
         stream_kind = getattr(self.input_random_state, "stream_kind", "")
         if not stream_kind.startswith("output_grad:"):
@@ -279,12 +282,13 @@ class TorchInputBackend(NumPyInputBackend):
             getattr(self.input_random_state, "config_fingerprint", ""),
             stream_kind,
         )
-        torch = self._torch()
-        self._device = torch.device(self.device)
-        self._generator = torch.Generator(device=self._device)
+        self._generator = self._torch_module.Generator(device=self._device)
         self._generator.manual_seed(seed)
 
     def _torch(self):
+        module = getattr(self, "_torch_module", None)
+        if module is not None:
+            return module
         import torch
 
         return torch
@@ -554,6 +558,22 @@ class PaddleInputBackend(NumPyInputBackend):
     name = "paddle"
 
     def __post_init__(self):
+        prepared = _PREPARED_INPUT_BACKENDS.get((self.name, self.device))
+        if prepared is None:
+            self._paddle_module = self._paddle()
+            self._place = self._paddle_module.CPUPlace()
+            self._generator = self._paddle_module.framework.core.default_cpu_generator()
+            if self.device.startswith(("gpu", "cuda")):
+                device_id = int(self.device.split(":", 1)[1]) if ":" in self.device else 0
+                self._place = self._paddle_module.CUDAPlace(device_id)
+                self._generator = self._paddle_module.framework.core.default_cuda_generator(
+                    device_id
+                )
+        else:
+            # place 与默认 generator 属于进程/设备资源，config 只拥有私有状态快照。
+            self._paddle_module = prepared._paddle_module
+            self._place = prepared._place
+            self._generator = prepared._generator
         # forward 与 output-grad 用不同 stream identity，不能共享首个随机样本。
         stream_kind = getattr(self.input_random_state, "stream_kind", "")
         if not stream_kind.startswith("output_grad:"):
@@ -563,15 +583,6 @@ class PaddleInputBackend(NumPyInputBackend):
             getattr(self.input_random_state, "config_fingerprint", ""),
             stream_kind,
         )
-        paddle = self._paddle()
-        # 私有状态必须来自目标 place 的默认 generator，否则恢复时设备状态类型不匹配。
-        self._place = paddle.CPUPlace()
-        self._generator = paddle.framework.core.default_cpu_generator()
-        if self.device.startswith(("gpu", "cuda")):
-            device_id = int(self.device.split(":", 1)[1]) if ":" in self.device else 0
-            self._place = paddle.CUDAPlace(device_id)
-            self._generator = paddle.framework.core.default_cuda_generator(device_id)
-
         # Paddle 只有设备级默认 generator；初始化私有状态后立即恢复进程原状态。
         process_state = self._generator.get_state()
         try:
@@ -581,6 +592,9 @@ class PaddleInputBackend(NumPyInputBackend):
             self._generator.set_state(process_state)
 
     def _paddle(self):
+        module = getattr(self, "_paddle_module", None)
+        if module is not None:
+            return module
         import paddle
 
         return paddle
@@ -871,7 +885,6 @@ class PaddleInputBackend(NumPyInputBackend):
 
 
 INPUT_BACKEND_ENV_VAR = "PADDLEAPITEST_INPUT_BACKEND"
-_PREPARED_INPUT_BACKENDS = {}
 _CACHED_NUMPY_OUTPUT_GRADS = {}
 _TRUE_VALUES = {"true", "1", "yes", "y"}
 _VALID_INPUT_BACKENDS = frozenset({"numpy", "torch", "paddle"})
@@ -1020,7 +1033,7 @@ def prepare_input_backend(policy: InputBackendPolicy):
     elif backend.name == "paddle" and policy.logical_device.startswith(("gpu", "cuda")):
         backend._paddle().device.cuda.synchronize()
     del probe
-    # 仅缓存完成初始化的无随机状态 backend；每个 config 仍创建独立生成实例。
+    # 缓存实例只提供进程级模块和设备句柄；每个 config 仍创建独立生成实例与 RNG 状态。
     _PREPARED_INPUT_BACKENDS[cache_key] = backend
     return backend
 

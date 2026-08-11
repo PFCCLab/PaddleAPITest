@@ -25,9 +25,7 @@ def derive_input_seed(seed, config_fingerprint, stream_kind):
     """Derive one stable 32-bit seed from the complete input stream identity."""
     # seed=0 是有效配置；不能用 ``seed or default`` 破坏零 seed 的可复现性。
     identity = f"{int(seed)}\x1f{str(config_fingerprint)}\x1f{str(stream_kind)}"
-    return int.from_bytes(hashlib.sha256(identity.encode("utf-8")).digest()[:8], "big") % (
-        2**32
-    )
+    return int.from_bytes(hashlib.sha256(identity.encode("utf-8")).digest()[:8], "big") % (2**32)
 
 
 class InputNumPyRandomState:
@@ -80,10 +78,6 @@ class InputConfigRandomState(InputNumPyRandomState):
         self._state = numpy.random.RandomState(
             derive_input_seed(seed, config_fingerprint, stream_kind)
         )
-
-    def commit(self):
-        # 保留兼容 API；配置随机流从未借用全局状态，因此提交是有意空操作。
-        return None
 
     def random(self, shape=None):
         return self._state.random(shape)

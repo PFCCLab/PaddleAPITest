@@ -144,7 +144,6 @@ class InputRule:
         self.function(input_rule_context)
         # finish 先检查遗漏，再一次性同步 TensorConfig 元数据和逻辑值。
         attach_input_values(api_config, input_rule_context._finish())
-        input_backend.commit()
         return True
 
 
