@@ -54,6 +54,27 @@
   python tools/remove_lines_by_keyword.py -p 'tester/api_config/monitor_config/accuracy/GPU/monitoring_configs_*.txt' -k kw.txt
   ```
 
+- `random_slim_api_configs.py`：对指定 API 的配置行按稳定随机种子保留指定比例，输出保留集与被裁减集；两份集合按行无交集且并集等于输入。默认处理 `fuse_weighted_swiglu_fp8_quant`、`paddlefleet_fused_swiglu_probs_bwd`、`fp8_quant_blockwise`、`fused_act_dequant`、`moe_permute`、`moe_unpermute`，保留比例为 10%。
+  ```bash
+  python tools/random_slim_api_configs.py \
+    --input-dir configs/original \
+    --kept-dir configs/slimmed \
+    --removed-dir configs/removed \
+    --archive-dir configs/archives \
+    --report-file configs/slim_report.json
+  ```
+  `--api` 可重复指定以覆盖默认 API 列表，`--keep-ratio` 与 `--seed` 可调整保留比例和可复现的随机选择。
+
+- `stratified_slim_preprocessed_configs.py`：针对目录内的每份 `*_preprocessed.txt` 独立按 API 分层裁减，不跨配置集合并抽样。默认保留 API 数量不超过 10 的全部配置；数量更大的 API 保留 `ceil(10% * n)` 条；所有以 `.empty` 或 `.empty_like` 结尾的 API 配置都会被移除。保留集与被裁减补集分别同步生成对应的 `*_api_extracted.txt`。
+  ```bash
+  python tools/stratified_slim_preprocessed_configs.py \
+    --input-dir workspace/0809 \
+    --kept-dir workspace/0809_slimmed \
+    --removed-dir workspace/0809_slimmed_removed \
+    --report-file workspace/0809_slim_report.json
+  ```
+  `--small-api-threshold`、`--keep-ratio` 与 `--seed` 可调整低频保留阈值、比例和确定性抽样种子。
+
 - `normalize_origin_api_config.py`：历史配置归一化/整理脚本，当前包含较多历史硬编码逻辑；使用前应先确认输入输出路径。
 
 - `shrink_large_configs.py`：针对 paddle_crash、OOM、timeout、config_input 中的大 Tensor 配置缩小 shape，生成缩小后的回归配置。
