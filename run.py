@@ -62,6 +62,7 @@ ENGINE_ARG_TYPES = {
     "gpu_ids": str,
     "test_cpu": bool,
     "use_cached_numpy": bool,
+    "cache_numpy_auxiliary": bool,
     "use_gpu_mode": bool,
     "atol": (int, float),
     "rtol": (int, float),

@@ -9,7 +9,10 @@ from .log_writer.log_worker import get_terminal_log_type
 
 class APITestCustomDeviceVSCPU(APITestBase):
     def __init__(self, api_config, **kwargs):
-        super().__init__(api_config)
+        super().__init__(
+            api_config,
+            runtime_config=kwargs.get("runtime_config"),
+        )
         self.test_amp = kwargs.get("test_amp", False)
         self.custom_device_type = self._get_first_custom_device_type()
         self.generate_failed_tests = kwargs.get("generate_failed_tests", False)

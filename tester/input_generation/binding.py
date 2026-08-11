@@ -204,6 +204,7 @@ class InputGenerationContext:
     input_binding: InputApiBinding
     config_fingerprint: str
     seed: int
+    backend_policy: object | None = None
 
 
 @dataclass(frozen=True)
@@ -522,10 +523,11 @@ def bind_api_inputs(api_config):
     )
 
 
-def build_input_generation_context(api_config, seed):
+def build_input_generation_context(api_config, seed, backend_policy=None):
     # 配置文本指纹使不同调用在原生 backend 中获得稳定且隔离的随机流。
     return InputGenerationContext(
         input_binding=bind_api_inputs(api_config),
         config_fingerprint=hashlib.sha256(api_config.config.encode()).hexdigest(),
         seed=seed,
+        backend_policy=backend_policy,
     )

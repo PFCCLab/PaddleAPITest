@@ -12,6 +12,7 @@ from tester.dtype_utils import to_torch_dtype
 
 from .backend import create_input_backend
 from .value import clear_input_value, read_input_value, read_input_value_backend
+from .value_generators import derive_input_seed
 
 # 优化器的零填充位置属于物化层专用数据。
 OPTIMIZER_APIS = {
@@ -31,7 +32,6 @@ class _LazyTorch:
 
 torch = _LazyTorch()
 
-USE_CACHED_NUMPY = os.getenv("USE_CACHED_NUMPY", "False").lower() == "true"
 TEST_NON_CONTIGUOUS = os.getenv("TEST_NON_CONTIGUOUS", "0").lower() in ("true", "1")
 USE_GPU_MODE = os.getenv("USE_GPU_MODE", "False").lower() == "true"
 cached_numpy = {}
@@ -151,24 +151,55 @@ def get_cached_numpy_array(
     scale=1.2,
     int_low=-65535,
     int_high=65535,
+    random_seed=0,
+    config_fingerprint="",
 ):
     dtype = _normalize_cache_dtype(dtype)
     shape = _shape_tuple(shape)
-    key = (dtype, shape, generation_kind, float(scale), int(int_low), int(int_high))
+    # cache identity 必须包含 seed 和配置指纹，不能把不同运行的随机值混用。
+    seed_identity = (int(random_seed), str(config_fingerprint))
+    key = (
+        dtype,
+        shape,
+        generation_kind,
+        float(scale),
+        int(int_low),
+        int(int_high),
+        seed_identity,
+    )
     if key in cached_numpy:
         return cached_numpy[key]
 
+    # 缓存首次填充也不能读取进程级 NumPy 状态，失败路径只影响当前局部数组。
+    rng = numpy.random.RandomState(
+        derive_input_seed(random_seed, config_fingerprint, f"cached_numpy:{generation_kind}")
+    )
     if "int" in dtype:
-        tensor = numpy.random.randint(int_low, int_high, size=shape, dtype="int64").astype(dtype)
+        tensor = rng.randint(int_low, int_high, size=shape, dtype="int64").astype(dtype)
     elif dtype.startswith("complex"):
         real_dtype = "float32" if dtype == "complex64" else "float64"
-        real_part = ((numpy.random.random(shape) - 0.5) * scale).astype(real_dtype)
-        imag_part = ((numpy.random.random(shape) - 0.5) * scale).astype(real_dtype)
+        real_part = ((rng.random(shape) - 0.5) * scale).astype(real_dtype)
+        imag_part = ((rng.random(shape) - 0.5) * scale).astype(real_dtype)
         tensor = (real_part + 1j * imag_part).astype(dtype)
     else:
-        tensor = ((numpy.random.random(shape) - 0.5) * scale).astype(dtype)
+        tensor = ((rng.random(shape) - 0.5) * scale).astype(dtype)
     cached_numpy[key] = tensor
     return tensor
+
+
+def numpy_auxiliary_cache_enabled():
+    """动态读取辅助 NumPy cache，避免 engine 设置环境变量后导出过期。"""
+    values = {"true", "1", "yes", "y"}
+    return os.getenv(
+        "PADDLEAPITEST_CACHE_NUMPY_AUXILIARY",
+        os.getenv("USE_CACHED_NUMPY", "False"),
+    ).lower() in values
+
+
+def __getattr__(name):
+    if name == "USE_CACHED_NUMPY":
+        return numpy_auxiliary_cache_enabled()
+    raise AttributeError(name)
 
 
 not_zero_apis = frozenset(
@@ -338,17 +369,23 @@ class TensorConfig:
                     if self._paddle_kernel_uses_gpu(api_config)
                     else paddle.CPUPlace()
                 )
-            if "cpu" in str(target_place).lower():
-                value = value._copy_to(paddle.CPUPlace(), False)
-            elif "gpu" in str(target_place).lower() or isinstance(target_place, paddle.CUDAPlace):
-                device_id = (
-                    target_place.get_device_id()
-                    if isinstance(target_place, paddle.CUDAPlace)
-                    else int(str(target_place).rsplit(":", 1)[-1])
-                    if ":" in str(target_place)
-                    else 0
-                )
-                value = value._copy_to(paddle.CUDAPlace(device_id), False)
+            # place 字符串在 CPU/CUDAPlace 上稳定包含设备编号，可用于避免同设备复制。
+            if str(value.place).lower() != str(target_place).lower():
+                # Paddle 的同 GPU `_copy_to()` 会引入额外同步，长驻 worker 中可能阻塞后续 case。
+                # 只有算子 place 与生成 place 不同时才允许发生真实设备搬运。
+                if "cpu" in str(target_place).lower():
+                    value = value._copy_to(paddle.CPUPlace(), False)
+                elif "gpu" in str(target_place).lower() or isinstance(
+                    target_place, paddle.CUDAPlace
+                ):
+                    device_id = (
+                        target_place.get_device_id()
+                        if isinstance(target_place, paddle.CUDAPlace)
+                        else int(str(target_place).rsplit(":", 1)[-1])
+                        if ":" in str(target_place)
+                        else 0
+                    )
+                    value = value._copy_to(paddle.CUDAPlace(device_id), False)
             if dtype is not None and str(value.dtype).split(".")[-1] != str(dtype):
                 value = paddle.cast(value, dtype=dtype)
             return value

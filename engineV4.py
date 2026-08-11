@@ -64,7 +64,10 @@ from tester.gpu_scheduler import (
     GpuWaveController,
     read_gpu_pressure_timeout,
 )
-from tester.input_generation.backend import resolve_input_backend_name
+from tester.input_generation.backend import (
+    resolve_input_backend_name,
+    resolve_input_backend_policy,
+)
 from tester.log_writer import (
     init_log,
     log_aggregation,
@@ -118,6 +121,7 @@ SANITIZER_FORWARD_ARGS = {
     "test_amp",
     "test_cpu",
     "use_cached_numpy",
+    "cache_numpy_auxiliary",
     "use_gpu_mode",
     "atol",
     "rtol",
@@ -1921,11 +1925,12 @@ def _estimate_case_gpu_memory(api_config_str, options):
         from tester import APIConfig
 
         api_config = APIConfig(api_config_str)
+        input_backend = getattr(options, "input_backend_resolved", None)
         estimate = estimate_gpu_memory(
             api_config,
             mode,
             check_grad=should_check_grad(api_config),
-            input_backend=resolve_input_backend_name(),
+            input_backend=input_backend or resolve_input_backend_name(),
             # 执行设备分别建模，不能用 use_gpu_mode 代替 Paddle/Torch 的真实 place。
             paddle_kernel_on_gpu=not options.test_cpu,
             torch_operator_on_gpu=_mode_runs_torch_gpu_reference(options),
@@ -2781,16 +2786,58 @@ def _load_custom_device_options(options):
 
 
 def _apply_runtime_environment_flags(options):
+    # 旧开关只映射到辅助缓存，不能再把 GPU 输入生成强制切回 NumPy。
     if options.use_gpu_mode and options.use_cached_numpy:
         print(
             f"{ARGUMENT_WARNING_PREFIX} "
-            "--use_cached_numpy=True is ignored because --use_gpu_mode=True uses GPU "
-            "tensor generation",
+            "--use_cached_numpy=True is retained as an auxiliary NumPy cache in GPU mode",
             flush=True,
         )
-        options.use_cached_numpy = False
-    os.environ["USE_CACHED_NUMPY"] = str(options.use_cached_numpy)
+    options.cache_numpy_auxiliary = bool(
+        getattr(options, "cache_numpy_auxiliary", False) or options.use_cached_numpy
+    )
+    if options.use_cached_numpy:
+        print(
+            f"{ARGUMENT_WARNING_PREFIX} --use_cached_numpy is deprecated; "
+            "use --cache_numpy_auxiliary=True",
+            flush=True,
+        )
+    # 同时写入新旧变量，保证 spawn worker 与历史模块读取到同一布尔值。
+    os.environ["USE_CACHED_NUMPY"] = str(options.cache_numpy_auxiliary)
+    os.environ["PADDLEAPITEST_CACHE_NUMPY_AUXILIARY"] = str(options.cache_numpy_auxiliary)
     os.environ["USE_GPU_MODE"] = str(options.use_gpu_mode)
+    # 主进程在创建 runtime config 前冻结模式，worker 不再重复猜测默认 backend。
+    mode = next(
+        (
+            name
+            for name in (
+                "accuracy",
+                "accuracy_dual_gpu",
+                "paddle_only",
+                "paddle_cinn",
+                "paddle_gpu_performance",
+                "torch_gpu_performance",
+                "paddle_torch_gpu_performance",
+                "accuracy_stable",
+                "accuracy_stable_dual_gpu",
+                "paddle_custom_device",
+                "custom_device_vs_gpu",
+            )
+            if getattr(options, name, False)
+        ),
+        None,
+    )
+    os.environ["PADDLEAPITEST_TEST_MODE"] = mode or ""
+    # policy 解析失败属于参数错误；解析成功后报告和预检都消费同一终态。
+    policy = resolve_input_backend_policy(
+        requested=os.environ.get("PADDLEAPITEST_INPUT_BACKEND"),
+        use_gpu_mode=options.use_gpu_mode,
+        use_cached_numpy=options.cache_numpy_auxiliary,
+        mode=mode,
+    )
+    options.input_backend_requested = policy.requested
+    options.input_backend_resolved = policy.resolved
+    options.input_logical_device = policy.logical_device
     if options.bitwise_alignment:
         options.atol = 0.0
         options.rtol = 0.0
@@ -2880,9 +2927,6 @@ def _prepare_common_options(options):
     if mode_error is not None:
         return mode_error
 
-    if not options._sanitizer_child:
-        log_report.print_run_header(options, options.paddle_version)
-
     if options.use_dump:
         if not options.api_config or options.api_config_file or options.api_config_file_pattern:
             return _argument_error("dump only supports single --api_config runs")
@@ -2904,7 +2948,12 @@ def _prepare_common_options(options):
             f"{ARGUMENT_WARNING_PREFIX} --test_backward takes effect only when --paddle_cinn=True",
             flush=True,
         )
-    _apply_runtime_environment_flags(options)
+    try:
+        _apply_runtime_environment_flags(options)
+    except ValueError as err:
+        return _argument_error(str(err))
+    if not options._sanitizer_child:
+        log_report.print_run_header(options, options.paddle_version)
     return None
 
 
@@ -3338,7 +3387,13 @@ def _build_argument_parser():
         "--use_cached_numpy",
         type=parse_bool,
         default=False,
-        help="Reuse cached NumPy inputs when available.",
+        help="Deprecated alias for --cache_numpy_auxiliary.",
+    )
+    parser.add_argument(
+        "--cache_numpy_auxiliary",
+        type=parse_bool,
+        default=False,
+        help="Cache auxiliary NumPy data such as output gradients.",
     )
     parser.add_argument(
         "--use_gpu_mode",

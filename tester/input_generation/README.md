@@ -66,8 +66,9 @@ Tensor 绑定和未解析原因。规则只应该读取它，不应该自己再�
 
 ### `InputGenerationContext`
 
-`InputGenerationContext` 封装绑定结果、配置指纹和 seed。NumPy RNG 使用独立状态副本，Torch/Paddle
-backend 使用 seed 与配置指纹初始化自己的 generator。
+`InputGenerationContext` 封装绑定结果、配置指纹、seed 和已解析的 backend policy。每个 config 的
+随机流由 `seed + config_fingerprint + stream_kind` 派生；NumPy 和 Paddle backend 使用局部 NumPy
+stream，Torch backend 使用私有 `torch.Generator`。不同 backend 只保证各自可复现，不保证 bytes 相同。
 
 ### `InputValue`
 
@@ -90,8 +91,8 @@ backend 使用 seed 与配置指纹初始化自己的 generator。
 
 ### Backend Selection
 
-未显式设置 backend 时 `use_gpu_mode=True` 自动使用 torch backend；
-显式设置环境变量时按请求选择：
+未显式设置 backend 时由测试模式选择默认值：Paddle-only/CINN/Paddle performance 使用 Paddle，
+accuracy/Torch performance 使用 Torch，普通直接模块调用使用 NumPy。显式设置环境变量时按请求选择：
 
 ```bash
 PADDLEAPITEST_INPUT_BACKEND=numpy
@@ -99,7 +100,7 @@ PADDLEAPITEST_INPUT_BACKEND=torch
 PADDLEAPITEST_INPUT_BACKEND=paddle
 ```
 
-未设置时默认 `numpy`。`torch` backend 的目标契约是 backend-native value：CPU 模式生成 CPU
+未设置时普通模式默认 `numpy`。`torch` backend 的目标契约是 backend-native value：CPU 模式生成 CPU
 `torch.Tensor`，GPU 模式生成 CUDA `torch.Tensor`，不转回 NumPy，也不保存 NumPy 数据。
 `paddle` backend 同样保存 backend-native `paddle.Tensor`；accuracy 模式下 Torch 输入由
 Paddle logical value 经 DLPack 生成，并在 Torch 侧 clone 为 Torch 自有存储。
@@ -108,8 +109,12 @@ Paddle logical value 经 DLPack 生成，并在 Torch 侧 clone 为 Torch 自有
 设备由 `test_cpu` 决定，Torch reference 输入和执行默认始终使用 GPU；因此 GPU logical value
 可以在 Paddle CPU kernel 执行前通过 DLPack/设备拷贝物化为 CPU Tensor。
 
-`USE_CACHED_NUMPY=True` 时固定使用 `numpy` backend。如果同时设置
-`PADDLEAPITEST_INPUT_BACKEND=torch` 或 `paddle`，框架会打印 warning 并忽略该 backend 请求。
+`PADDLEAPITEST_INPUT_BACKEND` 的非法值会在 engine 参数阶段直接失败。显式 NumPy 请求在 GPU mode
+下保留为 CPU logical value，并在运行头部显示最终 backend 和设备。
+
+`--cache_numpy_auxiliary=True`（环境变量 `PADDLEAPITEST_CACHE_NUMPY_AUXILIARY=True`）只缓存
+output grad 等辅助 NumPy 数据，不决定 input backend。旧的 `--use_cached_numpy` 和
+`USE_CACHED_NUMPY` 仍可用，但仅作为兼容别名并打印弃用提示。
 
 ## 规则编写方法
 
@@ -185,12 +190,11 @@ writer 在 rule 执行期间只暂存 backend 拷贝。rule 抛出异常或完�
 
 ### 5. 从全局随机状态改为 config-owned RNG
 
-旧实现更接近共享全局随机状态。现在输入生成持有 config 级 RNG，规则成功后才提交状态，
-失败不会污染其他 config。
+旧实现更接近共享全局随机状态。现在输入生成持有 config 级 RNG，失败不会污染全局或其他 config。
 
 ## 运行时约束
 
-- `InputConfigRandomState` 使用独立 `RandomState` 副本
+- Paddle 随机生成不播种 Paddle 全局 generator，而是从 config-local NumPy stream 生成后转换到目标 place
 - 同一 `TensorConfig` 复用于多个输入 path 时，`binding.py` 直接拒绝
 - `dispatcher.py` 只做规则查找和上下文构造
 - `value.py` 只管理输入数据，不承担框架创建
@@ -198,6 +202,6 @@ writer 在 rule 执行期间只暂存 backend 拷贝。rule 抛出异常或完�
 
 ## 当前状态
 
-- `InputConfigRandomState` 使用独立 `RandomState` 副本，并在规则成功后提交到全局
+- `InputConfigRandomState` 使用独立 `RandomState`，`commit()` 保留兼容入口但不写回全局
 - 所有注册规则统一使用单参数 `InputRuleContext` 协议
 - 运行时目录只保留当前实现代码

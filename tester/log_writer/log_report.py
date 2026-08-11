@@ -87,6 +87,10 @@ def print_run_header(options, paddle_version):
         ("paddle_kernel_device", "CPU" if options.test_cpu else "GPU"),
         ("torch_reference_device", "GPU" if torch_reference_gpu else "N/A"),
         ("input_compare_device", "GPU" if options.use_gpu_mode else "CPU"),
+        ("input_backend_requested", getattr(options, "input_backend_requested", None) or "default"),
+        ("input_backend_resolved", getattr(options, "input_backend_resolved", "numpy")),
+        ("input_logical_device", getattr(options, "input_logical_device", "cpu")),
+        ("random_seed", options.random_seed),
     ]
     if options.test_cpu:
         compute.append(("--test_cpu", True))
@@ -104,8 +108,8 @@ def print_run_header(options, paddle_version):
             compute.append(("--accuracy_dual_gpu", True))
         elif getattr(options, "accuracy_stable_dual_gpu", False):
             compute.append(("--accuracy_stable_dual_gpu", True))
-    elif options.use_cached_numpy:
-        compute.append(("--use_cached_numpy", True))
+    elif getattr(options, "cache_numpy_auxiliary", False):
+        compute.append(("--cache_numpy_auxiliary", True))
     compute.append(("--num_workers_per_gpu", options.num_workers_per_gpu))
     groups.append(("Compute", compute))
     for group_name, group_options in groups:

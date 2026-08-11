@@ -18,6 +18,8 @@ def dispatch_input_generation(api_test_case) -> bool:
     input_rule = input_rules.resolve(api_name)
 
     input_generation_context = build_input_generation_context(
-        api_config, seed=api_test_case.runtime_config.random_seed
+        api_config,
+        seed=api_test_case.runtime_config.random_seed,
+        backend_policy=getattr(api_test_case.runtime_config, "input_backend_policy", None),
     )
     return input_rule.generate(input_generation_context, api_config)
