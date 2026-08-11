@@ -118,7 +118,8 @@ python engineV4.py \
 常用附加参数包括 `--test_amp`、`--test_cpu`、`--atol`、`--rtol`、`--manual_threshold_config_file`、`--bitwise_alignment`、`--timeout`、`--random_seed`、`--generate_failed_tests` 和 `--exit_on_error`。
 
 `--test_cpu=True` 唯一决定算子设备：Paddle 与 Torch 的框架输入和算子执行都切到 CPU。
-它不决定输入逻辑值的生成设备或结果比较设备，这两项只由 `--use_gpu_mode` 控制。
+它不决定输入逻辑值的生成设备或结果比较设备；前者由最终 input backend 决定，后者由
+`--use_gpu_mode` 控制。
 
 ## 引擎与运行入口
 
@@ -148,22 +149,34 @@ python run.py -c test_pipeline/run_config.yaml
 
 ## GPU Mode 与动态显存管理
 
-`--use_gpu_mode=True` 在 GPU 上生成 Tensor 逻辑值并进行结果比较，同时复用 CUDA allocator，
-适用于大规模 `accuracy_stable` 测试。它不改变算子设备；此模式会忽略
-`--use_cached_numpy=True`。
+`--use_gpu_mode=True` 默认使用模式对应的 GPU-native backend 生成 Tensor 逻辑值，并在 GPU
+进行结果比较，同时复用 CUDA allocator。它不改变算子设备。显式
+`PADDLEAPITEST_INPUT_BACKEND=numpy` 会合法地改为 CPU 逻辑值；非 GPU mode 下
+`--use_cached_numpy=True` 复用 NumPy 生成的 forward/backward 输入。GPU mode 下保持 GPU-native
+输入生成策略，不把 cache 开关改作辅助输入语义。
 
 两个开关正交，四种组合的语义如下：
 
 | `test_cpu` | `use_gpu_mode` | Paddle/Torch 算子 | 输入生成与比较 |
 | --- | --- | --- | --- |
 | `False` | `False` | GPU | CPU |
-| `False` | `True` | GPU | GPU |
+| `False` | `True` | GPU | 模式默认 GPU；显式 NumPy 时输入在 CPU、比较在 GPU |
 | `True` | `False` | CPU | CPU |
-| `True` | `True` | CPU | GPU |
+| `True` | `True` | CPU | 模式默认 GPU；显式 NumPy 时输入在 CPU、比较在 GPU |
 
-组合模式 `test_cpu=True,use_gpu_mode=True` 会先在 GPU 生成逻辑输入，再物化为 CPU
+组合模式 `test_cpu=True,use_gpu_mode=True` 默认先在 GPU 生成逻辑输入，再物化为 CPU
 框架输入执行两侧算子，最后把结果送到 GPU 比较。纯 CPU 组合不要求 GPU；
 `accuracy_stable_dual_gpu` 仍不支持 `test_cpu=True`。
+
+未显式设置 `PADDLEAPITEST_INPUT_BACKEND` 时，GPU mode 的 backend 默认值如下：
+
+| 测试模式 | input backend |
+| --- | --- |
+| Paddle-only、Paddle CINN、Paddle GPU performance | Paddle |
+| accuracy、accuracy-stable、Torch/Paddle-Torch GPU performance | Torch |
+| 自定义设备模式 | NumPy |
+
+非 GPU mode 统一默认 NumPy。运行头部会同时打印 requested/resolved backend、逻辑值设备和 seed。
 
 GPU mode 会在输入生成前根据 TensorConfig 元数据和测试模式估算阶段存活集合。单 worker
 独占 GPU 时使用整卡容量，多 worker 共享时按 worker 数均分；只有通用下界已经超过容量的

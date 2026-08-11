@@ -90,8 +90,15 @@ backend 使用 seed 与配置指纹初始化自己的 generator。
 
 ### Backend Selection
 
-未显式设置 backend 时 `use_gpu_mode=True` 自动使用 torch backend；
-显式设置环境变量时按请求选择：
+未显式设置 backend 时，非 GPU mode 使用 NumPy；GPU mode 根据消费者选择默认 backend：
+
+| 测试模式 | 默认 backend |
+| --- | --- |
+| Paddle-only、Paddle CINN、Paddle GPU performance | Paddle |
+| accuracy、accuracy-stable、Torch/Paddle-Torch GPU performance | Torch |
+| 自定义设备模式 | NumPy |
+
+显式设置环境变量时按请求覆盖模式默认值：
 
 ```bash
 PADDLEAPITEST_INPUT_BACKEND=numpy
@@ -99,7 +106,8 @@ PADDLEAPITEST_INPUT_BACKEND=torch
 PADDLEAPITEST_INPUT_BACKEND=paddle
 ```
 
-未设置时默认 `numpy`。`torch` backend 的目标契约是 backend-native value：CPU 模式生成 CPU
+最终策略在 engine 参数规范化阶段写入 `TestRuntimeConfig`，规则和显存预检不再重复读取环境变量。
+`torch` backend 的目标契约是 backend-native value：CPU 模式生成 CPU
 `torch.Tensor`，GPU 模式生成 CUDA `torch.Tensor`，不转回 NumPy，也不保存 NumPy 数据。
 `paddle` backend 同样保存 backend-native `paddle.Tensor`；accuracy 模式下 Torch 输入由
 Paddle logical value 经 DLPack 生成，并在 Torch 侧 clone 为 Torch 自有存储。
@@ -108,8 +116,13 @@ Paddle logical value 经 DLPack 生成，并在 Torch 侧 clone 为 Torch 自有
 设备只由 `test_cpu` 决定；因此 GPU logical value 可以在 CPU 算子执行前通过 DLPack/设备拷贝
 物化为 CPU Tensor。
 
-`USE_CACHED_NUMPY=True` 时固定使用 `numpy` backend。如果同时设置
-`PADDLEAPITEST_INPUT_BACKEND=torch` 或 `paddle`，框架会打印 warning 并忽略该 backend 请求。
+非 GPU mode 下，`USE_CACHED_NUMPY=True` 复用 input_generation 生成的 NumPy forward/backward
+输入，并固定 NumPy 为逻辑输入 backend；GPU mode 不改变既有 GPU-native 生成策略。显式
+`PADDLEAPITEST_INPUT_BACKEND` 在 cache 未启用时按请求选择 backend。
+
+backend 原语收到逻辑 dtype 后统一解析生成 storage dtype。无法等价实现的 `arange`、`view_dtype`
+或 `finfo` 组合会抛出 `InputBackendCapabilityError`，错误同时包含 backend、API 规则、原语和逻辑
+dtype，不依赖底层 kernel 的异常文本。
 
 ## 规则编写方法
 
@@ -185,12 +198,14 @@ writer 在 rule 执行期间只暂存 backend 拷贝。rule 抛出异常或完�
 
 ### 5. 从全局随机状态改为 config-owned RNG
 
-旧实现更接近共享全局随机状态。现在输入生成持有 config 级 RNG，规则成功后才提交状态，
-失败不会污染其他 config。
+输入生成持有由 `random_seed + config_fingerprint` 派生的 config 级 RNG；它不读取或提交进程全局
+NumPy 状态，规则失败不会改变其他 config 的随机流。
 
 ## 运行时约束
 
-- `InputConfigRandomState` 使用独立 `RandomState` 副本
+- `InputConfigRandomState` 直接从 seed 和配置指纹初始化独立 `RandomState`
+- Paddle backend 的随机值先由该私有 NumPy 流生成，再物化到目标设备，不调用 `paddle.seed`
+- `use_cached_numpy` 缓存 forward/backward 等输入流；cache key 包含 seed、config fingerprint、stream kind 和绑定身份
 - 同一 `TensorConfig` 复用于多个输入 path 时，`binding.py` 直接拒绝
 - `dispatcher.py` 只做规则查找和上下文构造
 - `value.py` 只管理输入数据，不承担框架创建
