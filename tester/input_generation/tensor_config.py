@@ -300,7 +300,8 @@ class TensorConfig:
                 # Paddle 的同 GPU `_copy_to()` 会引入额外同步，长驻 worker 中可能阻塞后续 case。
                 # 只有算子 place 与生成 place 不同时才允许发生真实设备搬运。
                 if "cpu" in str(target_place).lower():
-                    value = value._copy_to(paddle.CPUPlace(), False)
+                    # 生成源会在全部输入物化后立即释放，跨设备复制必须先完成所有权交接。
+                    value = value._copy_to(paddle.CPUPlace(), True)
                 elif "gpu" in str(target_place).lower() or isinstance(
                     target_place, paddle.CUDAPlace
                 ):
@@ -311,7 +312,7 @@ class TensorConfig:
                         if ":" in str(target_place)
                         else 0
                     )
-                    value = value._copy_to(paddle.CUDAPlace(device_id), False)
+                    value = value._copy_to(paddle.CUDAPlace(device_id), True)
             if dtype is not None and str(value.dtype).split(".")[-1] != str(dtype):
                 value = paddle.cast(value, dtype=dtype)
             return value
@@ -500,21 +501,29 @@ class TensorConfig:
         if api_config is not None:
             # 清理 TensorConfig 时，也要清掉其关联的输入数据。
             clear_input_value(api_config, self)
+        torch_tensor = self.torch_tensor
+        paddle_tensor = self.paddle_tensor
         self.torch_tensor = None
         self.paddle_tensor = None
         self.cpu_tensor = None
         if not is_gpu_mode():
-            torch.cuda.empty_cache()
-            paddle.device.cuda.empty_cache()
+            # allocator 清理只跟随实际被释放的设备，不能由全局运行模式代替 Tensor place。
+            if torch_tensor is not None and torch_tensor.device.type == "cuda":
+                torch.cuda.empty_cache()
+            if paddle_tensor is not None and paddle_tensor.place.is_gpu_place():
+                paddle.device.cuda.empty_cache()
 
     def clear_paddle_tensor(self):
+        tensor = self.paddle_tensor
         self.paddle_tensor = None
-        if not is_gpu_mode():
+        # CPU tensor 不属于 CUDA allocator；清理它时访问 CUDA 会把 CPU case 变成设备同步点。
+        if not is_gpu_mode() and tensor is not None and tensor.place.is_gpu_place():
             paddle.device.cuda.empty_cache()
 
     def clear_torch_tensor(self):
+        tensor = self.torch_tensor
         self.torch_tensor = None
-        if not is_gpu_mode():
+        if not is_gpu_mode() and tensor is not None and tensor.device.type == "cuda":
             torch.cuda.empty_cache()
 
     def clear_generated_input_value(self, api_config):
