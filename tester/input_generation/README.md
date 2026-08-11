@@ -112,9 +112,9 @@ Paddle logical value 经 DLPack 生成，并在 Torch 侧 clone 为 Torch 自有
 `PADDLEAPITEST_INPUT_BACKEND` 的非法值会在 engine 参数阶段直接失败。显式 NumPy 请求在 GPU mode
 下保留为 CPU logical value，并在运行头部显示最终 backend 和设备。
 
-`--cache_numpy_auxiliary=True`（环境变量 `PADDLEAPITEST_CACHE_NUMPY_AUXILIARY=True`）只缓存
-output grad 等辅助 NumPy 数据，不决定 input backend。旧的 `--use_cached_numpy` 和
-`USE_CACHED_NUMPY` 仍可用，但仅作为兼容别名并打印弃用提示。
+NumPy 缓存只支持 `--use_cached_numpy=True`（运行时状态环境变量为 `USE_CACHED_NUMPY`）。
+非 GPU mode 开启后会强制使用 NumPy backend；显式 Torch/Paddle 请求被忽略并警告。
+GPU mode 会忽略缓存开关并警告。CLI 不接受 `--cache_numpy_auxiliary`。
 
 ## 规则编写方法
 

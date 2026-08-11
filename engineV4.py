@@ -2897,7 +2897,31 @@ def _load_custom_device_options(options):
 
 
 def _apply_runtime_environment_flags(options):
-    # 该开关只属于 NumPy backend；policy 会拒绝原生 backend 偷用主存缓存。
+    cache_requested = bool(options.use_cached_numpy)
+    requested_backend = (
+        (
+            getattr(options, "input_backend_requested", None)
+            or os.environ.get("PADDLEAPITEST_INPUT_BACKEND")
+            or ""
+        )
+        .strip()
+        .lower()
+    )
+    # 警告只在主进程规范化阶段输出，避免每个 spawn worker 重复报告同一参数冲突。
+    if options.use_gpu_mode and cache_requested:
+        print(
+            f"{ARGUMENT_WARNING_PREFIX} --use_cached_numpy=True is ignored when "
+            "--use_gpu_mode=True",
+            flush=True,
+        )
+        options.use_cached_numpy = False
+    elif cache_requested and requested_backend in {"torch", "paddle"}:
+        print(
+            f"{ARGUMENT_WARNING_PREFIX} PADDLEAPITEST_INPUT_BACKEND={requested_backend} is "
+            "ignored when --use_cached_numpy=True; using NumPy backend",
+            flush=True,
+        )
+    # 环境变量传播规范化后的有效 cache 状态，worker 不再自行解释冲突组合。
     os.environ["USE_CACHED_NUMPY"] = str(options.use_cached_numpy)
     os.environ["USE_GPU_MODE"] = str(options.use_gpu_mode)
     # 主进程在创建 runtime config 前冻结模式，worker 不再重复猜测默认 backend。
@@ -3476,7 +3500,10 @@ def _build_argument_parser():
         "--use_cached_numpy",
         type=parse_bool,
         default=False,
-        help="Reuse NumPy-backend output gradients; requires the NumPy input backend.",
+        help=(
+            "Reuse NumPy-backend output gradients and force the NumPy input backend; "
+            "ignored in GPU mode."
+        ),
     )
     parser.add_argument(
         "--use_gpu_mode",

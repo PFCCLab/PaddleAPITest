@@ -101,10 +101,11 @@ Paddle 前向和反向在 CPU 执行，Torch reference 仍在 GPU。输入生成
 
 在 GPU 生成输入和比较结果，并复用 CUDA allocator；不改变 Paddle 算子或 Torch reference 的执行设备。显式 NumPy backend 仍可合法降级为 CPU logical value，运行头会显示最终 backend/device。默认：`False`。
 
-#### `--cache_numpy_auxiliary=True`、`--use_cached_numpy=True`、`--test_amp=True`
+#### `--use_cached_numpy=True`、`--test_amp=True`
 
-`--cache_numpy_auxiliary=True` 只复用 output grad 等辅助 NumPy 数据；旧的 `--use_cached_numpy=True`
-是兼容别名并打印弃用提示。两者均不决定 input backend。`--test_amp=True` 启用自动混合精度检查。默认：`False`。
+`--use_cached_numpy=True` 复用 NumPy output grad，并在非 GPU mode 强制使用 NumPy input
+backend；显式 Torch/Paddle backend 会被忽略并警告。GPU mode 会忽略该开关并警告。
+`--cache_numpy_auxiliary` 明确不受支持。`--test_amp=True` 启用自动混合精度检查。默认：`False`。
 
 #### `--atol=FLOAT`、`--rtol=FLOAT`
 
@@ -228,9 +229,10 @@ python run.py [-c CONFIG] [OVERRIDES] [ENGINE_OPTIONS]
 
 选择输入生成 backend：`numpy`、`torch`、`paddle`。未指定时由测试模式选择默认值；普通直接调用默认 NumPy，Paddle-only/CINN/Paddle performance 默认 Paddle，accuracy/Torch performance 默认 Torch。非法值会在参数阶段失败。GPU mode 下显式 NumPy 会显示为 CPU logical value。
 
-#### `PADDLEAPITEST_CACHE_NUMPY_AUXILIARY`、`USE_CACHED_NUMPY`、`USE_GPU_MODE`、`USE_DUMP`、`DUMP_DIR`
+#### `USE_CACHED_NUMPY`、`USE_GPU_MODE`、`USE_DUMP`、`DUMP_DIR`
 
-`PADDLEAPITEST_CACHE_NUMPY_AUXILIARY` 只控制辅助 NumPy cache；`USE_CACHED_NUMPY` 是兼容别名。直接调用引擎时优先使用 CLI；只设置 `DUMP_DIR` 不会启用 dump。
+`USE_CACHED_NUMPY` 与 `USE_GPU_MODE` 对应同名 CLI 开关的运行时状态。直接调用引擎时优先使用
+CLI；只设置 `DUMP_DIR` 不会启用 dump。
 
 #### `CUDA_VISIBLE_DEVICES`、`CUDA_HOME`、`CUDA_PATH`
 

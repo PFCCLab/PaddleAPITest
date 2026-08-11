@@ -4730,7 +4730,10 @@
         "description": "_tmp_tensor = arg[0], result = _tmp_tensor.__ge__(other=y)"
     },
     "paddle.Tensor.__getitem__": {
-        "torch_api": "torch.Tensor.__getitem__"
+        "torch_api": "torch.Tensor.__getitem__",
+        "torch_args": [
+            "item"
+        ]
     },
     "paddle.Tensor.__gt__": {
         "torch_api": "torch.Tensor.__gt__",

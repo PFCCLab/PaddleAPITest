@@ -8412,7 +8412,10 @@ class CopsPutAlongAxisRule(BaseRule):
 
     def apply(self, paddle_api: str) -> ConvertResult:
         core = """
-arr          = locals().get("arr", x)
+# C ops 使用 arr，Tensor 方法使用 x；分步回退避免缺省表达式提前求值。
+arr          = locals().get("arr")
+if arr is None:
+    arr = x
 indices      = indices
 values       = values
 axis         = axis

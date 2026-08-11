@@ -952,17 +952,12 @@ def resolve_input_backend_policy(
         use_cached_numpy = _env_flag("USE_CACHED_NUMPY")
     else:
         use_cached_numpy = bool(use_cached_numpy)
-    # 旧缓存开关在未覆盖 backend 时选择完整 NumPy 路径；显式原生 backend 不得偷用缓存。
-    resolved = normalized_requested or ("numpy" if use_cached_numpy else None)
+    # GPU mode 优先于主存缓存；CPU cache 则拥有 backend 终态，不接受原生请求覆盖。
+    use_cached_numpy = use_cached_numpy and not use_gpu_mode
+    resolved = "numpy" if use_cached_numpy else normalized_requested
     resolved = resolved or _MODE_DEFAULT_BACKENDS.get(mode)
     if resolved is None:
         resolved = "torch" if use_gpu_mode else "numpy"
-    if use_cached_numpy and resolved != "numpy":
-        # cache 存储的是 NumPy backend 拥有的反向种子，不能跨 backend 偷换值所有者。
-        raise ValueError(
-            "NumPy cache requires PADDLEAPITEST_INPUT_BACKEND=numpy; "
-            f"resolved backend is {resolved!r}"
-        )
     # 性能模式本身要求 GPU-native 输入；显式 NumPy 仍是可见的 CPU 降级。
     effective_gpu_mode = use_gpu_mode or (mode in _GPU_NATIVE_MODES and resolved != "numpy")
     # logical_device 描述生成值的位置，不等同于 Paddle/Torch 算子的执行设备。
@@ -1064,6 +1059,16 @@ def _cached_numpy_output_grad(dtype, shape, stream_kind, seed, config_fingerprin
     return _CACHED_NUMPY_OUTPUT_GRADS[key]
 
 
+def _cast_native_output_grad(value, dtype, backend):
+    """将原生反向 seed 从采样 dtype 转为输出要求的逻辑 dtype。"""
+    # backend.cast 遵循前向输入的 storage dtype 协议，不能用于 BF16/FP8 最终 seed。
+    if backend.name == "torch":
+        return value.to(dtype=to_torch_dtype(dtype))
+    if backend.name == "paddle":
+        return backend._paddle().cast(value, dtype=dtype)
+    return value
+
+
 def generate_output_grad(
     *,
     dtype,
@@ -1117,4 +1122,6 @@ def generate_output_grad(
         imag = backend.random(shape, dtype=real_dtype) - 0.5
         return backend.cast(real + 1j * imag, dtype)
     value = backend.uniform(-0.5, 0.5, shape=shape, dtype=base_dtype)
-    return backend.cast(value, dtype) if base_dtype != dtype else value
+    if base_dtype == dtype or backend_name == "numpy":
+        return value
+    return _cast_native_output_grad(value, dtype, backend)
