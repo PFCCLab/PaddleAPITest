@@ -270,10 +270,13 @@ class TorchInputBackend(NumPyInputBackend):
 
     def __post_init__(self):
         # Torch 私有 Generator 只消费本 backend 的 stream，不触碰默认 generator。
+        stream_kind = getattr(self.input_random_state, "stream_kind", "")
+        if not stream_kind.startswith("output_grad:"):
+            stream_kind = "torch"
         seed = derive_input_seed(
             getattr(self.input_random_state, "seed", 0),
             getattr(self.input_random_state, "config_fingerprint", ""),
-            "torch",
+            stream_kind,
         )
         torch = self._torch()
         self._device = torch.device(self.device)
@@ -552,10 +555,13 @@ class PaddleInputBackend(NumPyInputBackend):
     def __post_init__(self):
         # Paddle 无稳定的逐实例 Generator；随机值改由独立 NumPy stream 生成。
         # 这里绝不能播种 Paddle 全局 generator，避免规则失败污染后续配置。
+        stream_kind = getattr(self.input_random_state, "stream_kind", "")
+        if not stream_kind.startswith("output_grad:"):
+            stream_kind = "paddle"
         self._random_source = InputConfigRandomState(
             getattr(self.input_random_state, "seed", 0),
             getattr(self.input_random_state, "config_fingerprint", ""),
-            stream_kind="paddle",
+            stream_kind=stream_kind,
         )
         paddle = self._paddle()
         self._place = paddle.CPUPlace()
@@ -946,3 +952,81 @@ def create_input_backend(
     if input_random_state is INPUT_NUMPY_RANDOM_STATE:
         _DEFAULT_INPUT_BACKENDS[cache_key] = input_backend
     return input_backend
+
+
+def prepare_input_backend(policy=None):
+    """准备现有 backend 的进程级模块、device context 和物化通道。"""
+    # policy 已在 engine 主进程解析；独立调用时才允许沿用环境变量解析结果。
+    policy = policy or resolve_input_backend_policy()
+    backend = create_input_backend(policy=policy)
+    if getattr(backend, "_runtime_prepared", False):
+        return backend
+
+    # 常量探针不读取 RNG 或 cache，只把首次真实物化移到 worker ready 之前。
+    probe = backend.asarray(numpy.zeros((1,), dtype="float32"), copy=False)
+    if backend.name == "torch" and policy.logical_device.startswith("cuda"):
+        backend._torch().cuda.synchronize(backend._device)
+    elif backend.name == "paddle" and policy.logical_device.startswith(("gpu", "cuda")):
+        backend._paddle().device.cuda.synchronize()
+    del probe
+    # 标记只写入兼容 backend 实例，不能扩展为跨 config 的随机状态缓存。
+    backend._runtime_prepared = True
+    return backend
+
+
+def generate_output_grad(
+    *,
+    dtype,
+    shape,
+    backend_name,
+    device,
+    seed,
+    config_fingerprint,
+    stream_index=0,
+    cache_enabled=False,
+):
+    """用现有 backend 和独立随机流生成 output grad。"""
+    dtype = str(dtype)
+    # stream 序号属于当前 config，保证多个输出梯度不会复用同一首样本。
+    stream_kind = f"output_grad:{backend_name}:{int(stream_index)}"
+    if cache_enabled:
+        if backend_name != "numpy":
+            raise ValueError("output-grad cache requires the NumPy backend")
+        # 延迟导入避免 tensor_config -> backend 的既有依赖形成模块环。
+        from .tensor_config import get_cached_numpy_array
+
+        return get_cached_numpy_array(
+            dtype,
+            shape,
+            generation_kind=stream_kind,
+            scale=1.0,
+            random_seed=seed,
+            config_fingerprint=config_fingerprint,
+        )
+
+    # 非缓存路径继续使用 backend 私有随机源，避免污染框架默认 generator。
+    random_state = InputConfigRandomState(seed, config_fingerprint, stream_kind=stream_kind)
+    if backend_name == "numpy":
+        backend = NumPyInputBackend(random_state)
+    elif backend_name == "torch":
+        backend = TorchInputBackend(random_state, device=device)
+    elif backend_name == "paddle":
+        backend = PaddleInputBackend(random_state, device=device)
+    else:
+        raise ValueError(f"unsupported output-grad backend: {backend_name!r}")
+
+    if "int" in dtype:
+        return backend.randint(-65535, 65535, shape=shape, dtype=dtype)
+    if dtype in {"float8_e5m2", "float8_e4m3fn"}:
+        base_dtype = "float16"
+    elif dtype == "bfloat16":
+        base_dtype = "float32"
+    else:
+        base_dtype = dtype
+    if dtype.startswith("complex"):
+        real_dtype = "float32" if dtype == "complex64" else "float64"
+        real = backend.random(shape, dtype=real_dtype) - 0.5
+        imag = backend.random(shape, dtype=real_dtype) - 0.5
+        return backend.cast(real + 1j * imag, dtype)
+    value = backend.uniform(-0.5, 0.5, shape=shape, dtype=base_dtype)
+    return backend.cast(value, dtype) if base_dtype != dtype else value

@@ -818,41 +818,35 @@ class APITestBase:
             config_fingerprint=getattr(self.api_config, "config", ""),
         )
 
-    def _output_grad_stream_kind(self, backend):
-        """为同一 config 的多输出梯度推进独立 stream，避免重复首样本。"""
+    def _output_grad_stream_index(self, backend):
+        """为同一 config 的多输出梯度分配独立 stream 序号。"""
         counters = getattr(self, "_output_grad_stream_counters", None)
         if counters is None:
             counters = collections.Counter()
             self._output_grad_stream_counters = counters
         index = counters[backend]
         counters[backend] += 1
-        return f"output_grad_{backend}:{index}"
+        return index
 
     def _make_numpy_output_grad(self, output):
         dtype = _dtype_name(output.dtype)
         from .input_generation.tensor_config import numpy_auxiliary_cache_enabled
-        from .input_generation.value_generators import InputConfigRandomState
 
         cache_enabled = getattr(self.runtime_config, "cache_numpy_auxiliary", None)
         if cache_enabled is None:
             cache_enabled = numpy_auxiliary_cache_enabled()
-        if cache_enabled:
-            dtype = "float32" if dtype == "bfloat16" else dtype
-            return self.get_cached_numpy(dtype, output.shape)
-        rng = InputConfigRandomState(
-            getattr(self.runtime_config, "random_seed", 0),
-            getattr(self.api_config, "config", ""),
-            stream_kind=self._output_grad_stream_kind("numpy"),
+        from .input_generation.backend import generate_output_grad
+
+        return generate_output_grad(
+            dtype=dtype,
+            shape=output.shape,
+            backend_name="numpy",
+            device="cpu",
+            seed=getattr(self.runtime_config, "random_seed", 0),
+            config_fingerprint=getattr(self.api_config, "config", ""),
+            stream_index=self._output_grad_stream_index("numpy"),
+            cache_enabled=cache_enabled,
         )
-        if "int" in dtype:
-            return rng.randint(-65535, 65535, shape=output.shape).astype(dtype)
-        if dtype in ["float8_e5m2", "float8_e4m3fn"]:
-            numpy_dtype = "float16"
-        elif dtype == "bfloat16":
-            numpy_dtype = "float32"
-        else:
-            numpy_dtype = dtype
-        return (rng.random(output.shape) - 0.5).astype(numpy_dtype)
 
     @staticmethod
     def _output_grad_intermediate_dtype(dtype):
@@ -887,71 +881,35 @@ class APITestBase:
 
     def _make_torch_output_grad(self, shape, dtype, device=None):
         device = device or torch.device("cuda", torch.cuda.current_device())
-        from .input_generation.backend import TorchInputBackend
-        from .input_generation.value_generators import InputConfigRandomState
+        from .input_generation.backend import generate_output_grad
 
-        # output grad 使用独立 stream，不能推进输入值或框架默认 generator 的状态。
-        backend = TorchInputBackend(
-            InputConfigRandomState(
-                getattr(self.runtime_config, "random_seed", 0),
-                getattr(self.api_config, "config", ""),
-                stream_kind=self._output_grad_stream_kind("torch"),
-            ),
+        return generate_output_grad(
+            dtype=dtype,
+            shape=shape,
+            backend_name="torch",
             device=str(device),
+            seed=getattr(self.runtime_config, "random_seed", 0),
+            config_fingerprint=getattr(self.api_config, "config", ""),
+            stream_index=self._output_grad_stream_index("torch"),
         )
-        if "int" in dtype:
-            return backend.randint(-65535, 65535, shape=shape, dtype=dtype)
-        # 特殊 dtype 先在可生成的中间类型采样，再转换到输出要求的逻辑 dtype。
-        if dtype in ["float8_e5m2", "float8_e4m3fn"]:
-            base_dtype = "float16"
-        elif dtype == "bfloat16":
-            base_dtype = "float32"
-        elif dtype.startswith("complex"):
-            real_dtype = "float32" if dtype == "complex64" else "float64"
-            real_part = backend.random(shape, dtype=real_dtype) - 0.5
-            imag_part = backend.random(shape, dtype=real_dtype) - 0.5
-            return backend.cast(real_part + 1j * imag_part, dtype)
-        else:
-            base_dtype = dtype
-        output_grad = backend.uniform(-0.5, 0.5, shape=shape, dtype=base_dtype)
-        if base_dtype != dtype:
-            output_grad = output_grad.to(dtype=self.to_torch_dtype(dtype))
-        return output_grad
 
     def _make_paddle_output_grad(self, shape, dtype, place=None):
-        from .input_generation.backend import PaddleInputBackend
-        from .input_generation.value_generators import InputConfigRandomState
-
         # grad 必须直接生成到输出所在 place，避免跨设备复制改变峰值显存语义。
         if place is not None and place.is_gpu_place():
             device = f"gpu:{place.gpu_device_id()}"
         else:
             device = "cpu"
-        # Paddle backend 内部用局部 NumPy stream 采样，因此不会污染算子随机状态。
-        backend = PaddleInputBackend(
-            InputConfigRandomState(
-                getattr(self.runtime_config, "random_seed", 0),
-                getattr(self.api_config, "config", ""),
-                stream_kind=self._output_grad_stream_kind("paddle"),
-            ),
+        from .input_generation.backend import generate_output_grad
+
+        return generate_output_grad(
+            dtype=dtype,
+            shape=shape,
+            backend_name="paddle",
             device=device,
+            seed=getattr(self.runtime_config, "random_seed", 0),
+            config_fingerprint=getattr(self.api_config, "config", ""),
+            stream_index=self._output_grad_stream_index("paddle"),
         )
-        if "int" in dtype:
-            return backend.randint(-65535, 65535, shape=shape, dtype=dtype)
-        if dtype in ["float8_e5m2", "float8_e4m3fn"]:
-            base_dtype = "float16"
-        elif dtype == "bfloat16":
-            base_dtype = "float32"
-        elif dtype.startswith("complex"):
-            real_dtype = "float32" if dtype == "complex64" else "float64"
-            real_part = backend.random(shape, dtype=real_dtype) - 0.5
-            imag_part = backend.random(shape, dtype=real_dtype) - 0.5
-            return backend.cast(real_part + 1j * imag_part, dtype)
-        else:
-            base_dtype = dtype
-        output_grad = backend.uniform(-0.5, 0.5, shape=shape, dtype=base_dtype)
-        # 同 dtype cast 不改变 seed，却会在大输出上再申请一份完整 GPU storage。
-        return paddle.cast(output_grad, dtype=dtype) if base_dtype != dtype else output_grad
 
     def _use_gpu_output_grad(self, output):
         if not self.gpu_mode_config.enabled:

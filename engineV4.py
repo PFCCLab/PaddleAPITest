@@ -372,6 +372,8 @@ def _init_runtime_modules(options):
         _import_optional_runtime_module("FusedQuantOps")
         import tester
 
+        # ready 必须覆盖输入 backend 的首次真实物化，避免首个 case 承担进程初始化。
+        tester.prepare_process_runtime(options)
         test_class = _select_test_class(options)
         globals().update({"APIConfig": tester.APIConfig, test_class.__name__: test_class})
 
@@ -398,14 +400,14 @@ def _init_worker_runtime(
         os.environ["CUDA_VISIBLE_DEVICES"] = _visible_gpu_ids(gpu_id, comparison_gpu_id)
         workers_on_gpu = (getattr(options, "gpu_workers_per_gpu_map", {}) or {}).get(gpu_id, 1)
         os.environ["PADDLEAPITEST_WORKERS_ON_GPU"] = str(workers_on_gpu)
+    if slot_index is not None and gpu_id is not None:
+        # backend 导入和准备阶段即可读取稳定 slot，复活 worker 也遵循同一初始化协议。
+        os.environ["PADDLEAPITEST_WORKER_SLOT"] = str(slot_index)
 
     _init_runtime_modules(options)
 
     if redirect_output:
         log_worker.redirect_stdio()
-
-    if slot_index is not None and gpu_id is not None:
-        os.environ["PADDLEAPITEST_WORKER_SLOT"] = str(slot_index)
 
 
 def _apply_worker_task_runtime_budget(options, task, gpu_id, comparison_gpu_id=None):
@@ -834,8 +836,12 @@ class WorkerPool:
                 self.slots.append(slot)
                 idx += 1
         else:
-            for gpu_id in available_gpus:
-                for _ in range(max_workers_per_gpu[gpu_id]):
+            # breadth-first 只调整启动先后，不改变每卡 slot 数与设备映射。
+            max_rounds = max(max_workers_per_gpu.values(), default=0)
+            for worker_round in range(max_rounds):
+                for gpu_id in available_gpus:
+                    if worker_round >= max_workers_per_gpu[gpu_id]:
+                        continue
                     slot = WorkerSlot(index=idx, gpu_id=gpu_id)
                     self.slots.append(slot)
                     idx += 1
@@ -2838,6 +2844,8 @@ def _apply_runtime_environment_flags(options):
     options.input_backend_requested = policy.requested
     options.input_backend_resolved = policy.resolved
     options.input_logical_device = policy.logical_device
+    # 主进程冻结一次终态，spawn worker、预检和具体 tester 共享同一份策略。
+    options.runtime_config = TestRuntimeConfig.from_options(options)
     if options.bitwise_alignment:
         options.atol = 0.0
         options.rtol = 0.0

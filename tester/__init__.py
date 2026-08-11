@@ -20,6 +20,7 @@ __all__ = [
     "analyse_configs",
     "cached_numpy",
     "paddle_to_torch",
+    "prepare_process_runtime",
 ]
 
 if TYPE_CHECKING:
@@ -41,6 +42,21 @@ if TYPE_CHECKING:
     from .paddle_only import APITestPaddleOnly
     from .paddle_torch_gpu_performance import APITestPaddleTorchGPUPerformance
     from .torch_gpu_performance import APITestTorchGPUPerformance
+
+
+def prepare_process_runtime(options):
+    """按 engine 已冻结的配置准备当前进程使用的输入 backend。"""
+    runtime_config = getattr(options, "runtime_config", None)
+    if runtime_config is None:
+        # 直接调用 tester 的兼容入口仍可在此收敛配置，engine 路径不会重复解析。
+        from .runtime_config import TestRuntimeConfig
+
+        runtime_config = TestRuntimeConfig.from_options(options)
+        options.runtime_config = runtime_config
+
+    from .input_generation.backend import prepare_input_backend
+
+    return prepare_input_backend(runtime_config.input_backend_policy)
 
 
 def __getattr__(name: str) -> Any:
