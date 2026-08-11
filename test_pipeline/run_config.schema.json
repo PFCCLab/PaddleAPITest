@@ -73,7 +73,7 @@
         "num_workers_per_gpu": {"type": "integer", "description": "对应 --num_workers_per_gpu。"},
         "gpu_ids": {"type": "string", "description": "对应 --gpu_ids。"},
         "test_cpu": {"type": "boolean", "description": "对应 --test_cpu。"},
-        "use_cached_numpy": {"type": "boolean", "description": "对应 --use_cached_numpy。"},
+        "use_cached_numpy": {"type": "boolean", "description": "对应 --use_cached_numpy；非 GPU mode 下缓存 input_generation 的 forward/backward NumPy 输入。"},
         "use_gpu_mode": {"type": "boolean", "description": "对应 --use_gpu_mode。"},
         "atol": {"type": "number", "description": "对应 --atol。"},
         "rtol": {"type": "number", "description": "对应 --rtol。"},

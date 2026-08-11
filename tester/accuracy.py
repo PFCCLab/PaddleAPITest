@@ -16,6 +16,8 @@ _ACCURACY_COMPARISON_WORKSPACE_BYTES = 256 * 1024**2
 
 
 class APITestAccuracy(APITestBase):
+    input_operation_mode = "accuracy"
+
     def __init__(self, api_config, **kwargs):
         super().__init__(api_config, runtime_config=kwargs.get("runtime_config"))
         self.test_amp = kwargs.get("test_amp", False)

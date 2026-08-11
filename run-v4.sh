@@ -89,7 +89,7 @@ TEST_PARAM_ARGS=(
     # --test_amp=True
     # 仅 Paddle 前反向切到 CPU；Torch reference 仍在 GPU
     # --test_cpu=True
-    # CPU numpy 缓存；gpu_mode 下自动关闭
+    # forward/backward NumPy 输入缓存；仅非 gpu_mode 生效
     # --use_cached_numpy=True
     # GPU 生成 + GPU compare；与 test_cpu 正交，不决定算子设备
     # --use_gpu_mode=True

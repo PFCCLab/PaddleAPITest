@@ -58,6 +58,8 @@ class _StableExecutionState:
 
 
 class APITestAccuracyStable(APITestBase):
+    input_operation_mode = "accuracy_stable"
+
     # 执行阶段错误广播映射: (iter_idx, source) -> 受影响的 comp 列表
     _TORCH_AFFECTED_COMPS = {
         0: ["P1T1", "P2T1", "T1T2", "P1T1B", "P2T1B", "T1T2B"],
