@@ -871,12 +871,12 @@ class PaddleInputBackend(NumPyInputBackend):
 
 
 INPUT_BACKEND_ENV_VAR = "PADDLEAPITEST_INPUT_BACKEND"
-# Only used when no config-local RNG is available, such as legacy TensorConfig helpers.
-_DEFAULT_INPUT_BACKENDS = {}
+_PREPARED_INPUT_BACKENDS = {}
+_CACHED_NUMPY_OUTPUT_GRADS = {}
 _TRUE_VALUES = {"true", "1", "yes", "y"}
 _VALID_INPUT_BACKENDS = frozenset({"numpy", "torch", "paddle"})
 # 模式默认值由 policy 唯一拥有，worker 和物化层只能消费解析结果。
-# cache 只属于 NumPy backend，不得参与 backend 选择或为原生 backend 生成数据。
+# USE_CACHED_NUMPY 只允许选择完整 NumPy backend，不得为原生 backend 生成辅助数据。
 # 未声明模式的直接模块调用保留 NumPy/CPU 的历史默认行为。
 _MODE_DEFAULT_BACKENDS = {
     "paddle_only": "paddle",
@@ -912,7 +912,7 @@ class InputBackendPolicy:
     resolved: str
     logical_device: str
     use_gpu_mode: bool
-    cache_numpy: bool
+    use_cached_numpy: bool
     mode: str | None = None
 
 
@@ -936,15 +936,12 @@ def resolve_input_backend_policy(
     else:
         use_gpu_mode = bool(use_gpu_mode)
     if use_cached_numpy is None:
-        use_cached_numpy = _env_flag(
-            "PADDLEAPITEST_CACHE_NUMPY_AUXILIARY",
-            os.getenv("USE_CACHED_NUMPY", "False"),
-        )
+        use_cached_numpy = _env_flag("USE_CACHED_NUMPY")
     else:
         use_cached_numpy = bool(use_cached_numpy)
-    mode = mode or os.environ.get("PADDLEAPITEST_TEST_MODE") or None
-    # 模式默认值只在没有显式请求时生效，保证命令行报告能解释覆盖关系。
-    resolved = normalized_requested or _MODE_DEFAULT_BACKENDS.get(mode)
+    # 旧缓存开关在未覆盖 backend 时选择完整 NumPy 路径；显式原生 backend 不得偷用缓存。
+    resolved = normalized_requested or ("numpy" if use_cached_numpy else None)
+    resolved = resolved or _MODE_DEFAULT_BACKENDS.get(mode)
     if resolved is None:
         resolved = "torch" if use_gpu_mode else "numpy"
     if use_cached_numpy and resolved != "numpy":
@@ -954,9 +951,7 @@ def resolve_input_backend_policy(
             f"resolved backend is {resolved!r}"
         )
     # 性能模式本身要求 GPU-native 输入；显式 NumPy 仍是可见的 CPU 降级。
-    effective_gpu_mode = use_gpu_mode or (
-        mode in _GPU_NATIVE_MODES and normalized_requested != "numpy"
-    )
+    effective_gpu_mode = use_gpu_mode or (mode in _GPU_NATIVE_MODES and resolved != "numpy")
     # logical_device 描述生成值的位置，不等同于 Paddle/Torch 算子的执行设备。
     logical_device = {
         "numpy": "cpu",
@@ -968,7 +963,7 @@ def resolve_input_backend_policy(
         resolved=resolved,
         logical_device=logical_device,
         use_gpu_mode=effective_gpu_mode,
-        cache_numpy=use_cached_numpy,
+        use_cached_numpy=use_cached_numpy,
         mode=mode,
     )
 
@@ -987,44 +982,36 @@ def _choice_shape(shape, *, scalar_empty):
     return scalar, normalized, 1 if scalar else int(numpy.prod(normalized))
 
 
-def resolve_input_backend_name(**kwargs) -> str:
-    """兼容旧调用方，只返回已解析的 backend 名称。"""
-    return resolve_input_backend_policy(**kwargs).resolved
-
-
 def create_input_backend(
-    input_random_state=INPUT_NUMPY_RANDOM_STATE,
+    input_random_state,
     *,
-    policy: InputBackendPolicy | None = None,
+    policy: InputBackendPolicy,
 ) -> InputBackend:
-    policy = policy or resolve_input_backend_policy()
+    # 工厂只消费冻结策略；环境变量解析属于 TestRuntimeConfig 的单一入口。
     normalized = policy.resolved
     device = policy.logical_device
 
-    # 只有无 config-local RNG 的兼容调用可以复用实例，避免随机流在配置之间共享。
-    cache_key = (normalized, device)
-    if input_random_state is INPUT_NUMPY_RANDOM_STATE and cache_key in _DEFAULT_INPUT_BACKENDS:
-        return _DEFAULT_INPUT_BACKENDS[cache_key]
-
     if normalized == "numpy":
-        input_backend = NumPyInputBackend(input_random_state)
+        return NumPyInputBackend(input_random_state)
     elif normalized == "torch":
-        input_backend = TorchInputBackend(input_random_state, device=device)
-    else:
-        input_backend = PaddleInputBackend(input_random_state, device=device)
-
-    if input_random_state is INPUT_NUMPY_RANDOM_STATE:
-        _DEFAULT_INPUT_BACKENDS[cache_key] = input_backend
-    return input_backend
+        return TorchInputBackend(input_random_state, device=device)
+    return PaddleInputBackend(input_random_state, device=device)
 
 
-def prepare_input_backend(policy=None):
+def prepare_input_backend(policy: InputBackendPolicy):
     """准备现有 backend 的进程级模块、device context 和物化通道。"""
-    # policy 已在 engine 主进程解析；独立调用时才允许沿用环境变量解析结果。
-    policy = policy or resolve_input_backend_policy()
-    backend = create_input_backend(policy=policy)
-    if getattr(backend, "_runtime_prepared", False):
-        return backend
+    if policy is None:
+        raise ValueError("input backend policy is required for runtime preparation")
+    cache_key = (policy.resolved, policy.logical_device)
+    if cache_key in _PREPARED_INPUT_BACKENDS:
+        return _PREPARED_INPUT_BACKENDS[cache_key]
+    # 准备阶段不生成随机输入；原生 backend 只接收不会推进 NumPy RNG 的 stream identity。
+    input_random_state = (
+        INPUT_NUMPY_RANDOM_STATE
+        if policy.resolved == "numpy"
+        else SimpleNamespace(seed=0, config_fingerprint="", stream_kind="runtime_probe")
+    )
+    backend = create_input_backend(input_random_state, policy=policy)
 
     # 常量探针不读取 RNG 或 cache，只把首次真实物化移到 worker ready 之前。
     probe = backend.zeros((1,), dtype="float32")
@@ -1033,9 +1020,35 @@ def prepare_input_backend(policy=None):
     elif backend.name == "paddle" and policy.logical_device.startswith(("gpu", "cuda")):
         backend._paddle().device.cuda.synchronize()
     del probe
-    # 标记只写入兼容 backend 实例，不能扩展为跨 config 的随机状态缓存。
-    backend._runtime_prepared = True
+    # 仅缓存完成初始化的无随机状态 backend；每个 config 仍创建独立生成实例。
+    _PREPARED_INPUT_BACKENDS[cache_key] = backend
     return backend
+
+
+def _cached_numpy_output_grad(dtype, shape, stream_kind, seed, config_fingerprint):
+    """返回 NumPy backend 拥有的稳定 output-grad 缓存。"""
+    if dtype in {"float8_e5m2", "float8_e4m3fn"}:
+        dtype = "float16"
+    elif dtype == "bfloat16":
+        dtype = "float32"
+    shape = _normalize_shape(shape, scalar_empty=False)
+    # cache key 包含完整 stream identity，不能让 worker 调度改变配置输入。
+    key = (dtype, shape, stream_kind, int(seed), str(config_fingerprint))
+    if key not in _CACHED_NUMPY_OUTPUT_GRADS:
+        rng = numpy.random.RandomState(
+            derive_input_seed(seed, config_fingerprint, f"cached_numpy:{stream_kind}")
+        )
+        if "int" in dtype:
+            value = rng.randint(-65535, 65535, size=shape, dtype="int64").astype(dtype)
+        elif dtype.startswith("complex"):
+            real_dtype = "float32" if dtype == "complex64" else "float64"
+            real = (rng.random(shape) - 0.5).astype(real_dtype)
+            imag = (rng.random(shape) - 0.5).astype(real_dtype)
+            value = (real + 1j * imag).astype(dtype)
+        else:
+            value = (rng.random(shape) - 0.5).astype(dtype)
+        _CACHED_NUMPY_OUTPUT_GRADS[key] = value
+    return _CACHED_NUMPY_OUTPUT_GRADS[key]
 
 
 def generate_output_grad(
@@ -1056,17 +1069,7 @@ def generate_output_grad(
     if cache_enabled:
         if backend_name != "numpy":
             raise ValueError("output-grad cache requires the NumPy backend")
-        # 延迟导入避免 tensor_config -> backend 的既有依赖形成模块环。
-        from .tensor_config import get_cached_numpy_array
-
-        return get_cached_numpy_array(
-            dtype,
-            shape,
-            generation_kind=stream_kind,
-            scale=1.0,
-            random_seed=seed,
-            config_fingerprint=config_fingerprint,
-        )
+        return _cached_numpy_output_grad(dtype, shape, stream_kind, seed, config_fingerprint)
 
     # 非缓存路径继续使用 backend 私有随机源，避免污染框架默认 generator。
     if backend_name == "numpy":

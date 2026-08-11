@@ -4,7 +4,6 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from .input_generation.backend import resolve_input_backend_name
 from .input_generation.tensor_config import (
     AUTOGRAD_DTYPES,
     FLOAT8_DTYPES,
@@ -167,14 +166,26 @@ def requires_inplace_input_copy(api_config):
     )
 
 
-def _framework_materialization(configs, input_backend, framework, *, force_clone=False):
+def _framework_materialization(
+    configs,
+    input_backend,
+    framework,
+    *,
+    input_source_on_gpu,
+    force_clone=False,
+):
     # 物化规则由 TensorConfig 统一给出；此处只累积顺序阶段的驻留量。
     resident_bytes = 0
     peak_bytes = 0
     # clone_target 独立累计，避免把复用的 native source 再算成一份框架驻留。
     clone_target_bytes = 0
     for config in configs:
-        plan = build_materialization_plan(config, input_backend, framework)
+        plan = build_materialization_plan(
+            config,
+            input_backend,
+            framework,
+            input_source_on_gpu=input_source_on_gpu,
+        )
         peak_bytes = max(
             peak_bytes,
             resident_bytes + plan.peak_bytes,
@@ -216,7 +227,8 @@ def estimate_gpu_memory(
     mode,
     *,
     check_grad,
-    input_backend="torch",
+    input_backend,
+    input_source_on_gpu,
     paddle_kernel_on_gpu=True,
     torch_operator_on_gpu=True,
 ):
@@ -225,9 +237,12 @@ def estimate_gpu_memory(
         raise ValueError(f"unsupported GPU memory preflight mode: {mode}")
     if input_backend not in {"numpy", "torch", "paddle"}:
         raise ValueError(f"unsupported input backend: {input_backend}")
+    # source 位置是显式物化事实；非法组合必须失败，不能退回 backend 名称猜测。
+    if input_backend == "numpy" and input_source_on_gpu:
+        raise ValueError("NumPy input source cannot reside on GPU")
 
     configs = _tensor_configs(api_config)
-    native_gpu_generation = input_backend != "numpy"
+    native_gpu_generation = bool(input_source_on_gpu)
     # NumPy backend 的生成峰值属于主存，不能为了 GPU mode 而误计入设备容量。
     generation_peak = _input_generation_peak(configs) if native_gpu_generation else 0
     generated_input_bytes = (
@@ -243,6 +258,7 @@ def estimate_gpu_memory(
             configs,
             input_backend,
             "torch",
+            input_source_on_gpu=input_source_on_gpu,
             force_clone=force_input_copy,
         )
         torch_framework_input_bytes = sum(_framework_live_input_bytes(config) for config in configs)
@@ -258,6 +274,7 @@ def estimate_gpu_memory(
             configs,
             input_backend,
             "paddle",
+            input_source_on_gpu=input_source_on_gpu,
             force_clone=force_input_copy,
         )
         paddle_framework_input_bytes = sum(
@@ -315,7 +332,12 @@ def estimate_gpu_memory(
         snapshot_extra_peak = (
             max(
                 (
-                    build_materialization_plan(config, input_backend, "torch").peak_bytes
+                    build_materialization_plan(
+                        config,
+                        input_backend,
+                        "torch",
+                        input_source_on_gpu=input_source_on_gpu,
+                    ).peak_bytes
                     for config in configs
                 ),
                 default=0,
@@ -330,6 +352,7 @@ def estimate_gpu_memory(
                 configs,
                 "numpy",
                 "torch",
+                input_source_on_gpu=False,
                 force_clone=force_input_copy,
             )
         stable_paddle_framework_peak = 0
@@ -338,6 +361,7 @@ def estimate_gpu_memory(
                 configs,
                 "numpy",
                 "paddle",
+                input_source_on_gpu=False,
                 force_clone=force_input_copy,
             )
         stages.append(
@@ -477,7 +501,8 @@ def decide_gpu_memory_preflight(
     check_grad,
     paddle_kernel_on_gpu=True,
     torch_operator_on_gpu=True,
-    input_backend=None,
+    input_backend,
+    input_source_on_gpu,
 ):
     # 预检只做 admission decision，不分配测试 Tensor，失败结果由调用方转换为 skip。
     """仅当配置峰值下界明显超过设备容量时返回 skip。"""
@@ -495,7 +520,8 @@ def decide_gpu_memory_preflight(
             api_config,
             mode,
             check_grad=check_grad,
-            input_backend=input_backend or resolve_input_backend_name(),
+            input_backend=input_backend,
+            input_source_on_gpu=input_source_on_gpu,
             paddle_kernel_on_gpu=paddle_kernel_on_gpu,
             torch_operator_on_gpu=torch_operator_on_gpu,
         )

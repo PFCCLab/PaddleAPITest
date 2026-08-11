@@ -27,7 +27,7 @@ class TestRuntimeConfig:
     input_backend_requested: str | None = None
     input_backend_resolved: str | None = None
     input_logical_device: str | None = None
-    cache_numpy: bool = False
+    use_cached_numpy: bool = False
     input_use_gpu_mode: bool = False
     input_backend_policy: object | None = None
     gpu_mode: GpuModeConfig = field(default_factory=GpuModeConfig)
@@ -61,11 +61,7 @@ class TestRuntimeConfig:
         policy = resolve_input_backend_policy(
             requested=getattr(options, "input_backend_requested", None),
             use_gpu_mode=bool(getattr(options, "use_gpu_mode", False)),
-            use_cached_numpy=bool(
-                getattr(options, "cache_numpy", False)
-                or getattr(options, "cache_numpy_auxiliary", False)
-                or getattr(options, "use_cached_numpy", False)
-            ),
+            use_cached_numpy=bool(getattr(options, "use_cached_numpy", False)),
             mode=next(
                 (
                     name
@@ -96,7 +92,7 @@ class TestRuntimeConfig:
             input_backend_requested=policy.requested,
             input_backend_resolved=policy.resolved,
             input_logical_device=policy.logical_device,
-            cache_numpy=policy.cache_numpy,
+            use_cached_numpy=policy.use_cached_numpy,
             input_use_gpu_mode=policy.use_gpu_mode,
             input_backend_policy=policy,
             gpu_mode=gpu_mode,
@@ -140,8 +136,9 @@ class TestRuntimeConfig:
 
 def runtime_config_for_gpu(options, gpu_id, comparison_gpu_id=None):
     runtime_config = getattr(options, "runtime_config", None)
+    # GPU 拓扑只能派生容量字段，不负责补建或重新解析输入策略。
     if runtime_config is None:
-        runtime_config = TestRuntimeConfig.from_options(options)
+        raise ValueError("runtime_config must be frozen before assigning a worker GPU")
     return runtime_config.for_gpu(
         gpu_id,
         getattr(options, "gpu_workers_per_gpu_map", {}) or {},

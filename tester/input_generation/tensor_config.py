@@ -10,9 +10,7 @@ import paddle
 import yaml
 from tester.dtype_utils import to_torch_dtype
 
-from .backend import create_input_backend
 from .value import clear_input_value, read_input_value, read_input_value_backend
-from .value_generators import derive_input_seed
 
 # 优化器的零填充位置属于物化层专用数据。
 OPTIMIZER_APIS = {
@@ -34,7 +32,6 @@ torch = _LazyTorch()
 
 TEST_NON_CONTIGUOUS = os.getenv("TEST_NON_CONTIGUOUS", "0").lower() in ("true", "1")
 USE_GPU_MODE = os.getenv("USE_GPU_MODE", "False").lower() == "true"
-cached_numpy = {}
 _DTYPE_BYTES = {
     "bool": 1,
     "uint8": 1,
@@ -136,70 +133,6 @@ def shape_storage_numel(shape, *, is_contiguous=True, strides=None):
     return storage_numel
 
 
-def _normalize_cache_dtype(dtype):
-    if dtype in ["float8_e5m2", "float8_e4m3fn"]:
-        return "float16"
-    if dtype == "bfloat16":
-        return "float32"
-    return str(dtype)
-
-
-def get_cached_numpy_array(
-    dtype,
-    shape,
-    generation_kind="input",
-    scale=1.2,
-    int_low=-65535,
-    int_high=65535,
-    random_seed=0,
-    config_fingerprint="",
-):
-    dtype = _normalize_cache_dtype(dtype)
-    shape = _shape_tuple(shape)
-    # cache identity 必须包含 seed 和配置指纹，不能把不同运行的随机值混用。
-    seed_identity = (int(random_seed), str(config_fingerprint))
-    key = (
-        dtype,
-        shape,
-        generation_kind,
-        float(scale),
-        int(int_low),
-        int(int_high),
-        seed_identity,
-    )
-    if key in cached_numpy:
-        return cached_numpy[key]
-
-    # 缓存首次填充也不能读取进程级 NumPy 状态，失败路径只影响当前局部数组。
-    rng = numpy.random.RandomState(
-        derive_input_seed(random_seed, config_fingerprint, f"cached_numpy:{generation_kind}")
-    )
-    if "int" in dtype:
-        tensor = rng.randint(int_low, int_high, size=shape, dtype="int64").astype(dtype)
-    elif dtype.startswith("complex"):
-        real_dtype = "float32" if dtype == "complex64" else "float64"
-        real_part = ((rng.random(shape) - 0.5) * scale).astype(real_dtype)
-        imag_part = ((rng.random(shape) - 0.5) * scale).astype(real_dtype)
-        tensor = (real_part + 1j * imag_part).astype(dtype)
-    else:
-        tensor = ((rng.random(shape) - 0.5) * scale).astype(dtype)
-    cached_numpy[key] = tensor
-    return tensor
-
-
-def __getattr__(name):
-    if name == "USE_CACHED_NUMPY":
-        values = {"true", "1", "yes", "y"}
-        return (
-            os.getenv(
-                "PADDLEAPITEST_CACHE_NUMPY_AUXILIARY",
-                os.getenv("USE_CACHED_NUMPY", "False"),
-            ).lower()
-            in values
-        )
-    raise AttributeError(name)
-
-
 not_zero_apis = frozenset(
     [
         "paddle.Tensor.__div__",
@@ -237,8 +170,6 @@ class TensorConfig:
         self.place = place
         self.is_contiguous = is_contiguous
         self.strides = strides
-        self.input_value = None
-        self.input_value_backend = None
         self.paddle_tensor = None
         self.torch_tensor = None
         self.cpu_tensor = None
@@ -253,8 +184,6 @@ class TensorConfig:
         result.place = copy.deepcopy(self.place)
         result.is_contiguous = self.is_contiguous
         result.strides = copy.deepcopy(self.strides)
-        result.input_value = None
-        result.input_value_backend = None
         result.paddle_tensor = None
         result.torch_tensor = None
         result.cpu_tensor = None
@@ -324,8 +253,7 @@ class TensorConfig:
         return ValueError(
             f"TensorConfig has no generated input value before {framework} materialization: "
             f"api={getattr(api_config, 'api_name', '<unknown>')}, "
-            f"shape={self.shape}, dtype={self.dtype}, "
-            f"backend={create_input_backend().name}"
+            f"shape={self.shape}, dtype={self.dtype}"
         )
 
     def _cast_intermediate_dtype(self):
@@ -574,8 +502,6 @@ class TensorConfig:
             clear_input_value(api_config, self)
         self.torch_tensor = None
         self.paddle_tensor = None
-        self.input_value = None
-        self.input_value_backend = None
         self.cpu_tensor = None
         if not is_gpu_mode():
             torch.cuda.empty_cache()
@@ -642,19 +568,22 @@ def _materialization_intermediate_bytes(config):
     return config.storage_numel() * intermediate_size
 
 
-def build_materialization_plan(config, input_backend, framework):
+def build_materialization_plan(config, input_backend, framework, *, input_source_on_gpu):
     """由实际 TensorConfig 物化规则生成 GPU 物化计划。"""
     if input_backend not in {"numpy", "torch", "paddle"}:
         raise ValueError(f"unsupported input backend: {input_backend}")
     if framework not in {"torch", "paddle"}:
         raise ValueError(f"unsupported materialization framework: {framework}")
+    # NumPy 值没有 GPU source storage，拒绝矛盾计划可避免错误复用主存数组。
+    if input_backend == "numpy" and input_source_on_gpu:
+        raise ValueError("NumPy input source cannot reside on GPU")
 
     target_bytes = _materialization_target_bytes(config)
     if target_bytes == 0:
         return MaterializationPlan()
 
-    source_bytes = generated_value_nbytes(config) if input_backend != "numpy" else 0
-    # NumPy source 在 CPU；Torch/Paddle native source 才可能与 GPU target 共享所有权。
+    source_bytes = generated_value_nbytes(config) if input_source_on_gpu else 0
+    # 只有 GPU source 才可能与 GPU target 共享所有权；backend 名称不能代表生成设备。
     name = dtype_name(config.dtype)
     cast_required = name in CAST_THROUGH_INTERMEDIATE_DTYPES
 
@@ -681,7 +610,7 @@ def build_materialization_plan(config, input_backend, framework):
             )
 
         # 原生同 dtype、同设备输入可复用生成 storage；cast 只在最终目标上新增 storage。
-        reuses_source = input_backend != "numpy" and not cast_required
+        reuses_source = input_source_on_gpu and not cast_required
         persistent_bytes = 0 if reuses_source else target_bytes
         temporary_bytes = 0 if reuses_source else target_bytes
         return MaterializationPlan(
@@ -696,7 +625,7 @@ def build_materialization_plan(config, input_backend, framework):
     logical_copy_bytes = (
         max(0, config.numel())
         * dtype_element_size("float16" if name in FLOAT8_DTYPES else config.dtype)
-        if input_backend == "numpy" or (input_backend == "paddle" and framework == "torch")
+        if not input_source_on_gpu or (input_backend == "paddle" and framework == "torch")
         else 0
     )
     final_cast_bytes = target_bytes if name in FLOAT8_DTYPES else 0

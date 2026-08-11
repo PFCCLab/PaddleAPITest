@@ -18,7 +18,6 @@ from .gpu_memory_preflight import (
     requires_inplace_input_copy,
     should_check_grad,
 )
-from .input_generation.backend import resolve_input_backend_name
 from .input_generation.binding import bind_input_parameters, split_tensor_method_arguments
 from .input_generation.tensor_config import (
     AUTOGRAD_DTYPES,
@@ -31,7 +30,6 @@ from .input_generation.tensor_config import (
 from .log_writer import log_worker
 from .log_writer.log_comparison import log_accuracy_tolerance
 from .log_writer.log_schema import MAX_CSV_CONFIG_LENGTH
-from .runtime_config import TestRuntimeConfig
 
 _TESTER_DIR = Path(__file__).resolve().parent
 
@@ -308,10 +306,13 @@ def classify_runtime_error(error_msg):
 
 class APITestBase:
     def __init__(self, api_config, use_torch=True, runtime_config=None):
+        # case 只能消费主进程冻结后的策略，不能在 worker 内根据环境重新选择 backend。
+        if runtime_config is None:
+            raise ValueError("runtime_config is required")
         self.api_config = api_config
         self.api_config.use_torch = use_torch
         self.use_torch = bool(use_torch)
-        self.runtime_config = runtime_config or TestRuntimeConfig()
+        self.runtime_config = runtime_config
         self.gpu_mode_config = self.runtime_config.gpu_mode
         # TensorConfig 通过 case 配置读取算子设备，避免把 GPU mode 当成执行设备开关。
         self.api_config.test_cpu = self.runtime_config.test_cpu
@@ -460,6 +461,9 @@ class APITestBase:
     def run_gpu_memory_preflight(self, mode):
         """在输入生成前统一执行 GPU 容量准入，并记录可审计终态。"""
         input_backend = getattr(self.runtime_config, "input_backend_resolved", None)
+        # 预检和实际生成必须共享同一个 resolved 名称，缺失时不能用默认值低估显存。
+        if input_backend is None:
+            raise ValueError("runtime config has no resolved input backend")
         decision = decide_gpu_memory_preflight(
             self.api_config,
             mode,
@@ -467,7 +471,10 @@ class APITestBase:
             check_grad=self.need_check_grad(),
             paddle_kernel_on_gpu=not self.runtime_config.test_cpu,
             torch_operator_on_gpu=self.use_torch,
-            input_backend=input_backend or resolve_input_backend_name(),
+            input_backend=input_backend,
+            input_source_on_gpu=(
+                input_backend != "numpy" and self.runtime_config.input_logical_device != "cpu"
+            ),
         )
         if not decision.should_skip:
             # 预检按总容量准入；首次分配前按计算卡公共阶段峰值释放上个 case 的跨框架缓存。
@@ -829,7 +836,7 @@ class APITestBase:
             seed=getattr(self.runtime_config, "random_seed", 0),
             config_fingerprint=getattr(self.api_config, "config", ""),
             stream_index=self._output_grad_stream_index("numpy"),
-            cache_enabled=bool(getattr(self.runtime_config, "cache_numpy", False)),
+            cache_enabled=bool(getattr(self.runtime_config, "use_cached_numpy", False)),
         )
 
     @staticmethod
@@ -918,7 +925,8 @@ class APITestBase:
         """由 resolved input backend 创建反向种子，再交给消费框架物化。"""
         dtype = _dtype_name(output.dtype)
         backend_name = getattr(self.runtime_config, "input_backend_resolved", None)
-        backend_name = backend_name or resolve_input_backend_name()
+        if backend_name is None:
+            raise ValueError("runtime config has no resolved input backend")
         if backend_name == "numpy":
             # NumPy seed 是该 backend 的正式反向输入，随后才按消费框架执行物化。
             return OutputGradSlot(seed_numpy=self._make_numpy_output_grad(output))

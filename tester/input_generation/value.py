@@ -51,70 +51,29 @@ def find_input_value(api_config, tensor_config):
 
 
 def read_input_value(api_config, tensor_config):
-    # 未挂载事务结果时回退到 TensorConfig 缓存，兼容物化后的局部更新。
     input_value = find_input_value(api_config, tensor_config)
-    if input_value is not None:
-        return input_value.generated_value
-    return tensor_config.input_value
+    return input_value.generated_value if input_value is not None else None
 
 
 def read_input_value_backend(api_config, tensor_config):
     input_value = find_input_value(api_config, tensor_config)
-    if input_value is not None:
-        return input_value.backend_name
-    return tensor_config.input_value_backend or "numpy"
-
-
-def _detect_input_value_backend(value):
-    # 这里只识别可能跨框架零拷贝的原生 Tensor，其余值统一按 NumPy 语义处理。
-    module = value.__class__.__module__.split(".", 1)[0]
-    if module in {"torch", "paddle"}:
-        return module
-    return "numpy"
-
-
-def write_input_value(api_config, tensor_config, new_value):
-    # 已提交记录和 TensorConfig 缓存必须同步更新，避免后续框架读取到不同逻辑值。
-    current_input_value = find_input_value(api_config, tensor_config)
-    input_backend = (
-        current_input_value.backend_name
-        if current_input_value is not None
-        else _detect_input_value_backend(new_value)
-    )
-    if current_input_value is not None:
-        updated_input_value = InputValue(
-            current_input_value.path,
-            new_value,
-            backend_name=input_backend,
-        )
-        input_value_by_tensor_id = getattr(api_config, _INPUT_VALUE_BY_TENSOR_ID_ATTR, None)
-        if input_value_by_tensor_id is not None:
-            input_value_by_tensor_id[id(tensor_config)] = updated_input_value
-        input_values = getattr(api_config, _INPUT_VALUES_ATTR, None)
-        if input_values is not None:
-            updated_input_values = (
-                updated_input_value if item.path == current_input_value.path else item
-                for item in input_values
-            )
-            setattr(api_config, _INPUT_VALUES_ATTR, tuple(updated_input_values))
-    tensor_config.input_value = new_value
-    tensor_config.input_value_backend = input_backend
-    return new_value
+    return input_value.backend_name if input_value is not None else None
 
 
 def clear_input_value(api_config, tensor_config):
-    # 清理同时覆盖路径序列、对象索引和 TensorConfig 缓存三个存储位置。
-    input_value = find_input_value(api_config, tensor_config)
+    # 清理同时覆盖路径序列和对象索引，不能留下只可按其中一种方式访问的值。
     input_value_by_tensor_id = getattr(api_config, _INPUT_VALUE_BY_TENSOR_ID_ATTR, None)
     if input_value_by_tensor_id is not None:
         input_value_by_tensor_id.pop(id(tensor_config), None)
-    if input_value is not None:
-        input_values = getattr(api_config, _INPUT_VALUES_ATTR, None)
-        if input_values is not None:
-            setattr(
-                api_config,
-                _INPUT_VALUES_ATTR,
-                tuple(item for item in input_values if item.path != input_value.path),
-            )
-    tensor_config.input_value = None
-    tensor_config.input_value_backend = None
+    input_values = getattr(api_config, _INPUT_VALUES_ATTR, None)
+    if input_values is not None:
+        # 同一个 TensorConfig 可能出现在多个参数路径，释放时必须清掉全部别名记录。
+        setattr(
+            api_config,
+            _INPUT_VALUES_ATTR,
+            tuple(
+                item
+                for item in input_values
+                if _tensor_value_at_path(api_config, item.path) is not tensor_config
+            ),
+        )

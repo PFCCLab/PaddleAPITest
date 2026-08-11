@@ -64,10 +64,6 @@ from tester.gpu_scheduler import (
     GpuWaveController,
     read_gpu_pressure_timeout,
 )
-from tester.input_generation.backend import (
-    resolve_input_backend_name,
-    resolve_input_backend_policy,
-)
 from tester.log_writer import (
     init_log,
     log_aggregation,
@@ -122,7 +118,6 @@ SANITIZER_FORWARD_ARGS = {
     "test_amp",
     "test_cpu",
     "use_cached_numpy",
-    "cache_numpy_auxiliary",
     "use_gpu_mode",
     "atol",
     "rtol",
@@ -1932,12 +1927,16 @@ def _estimate_case_gpu_memory(api_config_str, options):
         from tester import APIConfig
 
         api_config = APIConfig(api_config_str)
-        input_backend = getattr(options, "input_backend_resolved", None)
+        runtime_config = options.runtime_config
         estimate = estimate_gpu_memory(
             api_config,
             mode,
             check_grad=should_check_grad(api_config),
-            input_backend=input_backend or resolve_input_backend_name(),
+            input_backend=runtime_config.input_backend_resolved,
+            input_source_on_gpu=(
+                runtime_config.input_backend_resolved != "numpy"
+                and runtime_config.input_logical_device != "cpu"
+            ),
             # 执行设备分别建模，不能用 use_gpu_mode 代替 Paddle/Torch 的真实 place。
             paddle_kernel_on_gpu=not options.test_cpu,
             torch_operator_on_gpu=_mode_runs_torch_gpu_reference(options),
@@ -2793,19 +2792,8 @@ def _load_custom_device_options(options):
 
 
 def _apply_runtime_environment_flags(options):
-    # 两个入口只合并为 NumPy backend 自有缓存，不再提供跨 backend 的辅助数据通道。
-    options.cache_numpy = bool(
-        getattr(options, "cache_numpy_auxiliary", False) or options.use_cached_numpy
-    )
-    if options.use_cached_numpy:
-        print(
-            f"{ARGUMENT_WARNING_PREFIX} --use_cached_numpy is deprecated; "
-            "use --cache_numpy_auxiliary=True",
-            flush=True,
-        )
-    # 同时写入新旧变量，保证 spawn worker 与历史模块读取到同一布尔值。
-    os.environ["USE_CACHED_NUMPY"] = str(options.cache_numpy)
-    os.environ["PADDLEAPITEST_CACHE_NUMPY_AUXILIARY"] = str(options.cache_numpy)
+    # 该开关只属于 NumPy backend；policy 会拒绝原生 backend 偷用主存缓存。
+    os.environ["USE_CACHED_NUMPY"] = str(options.use_cached_numpy)
     os.environ["USE_GPU_MODE"] = str(options.use_gpu_mode)
     # 主进程在创建 runtime config 前冻结模式，worker 不再重复猜测默认 backend。
     mode = next(
@@ -2828,19 +2816,12 @@ def _apply_runtime_environment_flags(options):
         ),
         None,
     )
-    os.environ["PADDLEAPITEST_TEST_MODE"] = mode or ""
-    # policy 解析失败属于参数错误；解析成功后报告和预检都消费同一终态。
-    policy = resolve_input_backend_policy(
-        requested=os.environ.get("PADDLEAPITEST_INPUT_BACKEND"),
-        use_gpu_mode=options.use_gpu_mode,
-        use_cached_numpy=options.cache_numpy,
-        mode=mode,
-    )
+    # 主进程只解析一次终态，spawn worker、预检和具体 tester 共享同一份策略。
+    options.runtime_config = TestRuntimeConfig.from_options(options)
+    policy = options.runtime_config.input_backend_policy
     options.input_backend_requested = policy.requested
     options.input_backend_resolved = policy.resolved
     options.input_logical_device = policy.logical_device
-    # 主进程冻结一次终态，spawn worker、预检和具体 tester 共享同一份策略。
-    options.runtime_config = TestRuntimeConfig.from_options(options)
     if options.bitwise_alignment:
         options.atol = 0.0
         options.rtol = 0.0
@@ -3390,13 +3371,7 @@ def _build_argument_parser():
         "--use_cached_numpy",
         type=parse_bool,
         default=False,
-        help="Deprecated alias for --cache_numpy_auxiliary.",
-    )
-    parser.add_argument(
-        "--cache_numpy_auxiliary",
-        type=parse_bool,
-        default=False,
-        help="Cache NumPy-backend output gradients; requires the NumPy input backend.",
+        help="Reuse NumPy-backend output gradients; requires the NumPy input backend.",
     )
     parser.add_argument(
         "--use_gpu_mode",

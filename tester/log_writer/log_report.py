@@ -108,8 +108,8 @@ def print_run_header(options, paddle_version):
             compute.append(("--accuracy_dual_gpu", True))
         elif getattr(options, "accuracy_stable_dual_gpu", False):
             compute.append(("--accuracy_stable_dual_gpu", True))
-    elif getattr(options, "cache_numpy", False):
-        compute.append(("--cache_numpy_auxiliary", True))
+    if getattr(options, "use_cached_numpy", False):
+        compute.append(("--use_cached_numpy", True))
     compute.append(("--num_workers_per_gpu", options.num_workers_per_gpu))
     groups.append(("Compute", compute))
     for group_name, group_options in groups:

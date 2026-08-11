@@ -1,10 +1,8 @@
 # tester/__init__.py
 
-import os
 from typing import TYPE_CHECKING, Any
 
 __all__ = [
-    "USE_CACHED_NUMPY",
     "APIConfig",
     "APITestAccuracy",
     "APITestAccuracyStable",
@@ -18,7 +16,6 @@ __all__ = [
     "APITestTorchGPUPerformance",
     "TensorConfig",
     "analyse_configs",
-    "cached_numpy",
     "paddle_to_torch",
     "prepare_process_runtime",
 ]
@@ -27,13 +24,7 @@ if TYPE_CHECKING:
     from . import paddle_to_torch
     from .accuracy import APITestAccuracy
     from .accuracy_stable import APITestAccuracyStable
-    from .api_config import (
-        USE_CACHED_NUMPY,
-        APIConfig,
-        TensorConfig,
-        analyse_configs,
-        cached_numpy,
-    )
+    from .api_config import APIConfig, TensorConfig, analyse_configs
     from .base import APITestBase
     from .paddle_cinn_vs_dygraph import APITestCINNVSDygraph
     from .paddle_device_vs_cpu import APITestCustomDeviceVSCPU
@@ -48,11 +39,7 @@ def prepare_process_runtime(options):
     """按 engine 已冻结的配置准备当前进程使用的输入 backend。"""
     runtime_config = getattr(options, "runtime_config", None)
     if runtime_config is None:
-        # 直接调用 tester 的兼容入口仍可在此收敛配置，engine 路径不会重复解析。
-        from .runtime_config import TestRuntimeConfig
-
-        runtime_config = TestRuntimeConfig.from_options(options)
-        options.runtime_config = runtime_config
+        raise ValueError("runtime_config must be frozen before process runtime preparation")
 
     from .input_generation.backend import prepare_input_backend
 
@@ -119,14 +106,4 @@ def __getattr__(name: str) -> Any:
         from .api_config import analyse_configs
 
         return analyse_configs
-    elif name == "USE_CACHED_NUMPY":
-        return os.getenv(
-            "PADDLEAPITEST_CACHE_NUMPY_AUXILIARY",
-            os.getenv("USE_CACHED_NUMPY", "False"),
-        ).lower() in {"true", "1", "yes", "y"}
-    elif name == "cached_numpy":
-        from .api_config import cached_numpy
-
-        return cached_numpy
-
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

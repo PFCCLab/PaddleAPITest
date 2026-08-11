@@ -128,7 +128,9 @@ class InputRule:
     ) -> bool:
         # NumPy backend 需要局部 RandomState；原生 backend 直接消费 context 中的 seed 元数据。
         backend_policy = input_generation_context.backend_policy
-        if backend_policy is None or backend_policy.resolved == "numpy":
+        if backend_policy is None:
+            raise ValueError("input backend policy is required for input generation")
+        if backend_policy.resolved == "numpy":
             input_random_state = create_input_config_random_state(input_generation_context)
         else:
             input_random_state = input_generation_context
@@ -3734,8 +3736,6 @@ def _input_tensor_config_at(api_config, path):
 
 def _apply_input_value(api_config, input_value: InputValue, update_config):
     tensor_config = _input_tensor_config_at(api_config, input_value.path)
-    tensor_config.input_value = input_value.generated_value
-    tensor_config.input_value_backend = input_value.backend_name
     if update_config:
         dtype_name = str(getattr(input_value.generated_value, "dtype", ""))
         dtype_name = dtype_name.split(".")[-1] if dtype_name else dtype_name
