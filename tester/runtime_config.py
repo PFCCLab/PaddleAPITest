@@ -27,7 +27,7 @@ class TestRuntimeConfig:
     input_backend_requested: str | None = None
     input_backend_resolved: str | None = None
     input_logical_device: str | None = None
-    cache_numpy_auxiliary: bool | None = None
+    cache_numpy: bool = False
     input_use_gpu_mode: bool = False
     input_backend_policy: object | None = None
     gpu_mode: GpuModeConfig = field(default_factory=GpuModeConfig)
@@ -62,7 +62,8 @@ class TestRuntimeConfig:
             requested=getattr(options, "input_backend_requested", None),
             use_gpu_mode=bool(getattr(options, "use_gpu_mode", False)),
             use_cached_numpy=bool(
-                getattr(options, "cache_numpy_auxiliary", False)
+                getattr(options, "cache_numpy", False)
+                or getattr(options, "cache_numpy_auxiliary", False)
                 or getattr(options, "use_cached_numpy", False)
             ),
             mode=next(
@@ -95,7 +96,7 @@ class TestRuntimeConfig:
             input_backend_requested=policy.requested,
             input_backend_resolved=policy.resolved,
             input_logical_device=policy.logical_device,
-            cache_numpy_auxiliary=policy.cache_numpy_auxiliary,
+            cache_numpy=policy.cache_numpy,
             input_use_gpu_mode=policy.use_gpu_mode,
             input_backend_policy=policy,
             gpu_mode=gpu_mode,

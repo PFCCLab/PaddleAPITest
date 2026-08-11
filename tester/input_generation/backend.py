@@ -5,6 +5,7 @@ from __future__ import annotations
 import numbers
 import os
 from dataclasses import dataclass, field
+from types import SimpleNamespace
 from typing import Protocol
 
 import numpy
@@ -553,21 +554,31 @@ class PaddleInputBackend(NumPyInputBackend):
     name = "paddle"
 
     def __post_init__(self):
-        # Paddle 无稳定的逐实例 Generator；随机值改由独立 NumPy stream 生成。
-        # 这里绝不能播种 Paddle 全局 generator，避免规则失败污染后续配置。
+        # forward 与 output-grad 用不同 stream identity，不能共享首个随机样本。
         stream_kind = getattr(self.input_random_state, "stream_kind", "")
         if not stream_kind.startswith("output_grad:"):
             stream_kind = "paddle"
-        self._random_source = InputConfigRandomState(
+        seed = derive_input_seed(
             getattr(self.input_random_state, "seed", 0),
             getattr(self.input_random_state, "config_fingerprint", ""),
-            stream_kind=stream_kind,
+            stream_kind,
         )
         paddle = self._paddle()
+        # 私有状态必须来自目标 place 的默认 generator，否则恢复时设备状态类型不匹配。
         self._place = paddle.CPUPlace()
+        self._generator = paddle.framework.core.default_cpu_generator()
         if self.device.startswith(("gpu", "cuda")):
             device_id = int(self.device.split(":", 1)[1]) if ":" in self.device else 0
             self._place = paddle.CUDAPlace(device_id)
+            self._generator = paddle.framework.core.default_cuda_generator(device_id)
+
+        # Paddle 只有设备级默认 generator；初始化私有状态后立即恢复进程原状态。
+        process_state = self._generator.get_state()
+        try:
+            self._generator.manual_seed(seed)
+            self._random_state = self._generator.get_state()
+        finally:
+            self._generator.set_state(process_state)
 
     def _paddle(self):
         import paddle
@@ -594,57 +605,110 @@ class PaddleInputBackend(NumPyInputBackend):
             return "float64"
         return "float32"
 
+    def _run_random(self, function):
+        """临时挂载当前 config 的 Paddle RNG 状态，并隔离被测算子随机流。"""
+        process_state = self._generator.get_state()
+        try:
+            self._generator.set_state(self._random_state)
+            value = function()
+            # 只有原生随机调用成功才推进当前 backend 的私有 stream。
+            self._random_state = self._generator.get_state()
+            return value
+        finally:
+            self._generator.set_state(process_state)
+
     def random(self, shape=None, dtype=None):
-        value = self.asarray(self._random_source.random(shape), dtype="float32", copy=False)
+        paddle = self._paddle()
+        # 默认随机原语先生成稳定 float32 storage，再按逻辑 dtype 转换。
+        value = self._run_random(
+            lambda: paddle.rand(
+                self._paddle_shape(shape),
+                dtype="float32",
+                device=self.device,
+            )
+        )
         return self.cast(value, dtype) if dtype is not None else value
 
     def uniform(self, low=0.0, high=1.0, shape=None, dtype=None):
-        value = self.asarray(
-            self._random_source.uniform(low=float(low), high=float(high), shape=shape),
-            dtype=self._resolve_paddle_float_dtype(dtype),
-            copy=False,
+        paddle = self._paddle()
+        # seed=0 表示消费刚挂载的设备 generator，而不是创建算子私有固定 seed。
+        value = self._run_random(
+            lambda: paddle.uniform(
+                self._paddle_shape(shape),
+                dtype=self._resolve_paddle_float_dtype(dtype),
+                min=float(low),
+                max=float(high),
+                seed=0,
+                device=self.device,
+            )
         )
         return self.cast(value, dtype) if dtype is not None else value
 
     def randint(self, low, high=None, shape=None, dtype=None):
         if high is None:
             low, high = 0, low
-        value = self.asarray(
-            self._random_source.randint(int(low), int(high), shape=shape),
-            dtype="int64",
-            copy=False,
+        paddle = self._paddle()
+        value = self._run_random(
+            lambda: paddle.randint(
+                int(low),
+                int(high),
+                self._paddle_shape(shape),
+                dtype="int64",
+                device=self.device,
+            )
         )
         return self.cast(value, dtype) if dtype is not None else value
 
     def randn(self, *shape, dtype=None):
-        value = self.asarray(self._random_source.randn(*shape), dtype="float32", copy=False)
+        paddle = self._paddle()
+        value = self._run_random(
+            lambda: paddle.randn(
+                self._paddle_shape(shape),
+                dtype="float32",
+                device=self.device,
+            )
+        )
         return self.cast(value, dtype) if dtype is not None else value
 
     def choice(self, values, shape=None, replace=True, p=None):
-        # choice 也只能消费局部 NumPy stream，禁止 multinomial/randperm 隐式播种。
         paddle = self._paddle()
+        scalar, paddle_shape, num_samples = _choice_shape(shape, scalar_empty=True)
         if isinstance(values, numbers.Integral):
-            population = int(values)
+            population = paddle.arange(int(values), device=self.device)
         else:
-            if isinstance(values, paddle.Tensor):
-                # GPU Tensor 先复制到 CPU；该复制是数据搬运，不会触发随机算子。
-                values = values.cpu() if "gpu" in str(values.place).lower() else values
-                population = values.numpy()
-            else:
-                population = numpy.asarray(values)
-        if p is not None and hasattr(p, "cpu"):
-            p = p.cpu() if "gpu" in str(p.place).lower() else p
-            if isinstance(p, paddle.Tensor):
-                p = p.numpy()
-        result = self._random_source.choice(
-            population,
-            shape=shape,
-            replace=replace,
-            p=None if p is None else numpy.asarray(p),
-        )
-        if shape is None:
-            return result.item() if hasattr(result, "item") else result
-        return self.asarray(result, copy=False)
+            population = self.asarray(values, copy=False)
+
+        if p is not None:
+            # 带权采样由 Paddle multinomial 消费同一私有 stream，不回落到主存数组。
+            weights = self.asarray(p, dtype="float64", copy=False)
+            indices = self._run_random(
+                lambda: paddle.multinomial(weights, num_samples, replacement=replace)
+            )
+        elif replace:
+            # 有放回采样只生成 Paddle 索引，population 始终保持 backend-native。
+            indices = self._run_random(
+                lambda: paddle.randint(
+                    0,
+                    len(population),
+                    [num_samples],
+                    dtype="int64",
+                    device=self.device,
+                )
+            )
+        else:
+            if num_samples > len(population):
+                raise ValueError("Cannot take a larger sample than population when replace=False")
+            # 无放回采样通过原生 randperm 实现，保持与其他随机原语相同的状态推进。
+            indices = self._run_random(
+                lambda: paddle.randperm(
+                    len(population),
+                    dtype="int64",
+                    device=self.device,
+                )[:num_samples]
+            )
+
+        result = paddle.gather(population, indices)
+        return result.item() if scalar else self.reshape(result, paddle_shape)
 
     def asarray(self, value, dtype=None, copy=True):
         paddle = self._paddle()
@@ -807,13 +871,12 @@ class PaddleInputBackend(NumPyInputBackend):
 
 
 INPUT_BACKEND_ENV_VAR = "PADDLEAPITEST_INPUT_BACKEND"
-NUMPY_AUXILIARY_CACHE_ENV_VAR = "PADDLEAPITEST_CACHE_NUMPY_AUXILIARY"
 # Only used when no config-local RNG is available, such as legacy TensorConfig helpers.
 _DEFAULT_INPUT_BACKENDS = {}
 _TRUE_VALUES = {"true", "1", "yes", "y"}
 _VALID_INPUT_BACKENDS = frozenset({"numpy", "torch", "paddle"})
 # 模式默认值由 policy 唯一拥有，worker 和物化层只能消费解析结果。
-# cache 只控制辅助 NumPy 数据，不得再参与 backend 选择。
+# cache 只属于 NumPy backend，不得参与 backend 选择或为原生 backend 生成数据。
 # 未声明模式的直接模块调用保留 NumPy/CPU 的历史默认行为。
 _MODE_DEFAULT_BACKENDS = {
     "paddle_only": "paddle",
@@ -841,14 +904,6 @@ def _env_flag(name, default="False") -> bool:
     return os.getenv(name, default).lower() in _TRUE_VALUES
 
 
-def _cache_numpy_auxiliary_enabled() -> bool:
-    """读取辅助 NumPy cache 开关；旧变量只作为兼容输入。"""
-    return _env_flag(
-        NUMPY_AUXILIARY_CACHE_ENV_VAR,
-        os.getenv("USE_CACHED_NUMPY", "False"),
-    )
-
-
 @dataclass(frozen=True)
 class InputBackendPolicy:
     """一次运行内共享的输入 backend 请求、解析结果和逻辑值设备。"""
@@ -857,7 +912,7 @@ class InputBackendPolicy:
     resolved: str
     logical_device: str
     use_gpu_mode: bool
-    cache_numpy_auxiliary: bool
+    cache_numpy: bool
     mode: str | None = None
 
 
@@ -881,7 +936,10 @@ def resolve_input_backend_policy(
     else:
         use_gpu_mode = bool(use_gpu_mode)
     if use_cached_numpy is None:
-        use_cached_numpy = _cache_numpy_auxiliary_enabled()
+        use_cached_numpy = _env_flag(
+            "PADDLEAPITEST_CACHE_NUMPY_AUXILIARY",
+            os.getenv("USE_CACHED_NUMPY", "False"),
+        )
     else:
         use_cached_numpy = bool(use_cached_numpy)
     mode = mode or os.environ.get("PADDLEAPITEST_TEST_MODE") or None
@@ -889,6 +947,12 @@ def resolve_input_backend_policy(
     resolved = normalized_requested or _MODE_DEFAULT_BACKENDS.get(mode)
     if resolved is None:
         resolved = "torch" if use_gpu_mode else "numpy"
+    if use_cached_numpy and resolved != "numpy":
+        # cache 存储的是 NumPy backend 拥有的反向种子，不能跨 backend 偷换值所有者。
+        raise ValueError(
+            "NumPy cache requires PADDLEAPITEST_INPUT_BACKEND=numpy; "
+            f"resolved backend is {resolved!r}"
+        )
     # 性能模式本身要求 GPU-native 输入；显式 NumPy 仍是可见的 CPU 降级。
     effective_gpu_mode = use_gpu_mode or (
         mode in _GPU_NATIVE_MODES and normalized_requested != "numpy"
@@ -904,7 +968,7 @@ def resolve_input_backend_policy(
         resolved=resolved,
         logical_device=logical_device,
         use_gpu_mode=effective_gpu_mode,
-        cache_numpy_auxiliary=use_cached_numpy,
+        cache_numpy=use_cached_numpy,
         mode=mode,
     )
 
@@ -963,7 +1027,7 @@ def prepare_input_backend(policy=None):
         return backend
 
     # 常量探针不读取 RNG 或 cache，只把首次真实物化移到 worker ready 之前。
-    probe = backend.asarray(numpy.zeros((1,), dtype="float32"), copy=False)
+    probe = backend.zeros((1,), dtype="float32")
     if backend.name == "torch" and policy.logical_device.startswith("cuda"):
         backend._torch().cuda.synchronize(backend._device)
     elif backend.name == "paddle" and policy.logical_device.startswith(("gpu", "cuda")):
@@ -1005,15 +1069,23 @@ def generate_output_grad(
         )
 
     # 非缓存路径继续使用 backend 私有随机源，避免污染框架默认 generator。
-    random_state = InputConfigRandomState(seed, config_fingerprint, stream_kind=stream_kind)
     if backend_name == "numpy":
-        backend = NumPyInputBackend(random_state)
-    elif backend_name == "torch":
-        backend = TorchInputBackend(random_state, device=device)
-    elif backend_name == "paddle":
-        backend = PaddleInputBackend(random_state, device=device)
+        backend = NumPyInputBackend(
+            InputConfigRandomState(seed, config_fingerprint, stream_kind=stream_kind)
+        )
     else:
-        raise ValueError(f"unsupported output-grad backend: {backend_name!r}")
+        # 原生 backend 只需要 stream identity，不能为方便传参而实例化 NumPy RNG。
+        stream_identity = SimpleNamespace(
+            seed=seed,
+            config_fingerprint=config_fingerprint,
+            stream_kind=stream_kind,
+        )
+        if backend_name == "torch":
+            backend = TorchInputBackend(stream_identity, device=device)
+        elif backend_name == "paddle":
+            backend = PaddleInputBackend(stream_identity, device=device)
+        else:
+            raise ValueError(f"unsupported output-grad backend: {backend_name!r}")
 
     if "int" in dtype:
         return backend.randint(-65535, 65535, shape=shape, dtype=dtype)

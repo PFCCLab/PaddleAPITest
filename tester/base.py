@@ -25,7 +25,6 @@ from .input_generation.tensor_config import (
     TensorConfig,
     dtype_element_size,
     dtype_name,
-    get_cached_numpy_array,
     iter_unique_tensor_configs,
     tensor_config_tree_nbytes,
 )
@@ -808,16 +807,6 @@ class APITestBase:
 
         return [t for t in result if t.requires_grad]
 
-    def get_cached_numpy(self, dtype, shape, generation_kind="output_grad", scale=1.0):
-        return get_cached_numpy_array(
-            dtype,
-            shape,
-            generation_kind=generation_kind,
-            scale=scale,
-            random_seed=getattr(self.runtime_config, "random_seed", 0),
-            config_fingerprint=getattr(self.api_config, "config", ""),
-        )
-
     def _output_grad_stream_index(self, backend):
         """为同一 config 的多输出梯度分配独立 stream 序号。"""
         counters = getattr(self, "_output_grad_stream_counters", None)
@@ -830,11 +819,6 @@ class APITestBase:
 
     def _make_numpy_output_grad(self, output):
         dtype = _dtype_name(output.dtype)
-        from .input_generation.tensor_config import numpy_auxiliary_cache_enabled
-
-        cache_enabled = getattr(self.runtime_config, "cache_numpy_auxiliary", None)
-        if cache_enabled is None:
-            cache_enabled = numpy_auxiliary_cache_enabled()
         from .input_generation.backend import generate_output_grad
 
         return generate_output_grad(
@@ -845,7 +829,7 @@ class APITestBase:
             seed=getattr(self.runtime_config, "random_seed", 0),
             config_fingerprint=getattr(self.api_config, "config", ""),
             stream_index=self._output_grad_stream_index("numpy"),
-            cache_enabled=cache_enabled,
+            cache_enabled=bool(getattr(self.runtime_config, "cache_numpy", False)),
         )
 
     @staticmethod
@@ -874,6 +858,7 @@ class APITestBase:
         result_output_grad = torch.tensor(
             numpy_tensor,
             dtype=self.to_torch_dtype(dtype) if dtype != "bfloat16" else torch.float32,
+            device=output.device,
         )
         if dtype == "bfloat16":
             result_output_grad = result_output_grad.to(dtype=torch.bfloat16)
@@ -911,16 +896,6 @@ class APITestBase:
             stream_index=self._output_grad_stream_index("paddle"),
         )
 
-    def _use_gpu_output_grad(self, output):
-        if not self.gpu_mode_config.enabled:
-            return False
-        dtype = _dtype_name(output.dtype)
-        if isinstance(output, paddle.Tensor):
-            return output.place.is_gpu_place() and dtype in AUTOGRAD_DTYPES
-        if self.use_torch and isinstance(output, torch.Tensor):
-            return output.device.type != "cpu" and dtype in AUTOGRAD_DTYPES
-        return False
-
     @staticmethod
     def _output_grad_signature(outputs):
         return tuple((_dtype_name(output.dtype), tuple(output.shape)) for output in outputs)
@@ -932,33 +907,42 @@ class APITestBase:
                 return True
             if tensor.place.is_gpu_place() and output.place.is_gpu_place():
                 return int(tensor.place.gpu_device_id()) == int(output.place.gpu_device_id())
+            return str(tensor.place) == str(output.place)
         if isinstance(tensor, torch.Tensor) and isinstance(output, torch.Tensor):
             tensor_device = 0 if tensor.device.index is None else int(tensor.device.index)
             output_device = 0 if output.device.index is None else int(output.device.index)
             return tensor.device.type == output.device.type and tensor_device == output_device
         return False
 
-    def _make_gpu_paddle_output_grad_slot(self, output):
+    def _make_output_grad_slot(self, output):
+        """由 resolved input backend 创建反向种子，再交给消费框架物化。"""
         dtype = _dtype_name(output.dtype)
-        paddle_grad = self._make_paddle_output_grad(output.shape, dtype, place=output.place)
-        paddle_grad.stop_gradient = False
-        # Keep the native tensor. NumPy has no BF16 dtype and GPU tensors should
-        # not be forced through a host conversion merely to seed the other side.
-        return OutputGradSlot(seed_numpy=None, paddle_grad=paddle_grad)
+        backend_name = getattr(self.runtime_config, "input_backend_resolved", None)
+        backend_name = backend_name or resolve_input_backend_name()
+        if backend_name == "numpy":
+            # NumPy seed 是该 backend 的正式反向输入，随后才按消费框架执行物化。
+            return OutputGradSlot(seed_numpy=self._make_numpy_output_grad(output))
 
-    def _make_gpu_output_grad_pair_slot(self, output):
-        dtype = _dtype_name(output.dtype)
-        torch_grad = self._make_torch_output_grad(
-            output.shape,
-            dtype,
-            device=output.device,
-        ).detach()
-        # Paddle seed 由消费路径通过 DLPack 延迟共享，避免 Torch backward 前常驻等大 clone。
-        return OutputGradSlot(
-            seed_numpy=None,
-            paddle_grad=None,
-            torch_grad=torch_grad,
-        )
+        if isinstance(output, paddle.Tensor):
+            # 设备只决定原生 seed 的生成位置，不能反向改变 resolved backend。
+            device_id = int(output.place.gpu_device_id()) if output.place.is_gpu_place() else None
+        else:
+            device_id = int(output.device.index or 0) if output.device.type == "cuda" else None
+
+        if backend_name == "torch":
+            device = (
+                torch.device("cuda", device_id) if device_id is not None else torch.device("cpu")
+            )
+            # Torch seed 保持为唯一所有者，Paddle 消费时通过 DLPack 延迟共享。
+            torch_grad = self._make_torch_output_grad(output.shape, dtype, device=device).detach()
+            return OutputGradSlot(torch_grad=torch_grad)
+
+        if backend_name == "paddle":
+            place = paddle.CUDAPlace(device_id) if device_id is not None else paddle.CPUPlace()
+            paddle_grad = self._make_paddle_output_grad(output.shape, dtype, place=place)
+            paddle_grad.stop_gradient = False
+            return OutputGradSlot(paddle_grad=paddle_grad)
+        raise ValueError(f"unsupported output-grad backend: {backend_name!r}")
 
     @staticmethod
     def _torch_grad_to_paddle(torch_grad, output):
@@ -968,6 +952,9 @@ class APITestBase:
             device = torch.device("cpu")
         torch_grad = torch_grad.detach().to(device=device)
         paddle_grad = paddle.utils.dlpack.from_dlpack(torch.utils.dlpack.to_dlpack(torch_grad))
+        if not (output.place.is_cpu_place() or output.place.is_gpu_place()):
+            # 自定义设备不支持直接 DLPack 接收，先在 CPU 建立 Paddle 所有权再复制。
+            paddle_grad = paddle_grad._copy_to(output.place, False)
         paddle_grad.stop_gradient = False
         return paddle_grad
 
@@ -990,6 +977,11 @@ class APITestBase:
             slot.paddle_grad, output
         ):
             return slot.paddle_grad
+        if slot.paddle_grad is not None:
+            # Paddle backend 仍是唯一值所有者，place 转换不引入其他随机源。
+            paddle_grad = slot.paddle_grad.detach()._copy_to(output.place, False)
+            paddle_grad.stop_gradient = False
+            return paddle_grad
         if slot.seed_numpy is not None:
             return self._numpy_output_grad_to_paddle(slot.seed_numpy, output)
         if slot.torch_grad is not None:
@@ -1001,6 +993,8 @@ class APITestBase:
             slot.torch_grad, output
         ):
             return slot.torch_grad
+        if slot.torch_grad is not None:
+            return slot.torch_grad.detach().to(device=output.device)
         if slot.seed_numpy is not None:
             return self._numpy_output_grad_to_torch(slot.seed_numpy, output)
         if slot.paddle_grad is not None:
@@ -1015,17 +1009,8 @@ class APITestBase:
         if len(self.output_grad_slots) != len(result_outputs):
             self.output_grad_slots = []
             for output in result_outputs:
-                if self._use_gpu_output_grad(output):
-                    if isinstance(output, paddle.Tensor):
-                        self.output_grad_slots.append(
-                            self._make_gpu_paddle_output_grad_slot(output)
-                        )
-                    else:
-                        self.output_grad_slots.append(self._make_gpu_output_grad_pair_slot(output))
-                else:
-                    self.output_grad_slots.append(
-                        OutputGradSlot(seed_numpy=self._make_numpy_output_grad(output))
-                    )
+                # 输出所在框架不再决定随机源；它只决定最终梯度必须到达的设备。
+                self.output_grad_slots.append(self._make_output_grad_slot(output))
 
     def gen_paddle_output_and_output_grad(self, outputs):
         """Normalize Paddle outputs and align them with cached output-grad seeds."""

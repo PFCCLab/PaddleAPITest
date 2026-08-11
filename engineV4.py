@@ -77,6 +77,7 @@ from tester.log_writer import (
     log_worker,
 )
 from tester.runtime_config import (
+    TestRuntimeConfig,
     limit_worker_layout,
     runtime_config_for_gpu,
 )
@@ -2792,14 +2793,8 @@ def _load_custom_device_options(options):
 
 
 def _apply_runtime_environment_flags(options):
-    # 旧开关只映射到辅助缓存，不能再把 GPU 输入生成强制切回 NumPy。
-    if options.use_gpu_mode and options.use_cached_numpy:
-        print(
-            f"{ARGUMENT_WARNING_PREFIX} "
-            "--use_cached_numpy=True is retained as an auxiliary NumPy cache in GPU mode",
-            flush=True,
-        )
-    options.cache_numpy_auxiliary = bool(
+    # 两个入口只合并为 NumPy backend 自有缓存，不再提供跨 backend 的辅助数据通道。
+    options.cache_numpy = bool(
         getattr(options, "cache_numpy_auxiliary", False) or options.use_cached_numpy
     )
     if options.use_cached_numpy:
@@ -2809,8 +2804,8 @@ def _apply_runtime_environment_flags(options):
             flush=True,
         )
     # 同时写入新旧变量，保证 spawn worker 与历史模块读取到同一布尔值。
-    os.environ["USE_CACHED_NUMPY"] = str(options.cache_numpy_auxiliary)
-    os.environ["PADDLEAPITEST_CACHE_NUMPY_AUXILIARY"] = str(options.cache_numpy_auxiliary)
+    os.environ["USE_CACHED_NUMPY"] = str(options.cache_numpy)
+    os.environ["PADDLEAPITEST_CACHE_NUMPY_AUXILIARY"] = str(options.cache_numpy)
     os.environ["USE_GPU_MODE"] = str(options.use_gpu_mode)
     # 主进程在创建 runtime config 前冻结模式，worker 不再重复猜测默认 backend。
     mode = next(
@@ -2838,7 +2833,7 @@ def _apply_runtime_environment_flags(options):
     policy = resolve_input_backend_policy(
         requested=os.environ.get("PADDLEAPITEST_INPUT_BACKEND"),
         use_gpu_mode=options.use_gpu_mode,
-        use_cached_numpy=options.cache_numpy_auxiliary,
+        use_cached_numpy=options.cache_numpy,
         mode=mode,
     )
     options.input_backend_requested = policy.requested
@@ -3401,7 +3396,7 @@ def _build_argument_parser():
         "--cache_numpy_auxiliary",
         type=parse_bool,
         default=False,
-        help="Cache auxiliary NumPy data such as output gradients.",
+        help="Cache NumPy-backend output gradients; requires the NumPy input backend.",
     )
     parser.add_argument(
         "--use_gpu_mode",

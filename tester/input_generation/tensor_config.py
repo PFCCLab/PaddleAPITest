@@ -187,18 +187,16 @@ def get_cached_numpy_array(
     return tensor
 
 
-def numpy_auxiliary_cache_enabled():
-    """动态读取辅助 NumPy cache，避免 engine 设置环境变量后导出过期。"""
-    values = {"true", "1", "yes", "y"}
-    return os.getenv(
-        "PADDLEAPITEST_CACHE_NUMPY_AUXILIARY",
-        os.getenv("USE_CACHED_NUMPY", "False"),
-    ).lower() in values
-
-
 def __getattr__(name):
     if name == "USE_CACHED_NUMPY":
-        return numpy_auxiliary_cache_enabled()
+        values = {"true", "1", "yes", "y"}
+        return (
+            os.getenv(
+                "PADDLEAPITEST_CACHE_NUMPY_AUXILIARY",
+                os.getenv("USE_CACHED_NUMPY", "False"),
+            ).lower()
+            in values
+        )
     raise AttributeError(name)
 
 

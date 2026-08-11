@@ -8,8 +8,8 @@ from .backend import (
     PaddleInputBackend,
     TorchInputBackend,
     create_input_backend,
-    resolve_input_backend_policy,
     resolve_input_backend_name,
+    resolve_input_backend_policy,
 )
 from .tensor_config import TensorConfig, cached_numpy, get_cached_numpy_array
 from .value import InputValue
@@ -38,7 +38,7 @@ __all__ = [
 def __getattr__(name):
     # 可变环境开关必须按访问时读取，不能在模块导入阶段固化旧值。
     if name == "USE_CACHED_NUMPY":
-        from .tensor_config import numpy_auxiliary_cache_enabled
+        from . import tensor_config
 
-        return numpy_auxiliary_cache_enabled()
+        return tensor_config.USE_CACHED_NUMPY
     raise AttributeError(name)

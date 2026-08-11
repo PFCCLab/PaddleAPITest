@@ -126,11 +126,15 @@ class InputRule:
     def generate(
         self, input_generation_context: InputGenerationContext, api_config: object
     ) -> bool:
-        # 每个配置持有独立 RNG 副本；只有整条规则成功后才提交状态。
-        input_random_state = create_input_config_random_state(input_generation_context)
+        # NumPy backend 需要局部 RandomState；原生 backend 直接消费 context 中的 seed 元数据。
+        backend_policy = input_generation_context.backend_policy
+        if backend_policy is None or backend_policy.resolved == "numpy":
+            input_random_state = create_input_config_random_state(input_generation_context)
+        else:
+            input_random_state = input_generation_context
         input_backend = create_input_backend(
             input_random_state,
-            policy=input_generation_context.backend_policy,
+            policy=backend_policy,
         )
         input_rule_context = InputRuleContext(
             input_generation_context.input_binding, api_config, input_backend
@@ -628,11 +632,11 @@ def generate_optimizer_inputs(rule: InputRuleContext):
         if use_accuracy_compatible:
             beta_pow = beta**step
         else:
-            # Preserve the float32 power semantics without passing GPU scalars to NumPy.
+            # backend-native 标量保留 float32 幂语义，不把 Paddle/Torch 值交给 NumPy。
             step = step.item() if hasattr(step, "item") else step
             beta_pow = rule.ops.power(
-                numpy.float32(beta),
-                numpy.float32(int(step)),
+                rule.ops.full((), beta, dtype="float32"),
+                rule.ops.full((), int(step), dtype="float32"),
             )
             beta_pow = beta_pow.item() if hasattr(beta_pow, "item") else beta_pow
         return rule.ops.full(
