@@ -13,7 +13,6 @@ import yaml
 from .dtype_utils import to_torch_dtype
 from .dump_writer import DEFAULT_DUMP_DIR, DumpContext, dump_enabled
 from .gpu_memory_preflight import (
-    GpuMemoryDeferred,
     decide_gpu_memory_preflight,
     requires_inplace_input_copy,
 )
@@ -30,7 +29,7 @@ from .input_generation.tensor_config import (
 from .log_writer import log_worker
 from .log_writer.log_comparison import log_accuracy_tolerance
 from .log_writer.log_schema import MAX_CSV_CONFIG_LENGTH
-from .runtime_config import TestRuntimeConfig
+from .runtime_config import GpuMemoryDeferred, TestRuntimeConfig
 
 _TESTER_DIR = Path(__file__).resolve().parent
 

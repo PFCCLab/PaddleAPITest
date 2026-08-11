@@ -27,6 +27,10 @@ _RUNTIME_OPERATION_MODES = (
 )
 
 
+class GpuMemoryDeferred(RuntimeError):
+    """动态物理显存不足；本次 case 可在稍后重试。"""
+
+
 def numpy_cache_enabled(environ=None):
     """解析旧开关的输入生成缓存语义。"""
     env = os.environ if environ is None else environ

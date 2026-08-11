@@ -8,7 +8,6 @@ from dataclasses import dataclass, field
 from typing import Protocol
 
 import numpy
-from tester.dtype_utils import to_torch_dtype
 
 from .value_generators import (
     INPUT_NUMPY_RANDOM_STATE,
@@ -359,6 +358,8 @@ class TorchInputBackend(NumPyInputBackend):
         if storage_dtype is None:
             return None
         try:
+            from tester.dtype_utils import to_torch_dtype
+
             return to_torch_dtype(storage_dtype)
         except (TypeError, ValueError) as exc:
             raise self._capability_error(

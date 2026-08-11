@@ -51,7 +51,6 @@ from tester.dump_writer import (
     record_dump_terminal_status,
     resolve_dump_options,
 )
-from tester.gpu_memory_preflight import GpuMemoryDeferred
 from tester.log_writer import (
     init_log,
     log_aggregation,
@@ -62,6 +61,7 @@ from tester.log_writer import (
 )
 from tester.runtime_config import (
     NUMPY_CACHE_ENV_VAR,
+    GpuMemoryDeferred,
     TestRuntimeConfig,
     limit_worker_layout,
     runtime_config_for_gpu,
@@ -220,10 +220,9 @@ class PendingCase:
 @dataclass
 class CaseRuntimeContext:
     started_at: float
-    gpu_id: int
+    gpu_id: int | None
     comparison_gpu_id: int | None
     suppress_case_tags: bool
-    runtime_config: object | None = None
 
 
 @dataclass
@@ -325,12 +324,35 @@ def _init_runtime_modules(options):
         globals().update({"APIConfig": tester.APIConfig, test_class.__name__: test_class})
 
 
-def _visible_gpu_ids(gpu_id, comparison_gpu_id=None):
+def _configure_process_runtime(
+    environ,
+    gpu_ids,
+    *,
+    worker_slot=None,
+    workers_on_gpu=None,
+):
+    """在框架首次加载前固定目标进程的设备与 worker 身份。"""
+    visible_gpu_ids = tuple(gpu_id for gpu_id in gpu_ids if gpu_id is not None)
+    if visible_gpu_ids:
+        environ["CUDA_VISIBLE_DEVICES"] = ",".join(map(str, visible_gpu_ids))
+    if worker_slot is not None:
+        environ["PADDLEAPITEST_WORKER_SLOT"] = str(worker_slot)
+    if workers_on_gpu is not None:
+        environ["PADDLEAPITEST_WORKERS_ON_GPU"] = str(workers_on_gpu)
+
+
+def _configure_worker_environment(environ, slot_index, gpu_id, comparison_gpu_id, options):
+    # 普通 worker 与 sanitizer 子进程共享此环境协议，避免不同入口产生设备映射差异。
     if gpu_id is None:
-        return None
-    if comparison_gpu_id is None:
-        return str(gpu_id)
-    return f"{gpu_id},{comparison_gpu_id}"
+        return
+    # 显存预算按物理主卡的实际并发数计算，双卡比较设备不重复计入 worker 数。
+    workers_on_gpu = (getattr(options, "gpu_workers_per_gpu_map", {}) or {}).get(gpu_id, 1)
+    _configure_process_runtime(
+        environ,
+        (gpu_id, comparison_gpu_id),
+        worker_slot=slot_index,
+        workers_on_gpu=workers_on_gpu,
+    )
 
 
 def _init_worker_runtime(
@@ -338,23 +360,13 @@ def _init_worker_runtime(
     gpu_id,
     comparison_gpu_id,
     options,
-    *,
-    redirect_output,
 ):
+    # worker 内的框架只使用逻辑 gpu:0/gpu:1；物理卡选择只在此边界完成。
+    _configure_worker_environment(os.environ, slot_index, gpu_id, comparison_gpu_id, options)
+
     init_log(options.log_dir)
-
-    if gpu_id is not None:
-        os.environ["CUDA_VISIBLE_DEVICES"] = _visible_gpu_ids(gpu_id, comparison_gpu_id)
-        workers_on_gpu = (getattr(options, "gpu_workers_per_gpu_map", {}) or {}).get(gpu_id, 1)
-        os.environ["PADDLEAPITEST_WORKERS_ON_GPU"] = str(workers_on_gpu)
-
     _init_runtime_modules(options)
-
-    if redirect_output:
-        log_worker.redirect_stdio()
-
-    if slot_index is not None and gpu_id is not None:
-        os.environ["PADDLEAPITEST_WORKER_SLOT"] = str(slot_index)
+    log_worker.redirect_stdio()
 
 
 def _worker_loop(
@@ -386,7 +398,6 @@ def _worker_loop(
             gpu_id,
             comparison_gpu_id,
             options,
-            redirect_output=True,
         )
     except Exception as e:
         result_queue.put(("init_failed", slot_index, str(e)))
@@ -429,10 +440,6 @@ def _worker_loop(
                     log_worker.get_worker_log_offset(),
                 )
             )
-        except SystemExit:
-            # run_test_case 遇到 CUDA 错误时会走 os._exit，这里理论上不应到达；
-            # 如果是通过 sys.exit 进入这里，则继续向上抛出。
-            raise
         except Exception as e:
             result_queue.put(
                 (
@@ -493,9 +500,7 @@ def _sanitizer_worker_loop(
         options.sanitizer_command
     )
     child_env = os.environ.copy()
-    visible_gpu_ids = _visible_gpu_ids(gpu_id, comparison_gpu_id)
-    if visible_gpu_ids is not None:
-        child_env["CUDA_VISIBLE_DEVICES"] = visible_gpu_ids
+    _configure_worker_environment(child_env, slot_index, gpu_id, comparison_gpu_id, options)
     child_env["PADDLEAPITEST_SUPPRESS_CASE_TAGS"] = "1"
 
     def terminate_child(*args):
@@ -676,7 +681,6 @@ class WorkerPool:
         max_workers_per_gpu,
         options,
         *,
-        gpu_total_memory_map=None,
         cpu_worker_count=0,
     ):
         # 将 argparse.Namespace 转成 SimpleNamespace，便于 worker 进程更干净地 pickle。
@@ -685,10 +689,9 @@ class WorkerPool:
         else:
             self.options = options
         self.options.gpu_workers_per_gpu_map = dict(max_workers_per_gpu)
-        if gpu_total_memory_map is None:
-            # 允许外部预先收集，避免主流程和进程池重复探测同一批 GPU。
-            gpu_total_memory_map = _build_gpu_total_memory_map(available_gpus)
-        self.options.gpu_total_memory_map = dict(gpu_total_memory_map)
+        self.options.gpu_total_memory_map = dict(
+            getattr(self.options, "gpu_total_memory_map", {}) or {}
+        )
         self.result_queue = mp.Queue()
         self.slots: list[WorkerSlot] = []
         self._shutdown_event = threading.Event()
@@ -962,8 +965,6 @@ class WorkerPool:
             return
         exitcode = slot.process.exitcode if slot.process else None
         config = slot.current_task
-        if self._closed or self._shutdown_event.is_set():
-            return
         if config is not None:
             completed_offset = log_worker.append_case_end_to_worker_log(
                 slot.process.pid, "crashed", api_config_str=config
@@ -1341,19 +1342,10 @@ def _normalize_dual_gpu_option(options, option_name, base_mode):
     setattr(options, base_mode, True)
 
 
-def normalize_accuracy_stable_dual_gpu_options(options):
-    """兼容既有调用方，让 stable 双卡标志自洽地进入对应主模式。"""
-    _normalize_dual_gpu_option(options, "accuracy_stable_dual_gpu", "accuracy_stable")
-
-
-def normalize_accuracy_dual_gpu_options(options):
-    """让 accuracy 双卡标志自洽地进入 accuracy GPU mode。"""
-    _normalize_dual_gpu_option(options, "accuracy_dual_gpu", "accuracy")
-
-
 def normalize_dual_gpu_options(options):
-    normalize_accuracy_dual_gpu_options(options)
-    normalize_accuracy_stable_dual_gpu_options(options)
+    """将双卡组合开关规范化为基础测试模式与 GPU mode。"""
+    _normalize_dual_gpu_option(options, "accuracy_dual_gpu", "accuracy")
+    _normalize_dual_gpu_option(options, "accuracy_stable_dual_gpu", "accuracy_stable")
 
 
 def _requires_gpu_runtime(options):
@@ -1438,15 +1430,11 @@ def _apply_single_config_gpu_defaults(options):
 
 
 def _prepare_single_config_gpu(options):
-    normalize_dual_gpu_options(options)
-    if getattr(options, "accuracy_stable_dual_gpu", False) and getattr(options, "test_cpu", False):
-        raise ValueError("--accuracy_stable_dual_gpu=True does not support --test_cpu=True")
     if not _requires_gpu_runtime(options):
         options.gpu_workers_per_gpu_map = {}
         options.gpu_total_memory_map = {}
-        return None
+        return ()
 
-    _apply_single_config_gpu_defaults(options)
     gpu_ids = validate_gpu_options(options)
     expected_gpu_count = 2 if _dual_gpu_mode_enabled(options) else 1
     if len(gpu_ids) != expected_gpu_count:
@@ -1454,7 +1442,6 @@ def _prepare_single_config_gpu(options):
             f"single --api_config run requires exactly {expected_gpu_count} GPU(s); "
             f"got {len(gpu_ids)} GPUs: {gpu_ids}"
         )
-    os.environ["CUDA_VISIBLE_DEVICES"] = ",".join(str(gpu_id) for gpu_id in gpu_ids)
     options.gpu_total_memory_map = _build_gpu_total_memory_map(gpu_ids)
     options.gpu_workers_per_gpu_map = dict.fromkeys(gpu_ids, 1)
     return gpu_ids
@@ -1502,7 +1489,7 @@ def _run_single_config_with_sanitizer(options):
     )
     env = os.environ.copy()
     if gpu_ids:
-        env["CUDA_VISIBLE_DEVICES"] = ",".join(str(gpu_id) for gpu_id in gpu_ids)
+        _configure_process_runtime(env, gpu_ids)
 
     result = subprocess.run(
         cmd,
@@ -1846,17 +1833,15 @@ def _run_batch_mode(
     *,
     options,
     api_configs,
-    all_case,
     checkpointed_case,
     available_gpus,
     max_workers_per_gpu,
-    gpu_total_memory_map,
     cpu_worker_count,
     start_time,
 ):
+    all_case = len(api_configs)
     batch_state = BatchRunState()
     retry_state = BatchRetryState()
-    max_total_external_kills = MAX_TOTAL_EXTERNAL_KILL_EVENTS
     pool = None
     previous_signal_handlers = {}
 
@@ -1868,7 +1853,6 @@ def _run_batch_mode(
             available_gpus,
             max_workers_per_gpu,
             options,
-            gpu_total_memory_map=gpu_total_memory_map,
             cpu_worker_count=cpu_worker_count,
         )
 
@@ -1942,7 +1926,7 @@ def _run_batch_mode(
                         retry_state=retry_state,
                         pending_dispatch=pending_dispatch,
                         msg=msg,
-                        max_total_external_kills=max_total_external_kills,
+                        max_total_external_kills=MAX_TOTAL_EXTERNAL_KILL_EVENTS,
                     )
             refill_idle_workers()
 
@@ -2152,7 +2136,7 @@ def run_test_case(api_config_str, options):
     test_class = api_config = case = None
     case_status = "done"
     try:
-        case_context.runtime_config = runtime_config_for_gpu(
+        runtime_config = runtime_config_for_gpu(
             options,
             case_context.gpu_id,
             comparison_gpu_id=case_context.comparison_gpu_id,
@@ -2166,7 +2150,7 @@ def run_test_case(api_config_str, options):
 
         test_class = _select_test_class(options)
         kwargs = {k: v for k, v in vars(options).items() if k in VALID_TEST_ARGS}
-        kwargs["runtime_config"] = case_context.runtime_config
+        kwargs["runtime_config"] = runtime_config
         case = test_class(api_config, **kwargs)
         try:
             if dump_enabled():
@@ -2250,7 +2234,8 @@ def _prepare_common_options(options):
 
 def _run_sanitizer_child_mode(options):
     try:
-        _init_worker_runtime(None, None, None, options, redirect_output=False)
+        init_log(options.log_dir)
+        _init_runtime_modules(options)
         options.api_config = options.api_config.strip()
         defer_retry_count = 0
         while True:
@@ -2269,8 +2254,6 @@ def _run_sanitizer_child_mode(options):
                     flush=True,
                 )
                 time.sleep(delay)
-    except SystemExit:
-        raise
     except Exception as err:
         print(f"[test error] {options.api_config}: {err}", flush=True)
         return 2
@@ -2368,9 +2351,12 @@ def _run_single_case_mode(options, start_time):
         return _run_single_config_with_sanitizer(options)
 
     try:
-        _prepare_single_config_gpu(options)
+        gpu_ids = _prepare_single_config_gpu(options)
     except ValueError as err:
         return _argument_error(str(err))
+
+    if gpu_ids:
+        _configure_process_runtime(os.environ, gpu_ids)
 
     log_report.print_running_banner()
 
@@ -2519,6 +2505,8 @@ def _run_batch_case_mode(options, start_time):
             return 2
         options.sanitizer_cmd = sanitizer_cmd
 
+    options.gpu_total_memory_map = gpu_total_memory_map
+
     if available_gpus:
         log_report.print_compute_summary(
             available_gpus,
@@ -2536,11 +2524,9 @@ def _run_batch_case_mode(options, start_time):
     return _run_batch_mode(
         options=options,
         api_configs=api_configs,
-        all_case=all_case,
         checkpointed_case=batch_configs.finish_case,
         available_gpus=available_gpus,
         max_workers_per_gpu=max_workers_per_gpu,
-        gpu_total_memory_map=gpu_total_memory_map,
         cpu_worker_count=cpu_worker_count,
         start_time=start_time,
     )

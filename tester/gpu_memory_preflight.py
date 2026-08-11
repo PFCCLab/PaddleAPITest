@@ -7,7 +7,6 @@ from dataclasses import dataclass
 from .input_generation.tensor_config import (
     AUTOGRAD_DTYPES,
     build_materialization_plan,
-    dtype_element_size,
     dtype_name,
     generated_value_nbytes,
     iter_unique_tensor_configs,
@@ -23,10 +22,6 @@ _SUPPORTED_MODES = frozenset(
         "accuracy_stable_dual_gpu",
     }
 )
-
-
-class GpuMemoryDeferred(RuntimeError):
-    """动态物理显存不足；本次 case 可在稍后重试。"""
 
 
 # 预检只统计能由 TensorConfig 和执行模式可靠确定的 GPU 存活集合。
