@@ -18,11 +18,10 @@ APIConfig -> APITestBase.generate_input_values -> dispatcher.py -> binding.py ->
 - `value_generators.py`：与 API 无关的通用值生成，具体数组/tensor 由 backend 决定
 - `generation_rules.py`：`@input_rules.register` 规则、`InputRuleContext` 和规则执行入口
 - `dispatcher.py`：输入生成调度和规则查找
-- `backend.py`：输入生成 backend 选择和 numpy/torch/paddle 实现
+- `backend.py`：`InputBackend` Protocol、backend policy/factory，以及相互独立的 NumPy/Torch/Paddle 实现
 - `tensor_config.py`：张量配置、缓存和框架物化
 
 规则接口优化计划见
-`docs/superpowers/plans/2026-08-03-input-generation-rule-api-optimization.md`。
 
 ## 命名约束
 
@@ -202,6 +201,6 @@ writer 在 rule 执行期间只暂存 backend 拷贝。rule 抛出异常或完�
 
 ## 当前状态
 
-- `InputConfigRandomState` 使用独立 `RandomState`，`commit()` 保留兼容入口但不写回全局
+- `InputConfigRandomState` 使用独立 `RandomState`；native backend 使用配置 seed 派生自身随机源
 - 所有注册规则统一使用单参数 `InputRuleContext` 协议
 - 运行时目录只保留当前实现代码
