@@ -15,11 +15,12 @@ from .binding import InputApiBinding, InputGenerationContext
 from .tensor_config import (
     CAST_THROUGH_INTERMEDIATE_DTYPES,
     TensorConfig,
-    not_zero_apis,
     shape_numel,
 )
 from .tensor_spec import InputTensorSpec
-from .value import InputValue, attach_input_values, read_input_value
+
+# 规则层只通过 value 模块读取路径对象，避免再次实现 APIConfig 遍历。
+from .value import InputValue, attach_input_values, input_tensor_config_at, read_input_value
 from .value_generators import (
     create_input_config_random_state,
     generate_abs_plus_one_input_value,
@@ -48,6 +49,30 @@ from .value_generators import (
     generate_uniform_input_value,
     generate_unit_interval_input_value,
     generate_unit_plus_one_input_value,
+)
+
+# API 值域策略属于规则层，不由 TensorConfig 物化模块持有。
+not_zero_apis = frozenset(
+    {
+        "paddle.Tensor.__div__",
+        "paddle.Tensor.__floordiv__",
+        "paddle.Tensor.__mod__",
+        "paddle.Tensor.__rdiv__",
+        "paddle.Tensor.__rfloordiv__",
+        "paddle.Tensor.__rmod__",
+        "paddle.Tensor.__rtruediv__",
+        "paddle.Tensor.__truediv__",
+        "paddle.Tensor.divide",
+        "paddle.Tensor.floor_divide",
+        "paddle.Tensor.floor_mod",
+        "paddle.Tensor.mod",
+        "paddle.divide",
+        "paddle.floor_divide",
+        "paddle.floor_mod",
+        "paddle.mod",
+        "paddle.nn.functional.kl_div",
+        "paddle.sparse.divide",
+    }
 )
 
 # Core protocols and value-domain descriptors.
@@ -191,7 +216,7 @@ class _InputValueWriter:
         input_value = self._input_value_by_path.get(input_binding.path)
         if input_value is not None:
             return input_value.generated_value
-        tensor_config = _input_tensor_config_at(self._api_config, input_binding.path)
+        tensor_config = input_tensor_config_at(self._api_config, input_binding.path)
         return read_input_value(self._api_config, tensor_config)
 
     def _write_value(self, input_binding, input_value, update_config):
@@ -256,7 +281,7 @@ class InputRuleContext:
         if not self.is_tensor_config(value):
             return None
         for tensor in self._input_binding.tensor_bindings:
-            if _input_tensor_config_at(self._api_config, tensor.path) is value:
+            if input_tensor_config_at(self._api_config, tensor.path) is value:
                 return tensor
         return None
 
@@ -3721,20 +3746,8 @@ def generate_one_hot_inputs(rule: InputRuleContext):
     rule.generate_remaining()
 
 
-# Low-level config access.
-def _input_tensor_config_at(api_config, path):
-    value = (
-        api_config.args[path.argument_key]
-        if path.argument_kind == "args"
-        else api_config.kwargs[path.argument_key]
-    )
-    for index in path.item_indices:
-        value = value[index]
-    return value
-
-
 def _apply_input_value(api_config, input_value: InputValue, update_config):
-    tensor_config = _input_tensor_config_at(api_config, input_value.path)
+    tensor_config = input_tensor_config_at(api_config, input_value.path)
     if update_config:
         dtype_name = str(getattr(input_value.generated_value, "dtype", ""))
         dtype_name = dtype_name.split(".")[-1] if dtype_name else dtype_name

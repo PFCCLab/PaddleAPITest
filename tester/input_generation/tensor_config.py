@@ -133,30 +133,6 @@ def shape_storage_numel(shape, *, is_contiguous=True, strides=None):
     return storage_numel
 
 
-not_zero_apis = frozenset(
-    [
-        "paddle.Tensor.__div__",
-        "paddle.Tensor.__floordiv__",
-        "paddle.Tensor.__mod__",
-        "paddle.Tensor.__rdiv__",
-        "paddle.Tensor.__rfloordiv__",
-        "paddle.Tensor.__rmod__",
-        "paddle.Tensor.__rtruediv__",
-        "paddle.Tensor.__truediv__",
-        "paddle.Tensor.divide",
-        "paddle.Tensor.floor_divide",
-        "paddle.Tensor.floor_mod",
-        "paddle.Tensor.mod",
-        "paddle.divide",
-        "paddle.floor_divide",
-        "paddle.floor_mod",
-        "paddle.mod",
-        "paddle.nn.functional.kl_div",
-        "paddle.sparse.divide",
-    ]
-)
-
-
 class TensorConfig:
     """一次参数位置上的可变 Tensor 配置。
 

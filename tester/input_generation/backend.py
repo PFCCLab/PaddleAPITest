@@ -6,7 +6,7 @@ import numbers
 import os
 from dataclasses import dataclass, field
 from types import SimpleNamespace
-from typing import Protocol
+from typing import Protocol, runtime_checkable
 
 import numpy
 from tester.dtype_utils import to_torch_dtype
@@ -21,6 +21,7 @@ from .value_generators import (
 _PREPARED_INPUT_BACKENDS = {}
 
 
+@runtime_checkable
 class InputBackend(Protocol):
     """Value construction interface used by input-generation rules."""
 
@@ -105,6 +106,29 @@ class InputBackendCapabilityError(ValueError):
     """输入 backend 无法按协议物化某个逻辑 dtype 或原语。"""
 
 
+def _resolve_storage_dtype(dtype, backend_name):
+    """将逻辑 dtype 归一化为 backend 可稳定构造的 storage dtype。"""
+    # 三个 backend 共享逻辑 dtype 协议，但各自负责最终的原生物化。
+    if dtype is None:
+        return None
+    if isinstance(dtype, str):
+        dtype_name = dtype.replace("paddle.", "")
+    else:
+        try:
+            dtype_name = numpy.dtype(dtype).name
+        except TypeError:
+            dtype_name = str(dtype).split(".")[-1]
+    storage_dtype = resolve_input_dtype(dtype_name)
+    try:
+        numpy.dtype(storage_dtype)
+    except TypeError as err:
+        raise InputBackendCapabilityError(
+            f"{backend_name} backend does not support input dtype {dtype_name!r} "
+            f"(storage dtype {storage_dtype!r})"
+        ) from err
+    return storage_dtype
+
+
 @dataclass
 class NumPyInputBackend:
     """NumPy implementation of the input-generation backend."""
@@ -117,27 +141,7 @@ class NumPyInputBackend:
         return resolve_input_dtype(dtype)
 
     def _storage_dtype(self, dtype):
-        # 逻辑 dtype 属于配置协议，生成原语只接收 backend 能稳定构造的 storage dtype。
-        # BF16、FP8 和宽无符号整数因此必须在这一层统一降级，不能由各条规则自行判断。
-        # 映射后的 dtype 仍需显式校验，避免把底层库偶然抛出的错误当作协议定义。
-        if dtype is None:
-            return None
-        if isinstance(dtype, str):
-            dtype_name = dtype.replace("paddle.", "")
-        else:
-            try:
-                dtype_name = numpy.dtype(dtype).name
-            except TypeError:
-                dtype_name = str(dtype).split(".")[-1]
-        storage_dtype = resolve_input_dtype(dtype_name)
-        try:
-            numpy.dtype(storage_dtype)
-        except TypeError as err:
-            raise InputBackendCapabilityError(
-                f"{self.name} backend does not support input dtype {dtype_name!r} "
-                f"(storage dtype {storage_dtype!r})"
-            ) from err
-        return storage_dtype
+        return _resolve_storage_dtype(dtype, self.name)
 
     def random(self, shape=None, dtype=None):
         value = self.input_random_state.random(shape)
@@ -257,12 +261,20 @@ class NumPyInputBackend:
 
 
 @dataclass
-class TorchInputBackend(NumPyInputBackend):
+class TorchInputBackend:
     """Torch implementation of the input-generation backend."""
 
+    input_random_state: object = INPUT_NUMPY_RANDOM_STATE
     device: str = "cpu"
     name = "torch"
     _generator: object = field(init=False, repr=False)
+
+    def resolve_input_dtype(self, dtype: str) -> str:
+        # native backend 不再从 NumPy 继承协议实现，避免隐式回落。
+        return resolve_input_dtype(dtype)
+
+    def _storage_dtype(self, dtype):
+        return _resolve_storage_dtype(dtype, self.name)
 
     def __post_init__(self):
         prepared = _PREPARED_INPUT_BACKENDS.get((self.name, self.device))
@@ -551,11 +563,19 @@ class TorchInputBackend(NumPyInputBackend):
 
 
 @dataclass
-class PaddleInputBackend(NumPyInputBackend):
+class PaddleInputBackend:
     """Paddle implementation of the input-generation backend."""
 
+    input_random_state: object = INPUT_NUMPY_RANDOM_STATE
     device: str = "cpu"
     name = "paddle"
+
+    def resolve_input_dtype(self, dtype: str) -> str:
+        # native backend 不再从 NumPy 继承协议实现，避免隐式回落。
+        return resolve_input_dtype(dtype)
+
+    def _storage_dtype(self, dtype):
+        return _resolve_storage_dtype(dtype, self.name)
 
     def __post_init__(self):
         prepared = _PREPARED_INPUT_BACKENDS.get((self.name, self.device))

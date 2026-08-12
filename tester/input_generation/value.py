@@ -21,13 +21,13 @@ _INPUT_VALUE_BY_TENSOR_ID_ATTR = "_input_generation_value_by_tensor_id"
 
 
 def _tensor_value_at_path(api_config, path: InputTensorPath):
-    if path.argument_kind == "args":
-        value = api_config.args[path.argument_key]
-    else:
-        value = api_config.kwargs[path.argument_key]
-    for index in path.item_indices:
-        value = value[index]
-    return value
+    return path.resolve(api_config)
+
+
+def input_tensor_config_at(api_config, path: InputTensorPath):
+    """读取路径对应的 TensorConfig，供规则提交和生命周期管理共用。"""
+    # TensorConfig 的查找只依赖稳定路径，不读取或修改物化缓存。
+    return path.resolve(api_config)
 
 
 def attach_input_values(api_config, input_values):

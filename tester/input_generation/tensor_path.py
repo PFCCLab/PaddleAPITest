@@ -14,6 +14,18 @@ class InputTensorPath:
     argument_key: int | str
     item_indices: tuple[int, ...] = ()
 
+    def resolve(self, api_config):
+        """按稳定路径读取 APIConfig 中的当前值。"""
+        # 路径对象统一处理 args、kwargs 和嵌套索引，调用方不重复解析。
+        value = (
+            api_config.args[self.argument_key]
+            if self.argument_kind == "args"
+            else api_config.kwargs[self.argument_key]
+        )
+        for index in self.item_indices:
+            value = value[index]
+        return value
+
     def __post_init__(self):
         if self.argument_kind == "args":
             if not isinstance(self.argument_key, int) or self.argument_key < 0:
