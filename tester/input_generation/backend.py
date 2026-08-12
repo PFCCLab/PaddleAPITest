@@ -19,6 +19,22 @@ from .value_generators import (
 _PREPARED_INPUT_BACKENDS = {}
 
 
+def _normalize_shape(shape, *, scalar_empty):
+    """统一 NumPy 与原生 backend 对标量 shape 的边界表示。"""
+    if shape is None:
+        return [] if scalar_empty else ()
+    if isinstance(shape, numbers.Integral):
+        return [int(shape)] if scalar_empty else (int(shape),)
+    return list(shape) if scalar_empty else tuple(shape)
+
+
+def _choice_shape(shape, *, scalar_empty):
+    """返回采样目标的标量标志、规范 shape 和元素数量。"""
+    scalar = shape is None
+    normalized = _normalize_shape(shape, scalar_empty=scalar_empty)
+    return scalar, normalized, 1 if scalar else int(numpy.prod(normalized))
+
+
 @runtime_checkable
 class InputBackend(Protocol):
     """Value construction interface used by input-generation rules."""

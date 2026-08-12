@@ -3,7 +3,7 @@ from __future__ import annotations
 from collections.abc import Iterable
 from pathlib import Path
 
-from tester.api_config.config_analyzer import APIConfig
+from tester.api_config.parser import APIConfig
 
 from .spec import CompareCase
 

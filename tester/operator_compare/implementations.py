@@ -7,7 +7,10 @@ from typing import Any
 
 import paddle
 import torch
-from tester.api_config.config_analyzer import APIConfig, TensorConfig
+
+# operator_compare 复用 V4 的 parser 和 TensorConfig，避免回退到已删除的旧 analyzer。
+from tester.api_config.parser import APIConfig
+from tester.input_generation.tensor_config import TensorConfig
 from tester.paddle_to_torch import ConversionKind
 from tester.paddle_to_torch.arguments import bind_paddle_arguments
 from tester.paddle_to_torch.converter import Paddle2TorchConverter, get_converter

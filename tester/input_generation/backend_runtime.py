@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import numbers
 import os
 from dataclasses import dataclass
 from types import SimpleNamespace
@@ -18,6 +17,7 @@ from .backend import (
     NumPyInputBackend,
     PaddleInputBackend,
     TorchInputBackend,
+    _normalize_shape,
     derive_input_seed,
 )
 
@@ -49,15 +49,6 @@ _GPU_NATIVE_MODES = frozenset(
 def _env_flag(name, default="False") -> bool:
     # 环境变量只在策略解析时读取一次，worker 内不再重复解释字符串。
     return os.getenv(name, default).lower() in _TRUE_VALUES
-
-
-def _normalize_shape(shape, *, scalar_empty):
-    # NumPy 和原生 backend 对标量 shape 的表示不同，这里统一边界格式。
-    if shape is None:
-        return [] if scalar_empty else ()
-    if isinstance(shape, numbers.Integral):
-        return [int(shape)] if scalar_empty else (int(shape),)
-    return list(shape) if scalar_empty else tuple(shape)
 
 
 def create_input_backend(input_random_state, *, policy):
