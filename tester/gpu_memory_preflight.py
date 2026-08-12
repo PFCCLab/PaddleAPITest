@@ -4,15 +4,17 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+from .input_generation.materialization import (
+    build_materialization_plan,
+    generated_value_nbytes,
+    iter_unique_tensor_configs,
+)
 from .input_generation.tensor_config import (
     AUTOGRAD_DTYPES,
     FLOAT8_DTYPES,
     FORWARD_ONLY_APIS,
-    build_materialization_plan,
     dtype_element_size,
     dtype_name,
-    generated_value_nbytes,
-    iter_unique_tensor_configs,
 )
 
 _GIB = 1024**3

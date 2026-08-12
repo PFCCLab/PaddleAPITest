@@ -10,17 +10,13 @@ from dataclasses import dataclass
 
 import numpy
 
-from .backend import create_input_backend
+from .backend_runtime import create_input_backend
 from .binding import InputApiBinding, InputGenerationContext
 from .tensor_config import (
     CAST_THROUGH_INTERMEDIATE_DTYPES,
     TensorConfig,
     shape_numel,
 )
-from .tensor_spec import InputTensorSpec
-
-# 规则层只通过 value 模块读取路径对象，避免再次实现 APIConfig 遍历。
-from .value import InputValue, attach_input_values, input_tensor_config_at, read_input_value
 from .value_generators import (
     create_input_config_random_state,
     generate_abs_plus_one_input_value,
@@ -49,6 +45,15 @@ from .value_generators import (
     generate_uniform_input_value,
     generate_unit_interval_input_value,
     generate_unit_plus_one_input_value,
+)
+
+# 规则层只通过 value 模块读取路径对象，避免再次实现 APIConfig 遍历。
+from .values import (
+    InputTensorSpec,
+    InputValue,
+    attach_input_values,
+    input_tensor_config_at,
+    read_input_value,
 )
 
 # API 值域策略属于规则层，不由 TensorConfig 物化模块持有。

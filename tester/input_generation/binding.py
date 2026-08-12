@@ -11,8 +11,7 @@ from pathlib import Path
 import yaml
 
 from .tensor_config import TensorConfig
-from .tensor_path import InputTensorPath
-from .tensor_spec import InputTensorSpec
+from .values import InputTensorPath, InputTensorSpec
 
 INPUT_BASE_CONFIG = Path(__file__).resolve().parents[1] / "base_config.yaml"
 

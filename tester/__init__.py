@@ -41,7 +41,7 @@ def prepare_process_runtime(options):
     if runtime_config is None:
         raise ValueError("runtime_config must be frozen before process runtime preparation")
 
-    from .input_generation.backend import prepare_input_backend
+    from .input_generation.backend_runtime import prepare_input_backend
 
     return prepare_input_backend(runtime_config.input_backend_policy)
 

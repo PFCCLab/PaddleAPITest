@@ -5,7 +5,7 @@ import time
 import paddle
 
 from .base import APITestBase
-from .input_generation.tensor_config import tensor_config_tree_numel
+from .input_generation.materialization import tensor_config_tree_numel
 
 
 class APITestPaddleGPUPerformance(APITestBase):

@@ -19,13 +19,15 @@ from .gpu_memory_preflight import (
     should_check_grad,
 )
 from .input_generation.binding import bind_input_parameters, split_tensor_method_arguments
+from .input_generation.materialization import (
+    iter_unique_tensor_configs,
+    tensor_config_tree_nbytes,
+)
 from .input_generation.tensor_config import (
     AUTOGRAD_DTYPES,
     TensorConfig,
     dtype_element_size,
     dtype_name,
-    iter_unique_tensor_configs,
-    tensor_config_tree_nbytes,
 )
 from .log_writer import log_worker
 from .log_writer.log_comparison import log_accuracy_tolerance
@@ -826,7 +828,7 @@ class APITestBase:
 
     def _make_numpy_output_grad(self, output):
         dtype = _dtype_name(output.dtype)
-        from .input_generation.backend import generate_output_grad
+        from .input_generation.backend_runtime import generate_output_grad
 
         return generate_output_grad(
             dtype=dtype,
@@ -873,7 +875,7 @@ class APITestBase:
 
     def _make_torch_output_grad(self, shape, dtype, device=None):
         device = device or torch.device("cuda", torch.cuda.current_device())
-        from .input_generation.backend import generate_output_grad
+        from .input_generation.backend_runtime import generate_output_grad
 
         return generate_output_grad(
             dtype=dtype,
@@ -891,7 +893,7 @@ class APITestBase:
             device = f"gpu:{place.gpu_device_id()}"
         else:
             device = "cpu"
-        from .input_generation.backend import generate_output_grad
+        from .input_generation.backend_runtime import generate_output_grad
 
         return generate_output_grad(
             dtype=dtype,

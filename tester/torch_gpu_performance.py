@@ -6,7 +6,7 @@ from contextlib import nullcontext
 import torch
 
 from .base import APITestBase
-from .input_generation.tensor_config import tensor_config_tree_numel
+from .input_generation.materialization import tensor_config_tree_numel
 from .paddle_to_torch import ConversionKind, get_converter
 from .paddle_to_torch.arguments import bind_paddle_arguments
 

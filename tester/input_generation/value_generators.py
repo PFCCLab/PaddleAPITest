@@ -6,7 +6,7 @@ import hashlib
 
 import numpy
 
-from .tensor_spec import InputTensorSpec
+from .values import InputTensorSpec
 
 # 单值生成器只消费 InputTensorSpec 和 RNG，不读取 API 名称或修改 TensorConfig。
 # `spec` 与 `rng` 是本模块内部的数值计算惯例，完整输入标识由函数名和类型提供。
