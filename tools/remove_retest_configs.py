@@ -9,12 +9,14 @@ from pathlib import Path
 
 DEFAULT_LOG_PATH = Path("tester/api_config/test_log")
 LOG_PREFIXES = {
+    # 独立保留 known 清单，支持针对性复测和清理。
     "checkpoint": "checkpoint",
     "pass": "api_config_pass",
     "skip": "api_config_skip",
     "paddle_error": "api_config_paddle_error",
     "paddle_accuracy": "api_config_paddle_accuracy",
     "paddle_bitwise": "api_config_paddle_bitwise",
+    "paddle_bitwise_knows": "api_config_paddle_bitwise_knows",
     "paddle_cuda": "api_config_paddle_cuda",
     "paddle_crash": "api_config_paddle_crash",
     "oom": "api_config_oom",
@@ -129,6 +131,7 @@ def parse_args(argv=None):
   paddle_error      - api_config_paddle_error
   paddle_accuracy   - api_config_paddle_accuracy
   paddle_bitwise    - api_config_paddle_bitwise
+  paddle_bitwise_knows - api_config_paddle_bitwise_knows
   paddle_cuda       - api_config_paddle_cuda
   paddle_crash      - api_config_paddle_crash
   oom               - api_config_oom

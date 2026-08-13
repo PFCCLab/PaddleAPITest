@@ -67,6 +67,8 @@ VALID_TEST_ARGS = {
     "atol",
     "rtol",
     "manual_threshold_config_file",
+    # 保持旧引擎入口与 engineV4 的参数协议一致。
+    "accuracy_manual_file",
     "test_tol",
     "operation_mode",
     "bos_path",
@@ -998,6 +1000,14 @@ def main():
         type=str,
         default="",
         help="YAML file with per-API manual accuracy thresholds",
+    )
+    parser.add_argument(
+        "--accuracy_manual_file",
+        dest="accuracy_manual_file",
+        type=str,
+        default="",
+        # 兼容历史 engineV2 流程，字段语义与 V4 相同。
+        help="YAML file with per-API thresholds for strict accuracy fallback",
     )
     parser.add_argument(
         "--test_tol",

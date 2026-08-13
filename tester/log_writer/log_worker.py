@@ -310,7 +310,7 @@ def write_case_end(status, api_config_str, *, duration_ms=None):
     result_types = set(_case_result_types.get(api_config_str, ()))
     if result_types == {"pass"}:
         outcome = "PASS"
-    elif result_types == {"skip"}:
+    elif result_types in ({"skip"}, {"paddle_bitwise_knows"}):
         outcome = "SKIP"
     elif result_types:
         outcome = "FAIL"

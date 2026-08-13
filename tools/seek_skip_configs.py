@@ -16,6 +16,7 @@ LOG_PREFIXES = {
     "paddle_error": "api_config_paddle_error",
     "paddle_accuracy": "api_config_paddle_accuracy",
     "paddle_bitwise": "api_config_paddle_bitwise",
+    "paddle_bitwise_knows": "api_config_paddle_bitwise_knows",
     "paddle_cuda": "api_config_paddle_cuda",
     "paddle_crash": "api_config_paddle_crash",
     "oom": "api_config_oom",

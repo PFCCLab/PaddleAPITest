@@ -123,37 +123,26 @@ python "$PROCESSOR_DIR/dedup_config.py" \
     -o "$PADDLEONLY_1M_DIR/1M.txt"
 
 # ============================================================================
-# Step 4: 合并原始配置并生成 0size
+# Step 4: 生成最终 4096 配置并转换 0size
 # ============================================================================
 echo ""
-echo "[Step 4] 合并原始配置(按实际存在的 seq) + 去重，并生成 0-size..."
-
-# 合并原始 seq 配置。
-ORIG_INPUTS=""
-ORIG_SEQS=""
-for seq in 1024 2048 4096 8192; do
-    if [ -f "$INPUT_DIR/api_config_${seq}.txt" ]; then
-        ORIG_INPUTS="$ORIG_INPUTS $INPUT_DIR/api_config_${seq}.txt"
-        ORIG_SEQS="${ORIG_SEQS}${ORIG_SEQS:+_}${seq}"
-    else
-        echo "  [提示] 未找到 api_config_${seq}.txt，跳过"
-    fi
-done
-
-if [ -z "$ORIG_INPUTS" ]; then
-    echo "错误：未找到任何 api_config_{1024,2048,4096,8192}.txt，无法生成合并配置"
-    exit 1
-fi
+echo "[Step 4] 筛选目标 seq + 去重，并生成 0-size..."
 
 ORIG_MERGED_NAME="4096.txt"
-echo "  实际参与合并的 seq: $ORIG_SEQS  →  paddleonly_4096/$ORIG_MERGED_NAME"
-
-python "$PROCESSOR_DIR/merge_configs.py" \
-    -i $ORIG_INPUTS \
-    -o "$OUTPUT_DIR/_tmp_orig_merged.txt"
+# 1024/2048 仅作为推导锚点，8192 已废弃；三者不得进入任何最终配置集。
+if [ -f "$INPUT_DIR/api_config_4096.txt" ]; then
+    FINAL_4096_SOURCE="$INPUT_DIR/api_config_4096.txt"
+    echo "  使用真实 api_config_4096.txt"
+else
+    FINAL_4096_SOURCE="$DERIVED_4096"
+    echo "  [提示] 未找到真实 api_config_4096.txt，使用推导结果"
+fi
+if [ -f "$INPUT_DIR/api_config_8192.txt" ]; then
+    echo "  [废弃] api_config_8192.txt 不进入输出配置集"
+fi
 
 python "$PROCESSOR_DIR/dedup_config.py" \
-    -i "$OUTPUT_DIR/_tmp_orig_merged.txt" \
+    -i "$FINAL_4096_SOURCE" \
     -o "$PADDLEONLY_4096_DIR/$ORIG_MERGED_NAME"
 
 # 转 0size
@@ -166,7 +155,7 @@ python "$PROCESSOR_DIR/dedup_config.py" \
     -i "$OUTPUT_DIR/_tmp_0size.txt" \
     -o "$PADDLEONLY_0SIZE_DIR/0size.txt"
 
-rm -f "$OUTPUT_DIR/_tmp_orig_merged.txt" "$OUTPUT_DIR/_tmp_0size.txt"
+rm -f "$OUTPUT_DIR/_tmp_0size.txt"
 
 # ============================================================================
 # Step 5: 提取 API 名集合
@@ -189,7 +178,7 @@ python "$PROCESSOR_DIR/extract_api_set.py" \
 # ============================================================================
 # 清理中间文件，只保留最终结果
 # ============================================================================
-rm -f "$DERIVED_4096" "$DERIVED_1M" "$OUTPUT_DIR/_tmp_orig_merged.txt" "$OUTPUT_DIR/_tmp_0size.txt"
+rm -f "$DERIVED_4096" "$DERIVED_1M" "$OUTPUT_DIR/_tmp_0size.txt"
 
 echo ""
 echo "======================================================================"

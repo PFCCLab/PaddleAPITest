@@ -3,6 +3,7 @@
 通用 CI 配置：6 种 `{0size, 1M, 4096} × {accuracy, paddleonly}` 组合，
 特殊 accuracy 变体：2 种（`accuracy_compatible`、`accuracy_manual_threshold`），
 输入/输出路径用 `${APITEST_MODEL}` 占位，切换模型只需改这一个环境变量。
+所有 accuracy 配置均使用 `accuracy`/`accuracy_dual_gpu`，全局 `atol`、`rtol` 固定为 `0.0`。
 
 ## 目录约定
 

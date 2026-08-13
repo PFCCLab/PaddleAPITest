@@ -14,7 +14,9 @@ output:
   log_dir: "test_${APITEST_MODEL}_log_accuracy_manual_threshold"
 engine_args:
   accuracy: true
-  manual_threshold_config_file: "${APITEST_MODEL}/accuracy_manual_threshold/accuracy_manual_threshold_config.yaml"
+  atol: 0.0
+  rtol: 0.0
+  accuracy_manual_file: "${APITEST_MODEL}/accuracy_manual_threshold/accuracy_manual_threshold_config.yaml"
   use_gpu_mode: true
   num_gpus: -1
   num_workers_per_gpu: 1

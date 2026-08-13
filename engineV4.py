@@ -90,6 +90,8 @@ VALID_TEST_ARGS = {
     "atol",
     "rtol",
     "manual_threshold_config_file",
+    # tester 只在严格比较失败后读取该文件。
+    "accuracy_manual_file",
     "test_tol",
     "operation_mode",
     "bos_path",
@@ -122,6 +124,7 @@ SANITIZER_FORWARD_ARGS = {
     "atol",
     "rtol",
     "manual_threshold_config_file",
+    "accuracy_manual_file",
     "test_tol",
     "test_backward",
     "show_runtime_status",
@@ -3537,6 +3540,14 @@ def _build_argument_parser():
         type=str,
         default="",
         help="YAML file with per-API manual accuracy thresholds",
+    )
+    parser.add_argument(
+        "--accuracy_manual_file",
+        dest="accuracy_manual_file",
+        type=str,
+        default="",
+        # 该参数不改变全局 atol/rtol，只提供 known API 的二次复核。
+        help="YAML file with per-API thresholds for strict accuracy fallback",
     )
     parser.add_argument(
         "--test_tol",

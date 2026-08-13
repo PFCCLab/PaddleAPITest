@@ -78,6 +78,7 @@
         "atol": {"type": "number", "description": "对应 --atol。"},
         "rtol": {"type": "number", "description": "对应 --rtol。"},
         "manual_threshold_config_file": {"type": "string", "description": "对应 --manual_threshold_config_file。"},
+        "accuracy_manual_file": {"type": "string", "description": "严格逐位比较失败后的 API 手动阈值复核 YAML。"},
         "test_tol": {"type": "boolean", "description": "对应 --test_tol。"},
         "test_backward": {"type": "boolean", "description": "对应 --test_backward。"},
         "timeout": {"type": "integer", "description": "对应 --timeout。"},

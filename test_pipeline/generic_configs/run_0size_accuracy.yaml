@@ -10,7 +10,9 @@ input:
 output:
   log_dir: "test_${APITEST_MODEL}_log_0size_accuracy"
 engine_args:
-  accuracy_stable: true
+  accuracy: true
+  atol: 0.0
+  rtol: 0.0
   use_gpu_mode: true
   num_gpus: -1
   num_workers_per_gpu: 4

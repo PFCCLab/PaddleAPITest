@@ -115,6 +115,12 @@ backend；显式 Torch/Paddle backend 会被忽略并警告。GPU mode 会忽略
 
 读取每 API 精度阈值 YAML。默认：空。
 
+#### `--accuracy_manual_file=PATH`
+
+先执行 `atol=rtol=0.0` 的严格比较；若失败且 API 在该 YAML 的
+`manual_threshold_config` 中，则按其 `[atol, rtol]` 复核。复核通过的配置写入
+`api_config_paddle_bitwise_knows.txt` 并按已知不完全对齐跳过；默认：空。
+
 #### `--test_tol=True`、`--test_backward=True`
 
 前者启用 accuracy 容差诊断，不改变比较设备；后者只在 `paddle_cinn` 中启用反向检查。默认：`False`。

@@ -3,11 +3,14 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 
-ALLOWED_RESULT_TYPES = frozenset({"pass", "skip", "checkpoint", "paddle_bitwise"})
+ALLOWED_RESULT_TYPES = frozenset(
+    {"pass", "skip", "checkpoint", "paddle_bitwise", "paddle_bitwise_knows"}
+)
 RESULT_FILES = {
     "paddle_error": "api_config_paddle_error.txt",
     "paddle_accuracy": "api_config_paddle_accuracy.txt",
     "paddle_bitwise": "api_config_paddle_bitwise.txt",
+    "paddle_bitwise_knows": "api_config_paddle_bitwise_knows.txt",
     "paddle_cuda": "api_config_paddle_cuda.txt",
     "paddle_crash": "api_config_paddle_crash.txt",
     "oom": "api_config_oom.txt",

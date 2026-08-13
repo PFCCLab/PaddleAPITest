@@ -35,6 +35,22 @@ class APITestAccuracy(APITestBase):
         self.manual_threshold_config = self._load_manual_threshold_config(
             self.manual_threshold_config_file
         )
+        self.accuracy_manual_file = kwargs.get(
+            # 新字段优先，避免历史参数意外放宽严格比较。
+            "accuracy_manual_file",
+            kwargs.get("bitwise_knows_threshold_config_file", ""),
+        )
+        self.bitwise_knows_threshold_config = self._load_manual_threshold_config(
+            # 文件缺失或格式错误必须显式失败，不能静默跳过。
+            self.accuracy_manual_file
+        )
+        if self.accuracy_manual_file:
+            # 新参数定义的是 exact-first 协议，不能再被全局或历史特殊阈值放宽。
+            self.atol = 0.0
+            self.rtol = 0.0
+            self.bitwise_alignment = True
+        # known 结果延迟到整个 case 成功后写入，避免后续梯度失败造成重复终态。
+        self._bitwise_knows_detected = False
         if self.test_tol:
             torch.set_printoptions(profile="short")
         self.converter = get_converter()
@@ -122,34 +138,73 @@ class APITestAccuracy(APITestBase):
         except Exception:
             pass
 
-    def _load_manual_threshold_config(self, manual_threshold_config_file):
+    @staticmethod
+    def _load_manual_threshold_config(manual_threshold_config_file):
         if not manual_threshold_config_file:
             return {}
         with open(manual_threshold_config_file, encoding="utf-8") as f:
             config = yaml.safe_load(f) or {}
-        return config.get("manual_threshold_config") or {}
+
+        thresholds = config.get("manual_threshold_config") or {}
+        if not isinstance(thresholds, dict):
+            raise ValueError("manual_threshold_config must be a mapping")
+        normalized = {}
+        for api_name, threshold in thresholds.items():
+            if (
+                not isinstance(api_name, str)
+                or not isinstance(threshold, (list, tuple))
+                or len(threshold) != 2
+                or any(
+                    isinstance(value, bool) or not isinstance(value, (int, float))
+                    for value in threshold
+                )
+                or any(value < 0 for value in threshold)
+            ):
+                raise ValueError(
+                    f"invalid manual threshold for {api_name!r}: expected [atol, rtol] "
+                    "with two non-negative numbers"
+                )
+            normalized[api_name] = (float(threshold[0]), float(threshold[1]))
+        return normalized
+
+    def _threshold_api_name(self):
+        if self.api_config.api_name == "paddle._C_ops._run_custom_op":
+            return self.paddle_args[0]
+        return self.api_config.api_name
 
     def get_atol(self):
-        api_name = (
-            self.paddle_args[0]
-            if self.api_config.api_name == "paddle._C_ops._run_custom_op"
-            else self.api_config.api_name
-        )
-        threshold = self.manual_threshold_config.get(api_name)
+        if self.accuracy_manual_file:
+            return 0.0
+        threshold = self.manual_threshold_config.get(self._threshold_api_name())
         if threshold is not None:
             return threshold[0]
         return self.atol
 
     def get_rtol(self):
-        api_name = (
-            self.paddle_args[0]
-            if self.api_config.api_name == "paddle._C_ops._run_custom_op"
-            else self.api_config.api_name
-        )
-        threshold = self.manual_threshold_config.get(api_name)
+        if self.accuracy_manual_file:
+            return 0.0
+        threshold = self.manual_threshold_config.get(self._threshold_api_name())
         if threshold is not None:
             return threshold[1]
         return self.rtol
+
+    def _assert_with_bitwise_knows(self, assertion, *, atol, rtol):
+        """严格比较失败后，仅对 YAML 命中的 API 使用已知容差复核。"""
+        # 非零全局阈值属于原有比较路径，不触发 known 分类。
+        threshold = self.bitwise_knows_threshold_config.get(self._threshold_api_name())
+        if (atol, rtol) != (0.0, 0.0) or threshold is None or threshold == (0.0, 0.0):
+            assertion(atol, rtol)
+            return
+
+        try:
+            assertion(atol, rtol)
+        except AssertionError as strict_error:
+            try:
+                assertion(*threshold)
+            except AssertionError:
+                # 超出已知容差仍保留严格比较的诊断，维持原有失败语义。
+                raise strict_error
+            self._bitwise_knows_detected = True
 
     def _should_spill_torch_result_tree(
         self, convert_result, torch_output, torch_out_grads, probe_bytes
@@ -279,13 +334,17 @@ class APITestAccuracy(APITestBase):
                 return True
             if isinstance(left, tensor_types) and isinstance(right, tensor_types):
                 try:
-                    self.torch_assert_accuracy(
-                        left,
-                        right,
+                    self._assert_with_bitwise_knows(
+                        lambda atol, rtol: self.torch_assert_accuracy(
+                            left,
+                            right,
+                            atol=atol,
+                            rtol=rtol,
+                            tensor_index=index,
+                            tensor_count=count,
+                        ),
                         atol=self.get_atol(),
                         rtol=self.get_rtol(),
-                        tensor_index=index,
-                        tensor_count=count,
                     )
                 except GpuMemoryGuardSkip:
                     # 比较卡容量不足属于资源准入结果，不能写成数值精度失败。
@@ -303,9 +362,13 @@ class APITestAccuracy(APITestBase):
                 )
                 return False
             try:
-                self.np_assert_accuracy(
-                    numpy.array(left),
-                    numpy.array(right),
+                self._assert_with_bitwise_knows(
+                    lambda atol, rtol: self.np_assert_accuracy(
+                        numpy.array(left),
+                        numpy.array(right),
+                        atol=atol,
+                        rtol=rtol,
+                    ),
                     atol=self.get_atol(),
                     rtol=self.get_rtol(),
                 )
@@ -817,6 +880,7 @@ class APITestAccuracy(APITestBase):
 
         # backward compare 已经消费完两侧共享的 output-grad seed。
         self.clear_output_grad_cache()
-        self.report_case_result("pass")
-        self.dump_finalize("pass")
+        final_log_type = "paddle_bitwise_knows" if self._bitwise_knows_detected else "pass"
+        self.report_case_result(final_log_type)
+        self.dump_finalize(final_log_type)
         return True
