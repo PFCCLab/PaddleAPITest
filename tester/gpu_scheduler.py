@@ -4,9 +4,10 @@ from __future__ import annotations
 
 import math
 import os
-from dataclasses import dataclass
-from typing import Mapping, Sequence
 
+# 使用集合抽象类型，兼容运行时实例检查与类型标注。
+from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
 
 GIB = 1024**3
 GPU_PRESSURE_TIMEOUT_ENV_VAR = "PADDLEAPITEST_GPU_PRESSURE_TIMEOUT_SECONDS"
@@ -193,9 +194,7 @@ class GpuWaveController:
                 requested[self.device_ids[1]] = self.policy.case_admission_bytes(
                     estimate.comparison_bytes
                 )
-            exclusive = any(
-                requested[gpu_id] >= reserves[gpu_id] for gpu_id in self.device_ids
-            )
+            exclusive = any(requested[gpu_id] >= reserves[gpu_id] for gpu_id in self.device_ids)
             if exclusive and selected_indices:
                 # 大 case 留到独占波次，避免多个进程的真实峰值同时超过静态下界。
                 continue
@@ -230,8 +229,7 @@ class GpuWaveController:
         # 任一设备失约时整波作废，不能用部分 worker 执行部分 case。
         available = self._available_bytes(snapshots)
         if all(
-            self._planned_commitments[gpu_id] <= available[gpu_id]
-            for gpu_id in self.device_ids
+            self._planned_commitments[gpu_id] <= available[gpu_id] for gpu_id in self.device_ids
         ):
             # worker bootstrap 后仍满足原承诺，才允许把整波任务原子派发出去。
             return True

@@ -4,9 +4,9 @@
 
 ## 配置集合工具
 
-- `extract_api_set.py`：从配置 `.txt` 文件或目录中提取 API 名集合，默认输出 `tester/api_config/output/api_extracted.txt`。
+- `extract_api_set.py`：从配置 `.txt` 文件或目录中提取 API 名集合，输出到指定文件。
   ```bash
-  python tools/extract_api_set.py -i tester/api_config/api_config_tmp.txt -o tester/api_config/output
+  python tools/extract_api_set.py -i tester/api_config/api_config_tmp.txt -o tester/api_config/output/api_extracted.txt
   ```
 
 - `merge_config_set.py`：合并、去重、排序 API 配置集合，可按数量分片输出；原地修改时默认创建 `.backup`。
@@ -137,7 +137,6 @@
 
 - `prof_api_gsb.py`：性能 API 分组/标记辅助脚本，当前主要作为静态数据脚本使用。
 
-- `test_signature.py`、`test_tool.py`：开发期辅助测试脚本，使用前先确认当前内容是否符合目标场景。
 
 ## 注意事项
 

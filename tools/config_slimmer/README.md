@@ -155,10 +155,3 @@ python -m tools.config_slimmer.slim_configs configs.txt --dry-run
 ```
 
 `--dry-run` 向标准输出打印 JSON 统计，不创建文件。
-
-## 测试
-
-```bash
-python -m unittest tools.config_slimmer.test_slim_configs
-python -m unittest tools.config_slimmer.test_conservative_slim_configs
-```
