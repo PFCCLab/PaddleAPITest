@@ -38,7 +38,7 @@ class APITestAccuracy(APITestBase):
         self.accuracy_manual_file = kwargs.get(
             # 新字段优先，避免历史参数意外放宽严格比较。
             "accuracy_manual_file",
-            kwargs.get("bitwise_knows_threshold_config_file", ""),
+            "",
         )
         self.bitwise_knows_threshold_config = self._load_manual_threshold_config(
             # 文件缺失或格式错误必须显式失败，不能静默跳过。
