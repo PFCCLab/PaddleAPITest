@@ -250,6 +250,38 @@ def _collect_wait_timeout(pending_dispatch, default=0.5):
     return min(default, max(0.1, pending_delay))
 
 
+def _fatal_log_type_for_error(error, terminal_log_type=None):
+    """按普通运行路径的优先级识别 fatal 类型。"""
+    error_text = str(error).lower()
+    if any(marker in error_text for marker in OOM_ERROR_MARKERS):
+        return "oom"
+    if terminal_log_type == "torch_error" and any(
+        marker in error_text for marker in CUDA_ERROR_MARKERS
+    ):
+        return "torch_error"
+    if any(marker in error_text for marker in CUDA_ERROR_MARKERS):
+        return "paddle_cuda"
+    return None
+
+
+def _normalize_sanitizer_exitcode(output, *, returncode, sanitizer_error_exitcode):
+    """把 sanitizer 专用退出码还原为普通 worker 的 fatal 退出协议。"""
+    if returncode != sanitizer_error_exitcode:
+        return returncode
+    # 仅把 sanitizer 的协议码转换为统一 fatal 码，普通 child 退出码保持原语义。
+    # Torch 已写出的终态会出现在 child 输出中；OOM 仍由共享文本规则优先识别。
+    terminal_log_type = "torch_error" if "[torch_error]" in output.lower() else None
+    fatal_log_type = _fatal_log_type_for_error(output, terminal_log_type)
+    return log_worker.fatal_exit_code(fatal_log_type or "paddle_cuda", False)
+
+
+def _sanitizer_analysis_is_ignored(analysis):
+    """仅在过滤后没有应用 fatal 证据时忽略 sanitizer 噪声。"""
+    return bool(
+        analysis.only_ignored_diagnostics and _fatal_log_type_for_error(analysis.output) is None
+    )
+
+
 @dataclass
 class GpuEstimateFailureReport:
     """汇总显存估算失败。
@@ -1056,7 +1088,13 @@ def _sanitizer_worker_loop(
                     shutil.copyfileobj(output_file, sys.stdout)
                     sys.stdout.flush()
 
-                ignored = analysis is not None and analysis.only_ignored_diagnostics
+                ignored = analysis is not None and _sanitizer_analysis_is_ignored(analysis)
+                if not ignored:
+                    returncode = _normalize_sanitizer_exitcode(
+                        analysis.output if analysis is not None else "",
+                        returncode=returncode,
+                        sanitizer_error_exitcode=options.sanitizer_error_exitcode,
+                    )
                 if returncode in (0, 2) or ignored:
                     log_worker.merge_sanitizer_case_logs(case_log_dir)
                 shutil.rmtree(case_log_dir, ignore_errors=True)
@@ -2177,15 +2215,20 @@ def _run_single_config_with_sanitizer(options):
             end="" if analysis.output.endswith("\n") else "\n",
             flush=True,
         )
-    if analysis.only_ignored_diagnostics:
+    if _sanitizer_analysis_is_ignored(analysis):
         return 0
+    normalized_returncode = _normalize_sanitizer_exitcode(
+        raw_output,
+        returncode=result.returncode,
+        sanitizer_error_exitcode=options.sanitizer_error_exitcode,
+    )
     if result.returncode == options.sanitizer_error_exitcode:
         print(
             f"[error] compute-sanitizer reported errors for {api_config} "
             f"(exit {result.returncode})",
             flush=True,
         )
-    return result.returncode
+    return normalized_returncode
 
 
 def check_gpu_memory(gpu_ids, num_workers_per_gpu):
@@ -2813,16 +2856,7 @@ def _handle_batch_result(
         log_type, progress_status, terminal_recorded = log_worker.classify_exit(exitcode)
         if crash_source == "child":
             terminal_recorded = False
-        if (
-            progress_status == "PADDLE_CRASH"
-            and options.use_compute_sanitizer
-            and exitcode == options.sanitizer_error_exitcode
-        ):
-            log_type = "paddle_cuda"
-            progress_status = "PADDLE_CUDA"
-            terminal_recorded = False
-            progress_detail = f"sanitizer exit {exitcode}"
-        elif progress_status == "PADDLE_CRASH":
+        if progress_status == "PADDLE_CRASH":
             progress_detail = f"exit {exitcode}"
         if not terminal_recorded:
             log_worker.write_to_log(log_type, config)
@@ -3189,17 +3223,8 @@ def _build_case_runtime_context(api_config_str, options):
 
 
 def _handle_case_exception(api_config_str, err):
-    err_msg = str(err).lower()
     terminal_log_type = log_worker.get_terminal_log_type(api_config_str)
-    fatal_log_type = None
-    if any(marker in err_msg for marker in OOM_ERROR_MARKERS):
-        fatal_log_type = "oom"
-    elif terminal_log_type == "torch_error" and any(
-        marker in err_msg for marker in CUDA_ERROR_MARKERS
-    ):
-        fatal_log_type = "torch_error"
-    elif any(marker in err_msg for marker in CUDA_ERROR_MARKERS):
-        fatal_log_type = "paddle_cuda"
+    fatal_log_type = _fatal_log_type_for_error(err, terminal_log_type)
     if fatal_log_type is not None:
         exit_code = log_worker.fatal_exit_code(fatal_log_type, terminal_log_type == fatal_log_type)
         if dump_enabled():
