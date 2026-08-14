@@ -1430,12 +1430,6 @@ def main():
                 max_workers_per_gpu,
                 gpu_pairs=gpu_pairs,
             )
-        print(
-            f"Paddle kernels: {'CPU' if options.test_cpu else 'GPU'} | "
-            f"Torch reference: {'GPU' if _mode_runs_torch_gpu_reference(options) else 'N/A'} | "
-            f"input/compare: {'GPU' if options.use_gpu_mode else 'CPU'}",
-            flush=True,
-        )
         if not available_gpus:
             print(f"CPU: {cpu_count()} available | {total_workers} workers", flush=True)
 

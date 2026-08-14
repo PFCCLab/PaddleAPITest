@@ -4,7 +4,10 @@ from __future__ import annotations
 
 import math
 import os
+import platform
 from datetime import datetime, timedelta
+from importlib import import_module, metadata
+from importlib.util import find_spec
 
 from .log_schema import LOG_PREFIXES
 
@@ -24,6 +27,174 @@ def format_duration(seconds):
 
 def _print_section_banner(title):
     print(f"\n--- {title}")
+
+
+def _package_version(distribution_names):
+    """从发行版元数据读取版本，避免为打印日志提前导入运行时模块。"""
+    for distribution_name in distribution_names:
+        try:
+            return metadata.version(distribution_name)
+        except metadata.PackageNotFoundError:
+            continue
+        except Exception:
+            # 元数据损坏时继续尝试候选发行版，日志探测不能影响测试主流程。
+            continue
+    return "unknown"
+
+
+def _module_version(module_name, distribution_names):
+    """区分未安装模块和已安装但缺少版本元数据的模块。"""
+    # Python 模块名与 wheel 发行版名并不总是一致，先查询环境提供的映射。
+    # 映射读取失败只影响展示精度，不能阻断测试启动。
+    mapped_distributions = ()
+    try:
+        mapped_distributions = metadata.packages_distributions().get(module_name, ())
+    except Exception:
+        pass
+    version = _package_version((*distribution_names, *mapped_distributions))
+    if version != "unknown":
+        return version
+    # find_spec 只判断模块是否可发现，不执行其顶层初始化代码。
+    try:
+        return "unknown" if find_spec(module_name) is not None else "not installed"
+    except Exception:
+        return "unknown"
+
+
+def _load_nvml():
+    """惰性加载 NVML，CPU 或非 NVIDIA 环境不应因日志探测导入失败。"""
+    try:
+        return import_module("pynvml")
+    except Exception:
+        return None
+
+
+def _decode_nvml_value(value):
+    # 不同 pynvml 版本可能返回 bytes 或 str，日志层统一为可打印文本。
+    if isinstance(value, bytes):
+        return value.decode("utf-8", errors="replace")
+    return str(value)
+
+
+def _visible_gpu_tokens(raw_value, device_count):
+    """按 CUDA_VISIBLE_DEVICES 顺序保留进程可见的逻辑设备标识。"""
+    # 未设置变量时逻辑顺序与 NVML 物理索引一致。
+    if raw_value is None or not raw_value.strip():
+        return [str(index) for index in range(device_count)]
+    tokens = [token.strip() for token in raw_value.split(",") if token.strip()]
+    # CUDA 约定的隐藏设备标记必须映射为空列表，不能误报全部 GPU。
+    if tokens and tokens[0].lower() in {"-1", "none", "void", "nodevfiles"}:
+        return []
+    return tokens
+
+
+def _visible_gpu_ids(raw_value, device_count):
+    """返回数字形式的可见设备 ID；UUID 由 NVML 查询路径单独解析。"""
+    # 该兼容 helper 只返回合法数字索引，UUID 不应被错误转换为逻辑 ID。
+    ids = []
+    for token in _visible_gpu_tokens(raw_value, device_count):
+        try:
+            device_id = int(token)
+        except ValueError:
+            continue
+        if 0 <= device_id < device_count:
+            ids.append(device_id)
+    return ids
+
+
+def _format_gpu_memory(memory_info):
+    # 部分驱动绑定缺少 total 字段，此时保留设备条目并显式标记未知容量。
+    total_bytes = getattr(memory_info, "total", None)
+    if total_bytes is None:
+        return "unknown"
+    return f"{float(total_bytes) / (1024**3):.2f} GiB"
+
+
+def _collect_nvidia_info():
+    """采集当前进程可见的 NVIDIA 设备；任何 NVML 异常都降级为空快照。"""
+    nvml = _load_nvml()
+    if nvml is None:
+        return {"driver": "unavailable", "gpu_count": 0, "gpus": []}
+    try:
+        # 初始化与设备计数属于同一可用性边界，任一步失败都视为 NVML 不可用。
+        nvml.nvmlInit()
+        device_count = int(nvml.nvmlDeviceGetCount())
+    except Exception:
+        return {"driver": "unavailable", "gpu_count": 0, "gpus": []}
+
+    try:
+        driver = _decode_nvml_value(nvml.nvmlSystemGetDriverVersion())
+    except Exception:
+        # 驱动版本缺失不影响后续逐卡采集。
+        driver = "unavailable"
+
+    gpus = []
+    raw_visible = os.environ.get("CUDA_VISIBLE_DEVICES")
+    tokens = _visible_gpu_tokens(raw_visible, device_count)
+    # logical_id 按 CUDA 可见顺序编号，physical_id 保留 NVML 的真实定位信息。
+    for logical_id, token in enumerate(tokens):
+        try:
+            if token.isdigit():
+                physical_id = int(token)
+                if not 0 <= physical_id < device_count:
+                    continue
+                handle = nvml.nvmlDeviceGetHandleByIndex(physical_id)
+            else:
+                # UUID 可见性需要新版 NVML 接口；旧绑定只跳过该设备而不终止采集。
+                get_by_uuid = getattr(nvml, "nvmlDeviceGetHandleByUUID", None)
+                if get_by_uuid is None:
+                    continue
+                handle = get_by_uuid(token.encode("utf-8"))
+                physical_id = token
+            name = _decode_nvml_value(nvml.nvmlDeviceGetName(handle))
+            memory = _format_gpu_memory(nvml.nvmlDeviceGetMemoryInfo(handle))
+        except Exception:
+            # 单卡信息失败时保留其他卡，避免一次硬件查询异常丢失整份环境快照。
+            continue
+        gpus.append(
+            {
+                "logical_id": logical_id,
+                "physical_id": physical_id,
+                "name": name,
+                "memory": memory,
+            }
+        )
+    return {"driver": driver, "gpu_count": len(tokens), "gpus": gpus}
+
+
+def collect_environment_info(paddle_version):
+    """构造可序列化的环境快照，供日志头部和单元测试复用。"""
+    # 所有探测结果收敛为基础类型，避免日志层泄漏 NVML handle 等运行时对象。
+    nvidia_info = _collect_nvidia_info()
+    return {
+        "python": f"{platform.python_implementation()} {platform.python_version()}",
+        # Paddle 版本由 engine 启动阶段传入，避免报告层再次导入 Paddle。
+        "paddle": paddle_version,
+        "torch": _package_version(("torch",)),
+        "paddlefleet_ops": _module_version(
+            "paddlefleet_ops", ("paddlefleet_ops", "paddlefleet-ops")
+        ),
+        "driver": nvidia_info["driver"],
+        "gpu_count": nvidia_info["gpu_count"],
+        "gpus": nvidia_info["gpus"],
+    }
+
+
+def _print_environment_summary(info):
+    # 固定 Software/GPU 两段结构，便于人读日志和后续文本解析保持稳定。
+    _print_section_banner("ENVIRONMENT")
+    print("Software")
+    print(f"  Python: {info['python']}")
+    print(f"  Paddle: {info['paddle']}")
+    print(f"  Torch: {info['torch']}")
+    print(f"  paddlefleet_ops: {info['paddlefleet_ops']}")
+    print("GPU")
+    print(f"  Driver: {info['driver']}")
+    gpus = info["gpus"]
+    print(f"  Visible GPUs: {info.get('gpu_count', len(gpus))}")
+    for gpu in gpus:
+        physical = f" (physical {gpu['physical_id']})"
+        print(f"  GPU {gpu['logical_id']}{physical}: {gpu['name']} | {gpu['memory']}")
 
 
 def print_run_header(options, paddle_version):
@@ -50,7 +221,8 @@ def print_run_header(options, paddle_version):
         source_option = ("--api_config_file_pattern", options.api_config_file_pattern)
 
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
-    print(f">>> TEST RUN | {timestamp} | Paddle {paddle_version} | PID {os.getpid()}")
+    print(f">>> TEST RUN | {timestamp} | PID {os.getpid()}")
+    _print_environment_summary(collect_environment_info(paddle_version))
     _print_section_banner("OPTIONS")
     files = [
         source_option,
@@ -83,15 +255,9 @@ def print_run_header(options, paddle_version):
         )
     )
     requires_gpu = not options.test_cpu or options.use_gpu_mode or torch_reference_gpu
-    compute = [
-        ("paddle_kernel_device", "CPU" if options.test_cpu else "GPU"),
-        ("torch_reference_device", "GPU" if torch_reference_gpu else "N/A"),
-        ("input_compare_device", "GPU" if options.use_gpu_mode else "CPU"),
-        ("input_backend_requested", getattr(options, "input_backend_requested", None) or "default"),
-        ("input_backend_resolved", getattr(options, "input_backend_resolved", "numpy")),
-        ("input_logical_device", getattr(options, "input_logical_device", "cpu")),
-        ("random_seed", options.random_seed),
-    ]
+    compute = []
+    if getattr(options, "random_seed", 0) != 0:
+        test.append(("--random_seed", options.random_seed))
     if options.test_cpu:
         compute.append(("--test_cpu", True))
     if requires_gpu:

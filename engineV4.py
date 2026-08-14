@@ -19,35 +19,16 @@ import sys
 import tempfile
 import threading
 import time
-import warnings
 from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime
 from multiprocessing import cpu_count, set_start_method
 from pathlib import Path
 from types import SimpleNamespace
-from typing import TYPE_CHECKING
 
 import numpy as np
 import pynvml
 import yaml
-
-if TYPE_CHECKING:
-    import paddle
-    import torch
-    from tester import (
-        APIConfig,
-        APITestAccuracy,
-        APITestAccuracyStable,
-        APITestCINNVSDygraph,
-        APITestCustomDeviceVSCPU,
-        APITestPaddleDeviceVSGPU,
-        APITestPaddleGPUPerformance,
-        APITestPaddleOnly,
-        APITestPaddleTorchGPUPerformance,
-        APITestTorchGPUPerformance,
-    )
-
 from tester.dump_writer import (
     dump_enabled,
     parse_strict_bool,
@@ -162,6 +143,40 @@ GPU_PERFORMANCE_MODES = (
     "torch_gpu_performance",
     "paddle_torch_gpu_performance",
 )
+# 主模式互斥校验只看这些开关；dual 标志会先展开成对应主模式。
+PRIMARY_TEST_MODES = (
+    "paddle_only",
+    "paddle_cinn",
+    "accuracy",
+    "paddle_gpu_performance",
+    "torch_gpu_performance",
+    "paddle_torch_gpu_performance",
+    "accuracy_stable",
+    "paddle_custom_device",
+    "custom_device_vs_gpu",
+)
+TORCH_REFERENCE_MODES = (
+    "accuracy",
+    "accuracy_stable",
+    "accuracy_dual_gpu",
+    "accuracy_stable_dual_gpu",
+    "torch_gpu_performance",
+    "paddle_torch_gpu_performance",
+)
+TORCH_UTILITY_MODES = TORCH_REFERENCE_MODES + (
+    "paddle_cinn",
+    "paddle_gpu_performance",
+    "paddle_custom_device",
+    "custom_device_vs_gpu",
+)
+GPU_MEMORY_PREFLIGHT_MODES = (
+    "accuracy_stable_dual_gpu",
+    "accuracy_dual_gpu",
+    "accuracy_stable",
+    "accuracy",
+    "paddle_only",
+)
+_BYTES_PER_GIB = 1024**3
 
 # 选择测试类的优先级顺序。
 TEST_CLASS_BY_OPTION = (
@@ -214,6 +229,25 @@ EXTENDED_SCAN_MAX_CANDIDATES = 8192
 # 扩展扫描的最小间隔，从上一次扫描“结束”开始计时，避免扫描本身把间隔耗尽。
 EXTENDED_SCAN_MIN_INTERVAL_SECONDS = 5.0
 WORKER_PREPARE_RUNTIME = "prepare_runtime"
+
+
+def _option_enabled(options, name):
+    return bool(getattr(options, name, False))
+
+
+def _memory_defer_delay(retry_count):
+    retry_count = max(0, int(retry_count))
+    return min(
+        GPU_MEMORY_DEFER_MAX_BACKOFF_SECONDS,
+        GPU_MEMORY_DEFER_INITIAL_BACKOFF_SECONDS * (2 ** min(retry_count, 5)),
+    )
+
+
+def _collect_wait_timeout(pending_dispatch, default=0.5):
+    pending_delay = pending_dispatch.earliest_delay()
+    if pending_delay is None:
+        return default
+    return min(default, max(0.1, pending_delay))
 
 
 @dataclass
@@ -363,11 +397,12 @@ class PendingQueue:
         heapq.heappush(self._delayed, (case.ready_at, self._sequence, case))
 
     def _promote(self, now):
-        promoted = False
+        promoted = []
         while self._delayed and self._delayed[0][0] <= now:
-            self._ready.append(heapq.heappop(self._delayed)[2])
-            promoted = True
+            promoted.append(heapq.heappop(self._delayed)[2])
         if promoted:
+            # 重试 case 到期后优先于尚未派发的新 case；逆序扩展才能保留到期顺序。
+            self._ready.extendleft(reversed(promoted))
             self._invalidate_ready_snapshot()
 
     def append(self, case, *, now=None):
@@ -467,6 +502,7 @@ class PendingQueue:
         if not selected:
             return []
         selected_ids = {id(case) for case in selected}
+        # 只重建 ready 段，延迟堆保持原状；同一次扫描内的 id() 足以识别对象。
         self._ready = deque(case for case in self._ready if id(case) not in selected_ids)
         self._invalidate_ready_snapshot()
         return selected
@@ -507,7 +543,6 @@ class GpuWaveRuntime:
     slot_indices: tuple[int, ...]
     planned_cases: list[PendingCase] = field(default_factory=list)
     planned_slot_indices: tuple[int, ...] = ()
-    active_slot_indices: set[int] = field(default_factory=set)
     terminal_claims: TerminalClaims = field(default_factory=TerminalClaims)
     pressure_reported: bool = False
     # 上次扩展扫描的完成时刻；-inf 保证进程刚启动时首次扫描不会被误抑制。
@@ -569,20 +604,13 @@ class BatchMessage:
             slot_index=msg[1] if len(msg) > 1 else None,
             config=msg[2] if len(msg) > 2 else None,
         )
-        if message.msg_type == "done":
+        if message.msg_type in {"done", "timeout"}:
             message.worker_pid = msg[3] if len(msg) > 3 else None
             message.completed_offset = msg[4] if len(msg) > 4 else None
-        elif message.msg_type == "deferred":
+        elif message.msg_type in {"deferred", "error"}:
             message.reason = msg[3] if len(msg) > 3 else ""
             message.worker_pid = msg[4] if len(msg) > 4 else None
             message.completed_offset = msg[5] if len(msg) > 5 else None
-        elif message.msg_type == "error":
-            message.reason = msg[3] if len(msg) > 3 else ""
-            message.worker_pid = msg[4] if len(msg) > 4 else None
-            message.completed_offset = msg[5] if len(msg) > 5 else None
-        elif message.msg_type == "timeout":
-            message.worker_pid = msg[3] if len(msg) > 3 else None
-            message.completed_offset = msg[4] if len(msg) > 4 else None
         elif message.msg_type == "crashed":
             message.exitcode = msg[3] if len(msg) > 3 else None
             if len(msg) > 5 and msg[5] == "child":
@@ -628,7 +656,7 @@ def _init_runtime_modules(options, *, prepare_runtime=True):
         globals()["paddle"] = paddle
         if options.test_cpu:
             paddle.device.set_device("cpu")
-        elif not getattr(options, "paddle_custom_device", False):
+        elif not _option_enabled(options, "paddle_custom_device"):
             # CUDA_VISIBLE_DEVICES 只负责限定 slot，Paddle 仍需要显式设置 device。
             paddle.set_device("gpu")
         _import_optional_runtime_module("paddlefleet_ops")
@@ -831,7 +859,12 @@ def _build_sanitizer_case_command(api_config_str, options, sanitizer_cmd):
             continue
         if isinstance(value, bool) and not value:
             continue
-        formatted = "True" if value is True else "False" if value is False else str(value)
+        if value is True:
+            formatted = "True"
+        elif value is False:
+            formatted = "False"
+        else:
+            formatted = str(value)
         cmd.append(f"--{key}={formatted}")
     return cmd
 
@@ -1280,7 +1313,17 @@ class WorkerPool:
                     continue
                 slot.state = "preparing"
                 slot.started_at = time.monotonic()
-                slot.input_queue.put(WORKER_PREPARE_RUNTIME)
+                try:
+                    slot.input_queue.put(WORKER_PREPARE_RUNTIME)
+                except (OSError, EOFError, ValueError) as err:
+                    # 握手队列损坏时交给统一退役路径，不能让单 slot 失败中止整批。
+                    self._suspend_slot(slot)
+                    print(
+                        f"[worker] PREPARE_DISPATCH_FAILED | slot {slot.index} | "
+                        f"{type(err).__name__}: {err}",
+                        flush=True,
+                    )
+                    continue
                 preparing_gpu_ids.update(slot_gpu_ids)
                 started_count += 1
         return started_count
@@ -1304,8 +1347,13 @@ class WorkerPool:
             # 阻塞式回收放在锁外，避免 watchdog 被 join/SIGKILL 长时间挡住。
             if process is not None and process.is_alive():
                 if was_idle and input_queue is not None:
-                    input_queue.put(None)
-                    self._join_process(process, timeout=2)
+                    try:
+                        input_queue.put(None)
+                    except (OSError, EOFError, ValueError):
+                        # 队列已损坏时跳过优雅退出，下面仍会强制终止 worker。
+                        pass
+                    else:
+                        self._join_process(process, timeout=2)
                 if process.is_alive():
                     self._kill_process(process)
             elif process is not None:
@@ -1401,8 +1449,12 @@ class WorkerPool:
         slot = self.slots[slot_index]
         accounting_config = config.config if isinstance(config, WorkerTask) else config
         with self._lock:
+            previous_state = slot.state
+            previous_task = slot.current_task
+            previous_start = slot.task_start_time
             slot.current_task = accounting_config
-            slot.task_start_time = None  # 在 ack 到来时再记录
+            # 派发时刻即开始计时；ack 只刷新起点，避免 ack 丢失后超时永远不触发。
+            slot.task_start_time = time.monotonic()
             slot.state = "busy"
             worker_pid = slot.process.pid if slot.process is not None else None
             input_queue = slot.input_queue
@@ -1413,8 +1465,15 @@ class WorkerPool:
                 slot.task_start_time = None
                 slot.state = "suspended"
                 raise RuntimeError(f"slot {slot_index} is not dispatchable")
-            # 投递也在同一把锁内，避免 retire_slots 清空并关闭旧队列后才 put。
-            input_queue.put(config)
+            try:
+                # 投递也在同一把锁内，避免 retire_slots 清空并关闭旧队列后才 put。
+                input_queue.put(config)
+            except Exception:
+                # put 失败必须回滚账本，否则调用方会计入幽灵任务且再也收不到终态。
+                slot.current_task = previous_task
+                slot.task_start_time = previous_start
+                slot.state = previous_state
+                raise
             return worker_pid
 
     def collect_one(self, timeout=5.0):
@@ -1487,7 +1546,7 @@ class WorkerPool:
                 return
             # 在 slot 快照仍然一致时直接执行恢复动作。
             if slot.state in {"starting", "loaded", "preparing"}:
-                self._check_initializing_worker(slot, now=time.monotonic())
+                self._check_initializing_worker(slot, now=now)
                 return
             if (
                 slot.state == "busy"
@@ -1675,15 +1734,13 @@ def _read_smi_memory_snapshot(command, device_pattern):
 
 
 def detect_device_type() -> str:
-    global DEVICE_TYPE, DEVICE_TYPE_DETECTED, _NVML_INITIALIZED
+    global DEVICE_TYPE, DEVICE_TYPE_DETECTED
     if DEVICE_TYPE_DETECTED:
         return DEVICE_TYPE
 
     # 探测顺序决定运行后端优先级：NVIDIA GPU > XPU > Iluvatar > CPU。
     try:
-        if not _NVML_INITIALIZED:
-            pynvml.nvmlInit()
-            _NVML_INITIALIZED = True
+        _ensure_nvml()
         if pynvml.nvmlDeviceGetCount() > 0:
             DEVICE_TYPE = "gpu"
             DEVICE_TYPE_DETECTED = True
@@ -1708,35 +1765,25 @@ def detect_device_type() -> str:
 
 def get_device_count() -> int:
     """获取可用设备（加速器）数量。"""
-    global DEVICE_COUNT, _NVML_INITIALIZED
+    global DEVICE_COUNT
     if DEVICE_COUNT is not None:
         return DEVICE_COUNT
 
     device_type = detect_device_type()
-
     if device_type == "gpu":
-        if not _NVML_INITIALIZED:
-            pynvml.nvmlInit()
-            _NVML_INITIALIZED = True
-        count = pynvml.nvmlDeviceGetCount()
-        DEVICE_COUNT = count
-        return count
-
-    if device_type == "xpu":
+        _ensure_nvml()
+        DEVICE_COUNT = pynvml.nvmlDeviceGetCount()
+    elif device_type == "xpu":
         DEVICE_COUNT = _count_smi_devices(
             XPU_SMI_COMMAND,
             XPU_SMI_DEVICE_PATTERN,
             stop_at_processes=True,
         )
-        return DEVICE_COUNT
-
-    if device_type == "iluvatar_gpu":
+    elif device_type == "iluvatar_gpu":
         DEVICE_COUNT = _count_smi_devices(ILUVATAR_SMI_COMMAND, ILUVATAR_SMI_DEVICE_PATTERN)
-        return DEVICE_COUNT
-
-    # CPU 场景 / 无加速器场景
-    DEVICE_COUNT = 0
-    return 0
+    else:
+        DEVICE_COUNT = 0
+    return DEVICE_COUNT
 
 
 def _refresh_snapshot(device_type):
@@ -1765,23 +1812,31 @@ def _refresh_snapshot(device_type):
 
 def get_memory_info(gpu_id):
     """返回加速器设备的 (total_memory, used_memory)，单位 GB。"""
-    global _NVML_INITIALIZED
-    device_type = detect_device_type()
+    total_bytes, used_bytes = _read_device_memory_bytes(gpu_id)
+    return total_bytes / _BYTES_PER_GIB, used_bytes / _BYTES_PER_GIB
 
+
+def _ensure_nvml():
+    global _NVML_INITIALIZED
+    if not _NVML_INITIALIZED:
+        pynvml.nvmlInit()
+        _NVML_INITIALIZED = True
+
+
+def _read_device_memory_bytes(gpu_id):
+    """读取设备显存，单位字节，避免 GB 往返带来的取整误差。"""
+    device_type = detect_device_type()
     if device_type == "gpu":
-        if not _NVML_INITIALIZED:
-            pynvml.nvmlInit()
-            _NVML_INITIALIZED = True
+        _ensure_nvml()
         handle = pynvml.nvmlDeviceGetHandleByIndex(gpu_id)
         mem_info = pynvml.nvmlDeviceGetMemoryInfo(handle)
-        return int(mem_info.total) / (1024**3), int(mem_info.used) / (1024**3)
-
+        return int(mem_info.total), int(mem_info.used)
     if device_type in ("xpu", "iluvatar_gpu"):
         _refresh_snapshot(device_type)
         if _MEM_SNAPSHOT is None or gpu_id not in _MEM_SNAPSHOT:
             raise RuntimeError(f"Failed to get memory info for {device_type} device {gpu_id}")
-        return _MEM_SNAPSHOT[gpu_id]
-
+        total_gib, used_gib = _MEM_SNAPSHOT[gpu_id]
+        return int(total_gib * _BYTES_PER_GIB), int(used_gib * _BYTES_PER_GIB)
     raise RuntimeError("No supported accelerator (GPU / XPU / Iluvatar) detected.")
 
 
@@ -1789,10 +1844,10 @@ def _read_gpu_memory_snapshots(gpu_ids):
     snapshots = {}
     for gpu_id in gpu_ids:
         # 始终重新读取物理 used；外部进程和退出进程的遗留显存都会反映在 free。
-        total_gib, used_gib = get_memory_info(gpu_id)
+        total_bytes, used_bytes = _read_device_memory_bytes(gpu_id)
         snapshots[gpu_id] = GpuMemorySnapshot(
-            total_bytes=int(total_gib * 1024**3),
-            free_bytes=max(0, int((total_gib - used_gib) * 1024**3)),
+            total_bytes=total_bytes,
+            free_bytes=max(0, total_bytes - used_bytes),
         )
     return snapshots
 
@@ -1800,16 +1855,19 @@ def _read_gpu_memory_snapshots(gpu_ids):
 def _memoized_snapshot_reader(snapshot_reader):
     """把一轮调度内的显存采样收敛为每设备一次。
 
-    同一轮内不同阶段（reclaim 观察、波次规划、派发确认、压力日志）本来就应该看到
+    同一轮内不同阶段（reclaim 观察、波次规划、压力日志）本来就应该看到
     一致的快照；重复 NVML 查询既浪费又会让同轮决策基于互相矛盾的 free 值。
+    派发确认必须另取真实采样，不能复用这份缓存。
     """
     cache = {}
 
     def read(gpu_ids):
-        key = tuple(gpu_ids)
-        if key not in cache:
-            cache[key] = snapshot_reader(key)
-        return cache[key]
+        # 快照读取器的输入保持 tuple，避免缓存层改变既有调用方的参数契约。
+        gpu_ids = tuple(gpu_ids)
+        missing = tuple(gpu_id for gpu_id in gpu_ids if gpu_id not in cache)
+        if missing:
+            cache.update(snapshot_reader(missing))
+        return {gpu_id: cache[gpu_id] for gpu_id in gpu_ids}
 
     return read
 
@@ -1818,7 +1876,7 @@ def _build_gpu_total_memory_map(available_gpus):
     gpu_total_memory_map = {}
     for gpu_id in available_gpus:
         try:
-            gpu_total_memory_map[gpu_id] = get_memory_info(gpu_id)[0]
+            gpu_total_memory_map[gpu_id] = _read_device_memory_bytes(gpu_id)[0] / _BYTES_PER_GIB
         except Exception:
             pass
     return gpu_total_memory_map
@@ -1841,21 +1899,7 @@ def _argument_error(message):
 
 
 def _mode_uses_torch(options):
-    return any(
-        getattr(options, opt, False)
-        for opt in (
-            "accuracy",
-            "paddle_cinn",
-            "paddle_gpu_performance",
-            "torch_gpu_performance",
-            "paddle_torch_gpu_performance",
-            "accuracy_stable",
-            "accuracy_dual_gpu",
-            "accuracy_stable_dual_gpu",
-            "paddle_custom_device",
-            "custom_device_vs_gpu",
-        )
-    )
+    return any(_option_enabled(options, opt) for opt in TORCH_UTILITY_MODES)
 
 
 def _select_test_class(options):
@@ -1865,7 +1909,7 @@ def _select_test_class(options):
         (
             class_name
             for option, class_name in TEST_CLASS_BY_OPTION
-            if getattr(options, option, False)
+            if _option_enabled(options, option)
         ),
         "APITestAccuracy",
     )
@@ -1929,18 +1973,17 @@ def _parse_gpu_ids(gpu_ids_arg, device_count):
 
 def _dual_gpu_mode_enabled(options):
     """双卡判断只属于引擎资源协议，不承载 tester 的显存治理策略。"""
-    return bool(
-        getattr(options, "accuracy_dual_gpu", False)
-        or getattr(options, "accuracy_stable_dual_gpu", False)
+    return _option_enabled(options, "accuracy_dual_gpu") or _option_enabled(
+        options, "accuracy_stable_dual_gpu"
     )
 
 
 def _normalize_dual_gpu_option(options, option_name, base_mode):
-    if not getattr(options, option_name, False):
+    if not _option_enabled(options, option_name):
         return
     # 先把组合开关展开为既有主模式，再进入统一的模式互斥校验。
     # dual 标志本身不作为第二个主模式重复计数。
-    if not getattr(options, "use_gpu_mode", False):
+    if not _option_enabled(options, "use_gpu_mode"):
         print(
             f"{ARGUMENT_WARNING_PREFIX} "
             f"--{option_name}=True implies --use_gpu_mode=True; enabling GPU mode",
@@ -1968,25 +2011,15 @@ def normalize_dual_gpu_options(options):
 def _mode_runs_torch_gpu_reference(options):
     """只有真实执行 Torch reference 的模式才要求为其保留计算卡。"""
     # Paddle/CINN 等仅借用 Torch 工具的模式不属于 reference GPU 执行。
-    return any(
-        getattr(options, mode, False)
-        for mode in (
-            "accuracy",
-            "accuracy_stable",
-            "accuracy_dual_gpu",
-            "accuracy_stable_dual_gpu",
-            "torch_gpu_performance",
-            "paddle_torch_gpu_performance",
-        )
-    )
+    return any(_option_enabled(options, mode) for mode in TORCH_REFERENCE_MODES)
 
 
 def _requires_gpu_runtime(options):
     """GPU 算子或 GPU 生成/比较任一启用时，都必须准备 GPU 运行时。"""
     # test_cpu 只移走 Paddle kernel；Torch reference、GPU 生成和比较仍各自需要 GPU。
     return bool(
-        not getattr(options, "test_cpu", False)
-        or getattr(options, "use_gpu_mode", False)
+        not _option_enabled(options, "test_cpu")
+        or _option_enabled(options, "use_gpu_mode")
         or _mode_runs_torch_gpu_reference(options)
     )
 
@@ -2277,8 +2310,17 @@ def _fill_idle_workers(pool, pending_dispatch, *, on_dispatch):
         config = pending_dispatch.pop_ready()
         if config is None:
             break
-        # dispatch 在状态锁内读取 PID，作为终态认领的 slot 生命周期令牌。
-        worker_pid = pool.dispatch(slot.index, config)
+        try:
+            # dispatch 在状态锁内读取 PID，作为终态认领的 slot 生命周期令牌。
+            worker_pid = pool.dispatch(slot.index, config)
+        except Exception as err:
+            # 派发失败必须把 case 还回队首，否则这条配置会从批次中消失。
+            pending_dispatch.appendleft(PendingCase(config=config))
+            print(
+                f"[worker] DISPATCH_FAILED | slot {slot.index} | {type(err).__name__}: {err}",
+                flush=True,
+            )
+            break
         on_dispatch(slot.index, worker_pid, config)
         dispatched_count += 1
     return dispatched_count
@@ -2294,7 +2336,7 @@ def _build_gpu_wave_runtimes(pool):
             else (slot.gpu_id,)
         )
         grouped_slots.setdefault(device_ids, []).append(slot.index)
-    return {
+    runtimes = {
         device_ids: GpuWaveRuntime(
             controller=GpuWaveController(
                 device_ids=device_ids,
@@ -2304,19 +2346,17 @@ def _build_gpu_wave_runtimes(pool):
         )
         for device_ids, slot_indices in grouped_slots.items()
     }
+    slot_runtime_index = {
+        slot_index: runtime for runtime in runtimes.values() for slot_index in runtime.slot_indices
+    }
+    return runtimes, slot_runtime_index
 
 
 def _gpu_memory_preflight_mode(options):
-    for mode in (
-        "accuracy_stable_dual_gpu",
-        "accuracy_dual_gpu",
-        "accuracy_stable",
-        "accuracy",
-        "paddle_only",
-    ):
-        if getattr(options, mode, False):
-            return mode
-    return None
+    return next(
+        (mode for mode in GPU_MEMORY_PREFLIGHT_MODES if _option_enabled(options, mode)),
+        None,
+    )
 
 
 def _estimate_case_gpu_memory(api_config_str, options, *, failure_report):
@@ -2516,52 +2556,72 @@ def _try_dispatch_planned_waves(
             _requeue_planned_wave(runtime, pending_dispatch)
             continue
 
-        runtime.controller.mark_dispatched(len(runtime.planned_cases))
-        runtime.active_slot_indices = set(runtime.planned_slot_indices)
         runtime.terminal_claims.clear()
         workers_on_gpu = len(runtime.planned_cases)
-        for slot, pending in zip(slots, runtime.planned_cases, strict=True):
-            policy = runtime.controller.policy
-            worker_pid = pool.dispatch(
-                slot.index,
-                WorkerTask(
-                    config=pending.config,
-                    workers_on_gpu=workers_on_gpu,
-                    compute_budget_gib=(
-                        policy.case_admission_bytes(pending.compute_estimate_bytes) / 1024**3
+        policy = runtime.controller.policy
+        dual_gpu = len(runtime.controller.device_ids) == 2
+        dispatched_here = 0
+        try:
+            for slot, pending in zip(slots, runtime.planned_cases, strict=True):
+                worker_pid = pool.dispatch(
+                    slot.index,
+                    WorkerTask(
+                        config=pending.config,
+                        workers_on_gpu=workers_on_gpu,
+                        compute_budget_gib=(
+                            policy.case_admission_bytes(pending.compute_estimate_bytes)
+                            / _BYTES_PER_GIB
+                        ),
+                        comparison_budget_gib=(
+                            policy.case_admission_bytes(pending.comparison_estimate_bytes)
+                            / _BYTES_PER_GIB
+                            if dual_gpu
+                            else 0.0
+                        ),
                     ),
-                    comparison_budget_gib=(
-                        policy.case_admission_bytes(pending.comparison_estimate_bytes) / 1024**3
-                        if len(runtime.controller.device_ids) == 2
-                        else 0.0
-                    ),
-                ),
+                )
+                runtime.terminal_claims.register(slot.index, worker_pid, pending.config)
+                dispatched_here += 1
+        except Exception as err:
+            # 半波派发会让 active_cases 与真实在途任务脱节；未发出的 case 必须回队。
+            failed_slot_indices = runtime.planned_slot_indices[dispatched_here:]
+            if dispatched_here:
+                runtime.controller.mark_dispatched(dispatched_here)
+            else:
+                runtime.controller.cancel_planned_wave()
+            if failed_slot_indices:
+                pool.retire_slots(failed_slot_indices)
+            print(
+                f"[gpu] WAVE_DISPATCH_FAILED | devices={runtime.controller.device_ids} | "
+                f"{type(err).__name__}: {err}",
+                flush=True,
             )
-            runtime.terminal_claims.register(slot.index, worker_pid, pending.config)
-            dispatched_count += 1
+            remaining = runtime.planned_cases[dispatched_here:]
+            runtime.planned_cases = remaining
+            if remaining:
+                _requeue_planned_wave(runtime, pending_dispatch)
+            else:
+                runtime.planned_cases.clear()
+            runtime.planned_slot_indices = ()
+            dispatched_count += dispatched_here
+            continue
+        runtime.controller.mark_dispatched(dispatched_here)
         runtime.planned_cases.clear()
         runtime.planned_slot_indices = ()
+        dispatched_count += dispatched_here
     return dispatched_count
 
 
-def _runtime_for_slot(runtimes, slot_index):
-    return next(
-        (runtime for runtime in runtimes.values() if slot_index in runtime.slot_indices),
-        None,
-    )
-
-
-def _claim_gpu_wave_terminal(runtimes, msg):
+def _claim_gpu_wave_terminal(runtimes, slot_runtime_index, msg):
     """按 slot、worker PID 和配置认领一次且仅一次的 case 终态。"""
     message = BatchMessage.from_raw(msg)
     slot_index = message.slot_index
-    runtime = _runtime_for_slot(runtimes, slot_index)
+    runtime = slot_runtime_index.get(slot_index)
     if runtime is None:
         return False
     # timeout/done 竞争及旧进程迟到消息都不能消费新一代 active task。
     if not runtime.terminal_claims.claim(msg):
         return False
-    runtime.active_slot_indices.discard(slot_index)
     runtime.controller.mark_completed()
     return True
 
@@ -2727,10 +2787,7 @@ def _handle_batch_result(
         pool.retire_slots((slot_index,))
         retry_count = retry_state.per_case_memory_defer_retries.get(config, 0)
         retry_state.per_case_memory_defer_retries[config] = retry_count + 1
-        delay = min(
-            GPU_MEMORY_DEFER_MAX_BACKOFF_SECONDS,
-            GPU_MEMORY_DEFER_INITIAL_BACKOFF_SECONDS * (2 ** min(retry_count, 5)),
-        )
+        delay = _memory_defer_delay(retry_count)
         pending_dispatch.append(
             _pending_case_for_retry(
                 retry_state,
@@ -2770,8 +2827,10 @@ def _handle_batch_result(
         if not terminal_recorded:
             log_worker.write_to_log(log_type, config)
     elif msg_type == "error":
-        log_worker.write_to_log("config_parse", config)
-        progress_status = "CONFIG_PARSE"
+        # worker 的 error 通道覆盖配置解析失败和未分类异常，不能一律记成 parse。
+        log_type = "config_parse" if "APIConfig" in (reason or "") else "paddle_error"
+        log_worker.write_to_log(log_type, config)
+        progress_status = "CONFIG_PARSE" if log_type == "config_parse" else "PADDLE_ERROR"
         progress_detail = reason
 
     if (
@@ -2884,11 +2943,7 @@ def _run_cpu_batch_loop(
         or pending_dispatch
         or any(slot.state in {"starting", "loaded", "preparing"} for slot in pool.slots)
     ) and not batch_state.abort_run:
-        pending_delay = pending_dispatch.earliest_delay()
-        collect_timeout = 0.5
-        if pending_delay is not None:
-            collect_timeout = min(collect_timeout, max(0.1, pending_delay))
-        msg = pool.collect_one(timeout=collect_timeout)
+        msg = pool.collect_one(timeout=_collect_wait_timeout(pending_dispatch))
         if msg is not None and not pool._handle_worker_control_message(msg):
             # 控制消息只改变 slot 生命周期；case 终态才允许推进计数和 checkpoint。
             # 认领失败的迟到/重复终态没有任何批次副作用。
@@ -2980,7 +3035,7 @@ def _run_batch_mode(
         retry_state.case_memory_estimates = {
             pending.config: pending.gpu_estimate for pending in pending_dispatch.iter_all()
         }
-        gpu_runtimes = _build_gpu_wave_runtimes(pool)
+        gpu_runtimes, slot_runtime_index = _build_gpu_wave_runtimes(pool)
         pressure_timeout = GpuPressureTimeout(options.gpu_pressure_timeout)
 
         # 每轮只推进一次状态转换，确保同一 GPU 不会在波次中途补入新任务。
@@ -3042,11 +3097,7 @@ def _run_batch_mode(
                     print(f"[gpu] {summary_line}", flush=True)
                 break
 
-            pending_delay = pending_dispatch.earliest_delay()
-            collect_timeout = 0.5
-            if pending_delay is not None:
-                collect_timeout = min(collect_timeout, max(0.1, pending_delay))
-            msg = pool.collect_one(timeout=collect_timeout)
+            msg = pool.collect_one(timeout=_collect_wait_timeout(pending_dispatch))
             if msg is None:
                 continue
             handled_control = pool._handle_worker_control_message(msg)
@@ -3056,7 +3107,7 @@ def _run_batch_mode(
             if msg_type not in ("done", "deferred", "error", "timeout", "crashed"):
                 continue
             # 终态认领必须先于计数、日志和 checkpoint，失败消息没有任何批次副作用。
-            if not _claim_gpu_wave_terminal(gpu_runtimes, msg):
+            if not _claim_gpu_wave_terminal(gpu_runtimes, slot_runtime_index, msg):
                 continue
             tested_case_before = batch_state.tested_case
             _handle_batch_result(
@@ -3193,18 +3244,8 @@ def _validate_input_sources(options):
 
 
 def _validate_test_mode(options):
-    mode = [
-        options.accuracy,
-        options.paddle_only,
-        options.paddle_cinn,
-        options.paddle_gpu_performance,
-        options.torch_gpu_performance,
-        options.paddle_torch_gpu_performance,
-        options.accuracy_stable,
-        options.paddle_custom_device,
-        options.custom_device_vs_gpu,
-    ]
-    if len([m for m in mode if m is True]) != 1:
+    enabled_modes = [mode for mode in PRIMARY_TEST_MODES if _option_enabled(options, mode)]
+    if len(enabled_modes) != 1:
         return _argument_error(TEST_MODE_ERROR)
     # GPU 性能和自定义设备模式具有固定设备协议，不能被 test_cpu 改写为 CPU kernel。
     # 对矛盾组合在参数层 fail fast，避免 worker 启动后才触发硬编码 CUDA 同步错误。
@@ -3274,27 +3315,6 @@ def _apply_runtime_environment_flags(options):
     # 环境变量传播规范化后的有效 cache 状态，worker 不再自行解释冲突组合。
     os.environ["USE_CACHED_NUMPY"] = str(options.use_cached_numpy)
     os.environ["USE_GPU_MODE"] = str(options.use_gpu_mode)
-    # 主进程在创建 runtime config 前冻结模式，worker 不再重复猜测默认 backend。
-    mode = next(
-        (
-            name
-            for name in (
-                "accuracy",
-                "accuracy_dual_gpu",
-                "paddle_only",
-                "paddle_cinn",
-                "paddle_gpu_performance",
-                "torch_gpu_performance",
-                "paddle_torch_gpu_performance",
-                "accuracy_stable",
-                "accuracy_stable_dual_gpu",
-                "paddle_custom_device",
-                "custom_device_vs_gpu",
-            )
-            if getattr(options, name, False)
-        ),
-        None,
-    )
     # 主进程只解析一次终态，spawn worker、预检和具体 tester 共享同一份策略。
     options.runtime_config = TestRuntimeConfig.from_options(options)
     policy = options.runtime_config.input_backend_policy
@@ -3431,10 +3451,7 @@ def _run_sanitizer_child_mode(options):
                 run_test_case(options.api_config, options)
                 break
             except GpuMemoryDeferred as err:
-                delay = min(
-                    GPU_MEMORY_DEFER_MAX_BACKOFF_SECONDS,
-                    GPU_MEMORY_DEFER_INITIAL_BACKOFF_SECONDS * (2 ** min(defer_retry_count, 5)),
-                )
+                delay = _memory_defer_delay(defer_retry_count)
                 defer_retry_count += 1
                 print(
                     f"[DEFER] {options.api_config} | retry {defer_retry_count} "
@@ -3559,10 +3576,7 @@ def _run_single_case_mode(options, start_time):
             try:
                 run_test_case(options.api_config, options)
             except GpuMemoryDeferred as err:
-                delay = min(
-                    GPU_MEMORY_DEFER_MAX_BACKOFF_SECONDS,
-                    GPU_MEMORY_DEFER_INITIAL_BACKOFF_SECONDS * (2 ** min(defer_retry_count, 5)),
-                )
+                delay = _memory_defer_delay(defer_retry_count)
                 defer_retry_count += 1
                 log_report.print_case_notice(
                     "DEFER",
@@ -3703,12 +3717,6 @@ def _run_batch_case_mode(options, start_time):
             max_workers_per_gpu,
             gpu_pairs=gpu_pairs,
         )
-    print(
-        f"Paddle kernels: {'CPU' if options.test_cpu else 'GPU'} | "
-        f"Torch reference: {'GPU' if _mode_runs_torch_gpu_reference(options) else 'N/A'} | "
-        f"input/compare: {'GPU' if options.use_gpu_mode else 'CPU'}",
-        flush=True,
-    )
     if cpu_worker_count:
         print(f"CPU: {cpu_count()} available | {cpu_worker_count} workers", flush=True)
 
