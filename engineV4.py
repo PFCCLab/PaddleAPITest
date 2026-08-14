@@ -313,9 +313,14 @@ class PendingQueue:
         self._ready_snapshot_cache = None
         self._ready_snapshot_iterator = None
         self._ready_snapshot_version = -1
+        # 构造阶段没有并发读者，批量填充后一次发布版本，避免逐项失效扫描缓存。
         for case in cases:
-            # 初始化用 now=0.0：ready_at 默认为 0，且此时不应有未到期项。
-            self.append(case, now=0.0)
+            if case.ready_at <= 0.0:
+                self._ready.append(case)
+            else:
+                self._push_delayed(case)
+        if self._ready:
+            self._ready_version = 1
 
     def __len__(self):
         return len(self._ready) + len(self._delayed)
@@ -1365,7 +1370,8 @@ class WorkerPool:
             if msg_type == "ack":
                 config = msg[3]
                 if slot.state == "busy" and slot.current_task == config:
-                    slot.task_start_time = time.time()
+                    # 超时只依赖经过时长，不能受系统墙上时钟校正影响。
+                    slot.task_start_time = time.monotonic()
                 return True
             if msg_type == "child":
                 slot.child_pid = msg[3]
@@ -1448,7 +1454,7 @@ class WorkerPool:
         while not self._shutdown_event.is_set():
             if self._shutdown_event.wait(1.0):
                 break
-            self._watchdog_pass(now=time.time())
+            self._watchdog_pass(now=time.monotonic())
 
     def _watchdog_pass(self, *, now):
         """遍历所有 slot 做一轮检查，单个 slot 的失败不影响其余 slot。"""
@@ -2260,8 +2266,8 @@ def _resolve_cpu_worker_count(options, pending_cases):
     return min(requested, pending_cases, MAX_TOTAL_WORKERS)
 
 
-def _fill_idle_workers(pool, pending_dispatch, config_iter, *, on_dispatch):
-    """优先用 pending 队列补满空闲 worker，再消费新的 case。"""
+def _fill_idle_workers(pool, pending_dispatch, *, on_dispatch):
+    """用 pending 队列补满空闲 worker；首次任务与重试任务遵循同一顺序。"""
     dispatched_count = 0
     # 重试任务优先于新任务，保证外部 kill 或显存 defer 不会长期饥饿。
     while True:
@@ -2269,8 +2275,6 @@ def _fill_idle_workers(pool, pending_dispatch, config_iter, *, on_dispatch):
         if slot is None:
             break
         config = pending_dispatch.pop_ready()
-        if config is None:
-            config = next(config_iter, None)
         if config is None:
             break
         # dispatch 在状态锁内读取 PID，作为终态认领的 slot 生命周期令牌。
@@ -2857,7 +2861,6 @@ def _run_cpu_batch_loop(
 
     pending_dispatch = PendingQueue(PendingCase(config) for config in api_configs)
     # 所有首次任务也进入统一 pending 队列，使 retry 和普通任务共享同一公平规则。
-    empty_config_iter = iter(())
     # 与 GPU 路径共用同一套终态认领协议（两处实现），避免 done/timeout 竞争双计数。
     claims = TerminalClaims()
 
@@ -2867,7 +2870,6 @@ def _run_cpu_batch_loop(
         dispatched = _fill_idle_workers(
             pool,
             pending_dispatch,
-            empty_config_iter,
             on_dispatch=claims.register,
         )
         batch_state.active_tasks += dispatched
