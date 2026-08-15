@@ -51,6 +51,8 @@ DEFAULT_GPU_PRESSURE_TIMEOUT_SECONDS = 600.0
 SESSION_EVENT_PREFIX = "__PADDLEAPITEST_SANITIZER_SESSION__ "
 # 只有这些状态能结束一次 request；EOF 代表 session 级崩溃。
 _TERMINAL_STATUSES = frozenset({"done", "error", "crashed"})
+# slot 尚未 ready 的初始化态：批处理主循环据此判断是否仍有进展中 worker。
+_INITIALIZING_SLOT_STATES = frozenset({"starting", "loaded", "preparing"})
 from tester.log_writer import (
     init_log,
     log_aggregation,
@@ -1811,6 +1813,10 @@ class WorkerPool:
     def total_workers(self):
         return len(self.slots)
 
+    def has_initializing_slots(self):
+        """是否仍有未 ready 的 slot；批处理循环据此判断生命周期是否结束。"""
+        return any(slot.state in _INITIALIZING_SLOT_STATES for slot in self.slots)
+
     def start(self):
         """CPU worker 立即启动；GPU worker 等显存准入后按需创建。"""
         # 纯 CPU 没有显存准入阶段，需要先建立进程再进入普通空闲队列派发。
@@ -2004,7 +2010,7 @@ class WorkerPool:
     def _check_initializing_worker(self, slot, *, now=None):
         """终止并挂起一个在模块加载或 preparation 阶段失败的 worker。"""
         with self._lock:
-            if slot.state not in {"starting", "loaded", "preparing"} or slot.process is None:
+            if slot.state not in _INITIALIZING_SLOT_STATES or slot.process is None:
                 return False
             now = time.monotonic() if now is None else now
             phase = "module_load" if slot.state == "starting" else "preparation"
@@ -2081,7 +2087,7 @@ class WorkerPool:
                 return True
             if msg_type == "child":
                 # slot 已挂起时忽略迟到登记，否则 wrapper 被杀后 child 会重新进入账本。
-                if slot.state in {"starting", "loaded", "preparing", "busy"}:
+                if slot.state in _INITIALIZING_SLOT_STATES or slot.state == "busy":
                     slot.child_pid = msg[3]
                     return True
                 # wrapper PID 已校验，迟到 child 仍属于这一代 slot，交给锁外清理。
@@ -2217,7 +2223,7 @@ class WorkerPool:
         with self._lock:
             if self._shutdown_event.is_set():
                 return
-            if slot.state in {"starting", "loaded", "preparing"}:
+            if slot.state in _INITIALIZING_SLOT_STATES:
                 action = "initializing"
             elif (
                 slot.state == "busy"
@@ -2392,16 +2398,6 @@ def _smi_output(command):
     return subprocess.check_output([command], text=True, stderr=subprocess.STDOUT, timeout=5)
 
 
-def _command_has_device(command, device_pattern):
-    if not shutil.which(command):
-        return False
-    try:
-        out = _smi_output(command)
-    except Exception:
-        return False
-    return any(re.match(device_pattern, line) for line in out.splitlines())
-
-
 def _count_smi_devices(command, device_pattern, *, stop_at_processes=False):
     ids = set()
     for line in _smi_output(command).splitlines():
@@ -2451,7 +2447,14 @@ def detect_device_type() -> str:
         ("xpu", XPU_SMI_COMMAND, XPU_SMI_DEVICE_PATTERN),
         ("iluvatar_gpu", ILUVATAR_SMI_COMMAND, ILUVATAR_SMI_DEVICE_PATTERN),
     ):
-        if _command_has_device(command, device_pattern):
+        # 厂商命令缺失或异常时继续尝试下一个后端，最终回退 CPU。
+        if not shutil.which(command):
+            continue
+        try:
+            has_device = _count_smi_devices(command, device_pattern) > 0
+        except Exception:
+            has_device = False
+        if has_device:
             DEVICE_TYPE = device_type
             DEVICE_TYPE_DETECTED = True
             return DEVICE_TYPE
@@ -3335,9 +3338,7 @@ def _run_cpu_batch_loop(
     refill_idle_workers()
     # 初始化中 slot 纳入循环存活条件，避免重建进程的生命周期消息无人接收。
     while (
-        batch_state.active_tasks > 0
-        or pending_dispatch
-        or any(slot.state in {"starting", "loaded", "preparing"} for slot in pool.slots)
+        batch_state.active_tasks > 0 or pending_dispatch or pool.has_initializing_slots()
     ) and not batch_state.abort_run:
         msg = pool.collect_one(timeout=_collect_wait_timeout(pending_dispatch))
         if msg is not None and not pool._handle_worker_control_message(msg):
@@ -3674,10 +3675,7 @@ def _run_continuous_gpu_batch_loop(
     pressure_timeout = GpuPressureTimeout(options.gpu_pressure_timeout)
 
     while (
-        pending_dispatch
-        or assignments
-        or batch_state.active_tasks
-        or any(slot.state in {"starting", "loaded", "preparing"} for slot in pool.slots)
+        pending_dispatch or assignments or batch_state.active_tasks or pool.has_initializing_slots()
     ) and not batch_state.abort_run:
         # 每轮重新采样，不能把上一轮的 free 快照当作当前显存承诺。
         now = time.monotonic()
@@ -3718,7 +3716,7 @@ def _run_continuous_gpu_batch_loop(
             bool(pending_dispatch)
             and batch_state.active_tasks == 0
             and not assignments
-            and not any(slot.state in {"starting", "loaded", "preparing"} for slot in pool.slots)
+            and not pool.has_initializing_slots()
         )
         # startup assignment 和初始化 slot 都属于进展中状态，不应触发压力超时。
         if pressure_timeout.update(blocked=blocked, now=now):
