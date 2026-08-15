@@ -519,59 +519,6 @@ class GpuReservationLedger:
         return True
 
 
-class ContinuousGpuScheduler:
-    """单文件内的 slot 状态机；GPU 显存账本由 ledger 独立维护。"""
-
-    def __init__(self, slot_indices):
-        # scheduler 只维护 slot 生命周期，显存额度由 ledger 独立负责。
-        self.slot_states = {int(slot): "offline" for slot in slot_indices}
-        self.assignments = {}
-
-    def mark_idle(self, slot_index):
-        # 只有已知 slot 才能被主循环纳入可派发集合。
-        if slot_index not in self.slot_states:
-            raise KeyError(slot_index)
-        self.slot_states[slot_index] = "idle"
-
-    def mark_running(self, slot_index, assignment_id):
-        # assignment 绑定在进入 busy 前建立，迟到消息不能覆盖新一代任务。
-        if self.slot_states.get(slot_index) != "idle":
-            raise RuntimeError(f"slot {slot_index} is not idle")
-        self.slot_states[slot_index] = "running"
-        self.assignments[slot_index] = assignment_id
-
-    def mark_terminal(self, slot_index, assignment_id):
-        # 终态令牌必须匹配当前 slot assignment，否则保留现有状态。
-        if (
-            self.slot_states.get(slot_index) != "running"
-            or self.assignments.get(slot_index) != assignment_id
-        ):
-            return False
-        del self.assignments[slot_index]
-        self.slot_states[slot_index] = "idle"
-        return True
-
-
-class AssignmentClaims:
-    def __init__(self):
-        self._tokens = {}
-
-    def register(self, assignment_id, slot_index, worker_pid, config):
-        # slot 复用时覆盖旧令牌，旧 worker 的结果因此无法消费新任务。
-        self._tokens[slot_index] = (assignment_id, worker_pid, config)
-
-    def claim(self, assignment_id, message):
-        # 认领同时校验 assignment、PID 和配置三元组。
-        parsed = BatchMessage.from_raw(message)
-        token = self._tokens.get(parsed.slot_index)
-        if token is None or token[0] != assignment_id:
-            return False
-        if token[1:] != (parsed.worker_pid, parsed.config):
-            return False
-        del self._tokens[parsed.slot_index]
-        return True
-
-
 # 运行时透传给 test class 的选项白名单。
 VALID_TEST_ARGS = {
     "test_amp",
@@ -1813,6 +1760,31 @@ class WorkerPool:
     def total_workers(self):
         return len(self.slots)
 
+    def slot_devices(self):
+        """返回 scheduler 需要的设备拓扑，不暴露 WorkerSlot 实例。"""
+        return tuple((slot.index, slot.gpu_id, slot.comparison_gpu_id) for slot in self.slots)
+
+    def slot_can_schedule(self, slot_index):
+        # scheduler 只依赖可调度语义，不读取可变的 WorkerSlot 状态对象。
+        with self._lock:
+            return self.slots[slot_index].state in {"idle", "dead", "suspended"}
+
+    def slot_can_start(self, slot_index):
+        # 仅离线 slot 可启动；idle slot 已持有进程，不能创建第二代 worker。
+        with self._lock:
+            return self.slots[slot_index].state in {"dead", "suspended"}
+
+    def slot_is_idle(self, slot_index):
+        # idle 是 dispatch 的必要前置条件，状态检查由 pool 串行化。
+        with self._lock:
+            return self.slots[slot_index].state == "idle"
+
+    def worker_pid(self, slot_index):
+        # PID 是终态令牌的一部分，scheduler 不缓存进程对象。
+        with self._lock:
+            process = self.slots[slot_index].process
+            return process.pid if process is not None else None
+
     def has_initializing_slots(self):
         """是否仍有未 ready 的 slot；批处理循环据此判断生命周期是否结束。"""
         return any(slot.state in _INITIALIZING_SLOT_STATES for slot in self.slots)
@@ -1822,7 +1794,7 @@ class WorkerPool:
         # 纯 CPU 没有显存准入阶段，需要先建立进程再进入普通空闲队列派发。
         for slot in self.slots:
             if slot.gpu_id is None:
-                self._spawn_worker(slot)
+                self.start_worker(slot.index)
         self._watchdog_thread = threading.Thread(
             target=self._watchdog_loop, daemon=True, name="pool-watchdog"
         )
@@ -1847,7 +1819,7 @@ class WorkerPool:
                 self.start_loaded_preparations(range(self.total_workers))
             msg = self.collect_one(timeout=min(0.5, max(0.1, deadline - time.monotonic())))
             if msg is not None:
-                self._handle_worker_control_message(msg)
+                self.handle_message(msg)
             # 任一 slot 进入 suspended 都表示初始化已经失败，继续等待不会增加 ready 数量。
             if any(slot.state == "suspended" for slot in self.slots):
                 break
@@ -1880,14 +1852,15 @@ class WorkerPool:
             except Exception:
                 pass
 
-    def _spawn_worker(self, slot):
+    def start_worker(self, slot_index):
         """为指定 slot 拉起一个新的 worker 进程。"""
+        slot = self.slots[slot_index]
         with self._spawn_lock:
             # 只有主调度线程在显存准入后调用；锁只防止关闭流程并发穿透。
             if self._closed or self._shutdown_event.is_set():
-                return False
+                return None
             if slot.process is not None and slot.process.is_alive():
-                return False
+                return None
             if slot.process is not None:
                 self._join_process(slot.process, timeout=1)
             self._close_queue(slot.input_queue, cancel_join=True)
@@ -1932,7 +1905,7 @@ class WorkerPool:
             slot.child_pid = None
             slot.started_at = spawn_started_at
             # spawn 起点必须早于 p.start，才能覆盖 Python spawn 和 import 开销。
-            return True
+            return p.pid
 
     def start_loaded_preparations(self, slot_indices):
         """按物理设备放行已完成模块加载的 worker preparation。"""
@@ -2007,49 +1980,9 @@ class WorkerPool:
     def _startup_timeout(self):
         return getattr(self.options, "worker_startup_timeout", WORKER_STARTUP_TIMEOUT)
 
-    def _check_initializing_worker(self, slot, *, now=None):
-        """终止并挂起一个在模块加载或 preparation 阶段失败的 worker。"""
-        with self._lock:
-            if slot.state not in _INITIALIZING_SLOT_STATES or slot.process is None:
-                return False
-            now = time.monotonic() if now is None else now
-            phase = "module_load" if slot.state == "starting" else "preparation"
-            process = slot.process
-            if not process.is_alive():
-                failure = "crash"
-            elif slot.state == "loaded" or slot.started_at is None:
-                # loaded 表示 worker 正等待主进程按设备调度，不应消耗 preparation 超时。
-                return False
-            elif now - slot.started_at < self._startup_timeout():
-                return False
-            else:
-                failure = "timeout"
-            # 先清理 slot 账本，再在锁外做可能阻塞的进程回收。
-            # child PID 先脱离 slot 账本，迟到控制消息不会重新占用已挂起 slot。
-            child_pid = slot.child_pid
-            self._suspend_slot(slot)
-
-        if child_pid is not None:
-            self._kill_process_group(child_pid)
-        if failure == "crash":
-            print(
-                f"[worker] INIT_CRASH | slot {slot.index} | phase {phase} | "
-                f"exit {process.exitcode}",
-                flush=True,
-            )
-            self._join_process(process, timeout=1)
-        else:
-            print(
-                f"[worker] INIT_TIMEOUT | slot {slot.index} | phase {phase} | "
-                f"timeout {self._startup_timeout()} s",
-                flush=True,
-            )
-            self._kill_process(process)
-        # 不在 watchdog 内重建；下一轮先取消 assignment 并观察显存稳定。
-        return True
-
-    def _handle_worker_control_message(self, msg):
+    def handle_message(self, msg):
         """处理来自 worker 的生命周期、任务确认和 child 账务消息。"""
+        # 控制消息只推进 worker 状态；case 终态必须由 batch coordinator 认领。
         msg_type = msg[0]
         if msg_type not in {
             "loaded",
@@ -2161,11 +2094,19 @@ class WorkerPool:
         except queue.Empty:
             return None
 
-    def idle_slots(self):
-        """遍历当前处于空闲状态的 slot。"""
-        for slot in self.slots:
-            if slot.state == "idle":
-                yield slot
+    def idle_slot_indices(self):
+        """返回当前空闲 slot 的稳定快照，调用方不接触 WorkerSlot。"""
+        with self._lock:
+            idle_indices = tuple(slot.index for slot in self.slots if slot.state == "idle")
+        return iter(idle_indices)
+
+    def suspended_slot_indices(self):
+        # 返回索引快照，避免调用方遍历 watchdog 正在更新的 slot。
+        with self._lock:
+            suspended_indices = tuple(
+                slot.index for slot in self.slots if slot.state == "suspended"
+            )
+        return suspended_indices
 
     def mark_idle(self, slot_index, *, worker_pid):
         """仅在终态仍属于当前存活 worker 时把 busy slot 标记为空闲。"""
@@ -2238,63 +2179,87 @@ class WorkerPool:
             ):
                 action = "crash"
         # watchdog 的锁只保护快照；SIGKILL/join 放锁外避免阻塞派发和结果处理。
-        if action == "initializing":
-            self._check_initializing_worker(slot, now=now)
-        elif action == "timeout":
-            self._handle_timeout(slot, now=now)
-        elif action == "crash":
-            self._handle_crash(slot, now=now)
+        if action is not None:
+            self._handle_lifecycle_event(slot, action, now=now)
 
-    def _handle_timeout(self, slot, *, now=None):
-        """终止超时 worker，并写入 timeout 结果。"""
+    def _handle_lifecycle_event(self, slot, event, *, now):
+        """统一处理 worker 初始化失败、超时和异常死亡。"""
+        # 先在锁内摘除 slot 令牌，再在锁外执行阻塞式进程回收。
         with self._lock:
-            if (
-                self._closed
-                or self._shutdown_event.is_set()
-                or slot.state != "busy"
-                or slot.process is None
-            ):
-                return
-            config = slot.current_task
-            terminal_timestamp = time.monotonic() if now is None else float(now)
-            # 先摘下生命周期令牌，避免主线程退役与 watchdog 重复处理同一进程。
-            process = slot.process
-            old_pid = process.pid
-            child_pid = slot.child_pid
-            self._suspend_slot(slot)
+            if self._closed or self._shutdown_event.is_set():
+                return False
+            if event == "initializing":
+                if slot.state not in _INITIALIZING_SLOT_STATES or slot.process is None:
+                    return False
+                phase = "module_load" if slot.state == "starting" else "preparation"
+                process = slot.process
+                if not process.is_alive():
+                    failure = "crash"
+                elif slot.state == "loaded" or slot.started_at is None:
+                    # loaded 表示 worker 正等待主进程按设备调度，不应消耗 preparation 超时。
+                    return False
+                elif now - slot.started_at < self._startup_timeout():
+                    return False
+                else:
+                    failure = "timeout"
+                child_pid = slot.child_pid
+                self._suspend_slot(slot)
+            elif event == "timeout":
+                if slot.state != "busy" or slot.process is None:
+                    return False
+                config = slot.current_task
+                process = slot.process
+                old_pid = process.pid
+                child_pid = slot.child_pid
+                terminal_timestamp = float(now)
+                self._suspend_slot(slot)
+            elif event == "crash":
+                if (
+                    slot.state not in {"busy", "idle"}
+                    or slot.process is None
+                    or slot.process.is_alive()
+                ):
+                    return False
+                process = slot.process
+                exitcode = process.exitcode
+                worker_pid = process.pid
+                config = slot.current_task
+                terminal_timestamp = float(now)
+                child_pid = slot.child_pid
+                self._suspend_slot(slot)
+            else:
+                raise ValueError(f"unknown worker lifecycle event: {event!r}")
+
         if child_pid is not None:
             self._kill_process_group(child_pid)
-        self._kill_process(process)
+        if event == "initializing":
+            if failure == "crash":
+                print(
+                    f"[worker] INIT_CRASH | slot {slot.index} | phase {phase} | "
+                    f"exit {process.exitcode}",
+                    flush=True,
+                )
+                self._join_process(process, timeout=1)
+            else:
+                print(
+                    f"[worker] INIT_TIMEOUT | slot {slot.index} | phase {phase} | "
+                    f"timeout {self._startup_timeout()} s",
+                    flush=True,
+                )
+                self._kill_process(process)
+            # 不在 watchdog 内重建；下一轮先取消 assignment 并观察显存稳定。
+            return True
+        if event == "timeout":
+            self._kill_process(process)
+            if self._closed or self._shutdown_event.is_set():
+                return False
+            # watchdog 只上报候选终态，日志边界必须等主循环成功认领后再写。
+            self.result_queue.put(
+                ("timeout", slot.index, config, old_pid, None, terminal_timestamp)
+            )
+            return True
         if self._closed or self._shutdown_event.is_set():
-            return
-        # watchdog 只上报候选终态，日志边界必须等主循环成功认领后再写。
-        # 保留 watchdog 检测时刻，主循环认领延迟不能进入 case 时长。
-        self.result_queue.put(("timeout", slot.index, config, old_pid, None, terminal_timestamp))
-
-    def _handle_crash(self, slot, *, now=None):
-        """处理非预期死亡的 worker。"""
-        with self._lock:
-            if (
-                self._closed
-                or self._shutdown_event.is_set()
-                or slot.state not in {"busy", "idle"}
-                or slot.process is None
-                or slot.process.is_alive()
-            ):
-                return
-            # 进入函数时一次性取快照：主线程的 retire_slots 可能并发把 process 清空。
-            process = slot.process
-            exitcode = process.exitcode
-            worker_pid = process.pid
-            config = slot.current_task
-            terminal_timestamp = time.monotonic() if now is None else float(now)
-            child_pid = slot.child_pid
-            self._suspend_slot(slot)
-        # wrapper 异常死亡不会执行自身 finally，child 必须由 pool 主动回收。
-        if child_pid is not None:
-            self._kill_process_group(child_pid)
-        if self._closed or self._shutdown_event.is_set():
-            return
+            return False
         if config is not None:
             # 与 timeout 相同，crash 日志边界只能由胜出的终态消息写入。
             self.result_queue.put(
@@ -2313,6 +2278,7 @@ class WorkerPool:
                 f"[worker] PADDLE_CRASH | slot {slot.index} | exit {exitcode}",
                 flush=True,
             )
+        return True
 
     def _kill_process_group(self, pid):
         try:
@@ -3039,24 +3005,24 @@ def _fill_idle_workers(pool, pending_dispatch, *, on_dispatch):
     dispatched_count = 0
     # 重试任务优先于新任务，保证外部 kill 或显存 defer 不会长期饥饿。
     while True:
-        slot = next(pool.idle_slots(), None)
-        if slot is None:
+        slot_index = next(pool.idle_slot_indices(), None)
+        if slot_index is None:
             break
         config = pending_dispatch.pop_ready()
         if config is None:
             break
         try:
             # dispatch 在状态锁内读取 PID，作为终态认领的 slot 生命周期令牌。
-            worker_pid = pool.dispatch(slot.index, config)
+            worker_pid = pool.dispatch(slot_index, config)
         except Exception as err:
             # 派发失败必须把 case 还回队首，否则这条配置会从批次中消失。
             pending_dispatch.appendleft(PendingCase(config=config))
             print(
-                f"[worker] DISPATCH_FAILED | slot {slot.index} | {type(err).__name__}: {err}",
+                f"[worker] DISPATCH_FAILED | slot {slot_index} | {type(err).__name__}: {err}",
                 flush=True,
             )
             break
-        on_dispatch(slot.index, worker_pid, config)
+        on_dispatch(slot_index, worker_pid, config)
         dispatched_count += 1
     return dispatched_count
 
@@ -3116,6 +3082,57 @@ def _build_pending_cases(api_configs, options, *, failure_report):
             now=0.0,
         )
     return pending_cases
+
+
+class BatchTerminalCoordinator:
+    """统一认领并结算 CPU/GPU worker 的 case 终态。"""
+
+    def __init__(
+        self,
+        *,
+        pool,
+        options,
+        all_case,
+        checkpointed_case,
+        batch_state,
+        retry_state,
+        pending_dispatch,
+        max_total_external_kills,
+    ):
+        self.pool = pool
+        self.options = options
+        self.all_case = all_case
+        self.checkpointed_case = checkpointed_case
+        self.batch_state = batch_state
+        self.retry_state = retry_state
+        self.pending_dispatch = pending_dispatch
+        self.max_total_external_kills = max_total_external_kills
+        # CPU/GPU 共用同一令牌协议，避免 done 与 watchdog 终态重复结算。
+        self.claims = TerminalClaims()
+
+    def register(self, slot_index, worker_pid, config):
+        # dispatch 成功后才注册；排队中的 case 不能拥有终态令牌。
+        self.claims.register(slot_index, worker_pid, config)
+
+    def claim(self, msg):
+        # claim 是日志、retry 和 checkpoint 之前的唯一幂等门。
+        return self.claims.claim(msg)
+
+    def process(self, msg):
+        # tested_case 的变化代表产生了可 checkpoint 的业务终态。
+        before = self.batch_state.tested_case
+        _handle_batch_result(
+            pool=self.pool,
+            options=self.options,
+            all_case=self.all_case,
+            checkpointed_case=self.checkpointed_case,
+            batch_state=self.batch_state,
+            retry_state=self.retry_state,
+            pending_dispatch=self.pending_dispatch,
+            msg=msg,
+            max_total_external_kills=self.max_total_external_kills,
+        )
+        return self.batch_state.tested_case > before
 
 
 def _handle_batch_result(
@@ -3318,9 +3335,16 @@ def _run_cpu_batch_loop(
         return
 
     pending_dispatch = PendingQueue(PendingCase(config) for config in api_configs)
-    # 所有首次任务也进入统一 pending 队列，使 retry 和普通任务共享同一公平规则。
-    # 与 GPU 路径共用同一套终态认领协议（两处实现），避免 done/timeout 竞争双计数。
-    claims = TerminalClaims()
+    terminal = BatchTerminalCoordinator(
+        pool=pool,
+        options=options,
+        all_case=all_case,
+        checkpointed_case=checkpointed_case,
+        batch_state=batch_state,
+        retry_state=retry_state,
+        pending_dispatch=pending_dispatch,
+        max_total_external_kills=max_total_external_kills,
+    )
 
     def refill_idle_workers():
         if batch_state.abort_run:
@@ -3328,7 +3352,7 @@ def _run_cpu_batch_loop(
         dispatched = _fill_idle_workers(
             pool,
             pending_dispatch,
-            on_dispatch=claims.register,
+            on_dispatch=terminal.register,
         )
         batch_state.active_tasks += dispatched
         if dispatched and batch_state.test_started_at is None:
@@ -3341,27 +3365,18 @@ def _run_cpu_batch_loop(
         batch_state.active_tasks > 0 or pending_dispatch or pool.has_initializing_slots()
     ) and not batch_state.abort_run:
         msg = pool.collect_one(timeout=_collect_wait_timeout(pending_dispatch))
-        if msg is not None and not pool._handle_worker_control_message(msg):
+        if msg is not None and not pool.handle_message(msg):
             # 控制消息只改变 slot 生命周期；case 终态才允许推进计数和 checkpoint。
             # 认领失败的迟到/重复终态没有任何批次副作用。
-            if msg[0] in ("done", "deferred", "error", "timeout", "crashed") and claims.claim(msg):
-                _handle_batch_result(
-                    pool=pool,
-                    options=options,
-                    all_case=all_case,
-                    checkpointed_case=checkpointed_case,
-                    batch_state=batch_state,
-                    retry_state=retry_state,
-                    pending_dispatch=pending_dispatch,
-                    msg=msg,
-                    max_total_external_kills=max_total_external_kills,
-                )
+            if msg[0] in ("done", "deferred", "error", "timeout", "crashed") and terminal.claim(
+                msg
+            ):
+                terminal.process(msg)
 
         # timeout、crash 和 deferred 会挂起原 slot；纯 CPU 可直接重建，无需等待显存回收。
         if pending_dispatch and not batch_state.abort_run:
-            for slot in pool.slots:
-                if slot.state == "suspended":
-                    pool._spawn_worker(slot)
+            for slot_index in pool.suspended_slot_indices():
+                pool.start_worker(slot_index)
         # CPU replacement 不再参与首次全量屏障，模块加载完成后即可独立 preparation。
         pool.start_loaded_preparations(range(pool.total_workers))
         refill_idle_workers()
@@ -3379,266 +3394,267 @@ class ContinuousAssignment:
     dispatched: bool = False
 
 
-def _build_continuous_gpu_groups(pool, snapshots):
-    # 相同设备拓扑共享账本；不同双卡 pair 之间不能互相扣额度。
-    groups = {}
-    for slot in pool.slots:
-        device_ids = (
-            (slot.gpu_id, slot.comparison_gpu_id)
-            if slot.comparison_gpu_id is not None
-            else (slot.gpu_id,)
-        )
-        groups.setdefault(device_ids, []).append(slot.index)
-    return {
-        device_ids: {
-            "scheduler": ContinuousGpuScheduler(slot_indices),
-            "ledger": GpuReservationLedger(
-                device_ids,
-                snapshots={gpu_id: snapshots[gpu_id] for gpu_id in device_ids},
-                max_workers=len(slot_indices),
-            ),
-            "slot_indices": tuple(slot_indices),
-            "last_extended_scan": 0.0,
-        }
-        for device_ids, slot_indices in groups.items()
-    }
+class ContinuousGpuBatchScheduler:
+    """聚合 GPU group 的准入、worker 启动、派发和终态认领。"""
 
-
-def _continuous_start_workers(pool, groups, assignments):
-    # 只有已有显存承诺的 assignment 才能创建 CUDA context。
-    """只为已有 reservation 的 assignment 启动 worker，避免无承诺的 CUDA context。"""
-    for assignment in assignments.values():
-        # 已有 PID 表示 spawn 已提交，重复启动会破坏 slot 的生命周期令牌。
-        if assignment.dispatched or assignment.worker_pid is not None:
-            continue
-        slot = pool.slots[assignment.slot_index]
-        if slot.state not in {"dead", "suspended"}:
-            continue
-        if pool._spawn_worker(slot):
-            assignment.worker_pid = slot.process.pid if slot.process is not None else None
-        else:
-            # 关闭或 spawn 失败时交给统一的 startup 取消路径回队。
-            groups[assignment.group_key]["ledger"].mark_release_pending(assignment.assignment_id)
-
-
-def _continuous_cancel_failed_startup(
-    pool,
-    groups,
-    assignments,
-    pending_dispatch,
-):
-    # 初始化失败只撤销对应 slot，其他在途 assignment 仍可继续完成。
-    """初始化失败只回队当前 assignment，不影响同组其他在途 case。"""
-    for assignment_id, assignment in tuple(assignments.items()):
-        # 使用快照遍历允许本轮安全删除失败的 assignment。
-        slot = pool.slots[assignment.slot_index]
-        if assignment.dispatched or slot.state not in {"suspended", "dead"}:
-            continue
-        groups[assignment.group_key]["ledger"].mark_release_pending(assignment_id)
-        # 未形成业务终态的 assignment 必须回队，不能只释放 reservation。
-        pending_dispatch.appendleft(assignment.pending)
-        del assignments[assignment_id]
-
-
-def _continuous_schedule_idle_slots(
-    pool,
-    groups,
-    pending_dispatch,
-    assignments,
-    *,
-    next_assignment_id,
-    snapshots_reader,
-    now,
-):
-    # 每个 group 一次规划，避免每个 slot 重复复制和重建 ready 队列。
-    """按 GPU group 批量规划 idle slot；长尾 case 仍可被跳过。"""
-    scheduled = 0
-    for group_key, group in groups.items():
-        ledger = group["ledger"]
-        scheduler = group["scheduler"]
-        snapshots = snapshots_reader(group_key)
-        ledger.update_snapshots(snapshots)
-        idle_slots = [
-            slot_index
-            for slot_index in group["slot_indices"]
-            if pool.slots[slot_index].state in {"idle", "dead", "suspended"}
-            and slot_index not in scheduler.assignments
-        ]
-        if not idle_slots or not pending_dispatch:
-            continue
-
-        base_limit = max(
-            CANDIDATE_WINDOW_MIN,
-            len(group["slot_indices"]) * CANDIDATE_WINDOW_PER_WORKER,
-        )
-        candidates = pending_dispatch.candidate_window(base_limit, now=now)
-        extended = []
-        selected_indices = []
-        selected_configs = set()
-        planned = []
-
-        def plan_from_window(window, offset=0):
-            # 已规划 case 留在内存集合中，直到整组规划结束才从队列删除。
-            nonlocal scheduled
-            for slot_index in idle_slots:
-                if any(item[0] == slot_index for item in planned):
-                    continue
-                for local_index, pending in enumerate(window):
-                    if pending.config in selected_configs:
-                        continue
-                    assignment_id = next_assignment_id[0]
-                    reservation = ledger.reserve(
-                        assignment_id=assignment_id,
-                        slot_index=slot_index,
-                        estimates=pending.gpu_estimate,
-                    )
-                    if reservation is None:
-                        continue
-                    planned.append((slot_index, pending, assignment_id, reservation))
-                    selected_indices.append(offset + local_index)
-                    selected_configs.add(pending.config)
-                    next_assignment_id[0] += 1
-                    scheduled += 1
-                    break
-
-        plan_from_window(candidates)
-        if (
-            len(planned) < len(idle_slots)
-            and pending_dispatch.ready_count > len(candidates)
-            and now - group["last_extended_scan"] >= EXTENDED_SCAN_MIN_INTERVAL_SECONDS
-        ):
-            extended, _ = pending_dispatch.scan_window(
-                EXTENDED_SCAN_MAX_CANDIDATES,
-                cursor=len(candidates),
-                now=now,
-            )
-            if extended:
-                group["last_extended_scan"] = now
-                # scan_window 从 base_limit 之后开始，合并后索引可一次删除。
-                plan_from_window(extended, offset=len(candidates))
-
-        if not planned:
-            continue
-        selected_cases = pending_dispatch.take_case_selection(
-            candidates + extended,
-            selected_indices,
-        )
-        selected_by_config = {case.config for case in selected_cases}
-        for slot_index, pending, assignment_id, reservation in planned:
-            if pending.config not in selected_by_config:
-                # 队列被外部路径修改时撤销孤立 reservation，不能留下幽灵 lease。
-                ledger.mark_release_pending(assignment_id)
-                scheduled -= 1
-                continue
-            assignments[assignment_id] = ContinuousAssignment(
-                assignment_id,
-                group_key,
-                slot_index,
-                pending,
-                reservation,
-            )
-    return scheduled
-
-
-def _continuous_dispatch_ready(
-    pool,
-    groups,
-    assignments,
-    claims,
-    *,
-    snapshots_reader,
-):
-    # 只有 worker ready 且二次显存确认成功后，才把 case 投入 worker 队列。
-    dispatched = 0
-    for assignment in tuple(assignments.values()):
-        # tuple 快照避免 dispatch/retire 过程中修改 assignments 影响当前扫描。
-        if assignment.dispatched:
-            continue
-        slot = pool.slots[assignment.slot_index]
-        if slot.state == "idle" and assignment.worker_pid is None and slot.process is not None:
-            assignment.worker_pid = slot.process.pid
-        if slot.state != "idle" or assignment.worker_pid is None:
-            continue
-        group = groups[assignment.group_key]
-        snapshots = snapshots_reader(assignment.group_key)
-        if not group["ledger"].confirm(assignment.assignment_id, snapshots):
-            # 二次确认失败时 worker 只退役，case 留到下一次稳定回收后重试。
-            pool.retire_slots((slot.index,))
-            continue
-        workers_on_gpu = max(
-            1,
-            sum(
-                other.group_key == assignment.group_key and other.dispatched
-                for other in assignments.values()
-            )
-            + 1,
-        )
-        policy = group["ledger"].policy
-        dual_gpu = len(assignment.group_key) == 2
-        try:
-            # 预算传给 worker 后由其本地预检使用，不能只依赖主进程估算。
-            worker_pid = pool.dispatch(
-                slot.index,
-                WorkerTask(
-                    config=assignment.pending.config,
-                    workers_on_gpu=workers_on_gpu,
-                    compute_budget_gib=(
-                        policy.case_admission_bytes(assignment.pending.compute_estimate_bytes)
-                        / _BYTES_PER_GIB
-                    ),
-                    comparison_budget_gib=(
-                        policy.case_admission_bytes(assignment.pending.comparison_estimate_bytes)
-                        / _BYTES_PER_GIB
-                        if dual_gpu
-                        else 0.0
-                    ),
+    def __init__(self, pool, snapshots):
+        # 相同设备拓扑共享账本；不同双卡 pair 之间不能互相扣额度。
+        grouped_slots = {}
+        for slot_index, gpu_id, comparison_gpu_id in pool.slot_devices():
+            device_ids = (gpu_id, comparison_gpu_id) if comparison_gpu_id is not None else (gpu_id,)
+            grouped_slots.setdefault(device_ids, []).append(slot_index)
+        self.groups = {
+            device_ids: {
+                "ledger": GpuReservationLedger(
+                    device_ids,
+                    snapshots={gpu_id: snapshots[gpu_id] for gpu_id in device_ids},
+                    max_workers=len(slot_indices),
                 ),
+                "slot_indices": tuple(slot_indices),
+                "last_extended_scan": 0.0,
+            }
+            for device_ids, slot_indices in grouped_slots.items()
+        }
+        self.pool = pool
+        # assignments 覆盖 reservation 到结果结算的完整生命周期。
+        self.assignments = {}
+        # running 映射阻止 slot 复用后的迟到终态认领新 assignment。
+        self._running_assignments = {}
+        self._next_assignment_id = 1
+
+    def has_assignments(self):
+        # 未派发 reservation 也属于活跃 assignment，批次不能提前退出。
+        return bool(self.assignments)
+
+    def cancel_failed_startup(self, pending_dispatch):
+        # 初始化失败只回队当前 slot，其他在途 assignment 仍可继续完成。
+        for assignment_id, assignment in tuple(self.assignments.items()):
+            if assignment.dispatched or not self.pool.slot_can_start(assignment.slot_index):
+                continue
+            self.groups[assignment.group_key]["ledger"].mark_release_pending(assignment_id)
+            # 未形成业务终态的 assignment 必须回队，不能只释放 reservation。
+            pending_dispatch.appendleft(assignment.pending)
+            del self.assignments[assignment_id]
+
+    def reclaim(self, snapshots_reader, *, now):
+        # release_pending 期间只观察物理回收，不创建替代 worker。
+        # 物理显存稳定前不能用 worker 退出事件提前释放 lease。
+        for group_key, group in self.groups.items():
+            group["ledger"].advance_reclaim(snapshots_reader(group_key), now=now)
+
+    def schedule(self, pending_dispatch, *, snapshots_reader, now):
+        """按 group 批量规划可准入 case，并保留 pending 队列顺序。"""
+        # reservation 建立后 assignment 才离开 pending 队列。
+        scheduled = 0
+        for group_key, group in self.groups.items():
+            ledger = group["ledger"]
+            ledger.update_snapshots(snapshots_reader(group_key))
+            idle_slots = [
+                slot_index
+                for slot_index in group["slot_indices"]
+                if self.pool.slot_can_schedule(slot_index)
+                and not any(
+                    assignment.slot_index == slot_index for assignment in self.assignments.values()
+                )
+            ]
+            if not idle_slots or not pending_dispatch:
+                continue
+
+            base_limit = max(
+                CANDIDATE_WINDOW_MIN,
+                len(group["slot_indices"]) * CANDIDATE_WINDOW_PER_WORKER,
             )
-        except Exception as err:
-            # put/queue 失败不能留下 active_tasks 幽灵计数或占用 slot。
-            print(
-                f"[gpu] ASSIGNMENT_DISPATCH_FAILED | slot={slot.index} | "
-                f"{type(err).__name__}: {err}",
-                flush=True,
+            candidates = pending_dispatch.candidate_window(base_limit, now=now)
+            extended = []
+            selected_indices = []
+            selected_configs = set()
+            planned = []
+
+            def plan_from_window(window, offset=0):
+                # 已规划 case 留在内存集合中，直到整组规划结束才从队列删除。
+                nonlocal scheduled
+                for slot_index in idle_slots:
+                    if any(item[0] == slot_index for item in planned):
+                        continue
+                    for local_index, pending in enumerate(window):
+                        if pending.config in selected_configs:
+                            continue
+                        assignment_id = self._next_assignment_id
+                        reservation = ledger.reserve(
+                            assignment_id=assignment_id,
+                            slot_index=slot_index,
+                            estimates=pending.gpu_estimate,
+                        )
+                        if reservation is None:
+                            continue
+                        planned.append((slot_index, pending, assignment_id, reservation))
+                        selected_indices.append(offset + local_index)
+                        selected_configs.add(pending.config)
+                        self._next_assignment_id += 1
+                        scheduled += 1
+                        break
+
+            plan_from_window(candidates)
+            if (
+                len(planned) < len(idle_slots)
+                and pending_dispatch.ready_count > len(candidates)
+                and now - group["last_extended_scan"] >= EXTENDED_SCAN_MIN_INTERVAL_SECONDS
+            ):
+                extended, _ = pending_dispatch.scan_window(
+                    EXTENDED_SCAN_MAX_CANDIDATES,
+                    cursor=len(candidates),
+                    now=now,
+                )
+                if extended:
+                    group["last_extended_scan"] = now
+                    # scan_window 从 base_limit 之后开始，合并后索引可一次删除。
+                    plan_from_window(extended, offset=len(candidates))
+
+            if not planned:
+                continue
+            selected_cases = pending_dispatch.take_case_selection(
+                candidates + extended,
+                selected_indices,
             )
-            group["ledger"].mark_release_pending(assignment.assignment_id)
-            pool.retire_slots((slot.index,))
-            continue
-        assignment.worker_pid = worker_pid
-        assignment.dispatched = True
-        claims.register(
-            assignment.assignment_id,
-            slot.index,
-            worker_pid,
-            assignment.pending.config,
+            selected_by_config = {case.config for case in selected_cases}
+            for slot_index, pending, assignment_id, reservation in planned:
+                if pending.config not in selected_by_config:
+                    # 队列被外部路径修改时撤销孤立 reservation，不能留下幽灵 lease。
+                    ledger.mark_release_pending(assignment_id)
+                    scheduled -= 1
+                    continue
+                self.assignments[assignment_id] = ContinuousAssignment(
+                    assignment_id,
+                    group_key,
+                    slot_index,
+                    pending,
+                    reservation,
+                )
+        return scheduled
+
+    def start_workers(self):
+        """只为已有 reservation 的 assignment 启动 worker。"""
+        # spawn 不参与显存决策，只消费 schedule 已建立的准入承诺。
+        for assignment in self.assignments.values():
+            # 已有 PID 表示 spawn 已提交，重复启动会破坏 slot 的生命周期令牌。
+            if assignment.dispatched or assignment.worker_pid is not None:
+                continue
+            if not self.pool.slot_can_start(assignment.slot_index):
+                continue
+            worker_pid = self.pool.start_worker(assignment.slot_index)
+            if worker_pid is not None:
+                assignment.worker_pid = worker_pid
+            else:
+                # 关闭或 spawn 失败时交给统一的 startup 取消路径回队。
+                self.groups[assignment.group_key]["ledger"].mark_release_pending(
+                    assignment.assignment_id
+                )
+
+    def dispatch_ready(self, *, snapshots_reader, terminal_coordinator):
+        # 只有 worker ready 且二次显存确认成功后，才把 case 投入 worker 队列。
+        dispatched = 0
+        for assignment in tuple(self.assignments.values()):
+            # tuple 快照避免 dispatch/retire 过程中修改 assignments 影响当前扫描。
+            if assignment.dispatched:
+                continue
+            if assignment.worker_pid is None:
+                assignment.worker_pid = self.pool.worker_pid(assignment.slot_index)
+            if not self.pool.slot_is_idle(assignment.slot_index) or assignment.worker_pid is None:
+                continue
+            group = self.groups[assignment.group_key]
+            if not group["ledger"].confirm(
+                assignment.assignment_id, snapshots_reader(assignment.group_key)
+            ):
+                # 二次确认失败时 worker 只退役，case 留到下一次稳定回收后重试。
+                self.pool.retire_slots((assignment.slot_index,))
+                continue
+            workers_on_gpu = max(
+                1,
+                sum(
+                    other.group_key == assignment.group_key and other.dispatched
+                    for other in self.assignments.values()
+                )
+                + 1,
+            )
+            policy = group["ledger"].policy
+            dual_gpu = len(assignment.group_key) == 2
+            try:
+                # 预算传给 worker 后由其本地预检使用，不能只依赖主进程估算。
+                worker_pid = self.pool.dispatch(
+                    assignment.slot_index,
+                    WorkerTask(
+                        config=assignment.pending.config,
+                        workers_on_gpu=workers_on_gpu,
+                        compute_budget_gib=(
+                            policy.case_admission_bytes(assignment.pending.compute_estimate_bytes)
+                            / _BYTES_PER_GIB
+                        ),
+                        comparison_budget_gib=(
+                            policy.case_admission_bytes(
+                                assignment.pending.comparison_estimate_bytes
+                            )
+                            / _BYTES_PER_GIB
+                            if dual_gpu
+                            else 0.0
+                        ),
+                    ),
+                )
+            except Exception as err:
+                # put/queue 失败不能留下 active_tasks 幽灵计数或占用 slot。
+                print(
+                    f"[gpu] ASSIGNMENT_DISPATCH_FAILED | slot={assignment.slot_index} | "
+                    f"{type(err).__name__}: {err}",
+                    flush=True,
+                )
+                group["ledger"].mark_release_pending(assignment.assignment_id)
+                self.pool.retire_slots((assignment.slot_index,))
+                continue
+            assignment.worker_pid = worker_pid
+            assignment.dispatched = True
+            terminal_coordinator.register(
+                assignment.slot_index,
+                worker_pid,
+                assignment.pending.config,
+            )
+            self._running_assignments[assignment.slot_index] = assignment.assignment_id
+            dispatched += 1
+        return dispatched
+
+    def claim_terminal(self, msg, terminal_coordinator):
+        # 终态先做 assignment 级认领，再进入日志、checkpoint 和 retry 处理。
+        message = BatchMessage.from_raw(msg)
+        if message.slot_index is None:
+            return None
+        assignment = next(
+            (
+                item
+                for item in self.assignments.values()
+                if item.slot_index == message.slot_index and item.dispatched
+            ),
+            None,
         )
-        if group["scheduler"].slot_states.get(slot.index) != "idle":
-            group["scheduler"].mark_idle(slot.index)
-        group["scheduler"].mark_running(slot.index, assignment.assignment_id)
-        dispatched += 1
-    return dispatched
+        if assignment is None:
+            return None
+        if self._running_assignments.get(message.slot_index) != assignment.assignment_id:
+            return None
+        # 通用令牌继续校验 PID/config，两个账本共同阻断跨代消息。
+        if not terminal_coordinator.claim(msg):
+            return None
+        group = self.groups[assignment.group_key]
+        if not group["ledger"].claim_terminal(assignment.assignment_id):
+            return None
+        del self._running_assignments[assignment.slot_index]
+        return assignment
 
+    def record_result(self, assignment, msg_type):
+        self.groups[assignment.group_key]["ledger"].record_result(msg_type)
 
-def _continuous_claim_terminal(groups, assignments, claims, msg):
-    # 终态先做 assignment 级认领，再进入日志、checkpoint 和 retry 处理。
-    message = BatchMessage.from_raw(msg)
-    if message.slot_index is None:
-        return None
-    assignment = next(
-        (
-            item
-            for item in assignments.values()
-            if item.slot_index == message.slot_index and item.dispatched
-        ),
-        None,
-    )
-    if assignment is None or not claims.claim(assignment.assignment_id, msg):
-        return None
-    group = groups[assignment.group_key]
-    if not group["ledger"].claim_terminal(assignment.assignment_id):
-        return None
-    group["scheduler"].mark_terminal(assignment.slot_index, assignment.assignment_id)
-    return assignment
+    def finish(self, assignment):
+        """在批处理结果完成 retry/checkpoint 后移除 assignment。"""
+        # 业务结算先于删除，retry 路径仍可读取原 assignment 上下文。
+        current = self.assignments.pop(assignment.assignment_id, None)
+        if current is not assignment:
+            raise RuntimeError(f"assignment {assignment.assignment_id} is not active")
 
 
 def _run_continuous_gpu_batch_loop(
@@ -3662,48 +3678,48 @@ def _run_continuous_gpu_batch_loop(
     initial_snapshots = _read_gpu_memory_snapshots(
         tuple(
             gpu_id
-            for slot in pool.slots
-            for gpu_id in (slot.gpu_id, slot.comparison_gpu_id)
+            for _, gpu_id, comparison_gpu_id in pool.slot_devices()
+            for gpu_id in (gpu_id, comparison_gpu_id)
             if gpu_id is not None
         )
     )
-    groups = _build_continuous_gpu_groups(pool, initial_snapshots)
-    assignments = {}
-    # claims 与 ledger 都以 assignment_id 为主键，避免 slot 复用产生跨代串消息。
-    claims = AssignmentClaims()
-    next_assignment_id = [1]
+    scheduler = ContinuousGpuBatchScheduler(pool, initial_snapshots)
+    terminal = BatchTerminalCoordinator(
+        pool=pool,
+        options=options,
+        all_case=all_case,
+        checkpointed_case=checkpointed_case,
+        batch_state=batch_state,
+        retry_state=retry_state,
+        pending_dispatch=pending_dispatch,
+        max_total_external_kills=max_total_external_kills,
+    )
+    # scheduler 以 assignment_id 为主键，避免 slot 复用产生跨代串消息。
     pressure_timeout = GpuPressureTimeout(options.gpu_pressure_timeout)
 
     while (
-        pending_dispatch or assignments or batch_state.active_tasks or pool.has_initializing_slots()
+        pending_dispatch
+        or scheduler.has_assignments()
+        or batch_state.active_tasks
+        or pool.has_initializing_slots()
     ) and not batch_state.abort_run:
         # 每轮重新采样，不能把上一轮的 free 快照当作当前显存承诺。
         now = time.monotonic()
         planning_snapshots_reader = _memoized_snapshot_reader(_read_gpu_memory_snapshots)
-        _continuous_cancel_failed_startup(pool, groups, assignments, pending_dispatch)
-        for group_key, group in groups.items():
-            # release_pending 期间只观察物理回收，不创建替代 worker。
-            snapshots = planning_snapshots_reader(group_key)
-            group["ledger"].advance_reclaim(snapshots, now=now)
-        _continuous_schedule_idle_slots(
-            pool,
-            groups,
+        scheduler.cancel_failed_startup(pending_dispatch)
+        scheduler.reclaim(planning_snapshots_reader, now=now)
+        scheduler.schedule(
             pending_dispatch,
-            assignments,
-            next_assignment_id=next_assignment_id,
             snapshots_reader=planning_snapshots_reader,
             now=now,
         )
-        _continuous_start_workers(pool, groups, assignments)
+        scheduler.start_workers()
         pool.start_loaded_preparations(range(pool.total_workers))
         # worker preparation 可能改变显存，confirm 必须使用新的一轮采样。
         confirm_snapshots_reader = _memoized_snapshot_reader(_read_gpu_memory_snapshots)
-        dispatched = _continuous_dispatch_ready(
-            pool,
-            groups,
-            assignments,
-            claims,
+        dispatched = scheduler.dispatch_ready(
             snapshots_reader=confirm_snapshots_reader,
+            terminal_coordinator=terminal,
         )
         if dispatched:
             # active_tasks 只统计已真正 put 到 worker 队列的 case。
@@ -3715,7 +3731,7 @@ def _run_continuous_gpu_batch_loop(
         blocked = (
             bool(pending_dispatch)
             and batch_state.active_tasks == 0
-            and not assignments
+            and not scheduler.has_assignments()
             and not pool.has_initializing_slots()
         )
         # startup assignment 和初始化 slot 都属于进展中状态，不应触发压力超时。
@@ -3733,31 +3749,20 @@ def _run_continuous_gpu_batch_loop(
         if msg is None:
             # 没有消息时下一轮仍需处理 watchdog 状态和显存回收。
             continue
-        if pool._handle_worker_control_message(msg):
+        if pool.handle_message(msg):
             continue
         if msg[0] not in {"done", "deferred", "error", "timeout", "crashed"}:
             # 控制消息已在上方处理，未知消息不能改变 active_tasks。
             continue
-        assignment = _continuous_claim_terminal(groups, assignments, claims, msg)
+        assignment = scheduler.claim_terminal(msg, terminal)
         if assignment is None:
             # 迟到或重复终态不应再次写 checkpoint、计数或触发 retry。
             continue
-        groups[assignment.group_key]["ledger"].record_result(msg[0])
-        before = batch_state.tested_case
-        _handle_batch_result(
-            pool=pool,
-            options=options,
-            all_case=all_case,
-            checkpointed_case=checkpointed_case,
-            batch_state=batch_state,
-            retry_state=retry_state,
-            pending_dispatch=pending_dispatch,
-            msg=msg,
-            max_total_external_kills=max_total_external_kills,
-        )
-        del assignments[assignment.assignment_id]
+        scheduler.record_result(assignment, msg[0])
+        progressed = terminal.process(msg)
+        scheduler.finish(assignment)
         # 删除 assignment 必须发生在统一结果处理之后，便于 retry 读取原 case。
-        if batch_state.tested_case > before:
+        if progressed:
             pressure_timeout.update(blocked=False, now=time.monotonic())
         elif msg[0] == "deferred":
             pressure_timeout.update(blocked=True, now=time.monotonic())
@@ -3806,7 +3811,7 @@ def _run_batch_mode(
         for sig in (signal.SIGINT, signal.SIGTERM):
             previous_signal_handlers[sig] = signal.signal(sig, cleanup_handler)
 
-        print(f"Workers: lazy | {len(pool.slots)} logical slots", flush=True)
+        print(f"Workers: lazy | {pool.total_workers} logical slots", flush=True)
         pool.start()
         if cpu_worker_count:
             _run_cpu_batch_loop(
