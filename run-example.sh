@@ -114,10 +114,9 @@ TIME_OUT_ARGS=(
 
 # ── engineV4 only 参数说明 ─────────────────────────────────────
 # 以下参数仅 engineV4.py 支持，engineV2.py 不要传入：
-# - --use_compute_sanitizer=True: 为每个 case 通过 compute-sanitizer 子进程运行，定位 CUDA 访存/同步等问题。
+# - --use_compute_sanitizer=True: 所有 case 通过可复用 compute-sanitizer session 运行，定位 CUDA 访存/同步等问题。
 # - --sanitizer_command="compute-sanitizer --target-processes all --error-exitcode=86"
 # - --sanitizer_error_exitcode=86
-# - --_sanitizer_child=True: engineV4 内部子进程参数，普通运行不要配置。
 
 mkdir -p "$LOG_DIR" || {
     echo "[错误] 无法创建日志目录 | 日志 $LOG_DIR"

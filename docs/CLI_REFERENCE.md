@@ -153,13 +153,13 @@ backend；显式 Torch/Paddle backend 会被忽略并警告。GPU mode 会忽略
 
 #### `--use_compute_sanitizer=True`
 
-每个 case 在 compute-sanitizer 子进程中运行，仅 engineV4 支持。默认：`False`。
+所有 case 通过一个常驻 compute-sanitizer session 顺序运行；同一 worker 的正常 case 复用 Python/Paddle/CUDA runtime，session crash 或 timeout 后才重建。仅 engineV4 支持。默认：`False`。
 
 #### `--sanitizer_command=COMMAND`、`--sanitizer_error_exitcode=N`
 
 Sanitizer 命令前缀和报错退出码。默认分别为 `compute-sanitizer --target-processes all --error-exitcode=86` 和 `86`。
 
-`--_sanitizer_child` 是内部子进程参数，禁止手工设置。
+session 入口为内部参数，禁止手工设置。
 
 ## `run.py`
 

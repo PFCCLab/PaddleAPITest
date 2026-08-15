@@ -274,7 +274,7 @@ python engineV4.py \
 
 ### Compute Sanitizer
 
-engineV4 可为 case 启动 compute-sanitizer，定位 CUDA 非法访存、race 和同步错误：
+engineV4 通过常驻 compute-sanitizer session 运行所有 case，定位 CUDA 非法访存、race 和同步错误：
 
 ```bash
 python engineV4.py \
@@ -284,7 +284,7 @@ python engineV4.py \
   --sanitizer_command='compute-sanitizer --target-processes all --error-exitcode=86'
 ```
 
-该能力仅由 engineV4 提供。`--_sanitizer_child` 是内部参数，不应手工设置。
+该能力仅由 engineV4 提供；session 入口为内部参数，不应手工设置。
 
 ## 配置集
 

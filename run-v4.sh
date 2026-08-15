@@ -21,12 +21,11 @@ DRY_RUN=false             # true=只打印最终命令，不执行
 
 # ── compute-sanitizer（engineV4 only）──────────────────────────
 # compute-sanitizer 用于定位 CUDA kernel 的非法访存、race、同步错误等问题。
-# engineV4 会为每个 worker slot 启动独立 sanitizer 子进程，保留多 GPU/多 worker 并发。
+# engineV4 为每个 worker slot 启动一个 sanitizer session，正常 case 在 session 内复用 runtime。
 # engineV2 不支持以下 sanitizer 参数；ENGINE=engineV2 时请保持 USE_COMPUTE_SANITIZER=false，并不要传入 SANITIZER_ARGS。
 USE_COMPUTE_SANITIZER=false
 SANITIZER_COMMAND="compute-sanitizer --target-processes all --error-exitcode=86"
 SANITIZER_ERROR_EXITCODE=86
-# --_sanitizer_child 是 engineV4 内部参数，普通运行不要配置。
 
 # ── Paddle Flags ──────────────────────────────────────────────
 # 这些环境变量在启动 Paddle 前生效，用于控制 Paddle 运行时行为。

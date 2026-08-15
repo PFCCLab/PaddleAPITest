@@ -61,6 +61,14 @@ from tester.runtime_config import (
     runtime_config_for_gpu,
 )
 from tester.sanitizer_output import analyze_sanitizer_output
+from tester.sanitizer_session import (
+    SESSION_EVENT_PREFIX,
+    encode_ready,
+    encode_request,
+    encode_result,
+    parse_event,
+)
+from tester.scheduling_observer import SchedulingObserver, parse_sanitizer_timing_file
 
 os.environ["FLAGS_use_system_allocator"] = "1"
 os.environ["NVIDIA_TF32_OVERRIDE"] = "0"
@@ -220,6 +228,8 @@ GPU_MEMORY_DEFER_INITIAL_BACKOFF_SECONDS = 1.0
 GPU_MEMORY_DEFER_MAX_BACKOFF_SECONDS = 30.0
 SANITIZER_COMPUTE_BUDGET_ENV = "PADDLEAPITEST_WAVE_COMPUTE_BUDGET_GIB"
 SANITIZER_COMPARISON_BUDGET_ENV = "PADDLEAPITEST_WAVE_COMPARISON_BUDGET_GIB"
+SANITIZER_TIMING_FILE_ENV = "PADDLEAPITEST_SANITIZER_TIMING_FILE"
+# 观测文件只在 sanitizer session 环境中出现，普通 worker 不读取该变量。
 # 波次准入只需要队首少量候选；窗口随本波最大并发放大，保留跳过大 case 的能力。
 CANDIDATE_WINDOW_PER_WORKER = 32
 CANDIDATE_WINDOW_MIN = 64
@@ -248,6 +258,23 @@ def _collect_wait_timeout(pending_dispatch, default=0.5):
     if pending_delay is None:
         return default
     return min(default, max(0.1, pending_delay))
+
+
+def _safe_observe(observer, method, *args, **kwargs):
+    """观测故障只丢统计样本，不能改变 worker 或 case 的失败语义。"""
+    if observer is None:
+        # CPU batch 不创建 observer，保持原路径无额外对象访问。
+        return None
+    try:
+        return getattr(observer, method)(*args, **kwargs)
+    except Exception:
+        # 观测实现不能把日志/格式化故障升级成 batch 失败。
+        try:
+            observer.record_error(method)
+        except Exception:
+            # 连观测错误计数器也故障时直接丢弃，业务状态仍由原路径维护。
+            pass
+        return None
 
 
 def _fatal_log_type_for_error(error, terminal_log_type=None):
@@ -280,6 +307,17 @@ def _sanitizer_analysis_is_ignored(analysis):
     return bool(
         analysis.only_ignored_diagnostics and _fatal_log_type_for_error(analysis.output) is None
     )
+
+
+def _sanitizer_session_output_has_report(output):
+    """识别 session 当前 request 是否包含 compute-sanitizer 诊断块。"""
+    # 普通 Paddle 输出不会使用 sanitizer 的固定分隔线；按 request 片段检查可恢复逐 case 归因。
+    if "========= " not in output:
+        return False
+    if "Error:" in output or "Program hit" in output:
+        return True
+    summary_counts = re.findall(r"ERROR SUMMARY:\s*(\d+)\s+errors?", output)
+    return any(int(count) > 0 for count in summary_counts)
 
 
 @dataclass
@@ -575,6 +613,7 @@ class GpuWaveRuntime:
     slot_indices: tuple[int, ...]
     planned_cases: list[PendingCase] = field(default_factory=list)
     planned_slot_indices: tuple[int, ...] = ()
+    observation_wave_id: int | None = None
     terminal_claims: TerminalClaims = field(default_factory=TerminalClaims)
     pressure_reported: bool = False
     # 上次扩展扫描的完成时刻；-inf 保证进程刚启动时首次扫描不会被误抑制。
@@ -625,6 +664,8 @@ class BatchMessage:
     exitcode: int | None = None
     worker_pid: int | None = None
     completed_offset: int | None = None
+    # watchdog 生成的 timeout/crash 携带检测时刻，避免队列等待污染执行耗时。
+    terminal_timestamp: float | None = None
     reason: str | None = None
     crash_source: str = "worker"
 
@@ -639,19 +680,21 @@ class BatchMessage:
         if message.msg_type in {"done", "timeout"}:
             message.worker_pid = msg[3] if len(msg) > 3 else None
             message.completed_offset = msg[4] if len(msg) > 4 else None
+            message.terminal_timestamp = msg[5] if len(msg) > 5 else None
         elif message.msg_type in {"deferred", "error"}:
             message.reason = msg[3] if len(msg) > 3 else ""
             message.worker_pid = msg[4] if len(msg) > 4 else None
             message.completed_offset = msg[5] if len(msg) > 5 else None
         elif message.msg_type == "crashed":
             message.exitcode = msg[3] if len(msg) > 3 else None
-            if len(msg) > 5 and msg[5] == "child":
-                message.crash_source = "child"
+            if len(msg) > 5 and msg[5] == "session":
+                message.crash_source = "session"
                 message.worker_pid = msg[6] if len(msg) > 6 else None
                 message.completed_offset = msg[7] if len(msg) > 7 else None
             else:
                 message.worker_pid = msg[4] if len(msg) > 4 else None
                 message.completed_offset = msg[5] if len(msg) > 5 else None
+                message.terminal_timestamp = msg[6] if len(msg) > 6 else None
         return message
 
 
@@ -874,15 +917,8 @@ def _worker_loop(
         pass
 
 
-def _build_sanitizer_case_command(api_config_str, options, sanitizer_cmd):
-    cmd = [
-        *sanitizer_cmd,
-        sys.executable,
-        str(Path(__file__).resolve()),
-        f"--api_config={api_config_str}",
-        f"--log_dir={options.log_dir}",
-        "--_sanitizer_child=True",
-    ]
+def _append_sanitizer_forward_args(cmd, options):
+    """把主流程的测试选项统一转发给唯一的 sanitizer session 入口。"""
     for key in SANITIZER_FORWARD_ARGS_SORTED:
         value = getattr(options, key, None)
         if value is None:
@@ -901,19 +937,39 @@ def _build_sanitizer_case_command(api_config_str, options, sanitizer_cmd):
     return cmd
 
 
-def _sanitizer_child_environment(base_environment, task):
-    """为 sanitizer case child 构造本波独立环境。"""
-    child_environment = dict(base_environment)
-    if isinstance(task, WorkerTask):
-        # wrapper 不加载 GPU runtime；实际并发和两侧承诺必须随 case child 透传。
-        child_environment["PADDLEAPITEST_WORKERS_ON_GPU"] = str(task.workers_on_gpu)
-        child_environment[SANITIZER_COMPUTE_BUDGET_ENV] = str(task.compute_budget_gib)
-        child_environment[SANITIZER_COMPARISON_BUDGET_ENV] = str(task.comparison_budget_gib)
-    return child_environment
+def _build_sanitizer_session_command(options, sanitizer_cmd):
+    """构造常驻 sanitizer/Paddle session；case 配置通过 stdin 逐条传入。"""
+    cmd = [
+        *sanitizer_cmd,
+        sys.executable,
+        str(Path(__file__).resolve()),
+        f"--log_dir={options.log_dir}",
+        "--_sanitizer_session=True",
+    ]
+    return _append_sanitizer_forward_args(cmd, options)
 
 
-def _apply_sanitizer_child_wave_budget(options, environ=None):
-    """从内部环境恢复 wrapper 为本 case 选择的波次预算。"""
+def _terminate_sanitizer_session(process, *, wait=False):
+    """回收 session 进程组；wrapper 和单 case 入口共用同一清理协议。"""
+    if process is None:
+        return
+    if process.poll() is None:
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except (ProcessLookupError, OSError):
+            try:
+                process.kill()
+            except (ProcessLookupError, OSError, AttributeError):
+                pass
+    if wait:
+        try:
+            process.wait(timeout=5)
+        except (subprocess.TimeoutExpired, OSError, AttributeError):
+            pass
+
+
+def _apply_sanitizer_wave_budget(options, environ=None):
+    """从 session request 恢复 wrapper 为本波选择的显存预算。"""
     source = os.environ if environ is None else environ
     if SANITIZER_COMPUTE_BUDGET_ENV not in source:
         return False
@@ -936,7 +992,7 @@ def _apply_sanitizer_child_wave_budget(options, environ=None):
 
     visible_gpu_ids = tuple(int(value) for value in source["CUDA_VISIBLE_DEVICES"].split(","))
     if not visible_gpu_ids:
-        raise ValueError("sanitizer child requires a visible compute GPU")
+        raise ValueError("sanitizer session requires a visible compute GPU")
     compute_budget_gib = read_nonnegative_float(SANITIZER_COMPUTE_BUDGET_ENV)
     comparison_budget_gib = read_nonnegative_float(SANITIZER_COMPARISON_BUDGET_ENV)
     compute_gpu_id = visible_gpu_ids[0]
@@ -974,23 +1030,112 @@ def _sanitizer_worker_loop(
     child_env["PADDLEAPITEST_SUPPRESS_CASE_TAGS"] = "1"
 
     def terminate_child(*args):
-        if child_process is not None and child_process.poll() is None:
-            try:
-                os.killpg(child_process.pid, signal.SIGKILL)
-            except (ProcessLookupError, OSError):
-                child_process.kill()
+        _terminate_sanitizer_session(child_process)
         raise SystemExit(1)
 
     signal.signal(signal.SIGINT, terminate_child)
     signal.signal(signal.SIGTERM, terminate_child)
 
+    def drop_session():
+        """协议异常时回收仍存活的 session，避免 wrapper 丢失进程组句柄。"""
+        nonlocal child_process
+        process = child_process
+        child_process = None
+        if process is None or process.poll() is not None:
+            return
+        _terminate_sanitizer_session(process)
+
+    def start_session():
+        """启动并握手一个 session；失败只影响当前请求，wrapper 可继续重建。"""
+        nonlocal child_process
+        if child_process is not None and child_process.poll() is None:
+            return True
+        cmd = _build_sanitizer_session_command(options, sanitizer_cmd)
+        try:
+            child_process = subprocess.Popen(
+                cmd,
+                env=child_env,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                bufsize=1,
+                start_new_session=True,
+            )
+        except OSError as err:
+            child_process = None
+            print(f"[sanitizer session] spawn failed: {err}", flush=True)
+            return False
+        result_queue.put(("child", slot_index, os.getpid(), child_process.pid))
+        while True:
+            line = child_process.stdout.readline()
+            if not line:
+                child_process = None
+                return False
+            if line.startswith("__PADDLEAPITEST_SANITIZER_SESSION__ "):
+                try:
+                    event = parse_event(line)
+                except ValueError:
+                    drop_session()
+                    return False
+                if event["event"] == "ready":
+                    result_queue.put(
+                        (
+                            "sanitizer_session_ready",
+                            slot_index,
+                            os.getpid(),
+                            float(event.get("framework_ms", 0.0)),
+                        )
+                    )
+                    return True
+                drop_session()
+                return False
+            print(line, end="", flush=True)
+
+    def read_session_result(case_id, output_file, output_tail):
+        """读取一个 request 的输出，EOF 表示 session crash。"""
+        nonlocal child_process
+        while True:
+            line = child_process.stdout.readline()
+            if not line:
+                returncode = child_process.poll()
+                # stdout 提前关闭时进程可能仍存活；不能把坏 session 留给下一 request。
+                if returncode is None:
+                    drop_session()
+                    returncode = -1
+                return "crashed", returncode, "".join(output_tail)
+            if line.startswith("__PADDLEAPITEST_SANITIZER_SESSION__ "):
+                try:
+                    event = parse_event(line)
+                except ValueError as err:
+                    output_tail.append(f"[sanitizer session] protocol error: {err}\n")
+                    drop_session()
+                    return "crashed", -1, "".join(output_tail)
+                if event["event"] != "result" or int(event["case_id"]) != case_id:
+                    output_tail.append("[sanitizer session] unexpected result marker\n")
+                    drop_session()
+                    return "crashed", -1, "".join(output_tail)
+                return (
+                    str(event["status"]),
+                    0 if event["status"] == "done" else 2,
+                    "".join(output_tail),
+                )
+            output_tail.append(line)
+            output_file.write(line)
+
     try:
         result_queue.put(("loaded", slot_index, os.getpid()))
         if not _await_runtime_preparation(input_queue):
             return
-        # wrapper 不加载框架；握手只保持与普通 worker 相同的 slot 生命周期。
+        # session 在 ready 前完成框架初始化，首个 case 的 timeout 不包含 bootstrap 假成功。
+        if not start_session():
+            result_queue.put(("init_failed", slot_index, os.getpid(), "module_load", "session"))
+            return
         result_queue.put(("ready", slot_index, os.getpid()))
 
+        request_id = 0
         while True:
             try:
                 task = input_queue.get()
@@ -1013,69 +1158,74 @@ def _sanitizer_worker_loop(
             if case_log_dir.exists():
                 shutil.rmtree(case_log_dir)
             case_log_dir.mkdir(parents=True, exist_ok=True)
-            try:
-                cmd = _build_sanitizer_case_command(api_config_str, options, sanitizer_cmd)
-            except ValueError as err:
+            if not start_session():
                 shutil.rmtree(case_log_dir, ignore_errors=True)
-                completed_offset = log_worker.write_case_end("error", api_config_str)
                 result_queue.put(
                     (
-                        "error",
+                        # session 尚未接受该 case，不能伪造 sanitizer terminal；
+                        # 交给既有 deferred 路径回队并在新 slot 中重试。
+                        "deferred",
                         slot_index,
                         api_config_str,
-                        str(err),
+                        "sanitizer session unavailable",
                         os.getpid(),
-                        completed_offset,
+                        log_worker.get_worker_log_offset(),
                     )
                 )
                 continue
 
-            try:
-                case_child_env = _sanitizer_child_environment(child_env, task)
-                child_process = subprocess.Popen(
-                    cmd,
-                    env=case_child_env,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.STDOUT,
-                    text=True,
-                    encoding="utf-8",
-                    errors="replace",
-                    bufsize=1,
-                    start_new_session=True,
-                )
-            except OSError as err:
-                shutil.rmtree(case_log_dir, ignore_errors=True)
-                completed_offset = log_worker.write_case_end("error", api_config_str)
-                result_queue.put(
-                    (
-                        "error",
-                        slot_index,
-                        api_config_str,
-                        str(err),
-                        os.getpid(),
-                        completed_offset,
-                    )
-                )
-                continue
+            request_id += 1
             result_queue.put(("child", slot_index, os.getpid(), child_process.pid))
             output_tail = deque(maxlen=40)
             with tempfile.TemporaryFile(
                 mode="w+t", encoding="utf-8", errors="replace"
             ) as output_file:
+                timing_path = case_log_dir / "timing.tsv"
                 try:
-                    for line in child_process.stdout:
-                        output_tail.append(line)
-                        output_file.write(line)
-                    returncode = child_process.wait()
-                finally:
-                    if child_process.stdout is not None:
-                        child_process.stdout.close()
-
-                child_process = None
+                    worker_task = (
+                        task
+                        if isinstance(task, WorkerTask)
+                        else WorkerTask(
+                            config=api_config_str,
+                            workers_on_gpu=1,
+                            compute_budget_gib=0.0,
+                        )
+                    )
+                    child_process.stdin.write(
+                        encode_request(
+                            request_id,
+                            api_config_str,
+                            str(timing_path),
+                            workers_on_gpu=worker_task.workers_on_gpu,
+                            compute_budget_gib=worker_task.compute_budget_gib,
+                            comparison_budget_gib=worker_task.comparison_budget_gib,
+                        )
+                    )
+                    child_process.stdin.flush()
+                except (BrokenPipeError, OSError, AttributeError):
+                    status, returncode, child_output = "crashed", -1, ""
+                else:
+                    status, returncode, child_output = read_session_result(
+                        request_id, output_file, output_tail
+                    )
+                output_tail.clear()
+                output_tail.extend(child_output.splitlines(keepends=True))
+                # 先读取隔离 timing 文件，再删除目录；消息不是 case 终态。
+                # timing 归属 wrapper 执行阶段，不能与 request 的最终状态竞争 terminal claim。
+                for phase, duration in parse_sanitizer_timing_file(timing_path).items():
+                    result_queue.put(("sanitizer_timing", slot_index, os.getpid(), phase, duration))
                 output_file.seek(0)
-                if returncode == options.sanitizer_error_exitcode:
+                raw_output = output_file.read()
+                output_file.seek(0)
+                if status == "crashed":
+                    analysis = None
+                elif returncode == options.sanitizer_error_exitcode or (
+                    status == "done" and _sanitizer_session_output_has_report(raw_output)
+                ):
                     analysis = analyze_sanitizer_output(
-                        output_file.read(), returncode, options.sanitizer_error_exitcode
+                        raw_output,
+                        options.sanitizer_error_exitcode if status == "done" else returncode,
+                        options.sanitizer_error_exitcode,
                     )
                     if analysis.output:
                         print(
@@ -1083,23 +1233,48 @@ def _sanitizer_worker_loop(
                             end="" if analysis.output.endswith("\n") else "\n",
                             flush=True,
                         )
-                else:
+                elif status in {"error", "done"}:
                     analysis = None
                     shutil.copyfileobj(output_file, sys.stdout)
                     sys.stdout.flush()
+                else:
+                    analysis = None
+
+                if status == "done" and analysis is not None:
+                    # 常驻 sanitizer 不在每个 request 返回 86，按当前输出片段恢复原有分类。
+                    if not _sanitizer_analysis_is_ignored(analysis):
+                        status = "crashed"
+                        returncode = _normalize_sanitizer_exitcode(
+                            analysis.output,
+                            returncode=options.sanitizer_error_exitcode,
+                            sanitizer_error_exitcode=options.sanitizer_error_exitcode,
+                        )
 
                 ignored = analysis is not None and _sanitizer_analysis_is_ignored(analysis)
-                if not ignored:
+                if status not in {"crashed", "error"} and not ignored:
                     returncode = _normalize_sanitizer_exitcode(
                         analysis.output if analysis is not None else "",
                         returncode=returncode,
                         sanitizer_error_exitcode=options.sanitizer_error_exitcode,
                     )
-                if returncode in (0, 2) or ignored:
+                if status == "done" or ignored:
                     log_worker.merge_sanitizer_case_logs(case_log_dir)
                 shutil.rmtree(case_log_dir, ignore_errors=True)
 
-                if returncode == 0 or ignored:
+                if status == "crashed":
+                    result_queue.put(
+                        (
+                            "crashed",
+                            slot_index,
+                            api_config_str,
+                            returncode,
+                            "".join(output_tail),
+                            "session",
+                            os.getpid(),
+                            None,
+                        )
+                    )
+                elif status == "done" or ignored:
                     completed_offset = log_worker.write_case_end("completed", api_config_str)
                     result_queue.put(
                         (
@@ -1110,28 +1285,14 @@ def _sanitizer_worker_loop(
                             completed_offset,
                         )
                     )
-                elif returncode == 2:
+                else:
                     completed_offset = log_worker.write_case_end("error", api_config_str)
                     result_queue.put(
                         (
                             "error",
                             slot_index,
                             api_config_str,
-                            f"child exited with {returncode}",
-                            os.getpid(),
-                            completed_offset,
-                        )
-                    )
-                else:
-                    completed_offset = log_worker.write_case_end("crashed", api_config_str)
-                    result_queue.put(
-                        (
-                            "crashed",
-                            slot_index,
-                            api_config_str,
-                            returncode,
-                            "".join(output_tail),
-                            "child",
+                            f"session case exited with {returncode}",
                             os.getpid(),
                             completed_offset,
                         )
@@ -1139,13 +1300,9 @@ def _sanitizer_worker_loop(
     finally:
         if child_process is not None and child_process.poll() is None:
             try:
-                os.killpg(child_process.pid, signal.SIGKILL)
-            except (ProcessLookupError, OSError):
-                child_process.kill()
-            try:
-                child_process.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                pass
+                _terminate_sanitizer_session(child_process, wait=True)
+            finally:
+                child_process = None
         try:
             log_runtime.close_process_files()
             log_worker.restore_stdio()
@@ -1164,6 +1321,7 @@ class WorkerPool:
         *,
         gpu_total_memory_map=None,
         cpu_worker_count=0,
+        observer=None,
     ):
         # 将 argparse.Namespace 转成 SimpleNamespace，便于 worker 进程更干净地 pickle。
         if isinstance(options, argparse.Namespace):
@@ -1182,6 +1340,8 @@ class WorkerPool:
         self._lock = threading.Lock()  # 保护 slot 状态修改
         self._spawn_lock = threading.Lock()
         self._closed = False
+        # observer 只在主进程持有，不能放入传给 spawn worker 的 options。
+        self.observer = observer
 
         # CPU worker 使用 gpu_id=None；只有需要 GPU 运行时时才建立 GPU 槽位。
         idx = 0
@@ -1308,6 +1468,7 @@ class WorkerPool:
             )
             inherited_visibility = _visible_gpu_ids(slot.gpu_id, slot.comparison_gpu_id)
             previous_visibility = os.environ.get("CUDA_VISIBLE_DEVICES")
+            spawn_started_at = time.monotonic()
             try:
                 # spawn 会先导入本模块；必须在 start 前让子解释器继承 slot 映射。
                 if inherited_visibility is None:
@@ -1325,7 +1486,16 @@ class WorkerPool:
             slot.current_task = None
             slot.task_start_time = None
             slot.child_pid = None
-            slot.started_at = time.monotonic()
+            slot.started_at = spawn_started_at
+            # spawn 起点必须早于 p.start，才能覆盖 Python spawn 和 import 开销。
+            _safe_observe(
+                self.observer,
+                "record_worker_spawn",
+                slot.index,
+                slot.gpu_id,
+                spawn_started_at,
+                comparison_gpu_id=slot.comparison_gpu_id,
+            )
             return True
 
     def start_loaded_preparations(self, slot_indices):
@@ -1351,6 +1521,13 @@ class WorkerPool:
                     continue
                 slot.state = "preparing"
                 slot.started_at = time.monotonic()
+                # 记录放行时间而非 worker 收到命令时间，边界由主进程控制。
+                _safe_observe(
+                    self.observer,
+                    "record_worker_preparation_start",
+                    slot.index,
+                    slot.started_at,
+                )
                 try:
                     slot.input_queue.put(WORKER_PREPARE_RUNTIME)
                 except (OSError, EOFError, ValueError) as err:
@@ -1408,6 +1585,7 @@ class WorkerPool:
         now = time.monotonic() if now is None else now
         phase = "module_load" if slot.state == "starting" else "preparation"
         if not slot.process.is_alive():
+            _safe_observe(self.observer, "record_counter", "crash")
             print(
                 f"[worker] INIT_CRASH | slot {slot.index} | phase {phase} | "
                 f"exit {slot.process.exitcode}",
@@ -1434,7 +1612,15 @@ class WorkerPool:
     def _handle_worker_control_message(self, msg):
         """处理来自 worker 的生命周期、任务确认和 child 账务消息。"""
         msg_type = msg[0]
-        if msg_type not in {"loaded", "ready", "init_failed", "ack", "child"}:
+        if msg_type not in {
+            "loaded",
+            "ready",
+            "init_failed",
+            "ack",
+            "child",
+            "sanitizer_timing",
+            "sanitizer_session_ready",
+        }:
             return False
         slot_idx = msg[1]
         worker_pid = msg[2]
@@ -1447,11 +1633,13 @@ class WorkerPool:
                 if slot.state == "starting":
                     slot.state = "loaded"
                     slot.started_at = None
+                    _safe_observe(self.observer, "record_worker_loaded", slot_idx)
                 return True
             if msg_type == "ready":
                 if slot.state == "preparing":
                     slot.state = "idle"
                     slot.started_at = None
+                    _safe_observe(self.observer, "record_worker_ready", slot_idx)
                 return True
             if msg_type == "ack":
                 config = msg[3]
@@ -1461,6 +1649,14 @@ class WorkerPool:
                 return True
             if msg_type == "child":
                 slot.child_pid = msg[3]
+                _safe_observe(self.observer, "record_sanitizer_session_start", slot_idx)
+                return True
+            if msg_type == "sanitizer_timing":
+                # timing 消息仅更新摘要，不能消费 terminal claim 或改变 slot 状态。
+                _safe_observe(self.observer, "record_sanitizer_phase", msg[3], msg[4])
+                return True
+            if msg_type == "sanitizer_session_ready":
+                _safe_observe(self.observer, "record_sanitizer_session_ready", msg[3])
                 return True
 
             if msg_type == "init_failed":
@@ -1591,20 +1787,21 @@ class WorkerPool:
                 and slot.task_start_time is not None
                 and now - slot.task_start_time > self.options.timeout
             ):
-                self._handle_timeout(slot)
+                self._handle_timeout(slot, now=now)
                 return
             if (
                 slot.state in ("busy", "idle")
                 and slot.process is not None
                 and not slot.process.is_alive()
             ):
-                self._handle_crash(slot)
+                self._handle_crash(slot, now=now)
 
-    def _handle_timeout(self, slot):
+    def _handle_timeout(self, slot, *, now=None):
         """终止超时 worker，并写入 timeout 结果。"""
         if self._closed or self._shutdown_event.is_set():
             return
         config = slot.current_task
+        terminal_timestamp = time.monotonic() if now is None else float(now)
         # 与 crash 相同，process 只在入口取一次快照，避免并发 retire 造成二次解引用。
         process = slot.process
         old_pid = process.pid if process is not None else None
@@ -1616,13 +1813,16 @@ class WorkerPool:
             return
         try:
             # watchdog 只上报候选终态，日志边界必须等主循环成功认领后再写。
-            self.result_queue.put(("timeout", slot.index, config, old_pid))
+            # 保留 watchdog 检测时刻，主循环认领延迟不能进入 case 时长。
+            self.result_queue.put(
+                ("timeout", slot.index, config, old_pid, None, terminal_timestamp)
+            )
         finally:
             # 入队失败也必须挂起 slot，否则下一轮会对同一死进程重复上报。
             # 主循环收到终态后才会关闭整波并开始物理 free 稳定采样。
             self._suspend_slot(slot)
 
-    def _handle_crash(self, slot):
+    def _handle_crash(self, slot, *, now=None):
         """处理非预期死亡的 worker。"""
         if self._closed or self._shutdown_event.is_set():
             return
@@ -1631,6 +1831,7 @@ class WorkerPool:
         exitcode = process.exitcode if process is not None else None
         worker_pid = process.pid if process is not None else None
         config = slot.current_task
+        terminal_timestamp = time.monotonic() if now is None else float(now)
         # wrapper 异常死亡不会执行自身 finally，child 必须由 pool 主动回收，
         # 且必须早于 _suspend_slot 清空 child_pid。
         self._kill_slot_child(slot)
@@ -1639,8 +1840,19 @@ class WorkerPool:
         try:
             if config is not None:
                 # 与 timeout 相同，crash 日志边界只能由胜出的终态消息写入。
-                self.result_queue.put(("crashed", slot.index, config, exitcode, worker_pid))
+                self.result_queue.put(
+                    (
+                        "crashed",
+                        slot.index,
+                        config,
+                        exitcode,
+                        worker_pid,
+                        None,
+                        terminal_timestamp,
+                    )
+                )
             else:
+                _safe_observe(self.observer, "record_counter", "crash")
                 print(
                     f"[worker] PADDLE_CRASH | slot {slot.index} | exit {exitcode}",
                     flush=True,
@@ -2187,28 +2399,72 @@ def _run_single_config_with_sanitizer(options):
         return _argument_error(str(err))
 
     api_config = options.api_config.strip()
-    cmd = _build_sanitizer_case_command(
-        api_config,
-        options,
-        sanitizer_cmd,
-    )
+    cmd = _build_sanitizer_session_command(options, sanitizer_cmd)
     env = os.environ.copy()
     if gpu_ids:
         env["CUDA_VISIBLE_DEVICES"] = ",".join(str(gpu_id) for gpu_id in gpu_ids)
 
-    result = subprocess.run(
-        cmd,
-        env=env,
-        check=False,
-        capture_output=True,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-    )
-    raw_output = f"{result.stdout or ''}{result.stderr or ''}"
-    analysis = analyze_sanitizer_output(
-        raw_output, result.returncode, options.sanitizer_error_exitcode
-    )
+    process = None
+    raw_lines = []
+    status = "crashed"
+    returncode = -1
+    with tempfile.TemporaryDirectory(prefix="sanitizer_single_") as timing_dir:
+        timing_path = Path(timing_dir) / "timing.tsv"
+        try:
+            process = subprocess.Popen(
+                cmd,
+                env=env,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                bufsize=1,
+                start_new_session=True,
+            )
+            ready = False
+            while True:
+                line = process.stdout.readline()
+                if not line:
+                    break
+                if not line.startswith(SESSION_EVENT_PREFIX):
+                    raw_lines.append(line)
+                    continue
+                event = parse_event(line)
+                if event["event"] != "ready":
+                    raise ValueError("sanitizer session did not send ready")
+                ready = True
+                break
+            if ready:
+                process.stdin.write(encode_request(0, api_config, str(timing_path)))
+                process.stdin.flush()
+                while True:
+                    line = process.stdout.readline()
+                    if not line:
+                        returncode = process.poll()
+                        returncode = -1 if returncode is None else returncode
+                        break
+                    if not line.startswith(SESSION_EVENT_PREFIX):
+                        raw_lines.append(line)
+                        continue
+                    event = parse_event(line)
+                    if event["event"] != "result" or int(event["case_id"]) != 0:
+                        raise ValueError("sanitizer session returned an unexpected result")
+                    status = str(event["status"])
+                    returncode = 0 if status == "done" else 2
+                    break
+        except (BrokenPipeError, OSError, ValueError) as err:
+            raw_lines.append(f"[sanitizer session] {err}\n")
+            status = "crashed"
+            returncode = -1
+        finally:
+            _terminate_sanitizer_session(process, wait=True)
+
+    raw_output = "".join(raw_lines)
+    if status == "done" and _sanitizer_session_output_has_report(raw_output):
+        returncode = options.sanitizer_error_exitcode
+    analysis = analyze_sanitizer_output(raw_output, returncode, options.sanitizer_error_exitcode)
     if analysis.output:
         print(
             analysis.output,
@@ -2219,13 +2475,12 @@ def _run_single_config_with_sanitizer(options):
         return 0
     normalized_returncode = _normalize_sanitizer_exitcode(
         raw_output,
-        returncode=result.returncode,
+        returncode=returncode,
         sanitizer_error_exitcode=options.sanitizer_error_exitcode,
     )
-    if result.returncode == options.sanitizer_error_exitcode:
+    if returncode == options.sanitizer_error_exitcode:
         print(
-            f"[error] compute-sanitizer reported errors for {api_config} "
-            f"(exit {result.returncode})",
+            f"[error] compute-sanitizer reported errors for {api_config} (exit {returncode})",
             flush=True,
         )
     return normalized_returncode
@@ -2478,6 +2733,7 @@ def _try_plan_gpu_waves(
     pending_dispatch,
     *,
     snapshot_reader,
+    observer=None,
     now=None,
 ):
     """为当前 ready GPU 规划整波任务；此阶段只按需创建进程，不派发 case。"""
@@ -2534,12 +2790,29 @@ def _try_plan_gpu_waves(
         )
         selected_slots = candidate_slots[: len(runtime.planned_cases)]
         runtime.planned_slot_indices = tuple(slot.index for slot in selected_slots)
+        runtime.observation_wave_id = _safe_observe(
+            observer,
+            "record_wave_planned",
+            runtime.controller.device_ids,
+            len(runtime.planned_cases),
+            now,
+        )
+        # 先登记逻辑波次，再按需拉起缺口 slot，方便把启动耗时归因到该波。
         for slot in selected_slots:
             if slot.state != "idle":
                 pool._spawn_worker(slot)
 
 
-def _requeue_planned_wave(runtime, pending_dispatch):
+def _requeue_planned_wave(runtime, pending_dispatch, *, observer=None):
+    if runtime.observation_wave_id is not None:
+        # 回队前撤销尚未派发的统计波次；已派发的部分波次继续保留。
+        cancelled = _safe_observe(
+            observer,
+            "record_wave_cancelled",
+            runtime.observation_wave_id,
+        )
+        if cancelled:
+            runtime.observation_wave_id = None
     for pending in reversed(runtime.planned_cases):
         pending_dispatch.appendleft(pending)
     runtime.planned_cases.clear()
@@ -2559,7 +2832,7 @@ def _cancel_unstartable_planned_waves(pool, runtimes, pending_dispatch):
         # 任一 slot 启动失败都会破坏整波屏障，不能只缩小已承诺的波次。
         runtime.controller.cancel_planned_wave()
         pool.retire_slots(runtime.planned_slot_indices)
-        _requeue_planned_wave(runtime, pending_dispatch)
+        _requeue_planned_wave(runtime, pending_dispatch, observer=pool.observer)
         cancelled_count += 1
     return cancelled_count
 
@@ -2584,6 +2857,7 @@ def _try_dispatch_planned_waves(
     pending_dispatch,
     *,
     snapshot_reader,
+    observer=None,
 ):
     """仅当本波全部 worker ready 且二次显存检查通过时原子派发。"""
     dispatched_count = 0
@@ -2596,7 +2870,7 @@ def _try_dispatch_planned_waves(
         snapshots = snapshot_reader(runtime.controller.device_ids)
         if not runtime.controller.confirm_planned_wave(snapshots):
             pool.retire_slots(runtime.planned_slot_indices)
-            _requeue_planned_wave(runtime, pending_dispatch)
+            _requeue_planned_wave(runtime, pending_dispatch, observer=observer)
             continue
 
         runtime.terminal_claims.clear()
@@ -2604,6 +2878,14 @@ def _try_dispatch_planned_waves(
         policy = runtime.controller.policy
         dual_gpu = len(runtime.controller.device_ids) == 2
         dispatched_here = 0
+        dispatch_started_at = time.monotonic()
+        # 该时间点只包住原子 put 循环，不改变 controller 的二次显存确认。
+        _safe_observe(
+            observer,
+            "record_wave_dispatch_start",
+            runtime.observation_wave_id,
+            dispatch_started_at,
+        )
         try:
             for slot, pending in zip(slots, runtime.planned_cases, strict=True):
                 worker_pid = pool.dispatch(
@@ -2630,6 +2912,24 @@ def _try_dispatch_planned_waves(
             failed_slot_indices = runtime.planned_slot_indices[dispatched_here:]
             if dispatched_here:
                 runtime.controller.mark_dispatched(dispatched_here)
+                dispatch_finished_at = time.monotonic()
+                _safe_observe(
+                    observer,
+                    "record_wave_dispatched",
+                    runtime.observation_wave_id,
+                    dispatch_finished_at,
+                )
+                for slot, pending in zip(
+                    slots[:dispatched_here], runtime.planned_cases[:dispatched_here], strict=True
+                ):
+                    _safe_observe(
+                        observer,
+                        "record_case_dispatched",
+                        runtime.observation_wave_id,
+                        slot.index,
+                        pending.config,
+                        dispatch_finished_at,
+                    )
             else:
                 runtime.controller.cancel_planned_wave()
             if failed_slot_indices:
@@ -2642,20 +2942,36 @@ def _try_dispatch_planned_waves(
             remaining = runtime.planned_cases[dispatched_here:]
             runtime.planned_cases = remaining
             if remaining:
-                _requeue_planned_wave(runtime, pending_dispatch)
+                _requeue_planned_wave(runtime, pending_dispatch, observer=observer)
             else:
                 runtime.planned_cases.clear()
             runtime.planned_slot_indices = ()
             dispatched_count += dispatched_here
             continue
         runtime.controller.mark_dispatched(dispatched_here)
+        dispatch_finished_at = time.monotonic()
+        _safe_observe(
+            observer,
+            "record_wave_dispatched",
+            runtime.observation_wave_id,
+            dispatch_finished_at,
+        )
+        for slot, pending in zip(slots, runtime.planned_cases, strict=True):
+            _safe_observe(
+                observer,
+                "record_case_dispatched",
+                runtime.observation_wave_id,
+                slot.index,
+                pending.config,
+                dispatch_finished_at,
+            )
         runtime.planned_cases.clear()
         runtime.planned_slot_indices = ()
         dispatched_count += dispatched_here
     return dispatched_count
 
 
-def _claim_gpu_wave_terminal(runtimes, slot_runtime_index, msg):
+def _claim_gpu_wave_terminal(runtimes, slot_runtime_index, msg, *, observer=None):
     """按 slot、worker PID 和配置认领一次且仅一次的 case 终态。"""
     message = BatchMessage.from_raw(msg)
     slot_index = message.slot_index
@@ -2666,10 +2982,29 @@ def _claim_gpu_wave_terminal(runtimes, slot_runtime_index, msg):
     if not runtime.terminal_claims.claim(msg):
         return False
     runtime.controller.mark_completed()
+    # terminal claim 成功后才记录 case 终点，迟到消息不会污染波内时长。
+    terminal_at = (
+        time.monotonic() if message.terminal_timestamp is None else message.terminal_timestamp
+    )
+    _safe_observe(
+        observer,
+        "record_case_terminal",
+        runtime.observation_wave_id,
+        slot_index,
+        terminal_at,
+    )
+    if runtime.controller.state == "reclaim_pending":
+        # 最后一个 case 才能开启显存稳定等待统计。
+        _safe_observe(
+            observer,
+            "record_reclaim_started",
+            runtime.observation_wave_id,
+            terminal_at,
+        )
     return True
 
 
-def _observe_gpu_reclaim(runtimes, *, snapshot_reader, now=None):
+def _observe_gpu_reclaim(runtimes, *, snapshot_reader, observer=None, now=None):
     now = time.monotonic() if now is None else now
     ready_count = 0
     for runtime in runtimes.values():
@@ -2678,6 +3013,14 @@ def _observe_gpu_reclaim(runtimes, *, snapshot_reader, now=None):
         # reclaim 期间只采样，不创建进程；ready 转换由控制器稳定窗口决定。
         snapshots = snapshot_reader(runtime.controller.device_ids)
         if runtime.controller.observe_reclaim(snapshots, now=now):
+            # 只有 controller 确认 ready 才结算 reclaim 时长并释放观测波 ID。
+            _safe_observe(
+                observer,
+                "record_reclaim_ready",
+                runtime.observation_wave_id,
+                now,
+            )
+            runtime.observation_wave_id = None
             ready_count += 1
     return ready_count
 
@@ -2761,6 +3104,7 @@ def _handle_batch_result(
     pending_dispatch,
     msg,
     max_total_external_kills,
+    observer=None,
 ):
     """处理单条 case 终态消息，并维护批处理状态。"""
     message = BatchMessage.from_raw(msg)
@@ -2790,7 +3134,7 @@ def _handle_batch_result(
         )
 
     worker_reusable = msg_type in ("done", "error") or (
-        msg_type == "crashed" and options.use_compute_sanitizer and crash_source == "child"
+        msg_type == "crashed" and options.use_compute_sanitizer and crash_source == "session"
     )
     external_kill = msg_type == "crashed" and exitcode in (
         -signal.SIGKILL,
@@ -2799,6 +3143,8 @@ def _handle_batch_result(
     batch_state.active_tasks -= 1
 
     if external_kill:
+        # external kill 同时是 crash 样本和可能的 retry 触发原因。
+        _safe_observe(observer, "record_counter", "crash")
         if _handle_external_kill_retry(
             retry_state,
             pending_dispatch,
@@ -2806,6 +3152,7 @@ def _handle_batch_result(
             max_case_retries=MAX_EXTERNAL_KILL_RETRIES_PER_CASE,
             max_total_external_kills=max_total_external_kills,
         ):
+            _safe_observe(observer, "record_counter", "retry")
             log_report.print_case_notice("RETRY", config, f"exit {exitcode}")
             if worker_reusable:
                 pool.mark_idle(slot_index, worker_pid=message.worker_pid)
@@ -2825,6 +3172,8 @@ def _handle_batch_result(
         pool.mark_idle(slot_index, worker_pid=message.worker_pid)
 
     if msg_type == "deferred":
+        # deferred 是显存准入退避，不属于 external-kill retry 计数。
+        _safe_observe(observer, "record_counter", "deferred")
         # runtime headroom 不足可能留下无法跨进程复用的 allocator 缓存。
         pool.mark_idle(slot_index, worker_pid=message.worker_pid)
         pool.retire_slots((slot_index,))
@@ -2853,8 +3202,10 @@ def _handle_batch_result(
         log_worker.write_to_log("timeout", config)
         progress_status = "TIMEOUT"
     elif msg_type == "crashed":
+        # 只有已认领的 crash 才计数，避免 watchdog/终态竞争双计数。
+        _safe_observe(observer, "record_counter", "crash")
         log_type, progress_status, terminal_recorded = log_worker.classify_exit(exitcode)
-        if crash_source == "child":
+        if crash_source == "session":
             terminal_recorded = False
         if progress_status == "PADDLE_CRASH":
             progress_detail = f"exit {exitcode}"
@@ -3020,6 +3371,8 @@ def _run_batch_mode(
     retry_state = BatchRetryState()
     max_total_external_kills = MAX_TOTAL_EXTERNAL_KILL_EVENTS
     pool = None
+    observer = SchedulingObserver() if not cpu_worker_count else None
+    # CPU batch 没有 GPU wave/reclaim 协议，不输出伪造的 GPU 指标。
     previous_signal_handlers = {}
 
     try:
@@ -3032,6 +3385,7 @@ def _run_batch_mode(
             options,
             gpu_total_memory_map=gpu_total_memory_map,
             cpu_worker_count=cpu_worker_count,
+            observer=observer,
         )
 
         def cleanup_handler(*args):
@@ -3080,6 +3434,7 @@ def _run_batch_mode(
             _observe_gpu_reclaim(
                 gpu_runtimes,
                 snapshot_reader=snapshot_reader,
+                observer=observer,
                 now=now,
             )
             _cancel_unstartable_planned_waves(pool, gpu_runtimes, pending_dispatch)
@@ -3088,6 +3443,7 @@ def _run_batch_mode(
                 gpu_runtimes,
                 pending_dispatch,
                 snapshot_reader=snapshot_reader,
+                observer=observer,
                 now=now,
             )
             _start_planned_wave_preparations(pool, gpu_runtimes)
@@ -3098,6 +3454,7 @@ def _run_batch_mode(
                 gpu_runtimes,
                 pending_dispatch,
                 snapshot_reader=_read_gpu_memory_snapshots,
+                observer=observer,
             )
             for transition_line in _collect_gpu_pressure_transitions(
                 gpu_runtimes,
@@ -3141,7 +3498,12 @@ def _run_batch_mode(
             if msg_type not in ("done", "deferred", "error", "timeout", "crashed"):
                 continue
             # 终态认领必须先于计数、日志和 checkpoint，失败消息没有任何批次副作用。
-            if not _claim_gpu_wave_terminal(gpu_runtimes, slot_runtime_index, msg):
+            if not _claim_gpu_wave_terminal(
+                gpu_runtimes,
+                slot_runtime_index,
+                msg,
+                observer=observer,
+            ):
                 continue
             tested_case_before = batch_state.tested_case
             _handle_batch_result(
@@ -3154,6 +3516,7 @@ def _run_batch_mode(
                 pending_dispatch=pending_dispatch,
                 msg=msg,
                 max_total_external_kills=max_total_external_kills,
+                observer=observer,
             )
             result_now = time.monotonic()
             if batch_state.tested_case > tested_case_before:
@@ -3173,6 +3536,13 @@ def _run_batch_mode(
         _restore_batch_signal_handlers(previous_signal_handlers)
         if pool is not None:
             pool.shutdown(force=batch_state.shutdown_force)
+        if observer is not None:
+            try:
+                # 摘要放在 worker 清理后，确保最后一个 terminal/reclaim 事件已入账。
+                for observation_line in observer.summary_lines():
+                    print(observation_line, flush=True)
+            except Exception as err:
+                print(f"[gpu] OBSERVE_ERROR | {type(err).__name__}: {err}", flush=True)
         if options.use_compute_sanitizer:
             log_worker.clean_sanitizer_case_logs()
         log_counts = log_aggregation.finalize_logs()
@@ -3427,9 +3797,10 @@ def _prepare_common_options(options):
     if options.api_config and _requires_gpu_runtime(options):
         _apply_single_config_gpu_defaults(options)
 
-    common_error = _validate_input_sources(options)
-    if common_error is not None:
-        return common_error
+    if not options._sanitizer_session:
+        common_error = _validate_input_sources(options)
+        if common_error is not None:
+            return common_error
 
     mode_error = _validate_test_mode(options)
     if mode_error is not None:
@@ -3460,21 +3831,36 @@ def _prepare_common_options(options):
         _apply_runtime_environment_flags(options)
     except ValueError as err:
         return _argument_error(str(err))
-    if not options._sanitizer_child:
+    if not options._sanitizer_session:
         log_report.print_run_header(options, options.paddle_version)
     return None
 
 
-def _run_sanitizer_child_mode(options):
+def _write_sanitizer_case_timing(duration):
+    """把 session case 时长写入隔离文件，避免把内部标记混入 sanitizer 输出。"""
+    timing_path = os.environ.get(SANITIZER_TIMING_FILE_ENV)
+    if not timing_path:
+        # 单 case 普通运行没有隔离目录，保持零开销返回。
+        return
     try:
-        _apply_sanitizer_child_wave_budget(options)
-        _init_worker_runtime(None, None, None, options, redirect_output=False)
-        options.api_config = options.api_config.strip()
-        defer_retry_count = 0
+        with open(timing_path, "a", encoding="utf-8") as timing_file:
+            timing_file.write(f"case_execution\t{float(duration):.9f}\n")
+    except (OSError, TypeError, ValueError):
+        # timing 文件不可写时不影响 sanitizer return code 和日志合并。
+        # 观测目录不可写时继续沿用原有 sanitizer 结果协议。
+        return
+
+
+def _run_sanitizer_case_in_session(options, api_config):
+    """在已初始化的 runtime 中执行一个 case，保留 deferred 重试协议。"""
+    options.api_config = str(api_config).strip()
+    defer_retry_count = 0
+    case_started_at = time.monotonic()
+    try:
         while True:
             try:
                 run_test_case(options.api_config, options)
-                break
+                return "done"
             except GpuMemoryDeferred as err:
                 delay = _memory_defer_delay(defer_retry_count)
                 defer_retry_count += 1
@@ -3484,10 +3870,59 @@ def _run_sanitizer_child_mode(options):
                     flush=True,
                 )
                 time.sleep(delay)
+    finally:
+        # 每个 request 都单独结算，session 复用不能把多个 case 合并成一个样本。
+        _write_sanitizer_case_timing(time.monotonic() - case_started_at)
+
+
+def _run_sanitizer_session_mode(options):
+    """初始化一次 Python/Paddle/CUDA runtime，并按协议顺序处理全部 case。"""
+    framework_started_at = time.monotonic()
+    previous_timing_path = os.environ.pop(SANITIZER_TIMING_FILE_ENV, None)
+    try:
+        _apply_sanitizer_wave_budget(options)
+        _init_worker_runtime(None, None, None, options, redirect_output=False)
+        framework_duration = (time.monotonic() - framework_started_at) * 1000.0
+        print(encode_ready(framework_duration), end="", flush=True)
+        for line in sys.stdin:
+            try:
+                event = parse_event(line)
+            except ValueError as err:
+                print(f"[sanitizer session] protocol error: {err}", flush=True)
+                return 2
+            if event["event"] != "request":
+                print("[sanitizer session] expected request event", flush=True)
+                return 2
+            case_id = int(event["case_id"])
+            timing_path = str(event["timing_path"])
+            budget_environment = os.environ.copy()
+            if "workers_on_gpu" in event:
+                budget_environment["PADDLEAPITEST_WORKERS_ON_GPU"] = str(event["workers_on_gpu"])
+            if "compute_budget_gib" in event:
+                budget_environment[SANITIZER_COMPUTE_BUDGET_ENV] = str(event["compute_budget_gib"])
+            if "comparison_budget_gib" in event:
+                budget_environment[SANITIZER_COMPARISON_BUDGET_ENV] = str(
+                    event["comparison_budget_gib"]
+                )
+            _apply_sanitizer_wave_budget(options, budget_environment)
+            os.environ[SANITIZER_TIMING_FILE_ENV] = timing_path
+            try:
+                status = _run_sanitizer_case_in_session(options, str(event["config"]))
+            except SystemExit:
+                raise
+            except Exception as err:
+                print(f"[test error] {options.api_config}: {err}", flush=True)
+                status = "error"
+            finally:
+                if previous_timing_path is None:
+                    os.environ.pop(SANITIZER_TIMING_FILE_ENV, None)
+                else:
+                    os.environ[SANITIZER_TIMING_FILE_ENV] = previous_timing_path
+            print(encode_result(case_id, status), end="", flush=True)
     except SystemExit:
         raise
     except Exception as err:
-        print(f"[test error] {options.api_config}: {err}", flush=True)
+        print(f"[sanitizer session] init error: {err}", flush=True)
         return 2
     finally:
         try:
@@ -4005,7 +4440,7 @@ def _build_argument_parser():
         "--use_compute_sanitizer",
         type=parse_bool,
         default=False,
-        help="Run each case in a compute-sanitizer wrapped subprocess.",
+        help="Run all cases through a reusable compute-sanitizer session.",
     )
     parser.add_argument(
         "--sanitizer_command",
@@ -4020,7 +4455,7 @@ def _build_argument_parser():
         help="Exit code used by compute-sanitizer when it reports errors.",
     )
     parser.add_argument(
-        "--_sanitizer_child",
+        "--_sanitizer_session",
         type=parse_bool,
         default=False,
         help=argparse.SUPPRESS,
@@ -4042,7 +4477,7 @@ def main():
     _resolve_dump_options(parser, options)
     if not options.log_dir:
         options.log_dir = str(log_runtime.default_log_dir(single=bool(options.api_config)))
-    if not options._sanitizer_child:
+    if not options._sanitizer_session:
         log_runtime.init_main_output(options.log_dir)
         atexit.register(log_runtime.close_main_output)
     if options.random_seed != parser.get_default("random_seed"):
@@ -4051,8 +4486,8 @@ def main():
     if common_error is not None:
         return common_error
 
-    if options._sanitizer_child:
-        return _run_sanitizer_child_mode(options)
+    if options._sanitizer_session:
+        return _run_sanitizer_session_mode(options)
 
     if options.api_config:
         return _run_single_case_mode(options, start_time)

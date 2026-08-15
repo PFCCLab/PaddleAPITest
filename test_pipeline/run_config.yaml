@@ -140,12 +140,8 @@ engine_args:
 
   # ========== compute-sanitizer（engineV4 only）==========
   # compute-sanitizer 用于定位 CUDA kernel 的非法访存、race、同步错误等问题。
-  # engineV4 会为每个 worker slot 启动独立 sanitizer 子进程，保留多 GPU/多 worker 并发。
+  # engineV4 为每个 worker slot 启动一个 sanitizer session，正常 case 在 session 内复用 runtime。
   # engineV2 不支持以下字段。
   # use_compute_sanitizer: true
   # sanitizer_command: "compute-sanitizer --target-processes all --error-exitcode=86"
   # sanitizer_error_exitcode: 86
-
-  # ========== engineV4 内部参数 ==========
-  # _sanitizer_child 是 engineV4 compute-sanitizer 子进程内部参数，普通运行不要配置。
-  # _sanitizer_child: false

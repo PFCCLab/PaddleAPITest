@@ -20,7 +20,7 @@ FOREGROUND=true          # true=前台运行(调试用，Ctrl+C终止)
 DRY_RUN=false             # true=只打印最终命令，不执行
 
 # ── compute-sanitizer ─────────────────────────────────────────
-# true=由 engineV4 为每个 worker slot 单独启动 compute-sanitizer 子进程，保留多 GPU/多 worker 并发
+# true=由 engineV4 为每个 worker slot 启动可复用 compute-sanitizer session，保留多 GPU/多 worker 并发
 USE_COMPUTE_SANITIZER=false
 SANITIZER_COMMAND="compute-sanitizer --target-processes all --error-exitcode=86"
 SANITIZER_ERROR_EXITCODE=86

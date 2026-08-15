@@ -83,7 +83,6 @@ ENGINE_ARG_TYPES = {
     "use_compute_sanitizer": bool,
     "sanitizer_command": str,
     "sanitizer_error_exitcode": int,
-    "_sanitizer_child": bool,
 }
 
 
@@ -767,7 +766,6 @@ def run_once(
         "--api_config_file",
         "--api_config_file_pattern",
         "--log_dir",
-        "--_sanitizer_child",
     }
     if engine_args.get("num_gpus") == -1:
         hidden_options.add("--num_gpus")
