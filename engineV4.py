@@ -20,7 +20,7 @@ import sys
 import tempfile
 import threading
 import time
-from collections import deque
+from collections import OrderedDict, deque
 from dataclasses import dataclass, field
 from datetime import datetime
 from multiprocessing import cpu_count, set_start_method
@@ -353,6 +353,9 @@ class GpuReservationLedger:
         self._trackers = {gpu_id: GpuReclaimTracker() for gpu_id in self.device_ids}
         self._pending_release = set()
         self._claimed = set()
+        # 从单 worker 起步，稳定完成后再逐步扩容，避免启动阶段瞬间压满显存。
+        self.target_workers = min(self.max_workers, 1)
+        self._success_streak = 0
         # 初始化快照后才允许 reserve，避免无采样状态被当成无限容量。
         self.update_snapshots(snapshots)
 
@@ -375,24 +378,57 @@ class GpuReservationLedger:
         return requested
 
     def reserve(self, *, assignment_id, slot_index, estimates):
-        # reservation 先写入账本再启动 worker，启动失败时仍可进入回收状态。
-        if (
-            assignment_id in self._reservations
-            or sum(reservation.state == "active" for reservation in self._reservations.values())
-            >= self.max_workers
-        ):
+        # 常驻 worker 的旧 lease 可以被同一 slot 的新 assignment 原子替换。
+        if assignment_id in self._reservations:
             return None
         requested = self._requested(estimates)
+        old_lease = next(
+            (
+                reservation
+                for reservation in self._reservations.values()
+                if reservation.slot_index == slot_index and reservation.state == "release_pending"
+            ),
+            None,
+        )
+        active_count = sum(
+            reservation.state == "active" for reservation in self._reservations.values()
+        )
+        if active_count >= self.target_workers:
+            return None
+        committed = dict(self._committed)
+        if old_lease is not None:
+            for gpu_id, amount in old_lease.device_bytes.items():
+                committed[gpu_id] -= amount
         if any(
-            self._committed[gpu_id] + requested[gpu_id] > self._available(gpu_id)
+            committed[gpu_id] + requested[gpu_id] > self._available(gpu_id)
             for gpu_id in self.device_ids
         ):
             return None
+        if old_lease is not None:
+            self._pending_release.discard(old_lease.assignment_id)
+            self._reservations.pop(old_lease.assignment_id, None)
+            self._claimed.discard(old_lease.assignment_id)
+            self._committed.update(committed)
+            # pending lease 被同 slot 接管时，旧回收样本不能污染下一次 reclaim 基线。
+            for tracker in self._trackers.values():
+                tracker.reset()
         reservation = GpuReservation(assignment_id, slot_index, requested)
         self._reservations[assignment_id] = reservation
         for gpu_id, amount in requested.items():
             self._committed[gpu_id] += amount
         return reservation
+
+    def record_result(self, msg_type):
+        """按结果调整 group 并发上限；异常只收缩，不改变用户硬上限。"""
+        if msg_type == "done":
+            self._success_streak += 1
+            if self._success_streak >= 2 and self.target_workers < self.max_workers:
+                self.target_workers += 1
+                self._success_streak = 0
+            return
+        if msg_type in {"deferred", "timeout", "crashed"}:
+            self._success_streak = 0
+            self.target_workers = max(1, min(self.target_workers, self.max_workers) - 1)
 
     def confirm(self, assignment_id, snapshots):
         # worker bootstrap 可能改变 free，派发前必须做一次独立物理确认。
@@ -535,65 +571,6 @@ class AssignmentClaims:
             return False
         del self._tokens[parsed.slot_index]
         return True
-
-
-def _self_test_scheduler():
-    """单文件调度不变量自测；不导入 Paddle，供开发和 CI 使用。"""
-    # 这里覆盖单卡、双卡、重复终态和稳定回收四类最小状态转移。
-    snapshot = GpuMemorySnapshot(total_bytes=16 * GIB, free_bytes=14 * GIB)
-    ledger = GpuReservationLedger(
-        (0,),
-        snapshots={0: snapshot},
-        max_workers=2,
-    )
-    first = ledger.reserve(
-        assignment_id=1,
-        slot_index=0,
-        estimates=CaseGpuEstimate(compute_bytes=8 * GIB),
-    )
-    assert first is not None
-    assert (
-        ledger.reserve(
-            assignment_id=2,
-            slot_index=1,
-            estimates=CaseGpuEstimate(compute_bytes=8 * GIB),
-        )
-        is None
-    )
-    ledger.mark_release_pending(1)
-    assert ledger.reservation_state(1) == "release_pending"
-    assert ledger.claim_terminal(1)
-    assert not ledger.claim_terminal(1)
-    assert ledger.advance_reclaim({0: snapshot}, now=0.0) == 0
-    assert ledger.advance_reclaim({0: snapshot}, now=1.0) == (1,)
-
-    dual = GpuReservationLedger(
-        (0, 1),
-        snapshots={0: snapshot, 1: snapshot},
-        max_workers=1,
-    )
-    assert (
-        dual.reserve(
-            assignment_id=3,
-            slot_index=0,
-            estimates=CaseGpuEstimate(compute_bytes=8 * GIB, comparison_bytes=8 * GIB),
-        )
-        is not None
-    )
-    assert parse_event(encode_ready()) == {"event": "ready"}
-    request = parse_event(encode_request(1, "paddle.add", "/tmp/timing.tsv"))
-    assert request["event"] == "request"
-    assert parse_event(encode_result(1, "done"))["status"] == "done"
-
-    scheduler = ContinuousGpuScheduler((0,), (0, 1))
-    scheduler.mark_idle(0)
-    scheduler.mark_idle(1)
-    assert scheduler.next_idle_slot() == 0
-    scheduler.mark_running(0, 7)
-    scheduler.mark_running(1, 8)
-    scheduler.mark_terminal(0, 7)
-    assert scheduler.next_idle_slot() == 0
-    print("engineV4 scheduler self-test: PASS")
 
 
 # 运行时透传给 test class 的选项白名单。
@@ -748,11 +725,12 @@ FORECAST_TARGET_CASES = 100
 FORECAST_INITIAL_MAX_WAIT_SECONDS = 5 * 60
 GPU_MEMORY_DEFER_INITIAL_BACKOFF_SECONDS = 1.0
 GPU_MEMORY_DEFER_MAX_BACKOFF_SECONDS = 30.0
-SANITIZER_COMPUTE_BUDGET_ENV = "PADDLEAPITEST_WAVE_COMPUTE_BUDGET_GIB"
-SANITIZER_COMPARISON_BUDGET_ENV = "PADDLEAPITEST_WAVE_COMPARISON_BUDGET_GIB"
+# 首次 deferred 只清理并复用常驻 worker，连续失败才退役进程。
+GPU_MEMORY_DEFER_RETIRE_AFTER = 2
+SANITIZER_COMPUTE_BUDGET_ENV = "PADDLEAPITEST_SANITIZER_COMPUTE_BUDGET_GIB"
+SANITIZER_COMPARISON_BUDGET_ENV = "PADDLEAPITEST_SANITIZER_COMPARISON_BUDGET_GIB"
 SANITIZER_TIMING_FILE_ENV = "PADDLEAPITEST_SANITIZER_TIMING_FILE"
-# 观测文件只在 sanitizer session 环境中出现，普通 worker 不读取该变量。
-# 波次准入只需要队首少量候选；窗口随本波最大并发放大，保留跳过大 case 的能力。
+# 调度只需要有限候选；窗口随最大并发放大，保留跳过大 case 的能力。
 CANDIDATE_WINDOW_PER_WORKER = 32
 CANDIDATE_WINDOW_MIN = 64
 # 窗口内全部装不下时放大一次扫描范围，但仍然有界：无界扫描在百万级 pending 上
@@ -780,23 +758,6 @@ def _collect_wait_timeout(pending_dispatch, default=0.5):
     if pending_delay is None:
         return default
     return min(default, max(0.1, pending_delay))
-
-
-def _safe_observe(observer, method, *args, **kwargs):
-    """观测故障只丢统计样本，不能改变 worker 或 case 的失败语义。"""
-    if observer is None:
-        # CPU batch 不创建 observer，保持原路径无额外对象访问。
-        return None
-    try:
-        return getattr(observer, method)(*args, **kwargs)
-    except Exception:
-        # 观测实现不能把日志/格式化故障升级成 batch 失败。
-        try:
-            observer.record_error(method)
-        except Exception:
-            # 连观测错误计数器也故障时直接丢弃，业务状态仍由原路径维护。
-            pass
-        return None
 
 
 def _fatal_log_type_for_error(error, terminal_log_type=None):
@@ -880,6 +841,7 @@ class BatchRetryState:
     per_case_external_kill_retries: dict[str, int] = field(default_factory=dict)
     per_case_memory_defer_retries: dict[str, int] = field(default_factory=dict)
     case_memory_estimates: dict[str, CaseGpuEstimate] = field(default_factory=dict)
+    slot_memory_defer_retries: dict[int, int] = field(default_factory=dict)
     total_external_kills: int = 0
     unsafe_environment: bool = False
 
@@ -931,7 +893,8 @@ class PendingQueue:
     )
 
     def __init__(self, cases=()):
-        self._ready = deque()
+        # OrderedDict 同时提供稳定 FIFO 和按 config 的 O(1) 删除。
+        self._ready = OrderedDict()
         self._delayed = []
         # 单调序号让相同 ready_at 的堆序稳定，同时避免堆比较落到 PendingCase 上。
         self._sequence = 0
@@ -942,7 +905,7 @@ class PendingQueue:
         # 构造阶段没有并发读者，批量填充后一次发布版本，避免逐项失效扫描缓存。
         for case in cases:
             if case.ready_at <= 0.0:
-                self._ready.append(case)
+                self._ready[case.config] = case
             else:
                 self._push_delayed(case)
         if self._ready:
@@ -974,7 +937,7 @@ class PendingQueue:
         """按需缓存扫描前缀，避免百万级 ready 队列首次扩展时整队复制。"""
         if self._ready_snapshot_version != self._ready_version:
             self._ready_snapshot_cache = []
-            self._ready_snapshot_iterator = iter(self._ready)
+            self._ready_snapshot_iterator = iter(self._ready.values())
             self._ready_snapshot_version = self._ready_version
         cache = self._ready_snapshot_cache
         if cache is None or self._ready_snapshot_iterator is None:
@@ -994,13 +957,15 @@ class PendingQueue:
             promoted.append(heapq.heappop(self._delayed)[2])
         if promoted:
             # 重试 case 到期后优先于尚未派发的新 case；逆序扩展才能保留到期顺序。
-            self._ready.extendleft(reversed(promoted))
+            for case in reversed(promoted):
+                self._ready[case.config] = case
+                self._ready.move_to_end(case.config, last=False)
             self._invalidate_ready_snapshot()
 
     def append(self, case, *, now=None):
         now = time.monotonic() if now is None else now
         if case.ready_at <= now:
-            self._ready.append(case)
+            self._ready[case.config] = case
             self._invalidate_ready_snapshot()
         else:
             self._push_delayed(case)
@@ -1008,7 +973,8 @@ class PendingQueue:
     def appendleft(self, case, *, now=None):
         now = time.monotonic() if now is None else now
         if case.ready_at <= now:
-            self._ready.appendleft(case)
+            self._ready[case.config] = case
+            self._ready.move_to_end(case.config, last=False)
             self._invalidate_ready_snapshot()
         else:
             self._push_delayed(case)
@@ -1037,9 +1003,9 @@ class PendingQueue:
         self._promote(now)
         if not self._ready:
             return None
-        config = self._ready.popleft().config
+        _, case = self._ready.popitem(last=False)
         self._invalidate_ready_snapshot()
-        return config
+        return case.config
 
     def candidate_window(self, limit, now=None):
         """返回队首至多 limit 个已到期 case；limit 为 None 表示全部 ready case。
@@ -1050,8 +1016,8 @@ class PendingQueue:
         now = time.monotonic() if now is None else now
         self._promote(now)
         if limit is None or limit >= len(self._ready):
-            return list(self._ready)
-        return list(itertools.islice(self._ready, limit))
+            return list(self._ready.values())
+        return list(itertools.islice(self._ready.values(), limit))
 
     def scan_window(self, limit, *, cursor=0, now=None):
         """从 ready 段的游标位置取有界窗口，并返回下一次扫描游标。
@@ -1079,11 +1045,11 @@ class PendingQueue:
         selected_positions = set(selected_indices)
         window_size = min(window_size, len(self._ready))
         selected = []
-        retained = []
-        for index in range(window_size):
-            popped = self._ready.popleft()
-            (selected if index in selected_positions else retained).append(popped)
-        self._ready.extendleft(reversed(retained))
+        window = list(itertools.islice(self._ready.items(), window_size))
+        for index, (config, case) in enumerate(window):
+            if index in selected_positions:
+                selected.append(case)
+                self._ready.pop(config, None)
         if window_size:
             self._invalidate_ready_snapshot()
         return selected
@@ -1093,15 +1059,15 @@ class PendingQueue:
         selected = [candidates[index] for index in selected_indices if 0 <= index < len(candidates)]
         if not selected:
             return []
-        selected_ids = {id(case) for case in selected}
-        # 只重建 ready 段，延迟堆保持原状；同一次扫描内的 id() 足以识别对象。
-        self._ready = deque(case for case in self._ready if id(case) not in selected_ids)
+        # 只按 key 删除选中项，延迟堆和未选中的 ready 顺序都不变。
+        for case in selected:
+            self._ready.pop(case.config, None)
         self._invalidate_ready_snapshot()
         return selected
 
     def iter_all(self):
         """遍历全部 case，仅用于构建批次级快照。"""
-        yield from self._ready
+        yield from self._ready.values()
         for _, _, case in self._delayed:
             yield case
 
@@ -1328,7 +1294,7 @@ def _worker_loop(
           terminates the process. Watchdog detects exitcode != 0 and suspends the slot.
 
     The main process never dispatches to a dead/starting worker. After a crash or timeout, the
-    case returns to `pending_dispatch`; a later admitted wave may create a replacement worker.
+    case returns to `pending_dispatch`; a later admission may create a replacement worker.
     """
     # 模块加载与设备 preparation 分成两个阶段，主进程据 slot 拓扑控制第二阶段并发。
     try:
@@ -1472,8 +1438,8 @@ def _terminate_sanitizer_session(process, *, wait=False):
             pass
 
 
-def _apply_sanitizer_wave_budget(options, environ=None):
-    """从 session request 恢复 wrapper 为本波选择的显存预算。"""
+def _apply_sanitizer_budget(options, environ=None):
+    """从 session request 恢复 wrapper 为当前 request 选择的显存预算。"""
     source = os.environ if environ is None else environ
     if SANITIZER_COMPUTE_BUDGET_ENV not in source:
         return False
@@ -1825,7 +1791,6 @@ class WorkerPool:
         *,
         gpu_total_memory_map=None,
         cpu_worker_count=0,
-        observer=None,
     ):
         # 将 argparse.Namespace 转成 SimpleNamespace，便于 worker 进程更干净地 pickle。
         if isinstance(options, argparse.Namespace):
@@ -1844,9 +1809,6 @@ class WorkerPool:
         self._lock = threading.Lock()  # 保护 slot 状态修改
         self._spawn_lock = threading.Lock()
         self._closed = False
-        # observer 只在主进程持有，不能放入传给 spawn worker 的 options。
-        self.observer = observer
-
         # CPU worker 使用 gpu_id=None；只有需要 GPU 运行时时才建立 GPU 槽位。
         idx = 0
         if cpu_worker_count:
@@ -1992,14 +1954,6 @@ class WorkerPool:
             slot.child_pid = None
             slot.started_at = spawn_started_at
             # spawn 起点必须早于 p.start，才能覆盖 Python spawn 和 import 开销。
-            _safe_observe(
-                self.observer,
-                "record_worker_spawn",
-                slot.index,
-                slot.gpu_id,
-                spawn_started_at,
-                comparison_gpu_id=slot.comparison_gpu_id,
-            )
             return True
 
     def start_loaded_preparations(self, slot_indices):
@@ -2025,13 +1979,6 @@ class WorkerPool:
                     continue
                 slot.state = "preparing"
                 slot.started_at = time.monotonic()
-                # 记录放行时间而非 worker 收到命令时间，边界由主进程控制。
-                _safe_observe(
-                    self.observer,
-                    "record_worker_preparation_start",
-                    slot.index,
-                    slot.started_at,
-                )
                 try:
                     slot.input_queue.put(WORKER_PREPARE_RUNTIME)
                 except (OSError, EOFError, ValueError) as err:
@@ -2048,7 +1995,7 @@ class WorkerPool:
         return started_count
 
     def retire_slots(self, slot_indices):
-        """停止空闲或启动中的进程；显存是否回收由 GPU 波次控制器另行确认。"""
+        """停止空闲或启动中的进程；显存是否回收由 GPU 调度器另行确认。"""
         for slot_index in slot_indices:
             slot = self.slots[slot_index]
             with self._lock:
@@ -2089,7 +2036,6 @@ class WorkerPool:
         now = time.monotonic() if now is None else now
         phase = "module_load" if slot.state == "starting" else "preparation"
         if not slot.process.is_alive():
-            _safe_observe(self.observer, "record_counter", "crash")
             print(
                 f"[worker] INIT_CRASH | slot {slot.index} | phase {phase} | "
                 f"exit {slot.process.exitcode}",
@@ -2110,7 +2056,7 @@ class WorkerPool:
         )
         self._kill_process(slot.process)
         self._suspend_slot(slot)
-        # 不在 watchdog 内重建；下一轮要先取消波次并观察显存稳定。
+        # 不在 watchdog 内重建；下一轮先取消 assignment 并观察显存稳定。
         return True
 
     def _handle_worker_control_message(self, msg):
@@ -2137,13 +2083,11 @@ class WorkerPool:
                 if slot.state == "starting":
                     slot.state = "loaded"
                     slot.started_at = None
-                    _safe_observe(self.observer, "record_worker_loaded", slot_idx)
                 return True
             if msg_type == "ready":
                 if slot.state == "preparing":
                     slot.state = "idle"
                     slot.started_at = None
-                    _safe_observe(self.observer, "record_worker_ready", slot_idx)
                 return True
             if msg_type == "ack":
                 config = msg[3]
@@ -2153,14 +2097,10 @@ class WorkerPool:
                 return True
             if msg_type == "child":
                 slot.child_pid = msg[3]
-                _safe_observe(self.observer, "record_sanitizer_session_start", slot_idx)
                 return True
             if msg_type == "sanitizer_timing":
-                # timing 消息仅更新摘要，不能消费 terminal claim 或改变 slot 状态。
-                _safe_observe(self.observer, "record_sanitizer_phase", msg[3], msg[4])
                 return True
             if msg_type == "sanitizer_session_ready":
-                _safe_observe(self.observer, "record_sanitizer_session_ready", msg[3])
                 return True
 
             if msg_type == "init_failed":
@@ -2356,7 +2296,6 @@ class WorkerPool:
                     )
                 )
             else:
-                _safe_observe(self.observer, "record_counter", "crash")
                 print(
                     f"[worker] PADDLE_CRASH | slot {slot.index} | exit {exitcode}",
                     flush=True,
@@ -2609,7 +2548,7 @@ def _read_gpu_memory_snapshots(gpu_ids):
 def _memoized_snapshot_reader(snapshot_reader):
     """把一轮调度内的显存采样收敛为每设备一次。
 
-    同一轮内不同阶段（reclaim 观察、波次规划、压力日志）本来就应该看到
+    同一轮内不同阶段（reclaim 观察、规划、压力日志）本来就应该看到
     一致的快照；重复 NVML 查询既浪费又会让同轮决策基于互相矛盾的 free 值。
     派发确认必须另取真实采样，不能复用这份缓存。
     """
@@ -2747,19 +2686,9 @@ def _normalize_dual_gpu_option(options, option_name, base_mode):
     setattr(options, base_mode, True)
 
 
-def normalize_accuracy_stable_dual_gpu_options(options):
-    """兼容既有调用方，让 stable 双卡标志自洽地进入对应主模式。"""
-    _normalize_dual_gpu_option(options, "accuracy_stable_dual_gpu", "accuracy_stable")
-
-
-def normalize_accuracy_dual_gpu_options(options):
-    """让 accuracy 双卡标志自洽地进入 accuracy GPU mode。"""
-    _normalize_dual_gpu_option(options, "accuracy_dual_gpu", "accuracy")
-
-
 def normalize_dual_gpu_options(options):
-    normalize_accuracy_dual_gpu_options(options)
-    normalize_accuracy_stable_dual_gpu_options(options)
+    _normalize_dual_gpu_option(options, "accuracy_dual_gpu", "accuracy")
+    _normalize_dual_gpu_option(options, "accuracy_stable_dual_gpu", "accuracy_stable")
 
 
 def _mode_runs_torch_gpu_reference(options):
@@ -3200,7 +3129,6 @@ def _handle_batch_result(
     pending_dispatch,
     msg,
     max_total_external_kills,
-    observer=None,
 ):
     """处理单条 case 终态消息，并维护批处理状态。"""
     message = BatchMessage.from_raw(msg)
@@ -3240,7 +3168,6 @@ def _handle_batch_result(
 
     if external_kill:
         # external kill 同时是 crash 样本和可能的 retry 触发原因。
-        _safe_observe(observer, "record_counter", "crash")
         if _handle_external_kill_retry(
             retry_state,
             pending_dispatch,
@@ -3248,7 +3175,6 @@ def _handle_batch_result(
             max_case_retries=MAX_EXTERNAL_KILL_RETRIES_PER_CASE,
             max_total_external_kills=max_total_external_kills,
         ):
-            _safe_observe(observer, "record_counter", "retry")
             log_report.print_case_notice("RETRY", config, f"exit {exitcode}")
             if worker_reusable:
                 pool.mark_idle(slot_index, worker_pid=message.worker_pid)
@@ -3266,13 +3192,18 @@ def _handle_batch_result(
 
     if worker_reusable:
         pool.mark_idle(slot_index, worker_pid=message.worker_pid)
+        if msg_type != "deferred":
+            retry_state.slot_memory_defer_retries.pop(slot_index, None)
 
     if msg_type == "deferred":
         # deferred 是显存准入退避，不属于 external-kill retry 计数。
-        _safe_observe(observer, "record_counter", "deferred")
-        # runtime headroom 不足可能留下无法跨进程复用的 allocator 缓存。
+        # 首次 deferred 保留常驻 worker，只有连续失败才退役并强制回收 context。
         pool.mark_idle(slot_index, worker_pid=message.worker_pid)
-        pool.retire_slots((slot_index,))
+        defer_count = retry_state.slot_memory_defer_retries.get(slot_index, 0) + 1
+        retry_state.slot_memory_defer_retries[slot_index] = defer_count
+        if defer_count >= GPU_MEMORY_DEFER_RETIRE_AFTER:
+            pool.retire_slots((slot_index,))
+            retry_state.slot_memory_defer_retries.pop(slot_index, None)
         retry_count = retry_state.per_case_memory_defer_retries.get(config, 0)
         retry_state.per_case_memory_defer_retries[config] = retry_count + 1
         delay = _memory_defer_delay(retry_count)
@@ -3298,8 +3229,7 @@ def _handle_batch_result(
         log_worker.write_to_log("timeout", config)
         progress_status = "TIMEOUT"
     elif msg_type == "crashed":
-        # 只有已认领的 crash 才计数，避免 watchdog/终态竞争双计数。
-        _safe_observe(observer, "record_counter", "crash")
+        # 只有已认领的 crash 才写终态，避免 watchdog/终态竞争双计数。
         log_type, progress_status, terminal_recorded = log_worker.classify_exit(exitcode)
         if crash_source == "session":
             terminal_recorded = False
@@ -3482,18 +3412,10 @@ def _build_continuous_gpu_groups(pool, snapshots):
                 max_workers=len(slot_indices),
             ),
             "slot_indices": tuple(slot_indices),
+            "last_extended_scan": 0.0,
         }
         for device_ids, slot_indices in groups.items()
     }
-
-
-def _continuous_pending_candidates(pending_dispatch, group, *, now):
-    # 有界窗口允许跳过当前放不下的大 case，同时避免百万队列整队扫描。
-    window_size = max(
-        CANDIDATE_WINDOW_MIN,
-        len(group["slot_indices"]) * CANDIDATE_WINDOW_PER_WORKER,
-    )
-    return pending_dispatch.candidate_window(window_size, now=now)
 
 
 def _continuous_requeue_assignment(assignment, pending_dispatch):
@@ -3546,55 +3468,93 @@ def _continuous_schedule_idle_slots(
     snapshots_reader,
     now,
 ):
-    # 每个 idle slot 独立准入，长尾 case 不再阻塞同组其他 slot。
-    """为每个空闲 slot 独立准入 case；单个长尾不会形成整波屏障。"""
+    # 每个 group 一次规划，避免每个 slot 重复复制和重建 ready 队列。
+    """按 GPU group 批量规划 idle slot；长尾 case 仍可被跳过。"""
     scheduled = 0
     for group_key, group in groups.items():
         ledger = group["ledger"]
         scheduler = group["scheduler"]
         snapshots = snapshots_reader(group_key)
         ledger.update_snapshots(snapshots)
-        for slot_index in group["slot_indices"]:
-            # starting/preparing slot 已有 assignment，不能重复占用同一队列。
-            slot = pool.slots[slot_index]
-            if slot.state not in {"idle", "dead", "suspended"}:
-                continue
-            if slot_index in scheduler.assignments:
-                continue
-            candidates = _continuous_pending_candidates(pending_dispatch, group, now=now)
-            if not candidates:
-                continue
-            selected = None
-            reservation = None
-            for candidate_index, pending in enumerate(candidates):
-                # 逐候选试探 reservation，跳过当前显存放不下的配置。
-                candidate_id = next_assignment_id[0]
-                reservation = ledger.reserve(
-                    assignment_id=candidate_id,
-                    slot_index=slot_index,
-                    estimates=pending.gpu_estimate,
-                )
-                if reservation is not None:
-                    selected = (candidate_index, pending, candidate_id)
+        idle_slots = [
+            slot_index
+            for slot_index in group["slot_indices"]
+            if pool.slots[slot_index].state in {"idle", "dead", "suspended"}
+            and slot_index not in scheduler.assignments
+        ]
+        if not idle_slots or not pending_dispatch:
+            continue
+
+        base_limit = max(
+            CANDIDATE_WINDOW_MIN,
+            len(group["slot_indices"]) * CANDIDATE_WINDOW_PER_WORKER,
+        )
+        candidates = pending_dispatch.candidate_window(base_limit, now=now)
+        extended = []
+        selected_indices = []
+        selected_configs = set()
+        planned = []
+
+        def plan_from_window(window, offset=0):
+            # 已规划 case 留在内存集合中，直到整组规划结束才从队列删除。
+            nonlocal scheduled
+            for slot_index in idle_slots:
+                if any(item[0] == slot_index for item in planned):
+                    continue
+                for local_index, pending in enumerate(window):
+                    if pending.config in selected_configs:
+                        continue
+                    assignment_id = next_assignment_id[0]
+                    reservation = ledger.reserve(
+                        assignment_id=assignment_id,
+                        slot_index=slot_index,
+                        estimates=pending.gpu_estimate,
+                    )
+                    if reservation is None:
+                        continue
+                    planned.append((slot_index, pending, assignment_id, reservation))
+                    selected_indices.append(offset + local_index)
+                    selected_configs.add(pending.config)
+                    next_assignment_id[0] += 1
+                    scheduled += 1
                     break
-            if selected is None:
-                continue
-            candidate_index, pending, assignment_id = selected
-            selected_cases = pending_dispatch.take_case_selection(candidates, [candidate_index])
-            if not selected_cases:
-                # 队列结构若发生变化，临时承诺也必须进入回收账本。
+
+        plan_from_window(candidates)
+        if (
+            len(planned) < len(idle_slots)
+            and pending_dispatch.ready_count > len(candidates)
+            and now - group["last_extended_scan"] >= EXTENDED_SCAN_MIN_INTERVAL_SECONDS
+        ):
+            extended, _ = pending_dispatch.scan_window(
+                EXTENDED_SCAN_MAX_CANDIDATES,
+                cursor=len(candidates),
+                now=now,
+            )
+            if extended:
+                group["last_extended_scan"] = now
+                # scan_window 从 base_limit 之后开始，合并后索引可一次删除。
+                plan_from_window(extended, offset=len(candidates))
+
+        if not planned:
+            continue
+        selected_cases = pending_dispatch.take_case_selection(
+            candidates + extended,
+            selected_indices,
+        )
+        selected_by_config = {case.config for case in selected_cases}
+        for slot_index, pending, assignment_id, reservation in planned:
+            if pending.config not in selected_by_config:
+                # 队列被外部路径修改时撤销孤立 reservation，不能留下幽灵 lease。
                 ledger.mark_release_pending(assignment_id)
+                scheduled -= 1
                 continue
-            assignment = ContinuousAssignment(
+            assignments[assignment_id] = ContinuousAssignment(
                 assignment_id,
                 group_key,
                 slot_index,
                 pending,
                 reservation,
             )
-            assignments[assignment_id] = assignment
-            next_assignment_id[0] += 1
-            scheduled += 1
     return scheduled
 
 
@@ -3740,10 +3700,11 @@ def _run_continuous_gpu_batch_loop(
     ) and not batch_state.abort_run:
         # 每轮重新采样，不能把上一轮的 free 快照当作当前显存承诺。
         now = time.monotonic()
+        planning_snapshots_reader = _memoized_snapshot_reader(_read_gpu_memory_snapshots)
         _continuous_cancel_failed_startup(pool, groups, assignments, pending_dispatch)
         for group_key, group in groups.items():
             # release_pending 期间只观察物理回收，不创建替代 worker。
-            snapshots = _read_gpu_memory_snapshots(group_key)
+            snapshots = planning_snapshots_reader(group_key)
             group["ledger"].advance_reclaim(snapshots, now=now)
         _continuous_schedule_idle_slots(
             pool,
@@ -3751,17 +3712,19 @@ def _run_continuous_gpu_batch_loop(
             pending_dispatch,
             assignments,
             next_assignment_id=next_assignment_id,
-            snapshots_reader=_read_gpu_memory_snapshots,
+            snapshots_reader=planning_snapshots_reader,
             now=now,
         )
         _continuous_start_workers(pool, groups, assignments)
         pool.start_loaded_preparations(range(pool.total_workers))
+        # worker preparation 可能改变显存，confirm 必须使用新的一轮采样。
+        confirm_snapshots_reader = _memoized_snapshot_reader(_read_gpu_memory_snapshots)
         dispatched = _continuous_dispatch_ready(
             pool,
             groups,
             assignments,
             claims,
-            snapshots_reader=_read_gpu_memory_snapshots,
+            snapshots_reader=confirm_snapshots_reader,
         )
         if dispatched:
             # active_tasks 只统计已真正 put 到 worker 队列的 case。
@@ -3800,6 +3763,7 @@ def _run_continuous_gpu_batch_loop(
         if assignment is None:
             # 迟到或重复终态不应再次写 checkpoint、计数或触发 retry。
             continue
+        groups[assignment.group_key]["ledger"].record_result(msg[0])
         before = batch_state.tested_case
         _handle_batch_result(
             pool=pool,
@@ -3811,7 +3775,6 @@ def _run_continuous_gpu_batch_loop(
             pending_dispatch=pending_dispatch,
             msg=msg,
             max_total_external_kills=max_total_external_kills,
-            observer=None,
         )
         del assignments[assignment.assignment_id]
         # 删除 assignment 必须发生在统一结果处理之后，便于 retry 读取原 case。
@@ -3849,7 +3812,6 @@ def _run_batch_mode(
             options,
             gpu_total_memory_map=gpu_total_memory_map,
             cpu_worker_count=cpu_worker_count,
-            observer=None,
         )
 
         def cleanup_handler(*args):
@@ -4237,7 +4199,7 @@ def _run_sanitizer_session_mode(options):
     framework_started_at = time.monotonic()
     previous_timing_path = os.environ.pop(SANITIZER_TIMING_FILE_ENV, None)
     try:
-        _apply_sanitizer_wave_budget(options)
+        _apply_sanitizer_budget(options)
         _init_worker_runtime(None, None, None, options, redirect_output=False)
         framework_duration = (time.monotonic() - framework_started_at) * 1000.0
         print(encode_ready(framework_duration), end="", flush=True)
@@ -4261,7 +4223,7 @@ def _run_sanitizer_session_mode(options):
                 budget_environment[SANITIZER_COMPARISON_BUDGET_ENV] = str(
                     event["comparison_budget_gib"]
                 )
-            _apply_sanitizer_wave_budget(options, budget_environment)
+            _apply_sanitizer_budget(options, budget_environment)
             os.environ[SANITIZER_TIMING_FILE_ENV] = timing_path
             try:
                 status = _run_sanitizer_case_in_session(options, str(event["config"]))
@@ -4817,12 +4779,6 @@ def _build_argument_parser():
         default=False,
         help=argparse.SUPPRESS,
     )
-    parser.add_argument(
-        "--_self_test_scheduler",
-        action="store_true",
-        default=False,
-        help=argparse.SUPPRESS,
-    )
     return parser
 
 
@@ -4836,8 +4792,6 @@ def main():
     paddle_version = _detect_paddle_version()
     parser = _build_argument_parser()
     options = parser.parse_args()
-    if options._self_test_scheduler:
-        return _self_test_scheduler()
     options.paddle_version = paddle_version
     _resolve_dump_options(parser, options)
     if not options.log_dir:
