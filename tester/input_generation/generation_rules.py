@@ -146,11 +146,10 @@ _INPUT_VALUE_GENERATORS: dict[str, InputValueGenerator] = {
 class InputRule:
     """一条通过装饰器注册的输入生成规则。
 
-    这里保存的是规则的元信息和执行入口，不保存 API 约束逻辑本身。
+    这里仅保存执行入口，不保存 API 约束逻辑本身。
     规则函数负责描述参数关系，`InputRule` 负责完整性检查和提交。
     """
 
-    api_names: tuple[str, ...]
     function: InputRuleFunction
 
     def generate(
@@ -183,7 +182,6 @@ class _InputValueWriter:
     def __init__(self, api_config: object, input_backend):
         self._api_config = api_config
         self._input_backend = input_backend
-        self._generated_paths = set()
         self._input_value_by_path: dict[object, InputValue] = {}
         self._update_config_by_path: dict[object, bool] = {}
 
@@ -192,7 +190,7 @@ class _InputValueWriter:
         missing = [
             str(input_binding.path)
             for input_binding in rule.all_tensors
-            if input_binding.path not in self._generated_paths
+            if input_binding.path not in self._input_value_by_path
         ]
         if missing:
             raise ValueError(f"input rule {rule.api_name} left tensors ungenerated: {missing}")
@@ -205,15 +203,15 @@ class _InputValueWriter:
         return tuple(self._input_value_by_path.values())
 
     def is_generated(self, input_binding):
-        return input_binding.path in self._generated_paths
+        return input_binding.path in self._input_value_by_path
 
     def set_value(self, input_binding, input_value):
-        if input_binding.path in self._generated_paths:
+        if input_binding.path in self._input_value_by_path:
             raise ValueError(f"input rule generated tensor twice: {input_binding.path}")
         self._write_value(input_binding, input_value, update_config=True)
 
     def set_value_preserving_spec(self, input_binding, input_value):
-        if input_binding.path in self._generated_paths:
+        if input_binding.path in self._input_value_by_path:
             raise ValueError(f"input rule generated tensor twice: {input_binding.path}")
         self._write_value(input_binding, input_value, update_config=False)
 
@@ -233,7 +231,6 @@ class _InputValueWriter:
             self._input_backend.name,
         )
         self._update_config_by_path[input_binding.path] = update_config
-        self._generated_paths.add(input_binding.path)
 
 
 class InputRuleContext:
@@ -481,7 +478,6 @@ class InputRuleRegistry:
                 if api_name in self._by_api:
                     raise ValueError(f"input-generation API overlap: {api_name}")
             rule = InputRule(
-                api_names=names,
                 function=function,
             )
             for api_name in names:
@@ -489,10 +485,6 @@ class InputRuleRegistry:
             return function
 
         return decorator
-
-    @property
-    def by_api(self) -> dict[str, InputRule]:
-        return dict(self._by_api)
 
     def resolve(self, api_name: str) -> InputRule:
         # 未注册 API 直接返回独立默认规则，不伪造任意 API 的注册关系。
@@ -505,10 +497,7 @@ def generate_default_inputs(rule: InputRuleContext):
     rule.generate()
 
 
-DEFAULT_INPUT_RULE = InputRule(
-    api_names=(),
-    function=generate_default_inputs,
-)
+DEFAULT_INPUT_RULE = InputRule(function=generate_default_inputs)
 input_rules = InputRuleRegistry(DEFAULT_INPUT_RULE)
 
 # 以下顶层函数均属于 API 输入规则方法族，名称固定使用 `generate_*_inputs`。

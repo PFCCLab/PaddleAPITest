@@ -51,9 +51,6 @@ class InputTensorPath:
     def child(self, index):
         return InputTensorPath(self.argument_kind, self.argument_key, (*self.item_indices, index))
 
-    def top_level(self):
-        return InputTensorPath(self.argument_kind, self.argument_key)
-
     def __str__(self):
         value = (
             f"args[{self.argument_key}]"

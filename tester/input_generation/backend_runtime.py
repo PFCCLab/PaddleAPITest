@@ -11,15 +11,12 @@ from tester.dtype_utils import to_torch_dtype
 
 from . import backend as _backend_impl
 from .backend import (
-    INPUT_NUMPY_RANDOM_STATE,
-    InputBackend,
-    InputConfigRandomState,
     NumPyInputBackend,
     PaddleInputBackend,
     TorchInputBackend,
     _normalize_shape,
-    derive_input_seed,
 )
+from .value_generators import INPUT_NUMPY_RANDOM_STATE, InputConfigRandomState, derive_input_seed
 
 INPUT_BACKEND_ENV_VAR = "PADDLEAPITEST_INPUT_BACKEND"
 # backend 原语在初始化时读取同一缓存，避免 runtime 预热和 case backend 分叉。

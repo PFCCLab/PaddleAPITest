@@ -4,7 +4,6 @@ import copy
 import os
 import random
 
-import numpy
 import paddle
 import yaml
 from tester.dtype_utils import to_torch_dtype
@@ -68,10 +67,6 @@ def is_gpu_mode():
 def _torch_compute_device():
     # GPU 算子缺少 CUDA 时应显式失败，不能因环境差异静默改测 CPU kernel。
     return torch.device("cuda:0")
-
-
-def _shape_tuple(shape):
-    return tuple(int(dim) for dim in shape)
 
 
 def dtype_name(dtype):
@@ -231,17 +226,14 @@ class TensorConfig:
         return self.dtype
 
     def _torch_cast_dtype(self):
-        if self.dtype == "bfloat16":
-            return torch.float32
-        if self.dtype in FLOAT8_DTYPES:
-            return torch.float16
-        return to_torch_dtype(self.dtype)
+        # 先统一中间 dtype，再映射到 Torch，避免两套分支漂移。
+        return to_torch_dtype(self._cast_intermediate_dtype())
 
     def _float8_intermediate_dtype(self):
         return "float16" if self.dtype in FLOAT8_DTYPES else self.dtype
 
     def _torch_float8_intermediate_dtype(self):
-        return torch.float16 if self.dtype in FLOAT8_DTYPES else to_torch_dtype(self.dtype)
+        return to_torch_dtype(self._float8_intermediate_dtype())
 
     def _logical_numel(self, value):
         if hasattr(value, "numel"):

@@ -11,7 +11,6 @@ from tester.dtype_utils import to_torch_dtype
 
 from .value_generators import (
     INPUT_NUMPY_RANDOM_STATE,
-    InputConfigRandomState,
     derive_input_seed,
     resolve_input_dtype,
 )
