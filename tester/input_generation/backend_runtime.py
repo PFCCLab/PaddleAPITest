@@ -9,7 +9,6 @@ from types import SimpleNamespace
 import numpy
 from tester.dtype_utils import to_torch_dtype
 
-from . import backend as _backend_impl
 from .backend import (
     NumPyInputBackend,
     PaddleInputBackend,
@@ -19,9 +18,6 @@ from .backend import (
 from .value_generators import INPUT_NUMPY_RANDOM_STATE, InputConfigRandomState, derive_input_seed
 
 INPUT_BACKEND_ENV_VAR = "PADDLEAPITEST_INPUT_BACKEND"
-# backend 原语在初始化时读取同一缓存，避免 runtime 预热和 case backend 分叉。
-_PREPARED_INPUT_BACKENDS = _backend_impl._PREPARED_INPUT_BACKENDS
-_CACHED_NUMPY_OUTPUT_GRADS = {}
 _TRUE_VALUES = {"true", "1", "yes", "y"}
 _VALID_INPUT_BACKENDS = frozenset({"numpy", "torch", "paddle"})
 _MODE_DEFAULT_BACKENDS = {
@@ -50,18 +46,7 @@ def _env_flag(name, default="False") -> bool:
 
 def create_input_backend(input_random_state, *, policy):
     """按冻结策略创建一次性 backend 实例。"""
-    input_random_state = input_random_state or INPUT_NUMPY_RANDOM_STATE
-    # factory 只依赖冻结 policy，避免生成阶段再次读取环境状态。
-    device = policy.logical_device
-    if policy.resolved == "numpy":
-        # NumPy backend 永远使用 CPU 逻辑设备。
-        return NumPyInputBackend(input_random_state)
-    if policy.resolved == "torch":
-        # Torch backend 的 device 由 policy 统一决定。
-        return TorchInputBackend(input_random_state, device=device)
-    if policy.resolved == "paddle":
-        return PaddleInputBackend(input_random_state, device=device)
-    raise ValueError(f"unsupported input generation backend: {policy.resolved!r}")
+    return _INPUT_BACKEND_RUNTIME.create(input_random_state, policy=policy)
 
 
 def resolve_input_backend_policy(
@@ -108,55 +93,100 @@ class InputBackendPolicy:
     mode: str | None = None
 
 
+class InputBackendRuntime:
+    """Own prepared backend handles for one worker process."""
+
+    def __init__(self):
+        # backend implementation 不持有 cache；clear 后新一轮 prepare 必须重新探测设备。
+        self._prepared = {}
+        self._cached_numpy_output_grads = {}
+
+    def create(self, input_random_state, *, policy):
+        """Create a backend using the prepared handle selected by policy."""
+        input_random_state = input_random_state or INPUT_NUMPY_RANDOM_STATE
+        # factory 只依赖冻结 policy，避免生成阶段再次读取环境状态。
+        device = policy.logical_device
+        prepared = (
+            # cache hit 只复用不可变 runtime handle，随机 generator 仍由新 backend 独立创建。
+            self._prepared.get((policy.resolved, device)) if policy.resolved != "numpy" else None
+        )
+        if policy.resolved == "numpy":
+            # NumPy backend 永远使用 CPU 逻辑设备。
+            return NumPyInputBackend(input_random_state)
+        if policy.resolved == "torch":
+            # Torch backend 的 device 由 policy 统一决定。
+            return TorchInputBackend(input_random_state, device=device, prepared=prepared)
+        if policy.resolved == "paddle":
+            return PaddleInputBackend(input_random_state, device=device, prepared=prepared)
+        raise ValueError(f"unsupported input generation backend: {policy.resolved!r}")
+
+    def prepare(self, policy):
+        """Prepare and cache one backend module/device context."""
+        if policy is None:
+            raise ValueError("input backend policy is required for runtime preparation")
+        # 预热仅创建常量探针，不推进配置输入的随机流。
+        # cache key 同时包含 backend 和设备，防止 CPU/GPU context 交叉复用。
+        cache_key = (policy.resolved, policy.logical_device)
+        if cache_key in self._prepared:
+            return self._prepared[cache_key]
+        input_random_state = (
+            INPUT_NUMPY_RANDOM_STATE
+            if policy.resolved == "numpy"
+            else SimpleNamespace(seed=0, config_fingerprint="", stream_kind="runtime_probe")
+        )
+        backend = self.create(input_random_state, policy=policy)
+        probe = backend.zeros((1,), dtype="float32")
+        if backend.name == "torch" and policy.logical_device.startswith("cuda"):
+            backend._torch().cuda.synchronize(backend._device)
+        elif backend.name == "paddle" and policy.logical_device.startswith(("gpu", "cuda")):
+            backend._paddle().device.cuda.synchronize()
+        del probe
+        self._prepared[cache_key] = backend
+        return backend
+
+    def clear(self):
+        """Drop prepared handles and cached output gradients."""
+        self._prepared.clear()
+        self._cached_numpy_output_grads.clear()
+
+    def cached_numpy_output_grad(self, dtype, shape, stream_kind, seed, config_fingerprint):
+        """Return the process-local cached NumPy output gradient."""
+        # output-grad cache 与 prepared handle 一起清理，避免跨 runtime 配置复用数组。
+        if dtype in {"float8_e5m2", "float8_e4m3fn"}:
+            dtype = "float16"
+        elif dtype == "bfloat16":
+            dtype = "float32"
+        shape = _normalize_shape(shape, scalar_empty=False)
+        key = (dtype, shape, stream_kind, int(seed), str(config_fingerprint))
+        if key not in self._cached_numpy_output_grads:
+            rng = numpy.random.RandomState(
+                derive_input_seed(seed, config_fingerprint, f"cached_numpy:{stream_kind}")
+            )
+            if "int" in dtype:
+                value = rng.randint(-65535, 65535, size=shape, dtype="int64").astype(dtype)
+            elif dtype.startswith("complex"):
+                real_dtype = "float32" if dtype == "complex64" else "float64"
+                value = (rng.random(shape) - 0.5).astype(real_dtype) + 1j * (
+                    rng.random(shape) - 0.5
+                ).astype(real_dtype)
+                value = value.astype(dtype)
+            else:
+                value = (rng.random(shape) - 0.5).astype(dtype)
+            self._cached_numpy_output_grads[key] = value
+        return self._cached_numpy_output_grads[key]
+
+
+_INPUT_BACKEND_RUNTIME = InputBackendRuntime()
+
+
 def prepare_input_backend(policy):
     """准备进程级 backend 模块和设备 context。"""
-    if policy is None:
-        raise ValueError("input backend policy is required for runtime preparation")
-    # 预热仅创建常量探针，不推进配置输入的随机流。
-    # cache key 同时包含 backend 和设备，防止 CPU/GPU context 交叉复用。
-    cache_key = (policy.resolved, policy.logical_device)
-    if cache_key in _PREPARED_INPUT_BACKENDS:
-        return _PREPARED_INPUT_BACKENDS[cache_key]
-    input_random_state = (
-        INPUT_NUMPY_RANDOM_STATE
-        if policy.resolved == "numpy"
-        else SimpleNamespace(seed=0, config_fingerprint="", stream_kind="runtime_probe")
-    )
-    backend = create_input_backend(input_random_state, policy=policy)
-    probe = backend.zeros((1,), dtype="float32")
-    if backend.name == "torch" and policy.logical_device.startswith("cuda"):
-        backend._torch().cuda.synchronize(backend._device)
-    elif backend.name == "paddle" and policy.logical_device.startswith(("gpu", "cuda")):
-        backend._paddle().device.cuda.synchronize()
-    del probe
-    _PREPARED_INPUT_BACKENDS[cache_key] = backend
-    return backend
+    return _INPUT_BACKEND_RUNTIME.prepare(policy)
 
 
-def _cached_numpy_output_grad(dtype, shape, stream_kind, seed, config_fingerprint):
-    # 缓存只服务 NumPy output grad，原生 backend 仍使用各自 generator。
-    if dtype in {"float8_e5m2", "float8_e4m3fn"}:
-        dtype = "float16"
-    elif dtype == "bfloat16":
-        dtype = "float32"
-    shape = _normalize_shape(shape, scalar_empty=False)
-    key = (dtype, shape, stream_kind, int(seed), str(config_fingerprint))
-    if key not in _CACHED_NUMPY_OUTPUT_GRADS:
-        rng = numpy.random.RandomState(
-            derive_input_seed(seed, config_fingerprint, f"cached_numpy:{stream_kind}")
-        )
-        if "int" in dtype:
-            value = rng.randint(-65535, 65535, size=shape, dtype="int64").astype(dtype)
-        elif dtype.startswith("complex"):
-            real_dtype = "float32" if dtype == "complex64" else "float64"
-            value = (rng.random(shape) - 0.5).astype(real_dtype) + 1j * (
-                rng.random(shape) - 0.5
-            ).astype(real_dtype)
-            value = value.astype(dtype)
-        else:
-            value = (rng.random(shape) - 0.5).astype(dtype)
-        _CACHED_NUMPY_OUTPUT_GRADS[key] = value
-    return _CACHED_NUMPY_OUTPUT_GRADS[key]
+def clear_input_backend_runtime():
+    """清理当前进程的 backend handles 和 output-grad cache。"""
+    _INPUT_BACKEND_RUNTIME.clear()
 
 
 def generate_output_grad(
@@ -178,7 +208,9 @@ def generate_output_grad(
         # 只有 NumPy cache 可跨调用复用，原生 Tensor 绑定设备上下文。
         if backend_name != "numpy":
             raise ValueError("output-grad cache requires the NumPy backend")
-        return _cached_numpy_output_grad(dtype, shape, stream_kind, seed, config_fingerprint)
+        return _INPUT_BACKEND_RUNTIME.cached_numpy_output_grad(
+            dtype, shape, stream_kind, seed, config_fingerprint
+        )
     # 非缓存路径按 backend 创建私有随机源，避免污染框架全局 RNG。
     if backend_name == "numpy":
         backend = NumPyInputBackend(
@@ -221,6 +253,8 @@ def generate_output_grad(
 
 __all__ = [
     "InputBackendPolicy",
+    "InputBackendRuntime",
+    "clear_input_backend_runtime",
     "create_input_backend",
     "generate_output_grad",
     "prepare_input_backend",

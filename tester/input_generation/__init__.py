@@ -9,6 +9,8 @@ from .backend import (
 )
 from .backend_runtime import (
     InputBackendPolicy,
+    InputBackendRuntime,
+    clear_input_backend_runtime,
     create_input_backend,
     generate_output_grad,
     prepare_input_backend,
@@ -40,6 +42,8 @@ __all__ = [
     "InputBackend",
     "InputBackendCapabilityError",
     "InputBackendPolicy",
+    "InputBackendRuntime",
+    "clear_input_backend_runtime",
     "NumPyInputBackend",
     "PaddleInputBackend",
     "TorchInputBackend",

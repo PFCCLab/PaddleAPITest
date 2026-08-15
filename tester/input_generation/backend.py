@@ -15,8 +15,6 @@ from .value_generators import (
     resolve_input_dtype,
 )
 
-_PREPARED_INPUT_BACKENDS = {}
-
 
 def _normalize_shape(shape, *, scalar_empty):
     """统一 NumPy 与原生 backend 对标量 shape 的边界表示。"""
@@ -279,6 +277,7 @@ class TorchInputBackend:
 
     input_random_state: object = INPUT_NUMPY_RANDOM_STATE
     device: str = "cpu"
+    prepared: object = field(default=None, repr=False)
     name = "torch"
     _generator: object = field(init=False, repr=False)
 
@@ -290,7 +289,7 @@ class TorchInputBackend:
         return _resolve_storage_dtype(dtype, self.name)
 
     def __post_init__(self):
-        prepared = _PREPARED_INPUT_BACKENDS.get((self.name, self.device))
+        prepared = self.prepared
         if prepared is None:
             self._torch_module = self._torch()
             self._device = self._torch_module.device(self.device)
@@ -581,6 +580,7 @@ class PaddleInputBackend:
 
     input_random_state: object = INPUT_NUMPY_RANDOM_STATE
     device: str = "cpu"
+    prepared: object = field(default=None, repr=False)
     name = "paddle"
 
     def resolve_input_dtype(self, dtype: str) -> str:
@@ -591,7 +591,7 @@ class PaddleInputBackend:
         return _resolve_storage_dtype(dtype, self.name)
 
     def __post_init__(self):
-        prepared = _PREPARED_INPUT_BACKENDS.get((self.name, self.device))
+        prepared = self.prepared
         if prepared is None:
             self._paddle_module = self._paddle()
             self._place = self._paddle_module.CPUPlace()
