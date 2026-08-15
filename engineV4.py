@@ -161,13 +161,23 @@ def _encode_session_event(payload):
     )
 
 
+def _encode_nonnegative_finite(value, field):
+    # 编码端必须和解析端拒绝同一组非法预算，避免本地生成不可回读的协议。
+    if (
+        not isinstance(value, (int, float))
+        or isinstance(value, bool)
+        or not math.isfinite(float(value))
+        or value < 0
+    ):
+        raise ValueError(f"{field} must be non-negative")
+    return float(value)
+
+
 def encode_ready(framework_ms=None):
     # ready 只表示框架初始化完成，不代表已有 request 可以乱序执行。
     payload = {"event": "ready"}
     if framework_ms is not None:
-        if float(framework_ms) < 0:
-            raise ValueError("framework_ms must be non-negative")
-        payload["framework_ms"] = float(framework_ms)
+        payload["framework_ms"] = _encode_nonnegative_finite(framework_ms, "framework_ms")
     return _encode_session_event(payload)
 
 
@@ -181,8 +191,11 @@ def encode_request(
     comparison_budget_gib=None,
 ):
     # timing_path 属于 wrapper 与 session 的文件协议，必须保持字符串类型。
+    # case_id 不能借助 int() 放宽类型，否则编码端会接受解析端拒绝的字符串。
     if (
-        int(case_id) < 0
+        not isinstance(case_id, int)
+        or isinstance(case_id, bool)
+        or case_id < 0
         or not isinstance(config, str)
         or not config.strip()
         or not isinstance(timing_path, str)
@@ -191,24 +204,40 @@ def encode_request(
         raise ValueError("invalid sanitizer session request")
     payload = {
         "event": "request",
-        "case_id": int(case_id),
+        "case_id": case_id,
         "config": config,
         "timing_path": str(timing_path),
     }
     if workers_on_gpu is not None:
-        payload["workers_on_gpu"] = int(workers_on_gpu)
+        if (
+            not isinstance(workers_on_gpu, int)
+            or isinstance(workers_on_gpu, bool)
+            or workers_on_gpu <= 0
+        ):
+            raise ValueError("workers_on_gpu must be positive")
+        payload["workers_on_gpu"] = workers_on_gpu
     if compute_budget_gib is not None:
-        payload["compute_budget_gib"] = float(compute_budget_gib)
+        payload["compute_budget_gib"] = _encode_nonnegative_finite(
+            compute_budget_gib, "compute_budget_gib"
+        )
     if comparison_budget_gib is not None:
-        payload["comparison_budget_gib"] = float(comparison_budget_gib)
+        payload["comparison_budget_gib"] = _encode_nonnegative_finite(
+            comparison_budget_gib, "comparison_budget_gib"
+        )
     return _encode_session_event(payload)
 
 
 def encode_result(case_id, status):
     # session 崩溃不调用本函数伪造结果，由 wrapper 的 EOF 分支负责归类。
-    if int(case_id) < 0 or status not in _TERMINAL_STATUSES:
+    # result 事件也必须沿用解析端的整数 case_id 边界，避免终态令牌错配。
+    if (
+        not isinstance(case_id, int)
+        or isinstance(case_id, bool)
+        or case_id < 0
+        or status not in _TERMINAL_STATUSES
+    ):
         raise ValueError("invalid sanitizer session result")
-    return _encode_session_event({"event": "result", "case_id": int(case_id), "status": status})
+    return _encode_session_event({"event": "result", "case_id": case_id, "status": status})
 
 
 def parse_event(line):
@@ -217,7 +246,7 @@ def parse_event(line):
         raise ValueError("invalid sanitizer session marker")
     try:
         payload = json.loads(line[len(SESSION_EVENT_PREFIX) :])
-    except (TypeError, ValueError, json.JSONDecodeError) as err:
+    except (TypeError, ValueError) as err:
         raise ValueError("invalid sanitizer session JSON") from err
     if not isinstance(payload, dict):
         raise ValueError("sanitizer session event must be an object")
@@ -442,14 +471,6 @@ class GpuReservationLedger:
             return False
         return True
 
-    def active_assignments(self):
-        # release_pending 仍占用承诺，不能因为 worker 已退出就立刻复用。
-        return tuple(
-            reservation
-            for reservation in self._reservations.values()
-            if reservation.state in {"active", "release_pending"}
-        )
-
     def mark_release_pending(self, assignment_id):
         # 终态只开启回收观察，不直接释放显存承诺。
         reservation = self._reservations.get(assignment_id)
@@ -495,17 +516,12 @@ class GpuReservationLedger:
         self.mark_release_pending(assignment_id)
         return True
 
-    def reservation_state(self, assignment_id):
-        reservation = self._reservations.get(assignment_id)
-        return None if reservation is None else reservation.state
-
 
 class ContinuousGpuScheduler:
     """单文件内的 slot 状态机；GPU 显存账本由 ledger 独立维护。"""
 
-    def __init__(self, device_ids, slot_indices):
+    def __init__(self, slot_indices):
         # scheduler 只维护 slot 生命周期，显存额度由 ledger 独立负责。
-        self.device_ids = tuple(device_ids)
         self.slot_states = {int(slot): "offline" for slot in slot_indices}
         self.assignments = {}
 
@@ -533,25 +549,6 @@ class ContinuousGpuScheduler:
         self.slot_states[slot_index] = "idle"
         return True
 
-    def mark_suspended(self, slot_index):
-        # suspended slot 等待进程和物理显存清理后再由主循环复活。
-        if slot_index in self.slot_states:
-            self.slot_states[slot_index] = "suspended"
-            self.assignments.pop(slot_index, None)
-
-    def next_idle_slot(self):
-        return next((slot for slot, state in self.slot_states.items() if state == "idle"), None)
-
-
-@dataclass
-class AssignmentClaim:
-    """assignment 级终态令牌，防止旧 worker 消费新任务的结果。"""
-
-    assignment_id: int
-    slot_index: int
-    worker_pid: int
-    config: str
-
 
 class AssignmentClaims:
     def __init__(self):
@@ -559,15 +556,15 @@ class AssignmentClaims:
 
     def register(self, assignment_id, slot_index, worker_pid, config):
         # slot 复用时覆盖旧令牌，旧 worker 的结果因此无法消费新任务。
-        self._tokens[slot_index] = AssignmentClaim(assignment_id, slot_index, worker_pid, config)
+        self._tokens[slot_index] = (assignment_id, worker_pid, config)
 
     def claim(self, assignment_id, message):
         # 认领同时校验 assignment、PID 和配置三元组。
         parsed = BatchMessage.from_raw(message)
         token = self._tokens.get(parsed.slot_index)
-        if token is None or token.assignment_id != assignment_id:
+        if token is None or token[0] != assignment_id:
             return False
-        if token.worker_pid != parsed.worker_pid or token.config != parsed.config:
+        if token[1:] != (parsed.worker_pid, parsed.config):
             return False
         del self._tokens[parsed.slot_index]
         return True
@@ -919,13 +916,9 @@ class PendingQueue:
 
     @property
     def ready_count(self):
-        """已到期段长度；扩展扫描的上界判断只关心 ready 段，不含延迟段。"""
+        """返回已到期段长度；扩展扫描不应把延迟 case 算入候选窗口。"""
+        self._promote(time.monotonic())
         return len(self._ready)
-
-    @property
-    def ready_version(self):
-        """返回 ready 段版本；ready 发生结构变化时递增，供扫描游标校正。"""
-        return self._ready_version
 
     def _invalidate_ready_snapshot(self):
         self._ready_version += 1
@@ -1010,7 +1003,7 @@ class PendingQueue:
     def candidate_window(self, limit, now=None):
         """返回队首至多 limit 个已到期 case；limit 为 None 表示全部 ready case。
 
-        返回的是队首快照副本，不消费队列；真正取走由 take_window_selection 完成。
+        返回的是队首快照副本，不消费队列；真正取走由 take_case_selection 完成。
         读取路径会顺带把到期的延迟 case 迁入 ready 段。
         """
         now = time.monotonic() if now is None else now
@@ -1023,7 +1016,7 @@ class PendingQueue:
         """从 ready 段的游标位置取有界窗口，并返回下一次扫描游标。
 
         ready 队列不变时复用一次快照，避免为了跨过一批不可准入 case 而重复从队首
-        扫描；队列结构变化后由 ready_version 让调用方重新从当前窗口起点开始。
+        扫描；队列结构变化后会让调用方重新从当前窗口起点开始。
         """
         now = time.monotonic() if now is None else now
         self._promote(now)
@@ -1035,24 +1028,6 @@ class PendingQueue:
         ready = self._ready_snapshot_to(end)
         next_cursor = end if end < ready_count else 0
         return ready[start:end], next_cursor
-
-    def take_window_selection(self, window_size, selected_indices):
-        """从队首 window_size 个 case 中原子取走 selected_indices 指定的项。
-
-        未被选中的 case 以原顺序回到队首，保证同一轮内不会被重复规划。
-        必须紧跟同一 now 的 candidate_window 调用；越界下标会被静默忽略。
-        """
-        selected_positions = set(selected_indices)
-        window_size = min(window_size, len(self._ready))
-        selected = []
-        window = list(itertools.islice(self._ready.items(), window_size))
-        for index, (config, case) in enumerate(window):
-            if index in selected_positions:
-                selected.append(case)
-                self._ready.pop(config, None)
-        if window_size:
-            self._invalidate_ready_snapshot()
-        return selected
 
     def take_case_selection(self, candidates, selected_indices):
         """从任意扫描窗口中取走选中的 case，并保持其余 ready 顺序。"""
@@ -1080,9 +1055,6 @@ class TerminalClaims:
 
     def register(self, slot_index, worker_pid, config):
         self.tokens[slot_index] = (worker_pid, config)
-
-    def clear(self):
-        self.tokens.clear()
 
     def claim(self, msg):
         message = BatchMessage.from_raw(msg)
@@ -2031,31 +2003,42 @@ class WorkerPool:
 
     def _check_initializing_worker(self, slot, *, now=None):
         """终止并挂起一个在模块加载或 preparation 阶段失败的 worker。"""
-        if slot.state not in {"starting", "loaded", "preparing"} or slot.process is None:
-            return False
-        now = time.monotonic() if now is None else now
-        phase = "module_load" if slot.state == "starting" else "preparation"
-        if not slot.process.is_alive():
+        with self._lock:
+            if slot.state not in {"starting", "loaded", "preparing"} or slot.process is None:
+                return False
+            now = time.monotonic() if now is None else now
+            phase = "module_load" if slot.state == "starting" else "preparation"
+            process = slot.process
+            if not process.is_alive():
+                failure = "crash"
+            elif slot.state == "loaded" or slot.started_at is None:
+                # loaded 表示 worker 正等待主进程按设备调度，不应消耗 preparation 超时。
+                return False
+            elif now - slot.started_at < self._startup_timeout():
+                return False
+            else:
+                failure = "timeout"
+            # 先清理 slot 账本，再在锁外做可能阻塞的进程回收。
+            # child PID 先脱离 slot 账本，迟到控制消息不会重新占用已挂起 slot。
+            child_pid = slot.child_pid
+            self._suspend_slot(slot)
+
+        if child_pid is not None:
+            self._kill_process_group(child_pid)
+        if failure == "crash":
             print(
                 f"[worker] INIT_CRASH | slot {slot.index} | phase {phase} | "
-                f"exit {slot.process.exitcode}",
+                f"exit {process.exitcode}",
                 flush=True,
             )
-            self._join_process(slot.process, timeout=1)
-            self._suspend_slot(slot)
-            return True
-        # loaded 表示 worker 正等待主进程按设备调度，不应消耗 preparation 超时。
-        if slot.state == "loaded" or slot.started_at is None:
-            return False
-        if now - slot.started_at < self._startup_timeout():
-            return False
-        print(
-            f"[worker] INIT_TIMEOUT | slot {slot.index} | phase {phase} | "
-            f"timeout {self._startup_timeout()} s",
-            flush=True,
-        )
-        self._kill_process(slot.process)
-        self._suspend_slot(slot)
+            self._join_process(process, timeout=1)
+        else:
+            print(
+                f"[worker] INIT_TIMEOUT | slot {slot.index} | phase {phase} | "
+                f"timeout {self._startup_timeout()} s",
+                flush=True,
+            )
+            self._kill_process(process)
         # 不在 watchdog 内重建；下一轮先取消 assignment 并观察显存稳定。
         return True
 
@@ -2074,6 +2057,7 @@ class WorkerPool:
             return False
         slot_idx = msg[1]
         worker_pid = msg[2]
+        late_child_pid = None
         with self._lock:
             slot = self.slots[slot_idx]
             # 共享结果队列可能晚到已回收 worker 的消息，PID 是 slot 生命周期令牌。
@@ -2096,8 +2080,12 @@ class WorkerPool:
                     slot.task_start_time = time.monotonic()
                 return True
             if msg_type == "child":
-                slot.child_pid = msg[3]
-                return True
+                # slot 已挂起时忽略迟到登记，否则 wrapper 被杀后 child 会重新进入账本。
+                if slot.state in {"starting", "loaded", "preparing", "busy"}:
+                    slot.child_pid = msg[3]
+                    return True
+                # wrapper PID 已校验，迟到 child 仍属于这一代 slot，交给锁外清理。
+                late_child_pid = msg[3]
             if msg_type == "sanitizer_timing":
                 return True
             if msg_type == "sanitizer_session_ready":
@@ -2110,13 +2098,19 @@ class WorkerPool:
                 if slot.state != expected_state:
                     return True
                 process = slot.process
+                child_pid = slot.child_pid
                 self._suspend_slot(slot)
 
+        if late_child_pid is not None:
+            self._kill_process_group(late_child_pid)
+            return True
         if msg_type == "init_failed":
             print(
                 f"[worker] INIT_FAILED | slot {slot_idx} | phase {phase} | {error_msg}",
                 flush=True,
             )
+            if child_pid is not None:
+                self._kill_process_group(child_pid)
             self._join_process(process, timeout=1)
             # init_failed 常见于 bootstrap OOM，slot 必须退出 planned 启动屏障。
             return True
@@ -2218,91 +2212,101 @@ class WorkerPool:
                     pass
 
     def _watchdog_tick_slot(self, slot, *, now):
-        """在持有 slot 锁时评估单个 slot 并执行恢复。"""
+        """只在锁内做快照，进程终止和 join 必须在锁外执行。"""
+        action = None
         with self._lock:
             if self._shutdown_event.is_set():
                 return
-            # 在 slot 快照仍然一致时直接执行恢复动作。
             if slot.state in {"starting", "loaded", "preparing"}:
-                self._check_initializing_worker(slot, now=now)
-                return
-            if (
+                action = "initializing"
+            elif (
                 slot.state == "busy"
                 and slot.task_start_time is not None
                 and now - slot.task_start_time > self.options.timeout
             ):
-                self._handle_timeout(slot, now=now)
-                return
-            if (
+                action = "timeout"
+            elif (
                 slot.state in ("busy", "idle")
                 and slot.process is not None
                 and not slot.process.is_alive()
             ):
-                self._handle_crash(slot, now=now)
+                action = "crash"
+        # watchdog 的锁只保护快照；SIGKILL/join 放锁外避免阻塞派发和结果处理。
+        if action == "initializing":
+            self._check_initializing_worker(slot, now=now)
+        elif action == "timeout":
+            self._handle_timeout(slot, now=now)
+        elif action == "crash":
+            self._handle_crash(slot, now=now)
 
     def _handle_timeout(self, slot, *, now=None):
         """终止超时 worker，并写入 timeout 结果。"""
-        if self._closed or self._shutdown_event.is_set():
-            return
-        config = slot.current_task
-        terminal_timestamp = time.monotonic() if now is None else float(now)
-        # 与 crash 相同，process 只在入口取一次快照，避免并发 retire 造成二次解引用。
-        process = slot.process
-        old_pid = process.pid if process is not None else None
-        # timeout 路径先清 child，避免 sanitizer wrapper 退出后 child 继续占卡。
-        self._kill_slot_child(slot)
-        if process is not None:
-            self._kill_process(process)
-        if self._closed or self._shutdown_event.is_set():
-            return
-        try:
-            # watchdog 只上报候选终态，日志边界必须等主循环成功认领后再写。
-            # 保留 watchdog 检测时刻，主循环认领延迟不能进入 case 时长。
-            self.result_queue.put(
-                ("timeout", slot.index, config, old_pid, None, terminal_timestamp)
-            )
-        finally:
-            # 入队失败也必须挂起 slot，否则下一轮会对同一死进程重复上报。
-            # 主循环收到终态后才会关闭整波并开始物理 free 稳定采样。
+        with self._lock:
+            if (
+                self._closed
+                or self._shutdown_event.is_set()
+                or slot.state != "busy"
+                or slot.process is None
+            ):
+                return
+            config = slot.current_task
+            terminal_timestamp = time.monotonic() if now is None else float(now)
+            # 先摘下生命周期令牌，避免主线程退役与 watchdog 重复处理同一进程。
+            process = slot.process
+            old_pid = process.pid
+            child_pid = slot.child_pid
             self._suspend_slot(slot)
+        if child_pid is not None:
+            self._kill_process_group(child_pid)
+        self._kill_process(process)
+        if self._closed or self._shutdown_event.is_set():
+            return
+        # watchdog 只上报候选终态，日志边界必须等主循环成功认领后再写。
+        # 保留 watchdog 检测时刻，主循环认领延迟不能进入 case 时长。
+        self.result_queue.put(("timeout", slot.index, config, old_pid, None, terminal_timestamp))
 
     def _handle_crash(self, slot, *, now=None):
         """处理非预期死亡的 worker。"""
-        if self._closed or self._shutdown_event.is_set():
-            return
-        # 进入函数时一次性取快照：主线程的 retire_slots 可能并发把 process 清空。
-        process = slot.process
-        exitcode = process.exitcode if process is not None else None
-        worker_pid = process.pid if process is not None else None
-        config = slot.current_task
-        terminal_timestamp = time.monotonic() if now is None else float(now)
-        # wrapper 异常死亡不会执行自身 finally，child 必须由 pool 主动回收，
-        # 且必须早于 _suspend_slot 清空 child_pid。
-        self._kill_slot_child(slot)
-        if self._closed or self._shutdown_event.is_set():
-            return
-        try:
-            if config is not None:
-                # 与 timeout 相同，crash 日志边界只能由胜出的终态消息写入。
-                self.result_queue.put(
-                    (
-                        "crashed",
-                        slot.index,
-                        config,
-                        exitcode,
-                        worker_pid,
-                        None,
-                        terminal_timestamp,
-                    )
-                )
-            else:
-                print(
-                    f"[worker] PADDLE_CRASH | slot {slot.index} | exit {exitcode}",
-                    flush=True,
-                )
-        finally:
-            # 入队失败也必须挂起 slot，否则下一轮会对同一死进程重复上报。
+        with self._lock:
+            if (
+                self._closed
+                or self._shutdown_event.is_set()
+                or slot.state not in {"busy", "idle"}
+                or slot.process is None
+                or slot.process.is_alive()
+            ):
+                return
+            # 进入函数时一次性取快照：主线程的 retire_slots 可能并发把 process 清空。
+            process = slot.process
+            exitcode = process.exitcode
+            worker_pid = process.pid
+            config = slot.current_task
+            terminal_timestamp = time.monotonic() if now is None else float(now)
+            child_pid = slot.child_pid
             self._suspend_slot(slot)
+        # wrapper 异常死亡不会执行自身 finally，child 必须由 pool 主动回收。
+        if child_pid is not None:
+            self._kill_process_group(child_pid)
+        if self._closed or self._shutdown_event.is_set():
+            return
+        if config is not None:
+            # 与 timeout 相同，crash 日志边界只能由胜出的终态消息写入。
+            self.result_queue.put(
+                (
+                    "crashed",
+                    slot.index,
+                    config,
+                    exitcode,
+                    worker_pid,
+                    None,
+                    terminal_timestamp,
+                )
+            )
+        else:
+            print(
+                f"[worker] PADDLE_CRASH | slot {slot.index} | exit {exitcode}",
+                flush=True,
+            )
 
     def _kill_process_group(self, pid):
         try:
@@ -2384,7 +2388,8 @@ class WorkerPool:
 
 
 def _smi_output(command):
-    return subprocess.check_output([command], text=True, stderr=subprocess.STDOUT)
+    # 厂商探测工具失控时必须让设备探测回退到下一个后端。
+    return subprocess.check_output([command], text=True, stderr=subprocess.STDOUT, timeout=5)
 
 
 def _command_has_device(command, device_pattern):
@@ -2591,10 +2596,6 @@ def _argument_error(message):
     return 2
 
 
-def _mode_uses_torch(options):
-    return any(_option_enabled(options, opt) for opt in TORCH_UTILITY_MODES)
-
-
 def _select_test_class(options):
     import tester
 
@@ -2612,7 +2613,7 @@ def _select_test_class(options):
 def _clear_device_cache(options):
     import paddle
 
-    if _mode_uses_torch(options):
+    if any(_option_enabled(options, opt) for opt in TORCH_UTILITY_MODES):
         import torch
 
         torch.cuda.empty_cache()
@@ -3057,15 +3058,11 @@ def _fill_idle_workers(pool, pending_dispatch, *, on_dispatch):
     return dispatched_count
 
 
-def _gpu_memory_preflight_mode(options):
-    return next(
+def _estimate_case_gpu_memory(api_config_str, options, *, failure_report):
+    mode = next(
         (mode for mode in GPU_MEMORY_PREFLIGHT_MODES if _option_enabled(options, mode)),
         None,
     )
-
-
-def _estimate_case_gpu_memory(api_config_str, options, *, failure_report):
-    mode = _gpu_memory_preflight_mode(options)
     if mode is None:
         return CaseGpuEstimate()
     try:
@@ -3295,18 +3292,6 @@ def _handle_batch_result(
         log_aggregation.aggregate_logs()
 
 
-def _install_batch_signal_handlers(cleanup_handler):
-    previous_handlers = {}
-    for sig in (signal.SIGINT, signal.SIGTERM):
-        previous_handlers[sig] = signal.signal(sig, cleanup_handler)
-    return previous_handlers
-
-
-def _restore_batch_signal_handlers(previous_handlers):
-    for sig, handler in previous_handlers.items():
-        signal.signal(sig, handler)
-
-
 def _run_cpu_batch_loop(
     pool,
     options,
@@ -3405,7 +3390,7 @@ def _build_continuous_gpu_groups(pool, snapshots):
         groups.setdefault(device_ids, []).append(slot.index)
     return {
         device_ids: {
-            "scheduler": ContinuousGpuScheduler(device_ids, slot_indices),
+            "scheduler": ContinuousGpuScheduler(slot_indices),
             "ledger": GpuReservationLedger(
                 device_ids,
                 snapshots={gpu_id: snapshots[gpu_id] for gpu_id in device_ids},
@@ -3416,11 +3401,6 @@ def _build_continuous_gpu_groups(pool, snapshots):
         }
         for device_ids, slot_indices in groups.items()
     }
-
-
-def _continuous_requeue_assignment(assignment, pending_dispatch):
-    # 未形成业务终态的 assignment 必须回队，不能只释放 reservation。
-    pending_dispatch.appendleft(assignment.pending)
 
 
 def _continuous_start_workers(pool, groups, assignments):
@@ -3454,7 +3434,8 @@ def _continuous_cancel_failed_startup(
         if assignment.dispatched or slot.state not in {"suspended", "dead"}:
             continue
         groups[assignment.group_key]["ledger"].mark_release_pending(assignment_id)
-        _continuous_requeue_assignment(assignment, pending_dispatch)
+        # 未形成业务终态的 assignment 必须回队，不能只释放 reservation。
+        pending_dispatch.appendleft(assignment.pending)
         del assignments[assignment_id]
 
 
@@ -3824,7 +3805,8 @@ def _run_batch_mode(
             print(f"{datetime.now()} Cleanup completed", flush=True)
             sys.exit(1)
 
-        previous_signal_handlers = _install_batch_signal_handlers(cleanup_handler)
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            previous_signal_handlers[sig] = signal.signal(sig, cleanup_handler)
 
         print(f"Workers: lazy | {len(pool.slots)} logical slots", flush=True)
         pool.start()
@@ -3859,7 +3841,8 @@ def _run_batch_mode(
         batch_state.abort_run = True
     finally:
         # 在进入 pool 清理前恢复进程级信号处理器。
-        _restore_batch_signal_handlers(previous_signal_handlers)
+        for sig, handler in previous_signal_handlers.items():
+            signal.signal(sig, handler)
         if pool is not None:
             pool.shutdown(force=batch_state.shutdown_force)
         if options.use_compute_sanitizer:
@@ -4041,15 +4024,13 @@ def _apply_runtime_environment_flags(options):
 
 
 def _detect_paddle_version():
-    try:
-        from importlib.metadata import version as _pkg_version
+    from importlib.metadata import version
 
-        return _pkg_version("paddlepaddle-gpu")
+    try:
+        return version("paddlepaddle-gpu")
     except Exception:
         try:
-            from importlib.metadata import version as _pkg_version
-
-            return _pkg_version("paddlepaddle")
+            return version("paddlepaddle")
         except Exception:
             return "unknown"
 
