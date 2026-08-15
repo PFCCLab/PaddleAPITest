@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import threading
 import time
 import types
@@ -10,18 +11,49 @@ from enum import Enum
 from types import MappingProxyType
 from typing import Any
 
-from .config import (
-    ConversionEnvironment,
-    read_workers_on_gpu,
-    select_implementation,
-)
-
+IMPLEMENTATION_ENV_VAR = "PADDLEAPITEST_IMPL"
+WORKERS_ON_GPU_ENV_VAR = "PADDLEAPITEST_WORKERS_ON_GPU"
+# 这些值同时约束环境变量和 Rule 的 SUPPORTED_IMPLEMENTATIONS 声明。
+VALID_IMPLEMENTATIONS = frozenset({"apex", "te", "torch"})
 _WORKSPACE_PROBE_TTL = 0.25
 _WORKSPACE_PROBE_CACHE: dict[tuple[str | None, int], tuple[float, int]] = {}
 _WORKSPACE_PROBE_LOCK = threading.Lock()
 _RULE_REGISTRY: dict[str, type] = {}
 _RULE_REGISTRY_VIEW = MappingProxyType(_RULE_REGISTRY)
 _RULE_REGISTRY_FROZEN = False
+
+
+@dataclass(frozen=True)
+class ConversionEnvironment:
+    implementation: str | None
+
+
+def read_conversion_environment() -> ConversionEnvironment:
+    implementation = os.environ.get(IMPLEMENTATION_ENV_VAR)
+    # 非法显式选择必须在转换入口失败，不能被 Rule 默认值掩盖。
+    if implementation is not None and implementation not in VALID_IMPLEMENTATIONS:
+        expected = ", ".join(sorted(VALID_IMPLEMENTATIONS))
+        raise ValueError(
+            f"{IMPLEMENTATION_ENV_VAR} must be one of {expected}, got {implementation!r}"
+        )
+    return ConversionEnvironment(implementation=implementation)
+
+
+def read_workers_on_gpu() -> int:
+    # 未配置时按单 worker 预算，保持历史运行行为。
+    raw_workers_on_gpu = os.environ.get(WORKERS_ON_GPU_ENV_VAR, "1")
+    # workspace 按 worker 数切分，零值或非整数会破坏显存预算。
+    try:
+        workers_on_gpu = int(raw_workers_on_gpu)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            f"{WORKERS_ON_GPU_ENV_VAR} must be a positive integer, got {raw_workers_on_gpu!r}"
+        ) from exc
+    if workers_on_gpu < 1:
+        raise ValueError(
+            f"{WORKERS_ON_GPU_ENV_VAR} must be a positive integer, got {raw_workers_on_gpu!r}"
+        )
+    return workers_on_gpu
 
 
 def adaptive_workspace_bytes(
@@ -213,14 +245,24 @@ class BaseRule(ABC):
         for paddle_api in cls.PADDLE_APIS:
             _RULE_REGISTRY[paddle_api] = cls
 
-    def select_implementation(self) -> str:
-        if self.DEFAULT_IMPLEMENTATION is None:
+    def build_implementation_code(self) -> tuple[str, str]:
+        """选择参考实现，并按 ``_<实现名>_code`` 约定生成代码。"""
+        default = self.DEFAULT_IMPLEMENTATION
+        if default is None:
             raise RuntimeError(f"{type(self).__name__} does not declare a default implementation")
-        return select_implementation(
-            self._conversion_environment,
-            supported=self.SUPPORTED_IMPLEMENTATIONS,
-            default=self.DEFAULT_IMPLEMENTATION,
-        )
+        if default not in self.SUPPORTED_IMPLEMENTATIONS:
+            raise ValueError(f"default implementation {default!r} is not supported")
+        # 支持集必须与环境变量协议一致，避免新增实现被错误地静默回退。
+        if not self.SUPPORTED_IMPLEMENTATIONS <= VALID_IMPLEMENTATIONS:
+            invalid = ", ".join(sorted(self.SUPPORTED_IMPLEMENTATIONS - VALID_IMPLEMENTATIONS))
+            raise ValueError(f"unknown supported implementations: {invalid}")
+        requested = self._conversion_environment.implementation
+        implementation = requested if requested in self.SUPPORTED_IMPLEMENTATIONS else default
+        # 声明支持却缺少生成函数属于 Rule 协议错误，必须在转换阶段明确失败。
+        builder = getattr(self, f"_{implementation}_code", None)
+        if not callable(builder):
+            raise RuntimeError(f"{type(self).__name__} does not implement _{implementation}_code()")
+        return implementation, builder()
 
     @abstractmethod
     def apply(self, paddle_api: str) -> ConvertResult:
@@ -2170,11 +2212,7 @@ class Fp8QuantBlockwiseRule(BaseRule):
         # TE's blockwise transpose kernel rejects valid very-large Paddle
         # inputs with CUDA_INVALID_ARGUMENT. Use the shape-generic Torch
         # reference by default; TE remains available for explicit testing.
-        impl = self.select_implementation()
-        if impl == "torch":
-            core = self._torch_code()
-        else:
-            core = self._te_code()
+        impl, core = self.build_implementation_code()
         return self.build_result(
             paddle_api,
             kind=ConversionKind.COMPOSITE,
@@ -4876,8 +4914,7 @@ class MoePermuteRule(BaseRule):
     DEFAULT_IMPLEMENTATION = "torch"
 
     def apply(self, paddle_api: str) -> ConvertResult:
-        impl = self.select_implementation()
-        core = self._torch_code() if impl == "torch" else self._te_code()
+        impl, core = self.build_implementation_code()
         return self.build_result(
             paddle_api,
             kind=ConversionKind.COMPOSITE,
@@ -5081,8 +5118,7 @@ class MoeUnpermuteRule(BaseRule):
     DEFAULT_IMPLEMENTATION = "torch"
 
     def apply(self, paddle_api: str) -> ConvertResult:
-        impl = self.select_implementation()
-        core = self._torch_code() if impl == "torch" else self._te_code()
+        impl, core = self.build_implementation_code()
         return self.build_result(
             paddle_api,
             kind=ConversionKind.COMPOSITE,
@@ -8811,18 +8847,11 @@ class CopsFusedLinearParamGradAddRule(BaseRule):
     """
 
     SUPPORTED_IMPLEMENTATIONS = frozenset({"apex", "te", "torch"})
-    # The Torch fallback is portable across Torch/Transformer Engine builds;
-    # TE remains available through PADDLEAPITEST_IMPL=te.
-    DEFAULT_IMPLEMENTATION = "torch"
+    # 融合线性梯度以 TE 为历史对照基线，torch 和 apex 仅由环境变量显式选择。
+    DEFAULT_IMPLEMENTATION = "te"
 
     def apply(self, paddle_api: str) -> ConvertResult:
-        impl = self.select_implementation()
-        if impl == "apex":
-            core = self._wgrad_gemm_accum_fp32_code()
-        elif impl == "torch":
-            core = self._torch_code()
-        else:
-            core = self._te_general_gemm_code()
+        _, core = self.build_implementation_code()
         return self.build_result(
             paddle_api,
             kind=ConversionKind.COMPOSITE,
@@ -8830,7 +8859,7 @@ class CopsFusedLinearParamGradAddRule(BaseRule):
         )
 
     @staticmethod
-    def _te_general_gemm_code() -> str:
+    def _te_code() -> str:
         return """
 import os as _os
 import ctypes as _ctypes
@@ -8902,7 +8931,7 @@ result = [dweight_out, dbias_out]
 """
 
     @staticmethod
-    def _wgrad_gemm_accum_fp32_code() -> str:
+    def _apex_code() -> str:
         return """
 x               = x
 dout            = dout

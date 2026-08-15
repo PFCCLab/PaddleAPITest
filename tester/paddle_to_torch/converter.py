@@ -11,8 +11,15 @@ from typing import Any
 import torch
 
 from . import rules
-from .config import ConversionEnvironment, read_conversion_environment
-from .rules import BaseRule, ConversionKind, ConvertResult, GenericRule, adaptive_workspace_bytes
+from .rules import (
+    BaseRule,
+    ConversionEnvironment,
+    ConversionKind,
+    ConvertResult,
+    GenericRule,
+    adaptive_workspace_bytes,
+    read_conversion_environment,
+)
 
 _MAPPING_FIELD_TYPES = {
     "Rule": str,

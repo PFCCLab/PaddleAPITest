@@ -24,9 +24,9 @@ Paddle2Torch 是一个专注于将 PaddlePaddle API 转换为 PyTorch 对应实�
 ## 运行时配置与转换状态
 
 Paddle2Torch 统一通过 `PADDLEAPITEST_IMPL` 选择参考实现。合法值为 `torch`、`te` 和
-`apex`。未设置时，每个 Rule 使用自身声明的默认实现；当前大多数 Rule 默认为 `torch`，
-融合线性梯度 Rule 保持原有的 `te` 默认值。当全局值对当前 Rule 不适用时，该 Rule
-同样使用自己的默认实现；非法全局值会在转换前明确报错。
+`apex`。未设置时，每个 Rule 使用自身声明的默认实现；融合线性梯度 Rule 默认为 `te`，
+其余多实现 Rule 默认为 `torch`。当全局值对当前 Rule 不适用时，该 Rule 同样使用自己的
+默认实现；非法全局值会在转换前明确报错。
 转换引擎对每次调用只读取一次配置快照，同一快照同时用于生成代码和转换缓存键。
 原融合线性专用实现变量已退场，不再读取；相关作业必须改用 `PADDLEAPITEST_IMPL`。
 
@@ -73,8 +73,9 @@ Rule 使用 `build_result()` 构造结果，并显式声明 `DIRECT` 或 `COMPOS
 - `postprocess`：恢复 Paddle 的输出 dtype、layout 或数据结构。
 
 存在多个参考实现的 Rule 在类上声明 `SUPPORTED_IMPLEMENTATIONS` 和
-`DEFAULT_IMPLEMENTATION`，并通过无参数的 `select_implementation()` 选择实现。Rule
-不得直接读取实现环境变量，也不得在显式选择的外部实现不可用时静默回退。
+`DEFAULT_IMPLEMENTATION`，将实现代码生成函数统一命名为 `_<实现名>_code()`，并通过
+`build_implementation_code()` 选择实现。Rule 不得直接读取实现环境变量，也不得在显式
+选择的外部实现不可用时静默回退。
 
 ## 开发文档
 
