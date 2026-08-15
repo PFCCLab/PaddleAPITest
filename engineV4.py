@@ -1340,23 +1340,152 @@ def _build_sanitizer_session_command(options, sanitizer_cmd):
     return _append_sanitizer_forward_args(cmd, options)
 
 
-def _terminate_sanitizer_session(process, *, wait=False):
-    """回收 session 进程组；wrapper 和单 case 入口共用同一清理协议。"""
-    if process is None:
-        return
-    if process.poll() is None:
-        try:
-            os.killpg(process.pid, signal.SIGKILL)
-        except (ProcessLookupError, OSError):
+@dataclass(frozen=True)
+class SanitizerSessionResult:
+    # diagnostic 只承载 session 协议故障，不混入普通 sanitizer 输出流。
+    status: str
+    returncode: int
+    diagnostic: str = ""
+
+
+class SanitizerSession:
+    """管理一个常驻 sanitizer 子进程及其顺序 request 协议。"""
+
+    def __init__(self, command, environ):
+        # command/env 在 session 生命周期内固定，request 只改变协议 payload。
+        self.command = tuple(command)
+        self.environ = environ
+        self.process = None
+
+    @property
+    def pid(self):
+        # 调用方只拿 PID 做 watchdog 账务，不得依赖 subprocess 对象的可用性。
+        return self.process.pid if self.process is not None else None
+
+    def start(self, *, on_output, on_started=None):
+        """确保 session ready；新建 session 时返回 ready event。"""
+        # 已 ready 的 session 可直接复用，不重复触发框架初始化和 ready 计时。
+        if self.process is not None and self.process.poll() is None:
+            return None
+        # 已退出进程必须先清账，新的 Popen 才能成为唯一 session 句柄。
+        self.close()
+        self.process = subprocess.Popen(
+            self.command,
+            env=self.environ,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            bufsize=1,
+            start_new_session=True,
+        )
+        # 子进程组必须在框架初始化前登记，startup timeout 才能完整回收它。
+        if on_started is not None:
+            on_started(self.process.pid)
+        while True:
+            # 普通输出交给调用方归集，marker 才属于 session 控制协议。
+            line = self.process.stdout.readline()
+            if not line:
+                self.close(wait=True)
+                raise EOFError("sanitizer session exited before ready")
+            if not line.startswith(SESSION_EVENT_PREFIX):
+                on_output(line)
+                continue
             try:
-                process.kill()
-            except (ProcessLookupError, OSError, AttributeError):
-                pass
-    if wait:
+                event = parse_event(line)
+            except ValueError:
+                self.close(wait=True)
+                raise
+            if event["event"] != "ready":
+                self.close(wait=True)
+                raise ValueError("sanitizer session did not send ready")
+            return event
+
+    def run_request(
+        self,
+        case_id,
+        config,
+        timing_path,
+        *,
+        on_output,
+        workers_on_gpu=None,
+        compute_budget_gib=None,
+        comparison_budget_gib=None,
+    ):
+        """发送一个 request 并读取匹配的唯一终态 marker。"""
+        # session 不可用时返回业务可分类的 crashed，不让调用方接触进程细节。
+        process = self.process
+        if process is None or process.poll() is not None:
+            return SanitizerSessionResult("crashed", -1, "sanitizer session unavailable")
         try:
-            process.wait(timeout=5)
-        except (subprocess.TimeoutExpired, OSError, AttributeError):
-            pass
+            # request 必须由统一编码器生成，避免两个入口产生不同预算协议。
+            process.stdin.write(
+                encode_request(
+                    case_id,
+                    config,
+                    str(timing_path),
+                    workers_on_gpu=workers_on_gpu,
+                    compute_budget_gib=compute_budget_gib,
+                    comparison_budget_gib=comparison_budget_gib,
+                )
+            )
+            process.stdin.flush()
+        except (BrokenPipeError, OSError, AttributeError) as err:
+            # 写入失败表示 request 是否被接受未知，不能尝试在同一 session 重发。
+            self.close(wait=True)
+            return SanitizerSessionResult("crashed", -1, str(err))
+
+        while True:
+            line = process.stdout.readline()
+            if not line:
+                # EOF 后不能复用半关闭 stdout；close 同时回收 sanitizer 进程组。
+                returncode = process.poll()
+                # stdout 提前关闭时即使进程仍存活，也不能复用协议状态未知的 session。
+                self.close(wait=returncode is None)
+                return SanitizerSessionResult("crashed", -1 if returncode is None else returncode)
+            if not line.startswith(SESSION_EVENT_PREFIX):
+                on_output(line)
+                continue
+            try:
+                event = parse_event(line)
+            except ValueError as err:
+                # 非法 marker 会破坏流同步，诊断返回调用方后立即关闭 session。
+                self.close(wait=True)
+                return SanitizerSessionResult(
+                    "crashed", -1, f"[sanitizer session] protocol error: {err}\n"
+                )
+            if event["event"] != "result" or int(event["case_id"]) != case_id:
+                # 结果错配意味着 session 协议已经失去同步，必须整组退役。
+                self.close(wait=True)
+                return SanitizerSessionResult(
+                    "crashed", -1, "[sanitizer session] unexpected result marker\n"
+                )
+            status = str(event["status"])
+            return SanitizerSessionResult(status, 0 if status == "done" else 2)
+
+    def close(self, *, wait=False):
+        # close 幂等，异常路径和 signal handler 可以安全重复调用。
+        process = self.process
+        self.process = None
+        if process is None:
+            return
+        if process.poll() is None:
+            # session 使用独立进程组，必须同时回收 sanitizer 和其目标进程。
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except (ProcessLookupError, OSError):
+                try:
+                    process.kill()
+                except (ProcessLookupError, OSError, AttributeError):
+                    pass
+        if wait:
+            # wait 只用于确定性清理路径；signal handler 保持非阻塞退出。
+            try:
+                process.wait(timeout=5)
+            except (subprocess.TimeoutExpired, OSError, AttributeError):
+                pass
 
 
 def _apply_sanitizer_budget(options, environ=None):
@@ -1410,7 +1539,6 @@ def _sanitizer_worker_loop(
     init_log(options.log_dir)
     log_worker.redirect_stdio()
 
-    child_process = None
     sanitizer_cmd = getattr(options, "sanitizer_cmd", None) or shlex.split(
         options.sanitizer_command
     )
@@ -1419,102 +1547,39 @@ def _sanitizer_worker_loop(
     if visible_gpu_ids is not None:
         child_env["CUDA_VISIBLE_DEVICES"] = visible_gpu_ids
     child_env["PADDLEAPITEST_SUPPRESS_CASE_TAGS"] = "1"
+    session = SanitizerSession(_build_sanitizer_session_command(options, sanitizer_cmd), child_env)
 
     def terminate_child(*args):
-        _terminate_sanitizer_session(child_process)
+        session.close()
         raise SystemExit(1)
 
     signal.signal(signal.SIGINT, terminate_child)
     signal.signal(signal.SIGTERM, terminate_child)
 
-    def drop_session():
-        """协议异常时回收仍存活的 session，避免 wrapper 丢失进程组句柄。"""
-        nonlocal child_process
-        process = child_process
-        child_process = None
-        if process is None or process.poll() is not None:
-            return
-        _terminate_sanitizer_session(process)
-
     def start_session():
         """启动并握手一个 session；失败只影响当前请求，wrapper 可继续重建。"""
-        nonlocal child_process
-        if child_process is not None and child_process.poll() is None:
-            return True
-        cmd = _build_sanitizer_session_command(options, sanitizer_cmd)
         try:
-            child_process = subprocess.Popen(
-                cmd,
-                env=child_env,
-                stdin=subprocess.PIPE,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                bufsize=1,
-                start_new_session=True,
+            ready_event = session.start(
+                on_output=lambda line: print(line, end="", flush=True),
+                on_started=lambda child_pid: result_queue.put(
+                    ("child", slot_index, os.getpid(), child_pid)
+                ),
             )
         except OSError as err:
-            child_process = None
             print(f"[sanitizer session] spawn failed: {err}", flush=True)
             return False
-        result_queue.put(("child", slot_index, os.getpid(), child_process.pid))
-        while True:
-            line = child_process.stdout.readline()
-            if not line:
-                child_process = None
-                return False
-            if line.startswith("__PADDLEAPITEST_SANITIZER_SESSION__ "):
-                try:
-                    event = parse_event(line)
-                except ValueError:
-                    drop_session()
-                    return False
-                if event["event"] == "ready":
-                    result_queue.put(
-                        (
-                            "sanitizer_session_ready",
-                            slot_index,
-                            os.getpid(),
-                            float(event.get("framework_ms", 0.0)),
-                        )
-                    )
-                    return True
-                drop_session()
-                return False
-            print(line, end="", flush=True)
-
-    def read_session_result(case_id, output_file, output_tail):
-        """读取一个 request 的输出，EOF 表示 session crash。"""
-        nonlocal child_process
-        while True:
-            line = child_process.stdout.readline()
-            if not line:
-                returncode = child_process.poll()
-                # stdout 提前关闭时进程可能仍存活；不能把坏 session 留给下一 request。
-                if returncode is None:
-                    drop_session()
-                    returncode = -1
-                return "crashed", returncode, "".join(output_tail)
-            if line.startswith("__PADDLEAPITEST_SANITIZER_SESSION__ "):
-                try:
-                    event = parse_event(line)
-                except ValueError as err:
-                    output_tail.append(f"[sanitizer session] protocol error: {err}\n")
-                    drop_session()
-                    return "crashed", -1, "".join(output_tail)
-                if event["event"] != "result" or int(event["case_id"]) != case_id:
-                    output_tail.append("[sanitizer session] unexpected result marker\n")
-                    drop_session()
-                    return "crashed", -1, "".join(output_tail)
-                return (
-                    str(event["status"]),
-                    0 if event["status"] == "done" else 2,
-                    "".join(output_tail),
+        except (EOFError, ValueError):
+            return False
+        if ready_event is not None:
+            result_queue.put(
+                (
+                    "sanitizer_session_ready",
+                    slot_index,
+                    os.getpid(),
+                    float(ready_event.get("framework_ms", 0.0)),
                 )
-            output_tail.append(line)
-            output_file.write(line)
+            )
+        return True
 
     try:
         result_queue.put(("loaded", slot_index, os.getpid()))
@@ -1566,41 +1631,39 @@ def _sanitizer_worker_loop(
                 continue
 
             request_id += 1
-            result_queue.put(("child", slot_index, os.getpid(), child_process.pid))
+            result_queue.put(("child", slot_index, os.getpid(), session.pid))
             output_tail = deque(maxlen=40)
             with tempfile.TemporaryFile(
                 mode="w+t", encoding="utf-8", errors="replace"
             ) as output_file:
                 timing_path = case_log_dir / "timing.tsv"
-                try:
-                    worker_task = (
-                        task
-                        if isinstance(task, WorkerTask)
-                        else WorkerTask(
-                            config=api_config_str,
-                            workers_on_gpu=1,
-                            compute_budget_gib=0.0,
-                        )
+                worker_task = (
+                    task
+                    if isinstance(task, WorkerTask)
+                    else WorkerTask(
+                        config=api_config_str,
+                        workers_on_gpu=1,
+                        compute_budget_gib=0.0,
                     )
-                    child_process.stdin.write(
-                        encode_request(
-                            request_id,
-                            api_config_str,
-                            str(timing_path),
-                            workers_on_gpu=worker_task.workers_on_gpu,
-                            compute_budget_gib=worker_task.compute_budget_gib,
-                            comparison_budget_gib=worker_task.comparison_budget_gib,
-                        )
-                    )
-                    child_process.stdin.flush()
-                except (BrokenPipeError, OSError, AttributeError):
-                    status, returncode, child_output = "crashed", -1, ""
-                else:
-                    status, returncode, child_output = read_session_result(
-                        request_id, output_file, output_tail
-                    )
-                output_tail.clear()
-                output_tail.extend(child_output.splitlines(keepends=True))
+                )
+
+                def capture_output(line):
+                    output_tail.append(line)
+                    output_file.write(line)
+
+                request_result = session.run_request(
+                    request_id,
+                    api_config_str,
+                    timing_path,
+                    on_output=capture_output,
+                    workers_on_gpu=worker_task.workers_on_gpu,
+                    compute_budget_gib=worker_task.compute_budget_gib,
+                    comparison_budget_gib=worker_task.comparison_budget_gib,
+                )
+                status = request_result.status
+                returncode = request_result.returncode
+                if request_result.diagnostic:
+                    output_tail.append(request_result.diagnostic)
                 # 先读取隔离 timing 文件，再删除目录；消息不是 case 终态。
                 # timing 归属 wrapper 执行阶段，不能与 request 的最终状态竞争 terminal claim。
                 for phase, duration in parse_sanitizer_timing_file(timing_path).items():
@@ -1689,11 +1752,7 @@ def _sanitizer_worker_loop(
                         )
                     )
     finally:
-        if child_process is not None and child_process.poll() is None:
-            try:
-                _terminate_sanitizer_session(child_process, wait=True)
-            finally:
-                child_process = None
+        session.close(wait=True)
         try:
             log_runtime.close_process_files()
             log_worker.restore_stdio()
@@ -2807,62 +2866,30 @@ def _run_single_config_with_sanitizer(options):
     if gpu_ids:
         env["CUDA_VISIBLE_DEVICES"] = ",".join(str(gpu_id) for gpu_id in gpu_ids)
 
-    process = None
+    session = SanitizerSession(cmd, env)
     raw_lines = []
     status = "crashed"
     returncode = -1
     with tempfile.TemporaryDirectory(prefix="sanitizer_single_") as timing_dir:
         timing_path = Path(timing_dir) / "timing.tsv"
         try:
-            process = subprocess.Popen(
-                cmd,
-                env=env,
-                stdin=subprocess.PIPE,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                bufsize=1,
-                start_new_session=True,
+            session.start(on_output=raw_lines.append)
+            request_result = session.run_request(
+                0,
+                api_config,
+                timing_path,
+                on_output=raw_lines.append,
             )
-            ready = False
-            while True:
-                line = process.stdout.readline()
-                if not line:
-                    break
-                if not line.startswith(SESSION_EVENT_PREFIX):
-                    raw_lines.append(line)
-                    continue
-                event = parse_event(line)
-                if event["event"] != "ready":
-                    raise ValueError("sanitizer session did not send ready")
-                ready = True
-                break
-            if ready:
-                process.stdin.write(encode_request(0, api_config, str(timing_path)))
-                process.stdin.flush()
-                while True:
-                    line = process.stdout.readline()
-                    if not line:
-                        returncode = process.poll()
-                        returncode = -1 if returncode is None else returncode
-                        break
-                    if not line.startswith(SESSION_EVENT_PREFIX):
-                        raw_lines.append(line)
-                        continue
-                    event = parse_event(line)
-                    if event["event"] != "result" or int(event["case_id"]) != 0:
-                        raise ValueError("sanitizer session returned an unexpected result")
-                    status = str(event["status"])
-                    returncode = 0 if status == "done" else 2
-                    break
-        except (BrokenPipeError, OSError, ValueError) as err:
+            status = request_result.status
+            returncode = request_result.returncode
+            if request_result.diagnostic:
+                raw_lines.append(request_result.diagnostic)
+        except (EOFError, OSError, ValueError) as err:
             raw_lines.append(f"[sanitizer session] {err}\n")
             status = "crashed"
             returncode = -1
         finally:
-            _terminate_sanitizer_session(process, wait=True)
+            session.close(wait=True)
 
     raw_output = "".join(raw_lines)
     if status == "done" and _sanitizer_session_output_has_report(raw_output):
