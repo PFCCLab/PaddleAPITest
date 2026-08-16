@@ -331,6 +331,9 @@ class APITestBase:
         )
         self.output_grad_slots = []
         self.output_grad_slots_signature = None
+        from .input_generation.backend_runtime import reset_output_grad_streams
+
+        reset_output_grad_streams()
         # 同一 case 的结果树共享设备快照，避免每个叶子重复查询 CUDA allocator。
         self.comparison_workspace_cache = {}
         if use_torch:
@@ -806,34 +809,16 @@ class APITestBase:
 
         return [t for t in result if t.requires_grad]
 
-    def _output_grad_stream_index(self, backend):
-        """为同一 config 的多输出梯度分配独立 stream 序号。"""
-        counters = getattr(self, "_output_grad_stream_counters", None)
-        if counters is None:
-            counters = collections.Counter()
-            self._output_grad_stream_counters = counters
-        index = counters[backend]
-        counters[backend] += 1
-        return index
-
     def _make_numpy_output_grad(self, output):
         dtype = _dtype_name(output.dtype)
-        from .input_generation.backend_runtime import generate_output_grad
+        from .input_generation.backend_runtime import generate_output_grad_for_runtime
 
-        return generate_output_grad(
+        return generate_output_grad_for_runtime(
             dtype=dtype,
             shape=output.shape,
-            backend_name="numpy",
             device="cpu",
-            seed=getattr(self.runtime_config, "random_seed", 0),
-            config_fingerprint=getattr(self.api_config, "config", ""),
-            # output-grad 只读取自己的 runtime 字段，避免复用 forward 开关。
-            max_abs=getattr(self.runtime_config, "output_grad_max_abs", 0.5),
-            range_configured=getattr(
-                self.runtime_config, "output_grad_max_abs_is_configured", False
-            ),
-            stream_index=self._output_grad_stream_index("numpy"),
-            cache_enabled=bool(getattr(self.runtime_config, "use_cached_numpy", False)),
+            runtime_config=self.runtime_config,
+            config_fingerprint=self.api_config.config,
         )
 
     @staticmethod
@@ -870,20 +855,14 @@ class APITestBase:
 
     def _make_torch_output_grad(self, shape, dtype, device=None):
         device = device or torch.device("cuda", torch.cuda.current_device())
-        from .input_generation.backend_runtime import generate_output_grad
+        from .input_generation.backend_runtime import generate_output_grad_for_runtime
 
-        return generate_output_grad(
+        return generate_output_grad_for_runtime(
             dtype=dtype,
             shape=shape,
-            backend_name="torch",
             device=str(device),
-            seed=getattr(self.runtime_config, "random_seed", 0),
-            config_fingerprint=getattr(self.api_config, "config", ""),
-            max_abs=getattr(self.runtime_config, "output_grad_max_abs", 0.5),
-            range_configured=getattr(
-                self.runtime_config, "output_grad_max_abs_is_configured", False
-            ),
-            stream_index=self._output_grad_stream_index("torch"),
+            runtime_config=self.runtime_config,
+            config_fingerprint=self.api_config.config,
         )
 
     def _make_paddle_output_grad(self, shape, dtype, place=None):
@@ -892,20 +871,14 @@ class APITestBase:
             device = f"gpu:{place.gpu_device_id()}"
         else:
             device = "cpu"
-        from .input_generation.backend_runtime import generate_output_grad
+        from .input_generation.backend_runtime import generate_output_grad_for_runtime
 
-        return generate_output_grad(
+        return generate_output_grad_for_runtime(
             dtype=dtype,
             shape=shape,
-            backend_name="paddle",
             device=device,
-            seed=getattr(self.runtime_config, "random_seed", 0),
-            config_fingerprint=getattr(self.api_config, "config", ""),
-            max_abs=getattr(self.runtime_config, "output_grad_max_abs", 0.5),
-            range_configured=getattr(
-                self.runtime_config, "output_grad_max_abs_is_configured", False
-            ),
-            stream_index=self._output_grad_stream_index("paddle"),
+            runtime_config=self.runtime_config,
+            config_fingerprint=self.api_config.config,
         )
 
     @staticmethod

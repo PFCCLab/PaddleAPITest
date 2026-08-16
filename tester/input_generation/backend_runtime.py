@@ -97,6 +97,35 @@ class InputBackendPolicy:
     mode: str | None = None
 
 
+@dataclass(frozen=True)
+class OutputGradContext:
+    """冻结一次 output-grad 生成所需的运行策略。"""
+
+    backend_name: str
+    seed: int
+    config_fingerprint: str
+    max_abs: float
+    range_configured: bool
+    cache_enabled: bool = False
+
+    @classmethod
+    def from_runtime_config(cls, runtime_config, *, config_fingerprint=""):
+        """从 worker 已冻结配置读取 output-grad 事实，避免调用方重复拆字段。"""
+        backend_name = getattr(runtime_config, "input_backend_resolved", None)
+        if backend_name is None:
+            raise ValueError("runtime config has no resolved input backend")
+        return cls(
+            backend_name=backend_name,
+            seed=int(getattr(runtime_config, "random_seed", 0)),
+            config_fingerprint=str(config_fingerprint),
+            max_abs=float(getattr(runtime_config, "output_grad_max_abs", 0.5)),
+            range_configured=bool(
+                getattr(runtime_config, "output_grad_max_abs_is_configured", False)
+            ),
+            cache_enabled=bool(getattr(runtime_config, "use_cached_numpy", False)),
+        )
+
+
 class InputBackendRuntime:
     """Own prepared backend handles for one worker process."""
 
@@ -104,6 +133,7 @@ class InputBackendRuntime:
         # backend implementation 不持有 cache；clear 后新一轮 prepare 必须重新探测设备。
         self._prepared = {}
         self._cached_numpy_output_grads = {}
+        self._output_grad_stream_counters = {}
 
     def create(self, input_random_state, *, policy):
         """Create a backend using the prepared handle selected by policy."""
@@ -152,6 +182,104 @@ class InputBackendRuntime:
         """Drop prepared handles and cached output gradients."""
         self._prepared.clear()
         self._cached_numpy_output_grads.clear()
+        self._output_grad_stream_counters.clear()
+
+    def output_grad_context(self, runtime_config, *, config_fingerprint=""):
+        # fingerprint 来自 API 配置，不属于可变的 worker runtime 选项。
+        return OutputGradContext.from_runtime_config(
+            runtime_config, config_fingerprint=config_fingerprint
+        )
+
+    def reset_output_grad_streams(self):
+        """Reset stream identity at the output-grad slot lifecycle boundary."""
+        # 每个 tester case 都从 stream 0 开始，确保相同配置的结果可复现。
+        self._output_grad_stream_counters.clear()
+
+    def generate_output_grad(
+        self,
+        *,
+        dtype,
+        shape,
+        device,
+        context,
+        stream_index=None,
+    ):
+        """按冻结上下文生成并物化一个 output grad。"""
+        if not isinstance(context, OutputGradContext):
+            raise TypeError("output-grad context is required")
+        dtype = str(dtype)
+        if stream_index is None:
+            # stream 序号由 owner 分配，caller 只描述一个输出规格。
+            stream_index = self._output_grad_stream_counters.get(context.backend_name, 0)
+            self._output_grad_stream_counters[context.backend_name] = stream_index + 1
+        # 未显式设置范围时保持 legacy 的 [-0.5, 0.5) 协议。
+        max_abs = context.max_abs if context.range_configured else 0.5
+        stream_kind = f"output_grad:{context.backend_name}:{int(stream_index)}"
+        if context.cache_enabled:
+            # 原生 Tensor 绑定设备，只有 NumPy seed 允许跨调用缓存。
+            if context.backend_name != "numpy":
+                raise ValueError("output-grad cache requires the NumPy backend")
+            return self.cached_numpy_output_grad(
+                dtype,
+                shape,
+                stream_kind,
+                context.seed,
+                context.config_fingerprint,
+                max_abs,
+            )
+        if context.backend_name == "numpy":
+            # NumPy 通过独立 InputConfigRandomState 保持框架 RNG 隔离。
+            backend = NumPyInputBackend(
+                InputConfigRandomState(
+                    context.seed, context.config_fingerprint, stream_kind=stream_kind
+                )
+            )
+        else:
+            stream_identity = SimpleNamespace(
+                seed=context.seed,
+                config_fingerprint=context.config_fingerprint,
+                stream_kind=stream_kind,
+            )
+            if context.backend_name == "torch":
+                # Torch backend 以 device 作为最终物化位置，而非逻辑策略输入。
+                backend = TorchInputBackend(stream_identity, device=device)
+            elif context.backend_name == "paddle":
+                # Paddle backend 的随机状态由 backend 自己保存并恢复。
+                backend = PaddleInputBackend(stream_identity, device=device)
+            else:
+                raise ValueError(f"unsupported output-grad backend: {context.backend_name!r}")
+        if "int" in dtype:
+            # 整数梯度沿用固定宽度范围，不受浮点 max_abs 旋钮影响。
+            return backend.randint(-65535, 65535, shape=shape, dtype=dtype)
+        base_dtype = (
+            "float16"
+            if dtype in {"float8_e5m2", "float8_e4m3fn"}
+            else "float32"
+            if dtype == "bfloat16"
+            else dtype
+        )
+        if context.range_configured:
+            # 显式范围同时约束复数两个分量，避免 caller 各自解释策略。
+            spec = InputTensorSpec(tuple(shape), base_dtype, None, False, None)
+            value = generate_symmetric_input_value(spec, max_abs, backend)
+        elif dtype.startswith("complex"):
+            # 默认复数保留历史两次 random 调用顺序，兼容已有基线。
+            real_dtype = "float32" if dtype == "complex64" else "float64"
+            value = backend.cast(
+                backend.random(shape, dtype=real_dtype)
+                - 0.5
+                + 1j * (backend.random(shape, dtype=real_dtype) - 0.5),
+                dtype,
+            )
+        else:
+            # 默认实数路径保留 uniform 调用，避免改变历史采样顺序。
+            value = backend.uniform(-0.5, 0.5, shape=shape, dtype=base_dtype)
+        if base_dtype == dtype or context.backend_name == "numpy":
+            # NumPy seed 暂不做框架 dtype 转换，转换由 slot 消费方负责。
+            return value
+        if context.backend_name == "torch":
+            return value.to(dtype=to_torch_dtype(dtype))
+        return backend._paddle().cast(value, dtype=dtype)
 
     def cached_numpy_output_grad(
         self,
@@ -201,6 +329,26 @@ def clear_input_backend_runtime():
     _INPUT_BACKEND_RUNTIME.clear()
 
 
+def reset_output_grad_streams():
+    """Reset output-grad stream identity for a new tester case."""
+    _INPUT_BACKEND_RUNTIME.reset_output_grad_streams()
+
+
+def generate_output_grad_for_runtime(
+    *, dtype, shape, device, runtime_config, config_fingerprint=""
+):
+    """Generate output grad from the frozen runtime config owned by the worker."""
+    context = OutputGradContext.from_runtime_config(
+        runtime_config, config_fingerprint=config_fingerprint
+    )
+    return _INPUT_BACKEND_RUNTIME.generate_output_grad(
+        dtype=dtype,
+        shape=shape,
+        device=device,
+        context=context,
+    )
+
+
 def generate_output_grad(
     *,
     dtype,
@@ -214,77 +362,33 @@ def generate_output_grad(
     stream_index=0,
     cache_enabled=False,
 ):
-    """用独立随机流生成 output grad。"""
-    # output grad 使用独立 stream，不能推进前向输入的随机状态。
-    dtype = str(dtype)
-    # 只有显式环境配置才能改变旧 output-grad 随机流和数值范围。
-    max_abs = max_abs if range_configured else 0.5
-    stream_kind = f"output_grad:{backend_name}:{int(stream_index)}"
-    if cache_enabled:
-        # 只有 NumPy cache 可跨调用复用，原生 Tensor 绑定设备上下文。
-        if backend_name != "numpy":
-            raise ValueError("output-grad cache requires the NumPy backend")
-        return _INPUT_BACKEND_RUNTIME.cached_numpy_output_grad(
-            dtype,
-            shape,
-            stream_kind,
-            seed,
-            config_fingerprint,
-            max_abs,
-        )
-    # 非缓存路径按 backend 创建私有随机源，避免污染框架全局 RNG。
-    if backend_name == "numpy":
-        backend = NumPyInputBackend(
-            InputConfigRandomState(seed, config_fingerprint, stream_kind=stream_kind)
-        )
-    else:
-        stream_identity = SimpleNamespace(
-            seed=seed, config_fingerprint=config_fingerprint, stream_kind=stream_kind
-        )
-        if backend_name == "torch":
-            backend = TorchInputBackend(stream_identity, device=device)
-        elif backend_name == "paddle":
-            backend = PaddleInputBackend(stream_identity, device=device)
-        else:
-            raise ValueError(f"unsupported output-grad backend: {backend_name!r}")
-    if "int" in dtype:
-        return backend.randint(-65535, 65535, shape=shape, dtype=dtype)
-    base_dtype = (
-        "float16"
-        if dtype in {"float8_e5m2", "float8_e4m3fn"}
-        else "float32"
-        if dtype == "bfloat16"
-        else dtype
+    """Compatibility wrapper for callers that still pass expanded facts."""
+    context = OutputGradContext(
+        backend_name=backend_name,
+        seed=int(seed),
+        config_fingerprint=str(config_fingerprint),
+        max_abs=float(max_abs),
+        range_configured=bool(range_configured),
+        cache_enabled=bool(cache_enabled),
     )
-    if range_configured:
-        # 新协议统一覆盖 real/complex，复数两个分量使用相同上界。
-        spec = InputTensorSpec(tuple(shape), base_dtype, None, False, None)
-        value = generate_symmetric_input_value(spec, max_abs, backend)
-    elif dtype.startswith("complex"):
-        # legacy complex 保留原有 RNG 调用次序，避免默认精度基线变化。
-        real_dtype = "float32" if dtype == "complex64" else "float64"
-        value = backend.cast(
-            backend.random(shape, dtype=real_dtype)
-            - 0.5
-            + 1j * (backend.random(shape, dtype=real_dtype) - 0.5),
-            dtype,
-        )
-    else:
-        # legacy real 继续使用 backend uniform，不切换到 random 缩放公式。
-        value = backend.uniform(-0.5, 0.5, shape=shape, dtype=base_dtype)
-    if base_dtype == dtype or backend_name == "numpy":
-        return value
-    if backend_name == "torch":
-        return value.to(dtype=to_torch_dtype(dtype))
-    return backend._paddle().cast(value, dtype=dtype)
+    return _INPUT_BACKEND_RUNTIME.generate_output_grad(
+        dtype=dtype,
+        shape=shape,
+        device=device,
+        context=context,
+        stream_index=stream_index,
+    )
 
 
 __all__ = [
     "InputBackendPolicy",
     "InputBackendRuntime",
+    "OutputGradContext",
     "clear_input_backend_runtime",
     "create_input_backend",
     "generate_output_grad",
+    "generate_output_grad_for_runtime",
     "prepare_input_backend",
+    "reset_output_grad_streams",
     "resolve_input_backend_policy",
 ]
