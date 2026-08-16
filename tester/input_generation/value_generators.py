@@ -39,8 +39,10 @@ class InputNumPyRandomState:
             return numpy.random.randint(low, high, size=shape)
         return numpy.random.randint(low, high, size=shape, dtype=dtype)
 
-    def uniform(self, low=0.0, high=1.0, shape=None):
-        return numpy.random.uniform(low, high, size=shape)
+    def uniform(self, low=0.0, high=1.0, shape=None, dtype=None):
+        value = numpy.random.uniform(low, high, size=shape)
+        # numpy scalar 没有 astype，转数组仍可保持标量 shape。
+        return value if dtype is None else numpy.asarray(value, dtype=dtype)
 
     def randn(self, *args, **kwargs):
         return numpy.random.randn(*args, **kwargs)
@@ -87,8 +89,9 @@ class InputConfigRandomState(InputNumPyRandomState):
             return self._state.randint(low, high, size=shape)
         return self._state.randint(low, high, size=shape, dtype=dtype)
 
-    def uniform(self, low=0.0, high=1.0, shape=None):
-        return self._state.uniform(low, high, size=shape)
+    def uniform(self, low=0.0, high=1.0, shape=None, dtype=None):
+        value = self._state.uniform(low, high, size=shape)
+        return value if dtype is None else numpy.asarray(value, dtype=dtype)
 
     def randn(self, *args, **kwargs):
         return self._state.randn(*args, **kwargs)
@@ -117,14 +120,60 @@ def _complex_parts(dtype, shape, rng, *, low=None, high=None, offset=0.0, scale=
         real = rng.random(shape) * scale + offset
         imag = rng.random(shape) * scale + offset
     else:
-        real = rng.uniform(low, high, shape=shape)
-        imag = rng.uniform(low, high, shape=shape)
+        # 显式 real dtype 防止 backend 先按 float32 校验 float64 边界。
+        real = rng.uniform(low, high, shape=shape, dtype=real_dtype)
+        imag = rng.uniform(low, high, shape=shape, dtype=real_dtype)
     return rng.cast(real, real_dtype), rng.cast(imag, real_dtype)
 
 
 def _complex_value(dtype, shape, rng, **kwargs):
     real, imag = _complex_parts(dtype, shape, rng, **kwargs)
     return rng.cast(real + 1j * imag, dtype)
+
+
+def generate_symmetric_input_value(
+    spec: InputTensorSpec,
+    max_abs,
+    rng=INPUT_NUMPY_RANDOM_STATE,
+) -> object:
+    """生成实部和虚部分量均位于对称区间的数值。"""
+    dtype = resolve_input_dtype(spec.dtype)
+    if dtype.startswith("complex"):
+        # max_abs 约束每个分量，复数模长允许达到 sqrt(2) 倍上界。
+        return _complex_value(dtype, spec.shape, rng, offset=-max_abs, scale=2 * max_abs)
+    return rng.cast((rng.random(spec.shape) - 0.5) * (2 * max_abs), dtype)
+
+
+def generate_nonzero_symmetric_input_value(
+    spec: InputTensorSpec,
+    max_abs,
+    rng=INPUT_NUMPY_RANDOM_STATE,
+) -> object:
+    """生成可配置对称范围并替换量化后产生的零值。"""
+    dtype = resolve_input_dtype(spec.dtype)
+    value = generate_symmetric_input_value(spec, max_abs, rng)
+    # replacement 保持相同 dtype，避免低精度 Tensor 被 Python 标量提升。
+    replacement = rng.asarray(max_abs, dtype=dtype)
+    return rng.where(value == 0, replacement, value)
+
+
+def generate_normal_input_value(
+    spec: InputTensorSpec,
+    rng=INPUT_NUMPY_RANDOM_STATE,
+    *,
+    scale=1.0,
+) -> object:
+    """生成实部和虚部独立的正态分布数值。"""
+    dtype = resolve_input_dtype(spec.dtype)
+    if dtype.startswith("complex"):
+        # 正态复数消费两次独立随机流，不能将 real 结果直接 cast。
+        real_dtype = "float32" if dtype == "complex64" else "float64"
+        real = rng.cast(rng.randn(*spec.shape), real_dtype)
+        imag = rng.cast(rng.randn(*spec.shape), real_dtype)
+        value = rng.cast(real + 1j * imag, dtype)
+    else:
+        value = rng.cast(rng.randn(*spec.shape), dtype)
+    return rng.cast(value * scale, dtype)
 
 
 def generate_default_input_value(
@@ -135,23 +184,13 @@ def generate_default_input_value(
 ) -> object:
     """生成默认值。"""
     dtype = resolve_input_dtype(spec.dtype)
-    shape = spec.shape
-    if not shape:
-        if "int" in dtype:
-            return rng.asarray(rng.randint(-65535, 65535), dtype=dtype)
-        if dtype.startswith("complex"):
-            # 实部和虚部分别服从同一对称范围，保持原有独立随机抽样协议。
-            real = (rng.random() - 0.5) * (2 * max_abs)
-            imag = (rng.random() - 0.5) * (2 * max_abs)
-            return rng.asarray(real + 1j * imag, dtype=dtype)
-        return rng.asarray((rng.random() - 0.5) * (2 * max_abs), dtype=dtype)
-
+    if dtype == "bool":
+        # 连续随机数 cast 到 bool 几乎恒为 True，必须直接采样二值空间。
+        return rng.cast(rng.randint(0, 2, shape=spec.shape), dtype)
     if "int" in dtype:
         # 运行级浮点范围不能收窄已有的整数压力测试范围。
-        return rng.cast(rng.randint(-65535, 65535, shape=shape), dtype)
-    if dtype.startswith("complex"):
-        return _complex_value(dtype, shape, rng, offset=-max_abs, scale=2 * max_abs)
-    return rng.cast((rng.random(shape) - 0.5) * (2 * max_abs), dtype)
+        return rng.cast(rng.randint(-65535, 65535, shape=spec.shape), dtype)
+    return generate_symmetric_input_value(spec, max_abs, rng)
 
 
 def generate_nonzero_input_value(spec: InputTensorSpec, rng=INPUT_NUMPY_RANDOM_STATE) -> object:
@@ -169,14 +208,6 @@ def generate_nonzero_input_value(spec: InputTensorSpec, rng=INPUT_NUMPY_RANDOM_S
     if dtype.startswith("complex"):
         return _complex_value(dtype, shape, rng, offset=0.5)
     return rng.cast(rng.random(shape) + 0.5, dtype)
-
-
-def generate_fill_input_value(spec: InputTensorSpec, rng=INPUT_NUMPY_RANDOM_STATE) -> object:
-    """生成 `paddle.full` 的填充值。"""
-    dtype = resolve_input_dtype(spec.dtype)
-    if "int" in dtype:
-        return rng.cast(rng.randint(1, 65535, shape=spec.shape), dtype)
-    return rng.cast(rng.random(spec.shape) + 0.5, dtype)
 
 
 def generate_unit_interval_input_value(
@@ -199,14 +230,6 @@ def generate_unit_plus_one_input_value(
 ) -> object:
     """生成 [1, 2) 随机值。"""
     return rng.cast(rng.random(spec.shape) + 1.0, resolve_input_dtype(spec.dtype))
-
-
-def generate_signed_half_input_value(spec: InputTensorSpec, rng=INPUT_NUMPY_RANDOM_STATE) -> object:
-    """生成 [-0.5, 0.5) 随机值。"""
-    dtype = resolve_input_dtype(spec.dtype)
-    if "int" in dtype:
-        return rng.cast(rng.randint(-65535, 65535, shape=spec.shape), dtype)
-    return rng.cast(rng.random(spec.shape) - 0.5, dtype)
 
 
 def generate_normal_std_input_value(spec: InputTensorSpec, rng=INPUT_NUMPY_RANDOM_STATE) -> object:
@@ -285,16 +308,6 @@ def generate_int_or_unit_input_value(spec: InputTensorSpec, rng=INPUT_NUMPY_RAND
     return rng.cast(rng.random(spec.shape), dtype)
 
 
-def generate_int_or_default_input_value(
-    spec: InputTensorSpec, rng=INPUT_NUMPY_RANDOM_STATE
-) -> object:
-    """生成 `paddle.dot` 值。"""
-    dtype = resolve_input_dtype(spec.dtype)
-    if "int" in dtype:
-        return rng.cast(rng.randint(-127, 127, shape=spec.shape), dtype)
-    return generate_default_input_value(spec, rng)
-
-
 def generate_binary_input_value(spec: InputTensorSpec, rng=INPUT_NUMPY_RANDOM_STATE) -> object:
     """生成二值标签 {0, 1}。"""
     return rng.cast(
@@ -331,14 +344,6 @@ def generate_quantile_input_value(spec: InputTensorSpec, rng=INPUT_NUMPY_RANDOM_
     return rng.cast(rng.random(1), resolve_input_dtype(spec.dtype))
 
 
-def generate_remainder_input_value(spec: InputTensorSpec, rng=INPUT_NUMPY_RANDOM_STATE) -> object:
-    """生成 remainder 除数值。"""
-    dtype = resolve_input_dtype(spec.dtype)
-    if dtype in {"int32", "int64"}:
-        return generate_uniform_input_value(spec, 1, 65535, rng)
-    return generate_default_input_value(spec, rng)
-
-
 def generate_random_range_input_value(
     spec: InputTensorSpec,
     low=None,
@@ -347,18 +352,23 @@ def generate_random_range_input_value(
 ) -> object:
     """生成指定区间内的随机值。"""
     dtype = resolve_input_dtype(spec.dtype)
+    if dtype == "bool":
+        return rng.cast(rng.randint(0, 2, shape=spec.shape), dtype)
     if "int" in dtype:
         low = low if low is not None else -65535
         high = high if high is not None else 65535
         return rng.cast(rng.randint(low, high, shape=spec.shape), dtype)
     if dtype.startswith("complex"):
         real_dtype = "float32" if dtype == "complex64" else "float64"
-        real_low = low if low is not None else numpy.finfo(real_dtype).min / 2
-        real_high = high if high is not None else numpy.finfo(real_dtype).max / 2
+        # 原生随机算子的公共参数精度是 float32，默认边界必须三后端均可表示。
+        limit = min(numpy.finfo(real_dtype).max, numpy.finfo("float32").max) / 4
+        real_low = low if low is not None else -limit
+        real_high = high if high is not None else limit
         return _complex_value(dtype, spec.shape, rng, low=real_low, high=real_high)
-    low = low if low is not None else numpy.finfo(dtype).min / 2
-    high = high if high is not None else numpy.finfo(dtype).max / 2
-    return rng.cast(rng.uniform(low, high, shape=spec.shape), dtype)
+    limit = min(numpy.finfo(dtype).max, numpy.finfo("float32").max) / 4
+    low = low if low is not None else -limit
+    high = high if high is not None else limit
+    return rng.uniform(low, high, shape=spec.shape, dtype=dtype)
 
 
 def generate_uniform_input_value(
@@ -373,4 +383,4 @@ def generate_uniform_input_value(
         return rng.cast(rng.randint(low, high, shape=spec.shape), dtype)
     if dtype.startswith("complex"):
         return _complex_value(dtype, spec.shape, rng, low=low, high=high)
-    return rng.cast(rng.uniform(low, high, shape=spec.shape), dtype)
+    return rng.uniform(low, high, shape=spec.shape, dtype=dtype)

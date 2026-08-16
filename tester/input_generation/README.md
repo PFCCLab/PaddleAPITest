@@ -150,8 +150,10 @@ def generate_example(rule):
 PADDLEAPITEST_INPUT_MAX_ABS=10 python engineV4.py ...
 ```
 
-此时默认范围为 `[-10, 10)`；未设置时仍为 `[-0.6, 0.6)`。整数以及概率、索引、
-shape 等 API 专用值域不受影响。该值必须是有限正数，并在运行时配置创建时冻结。
+此时默认范围为 `[-10, 10)`；复数的实部和虚部分别使用该范围。显式设置变量时，
+backward output-grad 也使用同一范围；未设置时 forward 仍为 `[-0.6, 0.6)`，
+output-grad 保持历史 `[-0.5, 0.5)`。整数以及概率、索引、shape 等 API 专用值域不受影响。
+该值必须是有限正数，并在运行时配置创建时冻结。
 
 ## 验证
 

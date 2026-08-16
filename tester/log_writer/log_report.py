@@ -258,6 +258,11 @@ def print_run_header(options, paddle_version):
     compute = []
     if getattr(options, "random_seed", 0) != 0:
         test.append(("--random_seed", options.random_seed))
+    runtime_config = getattr(options, "runtime_config", None)
+    if runtime_config is not None:
+        # 记录生效值而非原始环境字符串，失败日志可直接复现输入范围。
+        test.append(("PADDLEAPITEST_INPUT_MAX_ABS", runtime_config.input_max_abs))
+        test.append(("output_grad_max_abs", runtime_config.output_grad_max_abs))
     if options.test_cpu:
         compute.append(("--test_cpu", True))
     if requires_gpu:

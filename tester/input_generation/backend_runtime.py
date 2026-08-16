@@ -6,7 +6,6 @@ import os
 from dataclasses import dataclass
 from types import SimpleNamespace
 
-import numpy
 from tester.dtype_utils import to_torch_dtype
 
 from .backend import (
@@ -15,7 +14,12 @@ from .backend import (
     TorchInputBackend,
     _normalize_shape,
 )
-from .value_generators import INPUT_NUMPY_RANDOM_STATE, InputConfigRandomState, derive_input_seed
+from .value_generators import (
+    INPUT_NUMPY_RANDOM_STATE,
+    InputConfigRandomState,
+    generate_symmetric_input_value,
+)
+from .values import InputTensorSpec
 
 INPUT_BACKEND_ENV_VAR = "PADDLEAPITEST_INPUT_BACKEND"
 _TRUE_VALUES = {"true", "1", "yes", "y"}
@@ -149,7 +153,15 @@ class InputBackendRuntime:
         self._prepared.clear()
         self._cached_numpy_output_grads.clear()
 
-    def cached_numpy_output_grad(self, dtype, shape, stream_kind, seed, config_fingerprint):
+    def cached_numpy_output_grad(
+        self,
+        dtype,
+        shape,
+        stream_kind,
+        seed,
+        config_fingerprint,
+        max_abs,
+    ):
         """Return the process-local cached NumPy output gradient."""
         # output-grad cache 与 prepared handle 一起清理，避免跨 runtime 配置复用数组。
         if dtype in {"float8_e5m2", "float8_e4m3fn"}:
@@ -157,21 +169,21 @@ class InputBackendRuntime:
         elif dtype == "bfloat16":
             dtype = "float32"
         shape = _normalize_shape(shape, scalar_empty=False)
-        key = (dtype, shape, stream_kind, int(seed), str(config_fingerprint))
+        # 范围参与 cache identity，避免窄范围梯度污染压力测试。
+        key = (dtype, shape, stream_kind, int(seed), str(config_fingerprint), max_abs)
         if key not in self._cached_numpy_output_grads:
-            rng = numpy.random.RandomState(
-                derive_input_seed(seed, config_fingerprint, f"cached_numpy:{stream_kind}")
+            # cache stream 名称保持历史派生方式，相同 seed 的默认梯度不漂移。
+            rng = InputConfigRandomState(
+                seed,
+                config_fingerprint,
+                f"cached_numpy:{stream_kind}",
             )
             if "int" in dtype:
-                value = rng.randint(-65535, 65535, size=shape, dtype="int64").astype(dtype)
-            elif dtype.startswith("complex"):
-                real_dtype = "float32" if dtype == "complex64" else "float64"
-                value = (rng.random(shape) - 0.5).astype(real_dtype) + 1j * (
-                    rng.random(shape) - 0.5
-                ).astype(real_dtype)
-                value = value.astype(dtype)
+                value = rng.cast(rng.randint(-65535, 65535, shape=shape), dtype)
             else:
-                value = (rng.random(shape) - 0.5).astype(dtype)
+                # cached complex 复用公共路径，保证实部和虚部独立采样。
+                spec = InputTensorSpec(shape, dtype, None, False, None)
+                value = generate_symmetric_input_value(spec, max_abs, rng)
             self._cached_numpy_output_grads[key] = value
         return self._cached_numpy_output_grads[key]
 
@@ -197,19 +209,28 @@ def generate_output_grad(
     device,
     seed,
     config_fingerprint,
+    max_abs=0.5,
+    range_configured=False,
     stream_index=0,
     cache_enabled=False,
 ):
     """用独立随机流生成 output grad。"""
     # output grad 使用独立 stream，不能推进前向输入的随机状态。
     dtype = str(dtype)
+    # 只有显式环境配置才能改变旧 output-grad 随机流和数值范围。
+    max_abs = max_abs if range_configured else 0.5
     stream_kind = f"output_grad:{backend_name}:{int(stream_index)}"
     if cache_enabled:
         # 只有 NumPy cache 可跨调用复用，原生 Tensor 绑定设备上下文。
         if backend_name != "numpy":
             raise ValueError("output-grad cache requires the NumPy backend")
         return _INPUT_BACKEND_RUNTIME.cached_numpy_output_grad(
-            dtype, shape, stream_kind, seed, config_fingerprint
+            dtype,
+            shape,
+            stream_kind,
+            seed,
+            config_fingerprint,
+            max_abs,
         )
     # 非缓存路径按 backend 创建私有随机源，避免污染框架全局 RNG。
     if backend_name == "numpy":
@@ -235,15 +256,22 @@ def generate_output_grad(
         if dtype == "bfloat16"
         else dtype
     )
-    if dtype.startswith("complex"):
+    if range_configured:
+        # 新协议统一覆盖 real/complex，复数两个分量使用相同上界。
+        spec = InputTensorSpec(tuple(shape), base_dtype, None, False, None)
+        value = generate_symmetric_input_value(spec, max_abs, backend)
+    elif dtype.startswith("complex"):
+        # legacy complex 保留原有 RNG 调用次序，避免默认精度基线变化。
         real_dtype = "float32" if dtype == "complex64" else "float64"
-        return backend.cast(
+        value = backend.cast(
             backend.random(shape, dtype=real_dtype)
             - 0.5
             + 1j * (backend.random(shape, dtype=real_dtype) - 0.5),
             dtype,
         )
-    value = backend.uniform(-0.5, 0.5, shape=shape, dtype=base_dtype)
+    else:
+        # legacy real 继续使用 backend uniform，不切换到 random 缩放公式。
+        value = backend.uniform(-0.5, 0.5, shape=shape, dtype=base_dtype)
     if base_dtype == dtype or backend_name == "numpy":
         return value
     if backend_name == "torch":

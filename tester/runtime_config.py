@@ -7,6 +7,7 @@ from dataclasses import dataclass, field, replace
 # 默认上界复现历史 `(random - 0.5) * 1.2` 的数值范围和随机流。
 INPUT_MAX_ABS_ENV_VAR = "PADDLEAPITEST_INPUT_MAX_ABS"
 DEFAULT_INPUT_MAX_ABS = 0.6
+DEFAULT_OUTPUT_GRAD_MAX_ABS = 0.5
 
 
 def resolve_input_max_abs(environ=None):
@@ -29,6 +30,14 @@ def resolve_input_max_abs(environ=None):
     return value
 
 
+def resolve_output_grad_max_abs(environ=None):
+    """仅在显式配置输入范围时同步扩大 backward output-grad。"""
+    source = os.environ if environ is None else environ
+    if INPUT_MAX_ABS_ENV_VAR not in source:
+        return DEFAULT_OUTPUT_GRAD_MAX_ABS
+    return resolve_input_max_abs(source)
+
+
 @dataclass(frozen=True)
 class GpuModeConfig:
     enabled: bool = False
@@ -48,6 +57,8 @@ class GpuModeConfig:
 class TestRuntimeConfig:
     random_seed: int = 0
     input_max_abs: float = DEFAULT_INPUT_MAX_ABS
+    output_grad_max_abs: float = DEFAULT_OUTPUT_GRAD_MAX_ABS
+    output_grad_range_configured: bool = False
     bitwise_alignment: bool = False
     test_cpu: bool = False
     input_backend_requested: str | None = None
@@ -113,6 +124,8 @@ class TestRuntimeConfig:
         return cls(
             random_seed=int(options.random_seed),
             input_max_abs=resolve_input_max_abs(),
+            output_grad_max_abs=resolve_output_grad_max_abs(),
+            output_grad_range_configured=INPUT_MAX_ABS_ENV_VAR in os.environ,
             bitwise_alignment=bool(options.bitwise_alignment),
             test_cpu=bool(options.test_cpu),
             input_backend_requested=policy.requested,

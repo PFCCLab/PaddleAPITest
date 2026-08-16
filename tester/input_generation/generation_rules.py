@@ -6,7 +6,7 @@ import inspect
 import math
 import numbers
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 import numpy
 
@@ -24,7 +24,6 @@ from .value_generators import (
     generate_default_input_value,
     generate_dropout_probability_input_value,
     generate_empty_shape_input_value,
-    generate_fill_input_value,
     generate_hinge_label_input_value,
     generate_int_64_input_value,
     generate_int_128_input_value,
@@ -32,16 +31,16 @@ from .value_generators import (
     generate_int_2048_input_value,
     generate_int_2048_raw_input_value,
     generate_int_65535_raw_input_value,
-    generate_int_or_default_input_value,
     generate_int_or_unit_input_value,
     generate_multiply_input_value,
     generate_nonzero_input_value,
+    generate_nonzero_symmetric_input_value,
+    generate_normal_input_value,
     generate_normal_std_input_value,
     generate_ones_shape_input_value,
     generate_quantile_input_value,
     generate_random_range_input_value,
-    generate_remainder_input_value,
-    generate_signed_half_input_value,
+    generate_symmetric_input_value,
     generate_uniform_input_value,
     generate_unit_interval_input_value,
     generate_unit_plus_one_input_value,
@@ -89,23 +88,17 @@ InputRuleFunction = Callable[["InputRuleContext"], None]
 
 # 这些描述符字符串要保持稳定，因为规则体直接依赖它们。
 _INPUT_VALUE_GENERATORS: dict[str, InputValueGenerator] = {
-    "default": lambda spec, low, high, rng: generate_default_input_value(spec, rng),
     "nonzero": lambda spec, low, high, rng: generate_nonzero_input_value(spec, rng),
     "unit_interval": lambda spec, low, high, rng: generate_unit_interval_input_value(spec, rng),
     "multiply": lambda spec, low, high, rng: generate_multiply_input_value(spec, rng),
     "unit_interval_plus_one": lambda spec, low, high, rng: generate_unit_plus_one_input_value(
         spec, rng
     ),
-    "signed_half_interval": lambda spec, low, high, rng: generate_signed_half_input_value(
-        spec, rng
-    ),
     "normal_std": lambda spec, low, high, rng: generate_normal_std_input_value(spec, rng),
     "dropout_probability": lambda spec, low, high, rng: generate_dropout_probability_input_value(
         spec, rng
     ),
-    "full_fill_value": lambda spec, low, high, rng: generate_fill_input_value(spec, rng),
     "quantile_q": lambda spec, low, high, rng: generate_quantile_input_value(spec, rng),
-    "remainder_rhs": lambda spec, low, high, rng: generate_remainder_input_value(spec, rng),
     "int_zero_1024": lambda spec, low, high, rng: generate_int_1024_input_value(spec, rng),
     "int_zero_64": lambda spec, low, high, rng: generate_int_64_input_value(spec, rng),
     "int_zero_2048_no_cast": lambda spec, low, high, rng: generate_int_2048_raw_input_value(
@@ -120,9 +113,6 @@ _INPUT_VALUE_GENERATORS: dict[str, InputValueGenerator] = {
     "ones_shape": lambda spec, low, high, rng: generate_ones_shape_input_value(spec, rng),
     "int_zero_65535_else_unit": lambda spec, low, high, rng: generate_int_or_unit_input_value(
         spec, rng
-    ),
-    "int_minus127_127_else_default": lambda spec, low, high, rng: (
-        generate_int_or_default_input_value(spec, rng)
     ),
     "binary_0_1": lambda spec, low, high, rng: generate_binary_input_value(spec, rng),
     "hinge_labels": lambda spec, low, high, rng: generate_hinge_label_input_value(spec, rng),
@@ -311,20 +301,46 @@ class InputRuleContext:
 
     def domain(self, generator, tensor, low=None, high=None):
         # 值域名称在写入前集中校验，拼写错误不会产生部分输入。
+        if generator == "default":
+            if low is not None or high is not None:
+                raise ValueError("default input generator does not accept explicit bounds")
+            return self.default(tensor)
         generate_value = _INPUT_VALUE_GENERATORS.get(generator)
         if generate_value is None:
             raise ValueError(f"unknown input value generator {generator!r} for {tensor.path}")
-        if generator == "default" and low is None and high is None:
-            # 运行级范围只覆盖默认浮点值域，API 专用 generator 保持自身定义域。
-            return generate_default_input_value(
-                tensor.input_spec,
-                self._input_backend,
-                max_abs=self._input_max_abs,
-            )
         return generate_value(tensor.input_spec, low, high, self._input_backend)
 
-    def default(self, tensor):
-        return self.domain("default", tensor)
+    def default(self, tensor, *, shape=None):
+        # shape-only 规则复用同一默认值域，不能在规则体内复制随机公式。
+        spec = (
+            tensor.input_spec if shape is None else replace(tensor.input_spec, shape=tuple(shape))
+        )
+        return generate_default_input_value(
+            spec,
+            self._input_backend,
+            max_abs=self._input_max_abs,
+        )
+
+    def uniform(self, tensor, low, high, *, shape=None):
+        # uniform 统一负责复数实部和虚部，规则层不得通过实数 cast 构造复数。
+        spec = (
+            tensor.input_spec if shape is None else replace(tensor.input_spec, shape=tuple(shape))
+        )
+        return generate_uniform_input_value(spec, low, high, self._input_backend)
+
+    def normal(self, tensor, *, shape=None, scale=1.0):
+        spec = (
+            tensor.input_spec if shape is None else replace(tensor.input_spec, shape=tuple(shape))
+        )
+        return generate_normal_input_value(spec, self._input_backend, scale=scale)
+
+    def default_nonzero(self, tensor):
+        # 除数继承 default 范围，但量化为零时必须遵守非零协议。
+        return generate_nonzero_symmetric_input_value(
+            tensor.input_spec,
+            self._input_max_abs,
+            self._input_backend,
+        )
 
     def set(self, tensor, value):
         self._input_value_writer.set_value(tensor, value)
@@ -416,7 +432,11 @@ class InputRuleContext:
                 _generate_input_binding_value(self, input_binding, generator)
 
     def _validate_generator(self, generator):
-        if isinstance(generator, str) and generator not in _INPUT_VALUE_GENERATORS:
+        if (
+            isinstance(generator, str)
+            and generator != "default"
+            and generator not in _INPUT_VALUE_GENERATORS
+        ):
             raise ValueError(f"unknown input value generator {generator!r} for {self.api_name}")
 
     def _numeric_dtype(self, dtype):
@@ -1357,9 +1377,6 @@ def generate_distribute_fpn_proposals_inputs(rule: InputRuleContext):
 def generate_proposals_inputs(rule: InputRuleContext):
     """输入规则：生成合法图像尺寸、anchor 和 proposal 分数输入。"""
 
-    def generate_random_input_value(input_binding):
-        return rule.ops.random(input_binding.shape, dtype=input_binding.dtype)
-
     def generate_img_size_input_value(input_binding):
         return rule.ops.cast(
             rule.ops.randint(0, 1024, shape=input_binding.shape),
@@ -1382,8 +1399,11 @@ def generate_proposals_inputs(rule: InputRuleContext):
         return anchors
 
     for input_binding in rule.all_tensors:
-        if input_binding.parameter_name in {"scores", "bbox_deltas"}:
-            rule.set(input_binding, generate_random_input_value(input_binding))
+        if input_binding.parameter_name == "scores":
+            # score 是概率，不能与无界的 bbox delta 共用值域。
+            rule.set(input_binding, rule.uniform(input_binding, 0, 1))
+        elif input_binding.parameter_name == "bbox_deltas":
+            rule.set(input_binding, rule.default(input_binding))
         elif input_binding.parameter_name == "img_size":
             rule.set(input_binding, generate_img_size_input_value(input_binding))
         elif input_binding.parameter_name == "anchors":
@@ -1497,8 +1517,15 @@ def generate_zero_65535_or_unit_inputs(rule: InputRuleContext):
 
 @input_rules.register("paddle.dot")
 def generate_dot_inputs(rule: InputRuleContext):
-    """输入规则：限制点积输入幅度以减少累加溢出。"""
-    rule.generate_all("int_minus127_127_else_default")
+    """输入规则：整数保守取值，浮点值复用可配置 default。"""
+
+    def generate_dot_input_value(input_binding):
+        if "int" in input_binding.dtype:
+            # 整数点积限制累加幅度，浮点和复数才跟随全局范围。
+            return rule.domain("uniform", input_binding, low=-127, high=127)
+        return rule.default(input_binding)
+
+    rule.generate_all(generate_dot_input_value)
 
 
 @input_rules.register("paddle.normal")
@@ -1506,7 +1533,7 @@ def generate_normal_inputs(rule: InputRuleContext):
     """输入规则：分别约束正态分布的 mean、std 和 shape 输入。"""
     rule.generate(
         (
-            ("mean", "signed_half_interval"),
+            ("mean", "default"),
             ("std", "normal_std"),
         ),
         default="int_zero_1024",
@@ -1584,13 +1611,9 @@ def generate_sigmoid_focal_loss_inputs(rule: InputRuleContext):
 
 @input_rules.register("paddle.full")
 def generate_full_inputs(rule: InputRuleContext):
-    """输入规则：按 shape 与 fill_value 的语义选择整数值域。"""
+    """输入规则：仅约束 shape，fill_value 使用普通输入策略。"""
     rule.generate(
-        (
-            ("shape", "int_zero_64"),
-            ("fill_value", "full_fill_value"),
-        ),
-        default="int_zero_64",
+        (("shape", "int_zero_64"),),
     )
 
 
@@ -1618,7 +1641,14 @@ def generate_quantile_inputs(rule: InputRuleContext):
 )
 def generate_remainder_inputs(rule: InputRuleContext):
     """输入规则：为余数运算生成非零右操作数。"""
-    rule.generate((("y", "remainder_rhs"),))
+
+    def generate_remainder_rhs(input_binding):
+        if "int" in input_binding.dtype:
+            # 整数直接避开零，浮点还需处理 cast 后的量化零。
+            return rule.domain("uniform", input_binding, low=1, high=65535)
+        return rule.default_nonzero(input_binding)
+
+    rule.generate((("y", generate_remainder_rhs),))
 
 
 @input_rules.register(
@@ -1809,11 +1839,9 @@ def generate_matrix_transpose_inputs(rule: InputRuleContext):
     """输入规则：保证矩阵转置输入至少具有二维结构。"""
 
     def generate_x_input_value(input_binding):
+        # 该规则只修复 rank，不应另行拥有随机数值分布。
         shape = input_binding.shape if len(input_binding.shape) >= 2 else (2, 2)
-        dtype = input_binding.dtype
-        if "int" in dtype:
-            return rule.ops.cast(rule.ops.randint(-65535, 65535, shape=shape), dtype)
-        return rule.ops.cast(rule.ops.random(shape) - 0.5, dtype)
+        return rule.default(input_binding, shape=shape)
 
     rule.generate((("x", generate_x_input_value),))
 
@@ -2053,18 +2081,12 @@ def generate_topk_inputs(rule: InputRuleContext):
 
     def generate_x_input_value(input_binding):
         dtype = input_binding.dtype
-        if dtype == "bfloat16" or dtype in {"float8_e4m3fn", "float8_e5m2"}:
-            dtype = "float32" if dtype == "bfloat16" else "float16"
-        if dtype in {"float32", "float64"}:
-            return rule.ops.cast(
-                (rule.ops.random(input_binding.shape) - 0.5) * 1.2,
-                dtype,
-            )
-        if dtype == "float16":
-            return rule.ops.cast(
-                rule.ops.cast(rule.ops.randn(*input_binding.shape), dtype) * 1e-3,
-                dtype,
-            )
+        if dtype in {"float32", "float64", "bfloat16"}:
+            # 普通浮点 topk 没有特殊定义域，继承 configurable default。
+            return rule.default(input_binding)
+        if dtype in {"float16", "float8_e4m3fn", "float8_e5m2"}:
+            # 低精度保留小尺度正态分布，控制排序比较的舍入误差。
+            return rule.normal(input_binding, scale=1e-3)
         if dtype in {"int32", "int64"}:
             return rule.ops.cast(
                 rule.ops.randint(-10, 10, shape=input_binding.shape),
@@ -3188,13 +3210,18 @@ def generate_cholesky_inputs(rule: InputRuleContext):
             )
         batch_dims = input_binding.shape[:-2]
         matrix_dim = input_binding.shape[-1]
-        matrix = rule.ops.random([*batch_dims, matrix_dim, matrix_dim], dtype=input_binding.dtype)
-        if len(batch_dims) > 0:
-            tensor = rule.ops.einsum("...ij,...kj->...ik", matrix, matrix)
+        if input_binding.dtype.startswith("complex"):
+            # 复数正定矩阵必须使用共轭转置，普通转置不保证 Hermitian。
+            matrix = rule.uniform(input_binding, 0, 1)
+            matrix_h = rule.ops.conj(rule.ops.swapaxes(matrix, -1, -2))
+            tensor = rule.ops.matmul(matrix, matrix_h)
         else:
-            tensor = rule.ops.dot(matrix, rule.ops.swapaxes(matrix, -1, -2))
+            matrix = rule.ops.random(input_binding.shape, dtype=input_binding.dtype)
+            if batch_dims:
+                tensor = rule.ops.einsum("...ij,...kj->...ik", matrix, matrix)
+            else:
+                tensor = rule.ops.dot(matrix, rule.ops.swapaxes(matrix, -1, -2))
         tensor += rule.ops.eye(matrix_dim, dtype=input_binding.dtype) * 10000
-        print("cholesky tensor", tensor)
         return tensor
 
     rule.generate((("x", generate_x_input_value),))
@@ -3214,8 +3241,13 @@ def generate_covariance_inputs(rule: InputRuleContext):
     def generate_x_input_value(input_binding):
         if len(input_binding.shape) < 1 or len(input_binding.shape) > 2:
             raise ValueError("Shape must have 1 or 2 dimensions for covariance input")
-        tensor = rule.ops.random(input_binding.shape, dtype=input_binding.dtype)
-        tensor += rule.ops.random(input_binding.shape, dtype=input_binding.dtype) * 1e-6
+        if input_binding.dtype.startswith("complex"):
+            # complex 样本独立生成实部和虚部，权重仍保持实数协议。
+            tensor = rule.uniform(input_binding, 0, 1)
+            tensor += rule.uniform(input_binding, 0, 1) * 1e-6
+        else:
+            tensor = rule.ops.random(input_binding.shape, dtype=input_binding.dtype)
+            tensor += rule.ops.random(input_binding.shape, dtype=input_binding.dtype) * 1e-6
         return tensor
 
     def generate_fweights_input_value(input_binding):
@@ -3255,17 +3287,17 @@ def generate_eigen_symmetric_inputs(rule: InputRuleContext):
             )
         batch_dims = input_binding.shape[:-2]
         matrix_dim = input_binding.shape[-1]
-        matrix = rule.ops.random([*batch_dims, matrix_dim, matrix_dim], dtype=input_binding.dtype)
-        if input_binding.dtype in ["complex64", "complex128"]:
-            matrix = matrix + 1j * rule.ops.random(
-                [*batch_dims, matrix_dim, matrix_dim],
-                dtype=input_binding.dtype,
-            )
-            tensor = matrix + rule.ops.conj(rule.ops.swapaxes(matrix, -1, -2))
-        elif len(batch_dims) > 0:
-            tensor = rule.ops.einsum("...ij,...kj->...ik", matrix, matrix)
+        if input_binding.dtype.startswith("complex"):
+            # Hermitian 输入由 complex 矩阵及其共轭转置构造。
+            matrix = rule.uniform(input_binding, 0, 1)
+            matrix_h = rule.ops.conj(rule.ops.swapaxes(matrix, -1, -2))
+            tensor = matrix + matrix_h
         else:
-            tensor = rule.ops.dot(matrix, rule.ops.swapaxes(matrix, -1, -2))
+            matrix = rule.ops.random(input_binding.shape, dtype=input_binding.dtype)
+            if batch_dims:
+                tensor = rule.ops.einsum("...ij,...kj->...ik", matrix, matrix)
+            else:
+                tensor = rule.ops.dot(matrix, rule.ops.swapaxes(matrix, -1, -2))
         tensor += rule.ops.eye(matrix_dim, dtype=input_binding.dtype) * 1e-6
         return tensor
 
@@ -3279,9 +3311,8 @@ def generate_lstsq_inputs(rule: InputRuleContext):
     def generate_matrix_input_value(input_binding):
         if len(input_binding.shape) < 2:
             raise ValueError("Shape must have at least 2 dimensions for lstsq x")
-        batch_dims = input_binding.shape[:-2]
-        rows, cols = input_binding.shape[-2], input_binding.shape[-1]
-        return rule.ops.random([*batch_dims, rows, cols], dtype=input_binding.dtype)
+        # lstsq 只要求二维矩阵，x 和 y 没有额外数值定义域。
+        return rule.default(input_binding)
 
     rule.generate(((("x", "y"), generate_matrix_input_value),))
 
@@ -3293,7 +3324,11 @@ def generate_lu_unpack_inputs(rule: InputRuleContext):
     def generate_x_input_value(input_binding):
         if len(input_binding.shape) < 2:
             raise ValueError("Shape must have at least 2 dimensions for LU matrix")
-        tensor = rule.ops.random(input_binding.shape, dtype=input_binding.dtype)
+        tensor = (
+            rule.uniform(input_binding, 0, 1)
+            if input_binding.dtype.startswith("complex")
+            else rule.ops.random(input_binding.shape, dtype=input_binding.dtype)
+        )
         diagonal_size = min(input_binding.shape[-2], input_binding.shape[-1])
         tensor[..., range(diagonal_size), range(diagonal_size)] += 1e-6
         return tensor
@@ -3319,7 +3354,11 @@ def generate_condition_inputs(rule: InputRuleContext):
 
     def generate_x_input_value(input_binding):
         matrix_size = input_binding.shape[-1]
-        tensor = rule.ops.random(input_binding.shape, dtype=input_binding.dtype)
+        tensor = (
+            rule.uniform(input_binding, 0, 1)
+            if input_binding.dtype.startswith("complex")
+            else rule.ops.random(input_binding.shape, dtype=input_binding.dtype)
+        )
         tensor += matrix_size * rule.ops.eye(matrix_size, dtype=input_binding.dtype)
         return tensor
 
@@ -3336,18 +3375,8 @@ def generate_determinant_inputs(rule: InputRuleContext):
         if input_binding.shape[-1] != input_binding.shape[-2]:
             raise AssertionError("Input must be square matrices.")
         matrix_size = input_binding.shape[-1]
-        is_complex = input_binding.dtype.startswith("complex")
-        if is_complex:
-            real_dtype = "float32" if input_binding.dtype == "complex64" else "float64"
-            real = rule.ops.uniform(0.5, 1.0, shape=input_binding.shape, dtype=real_dtype)
-            imag = rule.ops.uniform(0.5, 1.0, shape=input_binding.shape, dtype=real_dtype)
-            matrix = rule.ops.cast(real + 1j * imag, input_binding.dtype)
-            matrix_h = rule.ops.swapaxes(rule.ops.conj(matrix), -1, -2)
-        else:
-            matrix = rule.ops.uniform(
-                0.5, 1.0, shape=input_binding.shape, dtype=input_binding.dtype
-            )
-            matrix_h = rule.ops.swapaxes(matrix, -1, -2)
+        matrix = rule.uniform(input_binding, 0.5, 1.0)
+        matrix_h = rule.ops.swapaxes(rule.ops.conj(matrix), -1, -2)
         return rule.ops.matmul(matrix, matrix_h) + rule.ops.eye(
             matrix_size, dtype=input_binding.dtype
         )
@@ -3360,7 +3389,7 @@ def generate_pca_lowrank_inputs(rule: InputRuleContext):
     """输入规则：为低秩 PCA 生成受控随机矩阵。"""
 
     def generate_x_input_value(input_binding):
-        return rule.ops.cast(rule.ops.randn(*input_binding.shape), input_binding.dtype)
+        return rule.normal(input_binding)
 
     rule.generate((("x", generate_x_input_value),))
 
@@ -3371,13 +3400,7 @@ def generate_corrcoef_inputs(rule: InputRuleContext):
 
     def generate_x_input_value(input_binding):
         if input_binding.dtype == "float16":
-            return (
-                rule.ops.cast(
-                    rule.ops.randn(*input_binding.shape),
-                    input_binding.dtype,
-                )
-                * 1e-3
-            )
+            return rule.normal(input_binding, scale=1e-3)
         return rule.default(input_binding)
 
     rule.generate((("x", generate_x_input_value),))
@@ -3394,16 +3417,7 @@ def generate_pinv_inputs(rule: InputRuleContext):
     def generate_x_input_value(tensor):
         if len(tensor.shape) not in [2, 3]:
             raise ValueError("pinv only supports 2D or 3D tensors")
-        if tensor.dtype.startswith("complex"):
-            real_dtype = "float32" if tensor.dtype == "complex64" else "float64"
-            real = rule.ops.cast(rule.ops.randn(*tensor.shape), real_dtype)
-            imag = rule.ops.cast(rule.ops.randn(*tensor.shape), real_dtype)
-            matrix = rule.ops.cast(real + 1j * imag, tensor.dtype)
-        else:
-            matrix = rule.ops.cast(
-                rule.ops.randn(*tensor.shape),
-                tensor.dtype,
-            )
+        matrix = rule.normal(tensor)
         if len(tensor.shape) == 2:
             matrix_t = (
                 rule.ops.swapaxes(rule.ops.conj(matrix), -1, -2)
@@ -3445,6 +3459,8 @@ def generate_view_inputs(rule: InputRuleContext):
         if input_binding.dtype == "uint8":
             target = str(rule.arg("shape_or_dtype", ""))
             nbytes = shape_numel(input_binding.shape)
+            # view 的随机数只用于构造有限字节，不能跟随全局压力测试范围。
+            finite_max_abs = 0.6
             itemsize = {
                 "paddle.bfloat16": 2,
                 "paddle.float16": 2,
@@ -3454,9 +3470,10 @@ def generate_view_inputs(rule: InputRuleContext):
             if itemsize is not None and nbytes % itemsize == 0:
                 numel = nbytes // itemsize
                 if target == "paddle.bfloat16":
-                    finite_f32 = rule.ops.cast(
-                        (rule.ops.random(numel) - 0.5) * 1.2,
-                        "float32",
+                    finite_f32 = generate_symmetric_input_value(
+                        replace(input_binding.input_spec, shape=(numel,), dtype="float32"),
+                        finite_max_abs,
+                        rule.ops,
                     )
                     uint32_value = rule.ops.view_dtype(finite_f32, "uint32")
                     return rule.ops.view_dtype(
@@ -3466,9 +3483,14 @@ def generate_view_inputs(rule: InputRuleContext):
                         ),
                         "uint8",
                     )
-                finite = rule.ops.cast(
-                    (rule.ops.random(numel) - 0.5) * 1.2,
-                    target.replace("paddle.", ""),
+                finite = generate_symmetric_input_value(
+                    replace(
+                        input_binding.input_spec,
+                        shape=(numel,),
+                        dtype=target.replace("paddle.", ""),
+                    ),
+                    finite_max_abs,
+                    rule.ops,
                 )
                 return rule.ops.view_dtype(rule.ops.ascontiguousarray(finite), "uint8")
         return rule.default(input_binding)
@@ -3541,8 +3563,9 @@ def generate_rnnt_loss_inputs(rule: InputRuleContext):
     """输入规则：联动 logits、labels 和长度 Tensor 的默认形状。"""
 
     def generate_logits_input_value(input_binding):
+        # RNNT 规则只补合法四维 shape，logits 数值仍属于 default。
         shape = input_binding.shape if len(input_binding.shape) == 4 else (3, 4, 3, 5)
-        return rule.ops.random(shape, dtype=input_binding.dtype)
+        return rule.default(input_binding, shape=shape)
 
     def generate_labels_input_value(input_binding):
         shape = input_binding.shape if len(input_binding.shape) == 2 else (3, 2)
