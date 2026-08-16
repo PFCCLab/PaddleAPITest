@@ -114,8 +114,21 @@ def resolve_input_dtype(dtype: str) -> str:
     return _INPUT_INTERMEDIATE_DTYPES.get(dtype, dtype)
 
 
+def _complex_real_dtype(dtype):
+    # complex dtype 的分量精度是后续 uniform/normal helper 的唯一判断点。
+    return "float32" if dtype == "complex64" else "float64"
+
+
+def _uniform_value(dtype, shape, rng, low, high):
+    """统一固定区间的 real/complex 采样，避免 complex cast 丢失虚部。"""
+    # 所有固定区间规则在此分派，避免新增路径再次实数 cast complex。
+    if dtype.startswith("complex"):
+        return _complex_value(dtype, shape, rng, low=low, high=high)
+    return rng.uniform(low, high, shape=shape, dtype=dtype)
+
+
 def _complex_parts(dtype, shape, rng, *, low=None, high=None, offset=0.0, scale=1.0):
-    real_dtype = "float32" if dtype == "complex64" else "float64"
+    real_dtype = _complex_real_dtype(dtype)
     if low is None and high is None:
         real = rng.random(shape) * scale + offset
         imag = rng.random(shape) * scale + offset
@@ -167,7 +180,7 @@ def generate_normal_input_value(
     dtype = resolve_input_dtype(spec.dtype)
     if dtype.startswith("complex"):
         # 正态复数消费两次独立随机流，不能将 real 结果直接 cast。
-        real_dtype = "float32" if dtype == "complex64" else "float64"
+        real_dtype = _complex_real_dtype(dtype)
         real = rng.cast(rng.randn(*spec.shape), real_dtype)
         imag = rng.cast(rng.randn(*spec.shape), real_dtype)
         value = rng.cast(real + 1j * imag, dtype)
@@ -359,16 +372,16 @@ def generate_random_range_input_value(
         high = high if high is not None else 65535
         return rng.cast(rng.randint(low, high, shape=spec.shape), dtype)
     if dtype.startswith("complex"):
-        real_dtype = "float32" if dtype == "complex64" else "float64"
+        real_dtype = _complex_real_dtype(dtype)
         # 原生随机算子的公共参数精度是 float32，默认边界必须三后端均可表示。
         limit = min(numpy.finfo(real_dtype).max, numpy.finfo("float32").max) / 4
         real_low = low if low is not None else -limit
         real_high = high if high is not None else limit
-        return _complex_value(dtype, spec.shape, rng, low=real_low, high=real_high)
+        return _uniform_value(dtype, spec.shape, rng, real_low, real_high)
     limit = min(numpy.finfo(dtype).max, numpy.finfo("float32").max) / 4
     low = low if low is not None else -limit
     high = high if high is not None else limit
-    return rng.uniform(low, high, shape=spec.shape, dtype=dtype)
+    return _uniform_value(dtype, spec.shape, rng, low, high)
 
 
 def generate_uniform_input_value(
@@ -381,6 +394,4 @@ def generate_uniform_input_value(
     dtype = resolve_input_dtype(spec.dtype)
     if "int" in dtype:
         return rng.cast(rng.randint(low, high, shape=spec.shape), dtype)
-    if dtype.startswith("complex"):
-        return _complex_value(dtype, spec.shape, rng, low=low, high=high)
-    return rng.uniform(low, high, shape=spec.shape, dtype=dtype)
+    return _uniform_value(dtype, spec.shape, rng, low, high)

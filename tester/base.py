@@ -838,8 +838,9 @@ class APITestBase:
             seed=getattr(self.runtime_config, "random_seed", 0),
             config_fingerprint=getattr(self.api_config, "config", ""),
             # 未携带新 runtime 字段的旧调用方继续使用历史 output-grad 协议。
-            max_abs=getattr(self.runtime_config, "output_grad_max_abs", 0.5),
-            range_configured=getattr(self.runtime_config, "output_grad_range_configured", False),
+            # output-grad 与 forward 共用同一生效上界，legacy 分支由 flag 控制。
+            max_abs=getattr(self.runtime_config, "input_max_abs", 0.6),
+            range_configured=getattr(self.runtime_config, "input_max_abs_is_configured", False),
             stream_index=self._output_grad_stream_index("numpy"),
             cache_enabled=bool(getattr(self.runtime_config, "use_cached_numpy", False)),
         )
@@ -887,8 +888,8 @@ class APITestBase:
             device=str(device),
             seed=getattr(self.runtime_config, "random_seed", 0),
             config_fingerprint=getattr(self.api_config, "config", ""),
-            max_abs=getattr(self.runtime_config, "output_grad_max_abs", 0.5),
-            range_configured=getattr(self.runtime_config, "output_grad_range_configured", False),
+            max_abs=getattr(self.runtime_config, "input_max_abs", 0.6),
+            range_configured=getattr(self.runtime_config, "input_max_abs_is_configured", False),
             stream_index=self._output_grad_stream_index("torch"),
         )
 
@@ -907,8 +908,8 @@ class APITestBase:
             device=device,
             seed=getattr(self.runtime_config, "random_seed", 0),
             config_fingerprint=getattr(self.api_config, "config", ""),
-            max_abs=getattr(self.runtime_config, "output_grad_max_abs", 0.5),
-            range_configured=getattr(self.runtime_config, "output_grad_range_configured", False),
+            max_abs=getattr(self.runtime_config, "input_max_abs", 0.6),
+            range_configured=getattr(self.runtime_config, "input_max_abs_is_configured", False),
             stream_index=self._output_grad_stream_index("paddle"),
         )
 
