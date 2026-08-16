@@ -127,7 +127,12 @@ def _complex_value(dtype, shape, rng, **kwargs):
     return rng.cast(real + 1j * imag, dtype)
 
 
-def generate_default_input_value(spec: InputTensorSpec, rng=INPUT_NUMPY_RANDOM_STATE) -> object:
+def generate_default_input_value(
+    spec: InputTensorSpec,
+    rng=INPUT_NUMPY_RANDOM_STATE,
+    *,
+    max_abs=0.6,
+) -> object:
     """生成默认值。"""
     dtype = resolve_input_dtype(spec.dtype)
     shape = spec.shape
@@ -135,16 +140,18 @@ def generate_default_input_value(spec: InputTensorSpec, rng=INPUT_NUMPY_RANDOM_S
         if "int" in dtype:
             return rng.asarray(rng.randint(-65535, 65535), dtype=dtype)
         if dtype.startswith("complex"):
-            real = (rng.random() - 0.5) * 1.2
-            imag = (rng.random() - 0.5) * 1.2
+            # 实部和虚部分别服从同一对称范围，保持原有独立随机抽样协议。
+            real = (rng.random() - 0.5) * (2 * max_abs)
+            imag = (rng.random() - 0.5) * (2 * max_abs)
             return rng.asarray(real + 1j * imag, dtype=dtype)
-        return rng.asarray((rng.random() - 0.5) * 1.2, dtype=dtype)
+        return rng.asarray((rng.random() - 0.5) * (2 * max_abs), dtype=dtype)
 
     if "int" in dtype:
+        # 运行级浮点范围不能收窄已有的整数压力测试范围。
         return rng.cast(rng.randint(-65535, 65535, shape=shape), dtype)
     if dtype.startswith("complex"):
-        return _complex_value(dtype, shape, rng, offset=-0.6, scale=1.2)
-    return rng.cast((rng.random(shape) - 0.5) * 1.2, dtype)
+        return _complex_value(dtype, shape, rng, offset=-max_abs, scale=2 * max_abs)
+    return rng.cast((rng.random(shape) - 0.5) * (2 * max_abs), dtype)
 
 
 def generate_nonzero_input_value(spec: InputTensorSpec, rng=INPUT_NUMPY_RANDOM_STATE) -> object:

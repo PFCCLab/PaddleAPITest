@@ -204,6 +204,8 @@ class InputGenerationContext:
     config_fingerprint: str
     seed: int
     backend_policy: object
+    # 数值策略随生成上下文传递，规则执行阶段不再读取进程环境。
+    input_max_abs: float
 
 
 @dataclass(frozen=True)
@@ -522,11 +524,12 @@ def bind_api_inputs(api_config):
     )
 
 
-def build_input_generation_context(api_config, seed, backend_policy):
+def build_input_generation_context(api_config, seed, backend_policy, input_max_abs):
     # 配置文本指纹使不同调用在原生 backend 中获得稳定且隔离的随机流。
     return InputGenerationContext(
         input_binding=bind_api_inputs(api_config),
         config_fingerprint=hashlib.sha256(api_config.config.encode()).hexdigest(),
         seed=seed,
         backend_policy=backend_policy,
+        input_max_abs=input_max_abs,
     )

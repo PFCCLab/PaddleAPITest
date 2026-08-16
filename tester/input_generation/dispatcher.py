@@ -21,5 +21,6 @@ def dispatch_input_generation(api_test_case) -> bool:
         api_config,
         seed=api_test_case.runtime_config.random_seed,
         backend_policy=api_test_case.runtime_config.input_backend_policy,
+        input_max_abs=api_test_case.runtime_config.input_max_abs,
     )
     return input_rule.generate(input_generation_context, api_config)

@@ -168,7 +168,10 @@ class InputRule:
             policy=backend_policy,
         )
         input_rule_context = InputRuleContext(
-            input_generation_context.input_binding, api_config, input_backend
+            input_generation_context.input_binding,
+            api_config,
+            input_backend,
+            input_generation_context.input_max_abs,
         )
         self.function(input_rule_context)
         # finish 先检查遗漏，再一次性同步 TensorConfig 元数据和逻辑值。
@@ -236,10 +239,17 @@ class _InputValueWriter:
 class InputRuleContext:
     """面向规则作者的单一输入生成接口。"""
 
-    def __init__(self, input_binding: InputApiBinding, api_config: object, input_backend):
+    def __init__(
+        self,
+        input_binding: InputApiBinding,
+        api_config: object,
+        input_backend,
+        input_max_abs,
+    ):
         self._input_binding = input_binding
         self._api_config = api_config
         self._input_backend = input_backend
+        self._input_max_abs = input_max_abs
         self._input_value_writer = _InputValueWriter(api_config, input_backend)
 
     @property
@@ -304,6 +314,13 @@ class InputRuleContext:
         generate_value = _INPUT_VALUE_GENERATORS.get(generator)
         if generate_value is None:
             raise ValueError(f"unknown input value generator {generator!r} for {tensor.path}")
+        if generator == "default" and low is None and high is None:
+            # 运行级范围只覆盖默认浮点值域，API 专用 generator 保持自身定义域。
+            return generate_default_input_value(
+                tensor.input_spec,
+                self._input_backend,
+                max_abs=self._input_max_abs,
+            )
         return generate_value(tensor.input_spec, low, high, self._input_backend)
 
     def default(self, tensor):

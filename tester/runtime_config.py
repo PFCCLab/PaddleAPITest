@@ -1,6 +1,32 @@
 from __future__ import annotations
 
+import math
+import os
 from dataclasses import dataclass, field, replace
+
+# 默认上界复现历史 `(random - 0.5) * 1.2` 的数值范围和随机流。
+INPUT_MAX_ABS_ENV_VAR = "PADDLEAPITEST_INPUT_MAX_ABS"
+DEFAULT_INPUT_MAX_ABS = 0.6
+
+
+def resolve_input_max_abs(environ=None):
+    """解析普通浮点输入的对称绝对上界。"""
+    # 环境变量只在 runtime config 冻结时读取，worker 不再观察运行中的环境变化。
+    source = os.environ if environ is None else environ
+    raw_value = source.get(INPUT_MAX_ABS_ENV_VAR, str(DEFAULT_INPUT_MAX_ABS))
+    try:
+        value = float(raw_value)
+    except (TypeError, ValueError) as err:
+        # 配置错误必须在 worker 启动前失败，不能静默退回默认范围。
+        raise ValueError(
+            f"{INPUT_MAX_ABS_ENV_VAR} must be a finite positive number, got {raw_value!r}"
+        ) from err
+    if not math.isfinite(value) or value <= 0:
+        # 非有限值会直接污染所有浮点输入，零和负数不具备范围语义。
+        raise ValueError(
+            f"{INPUT_MAX_ABS_ENV_VAR} must be a finite positive number, got {raw_value!r}"
+        )
+    return value
 
 
 @dataclass(frozen=True)
@@ -21,6 +47,7 @@ class GpuModeConfig:
 @dataclass(frozen=True)
 class TestRuntimeConfig:
     random_seed: int = 0
+    input_max_abs: float = DEFAULT_INPUT_MAX_ABS
     bitwise_alignment: bool = False
     test_cpu: bool = False
     input_backend_requested: str | None = None
@@ -85,6 +112,7 @@ class TestRuntimeConfig:
         # 请求值和终态同时保存，日志可以区分默认选择与用户显式覆盖。
         return cls(
             random_seed=int(options.random_seed),
+            input_max_abs=resolve_input_max_abs(),
             bitwise_alignment=bool(options.bitwise_alignment),
             test_cpu=bool(options.test_cpu),
             input_backend_requested=policy.requested,

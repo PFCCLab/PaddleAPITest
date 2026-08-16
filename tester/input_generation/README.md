@@ -142,6 +142,17 @@ def generate_example(rule):
 - 未注册 API 仍使用默认规则；
 - `generation_rules.py` 仍是 API 规则的唯一定位入口。
 
+## 扩大默认浮点输入范围
+
+设置 `PADDLEAPITEST_INPUT_MAX_ABS` 可调整普通默认浮点和复数输入的对称绝对上界：
+
+```bash
+PADDLEAPITEST_INPUT_MAX_ABS=10 python engineV4.py ...
+```
+
+此时默认范围为 `[-10, 10)`；未设置时仍为 `[-0.6, 0.6)`。整数以及概率、索引、
+shape 等 API 专用值域不受影响。该值必须是有限正数，并在运行时配置创建时冻结。
+
 ## 验证
 
 代码变更后至少运行：
