@@ -6,7 +6,7 @@ from typing import Any
 
 import paddle
 from tester.dtype_utils import to_torch_dtype
-from tester.input_generation.binding import bind_input_parameters, resolve_input_api
+from tester.paddle_to_torch.invocation_binding import bind_input_parameters, resolve_input_api
 
 
 def resolve_paddle_api(api_name: str) -> Callable[..., Any]:

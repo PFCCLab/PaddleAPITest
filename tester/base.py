@@ -18,7 +18,6 @@ from .gpu_memory_preflight import (
     requires_inplace_input_copy,
     should_check_grad,
 )
-from .input_generation.binding import bind_input_parameters, split_tensor_method_arguments
 from .input_generation.generation_rules import input_rules
 from .input_generation.materialization import (
     clear_tensor_configs,
@@ -34,6 +33,7 @@ from .input_generation.tensor_config import (
 from .log_writer import log_worker
 from .log_writer.log_comparison import log_accuracy_tolerance
 from .log_writer.log_schema import MAX_CSV_CONFIG_LENGTH
+from .paddle_to_torch.invocation_binding import bind_input_parameters, split_tensor_method_arguments
 
 _TESTER_DIR = Path(__file__).resolve().parent
 
