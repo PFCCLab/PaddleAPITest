@@ -19,9 +19,10 @@ from tester.input_generation.value_generators import (
 from tester.input_generation.values import InputTensorSpec
 from tester.runtime_config import (
     DEFAULT_INPUT_MAX_ABS,
-    LEGACY_INPUT_MAX_ABS_FOR_OUTPUT_GRAD,
     input_max_abs_is_configured,
+    output_grad_max_abs_is_configured,
     resolve_input_max_abs,
+    resolve_output_grad_max_abs,
 )
 
 
@@ -49,6 +50,7 @@ def _generated_values(config, max_abs=10):
 class InputRangeTest(TestCase):
     def test_environment_value_is_validated(self):
         # 环境变量只决定是否同步 output-grad，不产生第二个范围配置字段。
+        # 两个变量必须分别识别，设置 input 不应打开 output-grad 的开关。
         self.assertEqual(resolve_input_max_abs({}), DEFAULT_INPUT_MAX_ABS)
         self.assertEqual(resolve_input_max_abs({"PADDLEAPITEST_INPUT_MAX_ABS": "10"}), 10)
         for invalid in ("0", "-1", "nan", "inf", "bad"):
@@ -56,6 +58,18 @@ class InputRangeTest(TestCase):
                 resolve_input_max_abs({"PADDLEAPITEST_INPUT_MAX_ABS": invalid})
         self.assertFalse(input_max_abs_is_configured({}))
         self.assertTrue(input_max_abs_is_configured({"PADDLEAPITEST_INPUT_MAX_ABS": "10"}))
+        self.assertFalse(output_grad_max_abs_is_configured({}))
+        self.assertTrue(
+            output_grad_max_abs_is_configured({"PADDLEAPITEST_OUTPUT_GRAD_MAX_ABS": "10"})
+        )
+        self.assertEqual(resolve_output_grad_max_abs({}), 0.5)
+        self.assertEqual(
+            resolve_output_grad_max_abs({"PADDLEAPITEST_OUTPUT_GRAD_MAX_ABS": "10"}),
+            10,
+        )
+        for invalid in ("0", "-1", "nan", "inf", "bad"):
+            with self.assertRaises(ValueError):
+                resolve_output_grad_max_abs({"PADDLEAPITEST_OUTPUT_GRAD_MAX_ABS": invalid})
 
     def test_default_bound_preserves_historical_values(self):
         # 默认配置必须保持相同 seed 下的历史输入，避免普通回归基线漂移。
@@ -109,17 +123,17 @@ class InputRangeTest(TestCase):
                 seed=11,
                 config_fingerprint="output-grad-range",
                 max_abs=max_abs,
-                range_configured=max_abs != LEGACY_INPUT_MAX_ABS_FOR_OUTPUT_GRAD,
+                range_configured=max_abs != 0.5,
                 cache_enabled=True,
             )
 
         clear_input_backend_runtime()
-        narrow = generate(LEGACY_INPUT_MAX_ABS_FOR_OUTPUT_GRAD)
+        narrow = generate(0.5)
         wide = generate(10)
-        self.assertTrue(numpy.all(numpy.abs(narrow.real) < LEGACY_INPUT_MAX_ABS_FOR_OUTPUT_GRAD))
-        self.assertTrue(numpy.all(numpy.abs(narrow.imag) < LEGACY_INPUT_MAX_ABS_FOR_OUTPUT_GRAD))
-        self.assertTrue(numpy.any(numpy.abs(wide.real) > LEGACY_INPUT_MAX_ABS_FOR_OUTPUT_GRAD))
-        self.assertTrue(numpy.any(numpy.abs(wide.imag) > LEGACY_INPUT_MAX_ABS_FOR_OUTPUT_GRAD))
+        self.assertTrue(numpy.all(numpy.abs(narrow.real) < 0.5))
+        self.assertTrue(numpy.all(numpy.abs(narrow.imag) < 0.5))
+        self.assertTrue(numpy.any(numpy.abs(wide.real) > 0.5))
+        self.assertTrue(numpy.any(numpy.abs(wide.imag) > 0.5))
 
     def test_default_equivalent_rules_use_configured_complex_values(self):
         # shape-only 和参数规则都必须回到 complex-aware default。

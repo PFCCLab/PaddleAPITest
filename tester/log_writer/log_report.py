@@ -262,13 +262,9 @@ def print_run_header(options, paddle_version):
     if runtime_config is not None:
         # 记录生效值而非原始环境字符串，失败日志可直接复现输入范围。
         test.append(("PADDLEAPITEST_INPUT_MAX_ABS", runtime_config.input_max_abs))
-        # 日志同时展示 forward 配置与 output-grad 的实际历史/显式范围。
-        effective_input_max_abs_for_output_grad = (
-            runtime_config.input_max_abs
-            if getattr(runtime_config, "input_max_abs_is_configured", False)
-            else 0.5
-        )
-        test.append(("input_max_abs_for_output_grad", effective_input_max_abs_for_output_grad))
+        # 两个环境变量分别记录，避免从日志误判 backward 的生效范围。
+        # 日志保留独立环境变量名称，重放时不需要猜测范围来源。
+        test.append(("PADDLEAPITEST_OUTPUT_GRAD_MAX_ABS", runtime_config.output_grad_max_abs))
     if options.test_cpu:
         compute.append(("--test_cpu", True))
     if requires_gpu:

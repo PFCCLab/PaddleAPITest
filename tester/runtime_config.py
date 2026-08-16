@@ -7,33 +7,48 @@ from dataclasses import dataclass, field, replace
 # 默认上界复现历史 `(random - 0.5) * 1.2` 的数值范围和随机流。
 INPUT_MAX_ABS_ENV_VAR = "PADDLEAPITEST_INPUT_MAX_ABS"
 DEFAULT_INPUT_MAX_ABS = 0.6
-LEGACY_INPUT_MAX_ABS_FOR_OUTPUT_GRAD = 0.5
+OUTPUT_GRAD_MAX_ABS_ENV_VAR = "PADDLEAPITEST_OUTPUT_GRAD_MAX_ABS"
+DEFAULT_OUTPUT_GRAD_MAX_ABS = 0.5
 
 
-def resolve_input_max_abs(environ=None):
-    """解析普通浮点输入的对称绝对上界。"""
-    # 环境变量只在 runtime config 冻结时读取，worker 不再观察运行中的环境变化。
+def _resolve_positive_max_abs(env_var, default, environ=None):
+    # 两个 max_abs 环境变量共享校验，但各自拥有独立的默认值和生效范围。
     source = os.environ if environ is None else environ
-    raw_value = source.get(INPUT_MAX_ABS_ENV_VAR, str(DEFAULT_INPUT_MAX_ABS))
+    raw_value = source.get(env_var, str(default))
     try:
         value = float(raw_value)
     except (TypeError, ValueError) as err:
         # 配置错误必须在 worker 启动前失败，不能静默退回默认范围。
-        raise ValueError(
-            f"{INPUT_MAX_ABS_ENV_VAR} must be a finite positive number, got {raw_value!r}"
-        ) from err
+        raise ValueError(f"{env_var} must be a finite positive number, got {raw_value!r}") from err
     if not math.isfinite(value) or value <= 0:
         # 非有限值会直接污染所有浮点输入，零和负数不具备范围语义。
-        raise ValueError(
-            f"{INPUT_MAX_ABS_ENV_VAR} must be a finite positive number, got {raw_value!r}"
-        )
+        raise ValueError(f"{env_var} must be a finite positive number, got {raw_value!r}")
     return value
 
 
+def resolve_input_max_abs(environ=None):
+    """解析普通浮点输入的对称绝对上界。"""
+    return _resolve_positive_max_abs(INPUT_MAX_ABS_ENV_VAR, DEFAULT_INPUT_MAX_ABS, environ)
+
+
+def resolve_output_grad_max_abs(environ=None):
+    # output-grad 不再隐式继承 forward 范围，避免两个测试旋钮相互覆盖。
+    """解析 backward output-grad 的独立对称绝对上界。"""
+    return _resolve_positive_max_abs(
+        OUTPUT_GRAD_MAX_ABS_ENV_VAR,
+        DEFAULT_OUTPUT_GRAD_MAX_ABS,
+        environ,
+    )
+
+
 def input_max_abs_is_configured(environ=None):
-    """判断是否显式配置了会同步影响 output-grad 的输入范围。"""
     source = os.environ if environ is None else environ
     return INPUT_MAX_ABS_ENV_VAR in source
+
+
+def output_grad_max_abs_is_configured(environ=None):
+    source = os.environ if environ is None else environ
+    return OUTPUT_GRAD_MAX_ABS_ENV_VAR in source
 
 
 @dataclass(frozen=True)
@@ -55,8 +70,11 @@ class GpuModeConfig:
 class TestRuntimeConfig:
     random_seed: int = 0
     input_max_abs: float = DEFAULT_INPUT_MAX_ABS
-    # 该标记区分默认历史 output-grad 范围与显式同步输入范围。
+    # forward/default generator 的显式配置状态。
     input_max_abs_is_configured: bool = False
+    output_grad_max_abs: float = DEFAULT_OUTPUT_GRAD_MAX_ABS
+    # backward output-grad 的显式配置状态。
+    output_grad_max_abs_is_configured: bool = False
     bitwise_alignment: bool = False
     test_cpu: bool = False
     input_backend_requested: str | None = None
@@ -123,6 +141,8 @@ class TestRuntimeConfig:
             random_seed=int(options.random_seed),
             input_max_abs=resolve_input_max_abs(),
             input_max_abs_is_configured=input_max_abs_is_configured(),
+            output_grad_max_abs=resolve_output_grad_max_abs(),
+            output_grad_max_abs_is_configured=output_grad_max_abs_is_configured(),
             bitwise_alignment=bool(options.bitwise_alignment),
             test_cpu=bool(options.test_cpu),
             input_backend_requested=policy.requested,
