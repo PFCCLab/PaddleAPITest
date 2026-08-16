@@ -506,8 +506,8 @@ def decide_gpu_memory_preflight(
     input_backend,
     input_source_on_gpu,
 ):
-    # 预检只做 admission decision，不分配测试 Tensor，失败结果由调用方转换为 skip。
-    """仅当配置峰值下界明显超过设备容量时返回 skip。"""
+    # 预检只做 admission decision，不分配测试 Tensor，容量不足由调用方记为 OOM。
+    """仅当配置峰值下界明显超过设备容量时返回拒绝决策。"""
     if not gpu_config.enabled:
         return GpuMemoryPreflightDecision(False, reason="GPU mode disabled")
     capacity_bytes = max(0, int(float(gpu_config.memory_budget or 0.0) * _GIB))

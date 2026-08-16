@@ -687,10 +687,10 @@ class APITestAccuracy(APITestBase):
                 )
             del inputs_list, result_outputs, result_outputs_grads
         except GpuMemoryGuardSkip as err:
-            self.report_case_result("skip", phase="memory_guard", message=str(err))
+            self.report_case_result("oom", phase="memory_guard", message=str(err))
             self.clear_runtime_inputs("paddle")
             self.clear_output_grad_cache()
-            self.dump_finalize("skip", memory_guard=str(err))
+            self.dump_finalize("oom", memory_guard=str(err))
             return False, None
         except Exception as err:
             if str(err).startswith("Too large tensor to get cached numpy: "):
@@ -720,8 +720,8 @@ class APITestAccuracy(APITestBase):
         try:
             dual_gpu_completed = bool(self._test_accuracy())
         except GpuMemoryGuardSkip as err:
-            self.report_case_result("skip", phase="memory_guard", message=str(err))
-            self.dump_finalize("skip", memory_guard=str(err))
+            self.report_case_result("oom", phase="memory_guard", message=str(err))
+            self.dump_finalize("oom", memory_guard=str(err))
         finally:
             # _test_accuracy 返回后局部结果引用已经销毁，此时才能可靠清理 allocator cache。
             if self.use_dual_gpu:

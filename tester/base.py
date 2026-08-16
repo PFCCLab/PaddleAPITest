@@ -515,6 +515,7 @@ class APITestBase:
                         f"physical_free={physical_free_bytes / _GIB:.2f} GiB, "
                         "basis=post_cleanup_physical_headroom"
                     )
+                    # 动态物理显存竞争仍走 worker 重试协议，不能固化为本次 case 的 OOM 终态。
                     self.record_memory_governance_metric("memory_preflight_defer")
                     raise GpuMemoryDeferred(message)
                 else:
@@ -523,9 +524,9 @@ class APITestBase:
                 return True
         else:
             message = decision.message()
-        self.record_memory_governance_metric("memory_preflight_skip")
-        self.report_case_result("skip", phase="preflight", message=message)
-        self.dump_finalize("skip", memory_preflight=message)
+        self.record_memory_governance_metric("memory_preflight_oom")
+        self.report_case_result("oom", phase="preflight", message=message)
+        self.dump_finalize("oom", memory_preflight=message)
         return False
 
     def reset_random_state(self, seed=None):

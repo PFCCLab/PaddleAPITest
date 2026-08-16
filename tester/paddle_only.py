@@ -146,8 +146,8 @@ class APITestPaddleOnly(APITestBase):
             paddle_output = self._run_paddle_forward()
             self._run_paddle_backward(paddle_output)
         except GpuMemoryGuardSkip as err:
-            self.report_case_result("skip", phase="memory_guard", message=str(err))
-            self._finalize_paddle_only("skip")
+            self.report_case_result("oom", phase="memory_guard", message=str(err))
+            self._finalize_paddle_only("oom")
             return
         except Exception as err:
             _, fatal = self._report_paddle_only_error(

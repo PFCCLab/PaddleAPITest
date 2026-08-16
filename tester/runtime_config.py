@@ -113,7 +113,8 @@ class TestRuntimeConfig:
         # options 通常已由 engine 规范化；这里保留解析能力供直接构造 runtime config 的入口使用。
         policy = resolve_input_backend_policy(
             requested=getattr(options, "input_backend_requested", None),
-            use_gpu_mode=bool(getattr(options, "use_gpu_mode", False)),
+            # 双卡 accuracy 的输入也必须跟随有效 GPU 拓扑，否则默认 backend 会错误落到 CPU。
+            use_gpu_mode=gpu_mode.enabled,
             use_cached_numpy=bool(getattr(options, "use_cached_numpy", False)),
             mode=next(
                 (

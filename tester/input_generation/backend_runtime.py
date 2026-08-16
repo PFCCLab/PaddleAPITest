@@ -69,9 +69,19 @@ def resolve_input_backend_policy(
     )
     # GPU 模式不能复用主存缓存，否则资源预估与真实物化会不一致。
     use_cached_numpy = use_cached_numpy and not use_gpu_mode
-    resolved = (
-        "numpy" if use_cached_numpy else normalized_requested or _MODE_DEFAULT_BACKENDS.get(mode)
-    )
+    default_backend = _MODE_DEFAULT_BACKENDS.get(mode)
+    if (
+        not use_gpu_mode
+        and normalized_requested is None
+        and mode
+        in {
+            "accuracy",
+            "accuracy_stable",
+        }
+    ):
+        # 普通 accuracy 默认只在 CPU 生成输入，显式 backend 仍由调用方保留。
+        default_backend = "numpy"
+    resolved = "numpy" if use_cached_numpy else normalized_requested or default_backend
     resolved = resolved or ("torch" if use_gpu_mode else "numpy")
     # 性能模式默认要求原生设备，显式 NumPy 仍然保留 CPU 语义。
     effective_gpu_mode = use_gpu_mode or (mode in _GPU_NATIVE_MODES and resolved != "numpy")

@@ -815,7 +815,7 @@ class APITestAccuracyStable(APITestBase):
                 ):
                     return
         except GpuMemoryGuardSkip as err:
-            self.report_case_result("skip", phase="memory_guard", message=str(err))
+            self.report_case_result("oom", phase="memory_guard", message=str(err))
             return
 
         summary_failed = False
@@ -833,7 +833,7 @@ class APITestAccuracyStable(APITestBase):
             log_worker.write_stable_passes(self.api_config.config)
         except GpuMemoryGuardSkip as err:
             summary_failed = True
-            self.report_case_result("skip", phase="memory_guard", message=str(err))
+            self.report_case_result("oom", phase="memory_guard", message=str(err))
             return
         except Exception:
             summary_failed = True
