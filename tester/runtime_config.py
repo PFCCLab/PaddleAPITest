@@ -84,6 +84,8 @@ class TestRuntimeConfig:
     input_use_gpu_mode: bool = False
     input_backend_policy: object | None = None
     gpu_mode: GpuModeConfig = field(default_factory=GpuModeConfig)
+    # batch worker 传入的紧凑估算；单 case 入口为 None，仍执行完整预检。
+    gpu_memory_estimate: object | None = None
 
     @property
     def paddle_kernel_device_type(self):

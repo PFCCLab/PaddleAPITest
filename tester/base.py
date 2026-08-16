@@ -471,21 +471,29 @@ class APITestBase:
         # 预检和实际生成必须共享同一个 resolved 名称，缺失时不能用默认值低估显存。
         if input_backend is None:
             raise ValueError("runtime config has no resolved input backend")
-        decision = decide_gpu_memory_preflight(
-            self.api_config,
-            mode,
-            self.gpu_mode_config,
-            check_grad=self.need_check_grad(),
-            paddle_kernel_on_gpu=not self.runtime_config.test_cpu,
-            torch_operator_on_gpu=self.use_torch,
-            input_backend=input_backend,
-            input_source_on_gpu=(
-                input_backend != "numpy" and self.runtime_config.input_logical_device != "cpu"
-            ),
-        )
-        if not decision.should_skip:
-            # 预检按总容量准入；首次分配前按计算卡公共阶段峰值释放上个 case 的跨框架缓存。
-            # 双卡可选 plan 描述后续驻留策略，不属于首次输入分配必须同时满足的集合。
+        if not self.gpu_mode_config.enabled:
+            return True
+        precomputed = getattr(self.runtime_config, "gpu_memory_estimate", None)
+        if precomputed is None:
+            # 单 case 入口或主进程估算失败时保留完整静态预检语义。
+            decision = decide_gpu_memory_preflight(
+                self.api_config,
+                mode,
+                self.gpu_mode_config,
+                check_grad=self.need_check_grad(),
+                paddle_kernel_on_gpu=not self.runtime_config.test_cpu,
+                torch_operator_on_gpu=self.use_torch,
+                input_backend=input_backend,
+                input_source_on_gpu=(
+                    input_backend != "numpy" and self.runtime_config.input_logical_device != "cpu"
+                ),
+            )
+            if decision.should_skip:
+                message = decision.message()
+                self.record_memory_governance_metric("memory_preflight_oom")
+                self.report_case_result("oom", phase="preflight", message=message)
+                self.dump_finalize("oom", memory_preflight=message)
+                return False
             compute_stages = tuple(
                 stage
                 for stage in getattr(decision.estimate, "stages", ())
@@ -495,39 +503,33 @@ class APITestBase:
                 (stage.total_bytes for stage in compute_stages),
                 default=0,
             )
-            if required_headroom_bytes > 0:
-                runtime_decision = gpu_mode_memory_decision(
-                    self.gpu_mode_config,
-                    required_headroom_bytes=required_headroom_bytes,
-                    use_torch=self.use_torch,
-                )
-                if runtime_decision.cleanup_performed:
-                    self.record_memory_governance_metric("preflight_cache_release")
-                # 静态预算决定终态 skip；整卡 free 只是瞬时调度信号，不能固化为 skip。
-                physical_free_bytes = runtime_decision.free_after_bytes
-                if (
-                    physical_free_bytes is not None
-                    and required_headroom_bytes > physical_free_bytes
-                ):
-                    message = (
-                        f"mode={mode}, stage=runtime_headroom, device=compute, "
-                        f"estimated_peak={required_headroom_bytes / _GIB:.2f} GiB, "
-                        f"physical_free={physical_free_bytes / _GIB:.2f} GiB, "
-                        "basis=post_cleanup_physical_headroom"
-                    )
-                    # 动态物理显存竞争仍走 worker 重试协议，不能固化为本次 case 的 OOM 终态。
-                    self.record_memory_governance_metric("memory_preflight_defer")
-                    raise GpuMemoryDeferred(message)
-                else:
-                    return True
-            else:
-                return True
         else:
-            message = decision.message()
-        self.record_memory_governance_metric("memory_preflight_oom")
-        self.report_case_result("oom", phase="preflight", message=message)
-        self.dump_finalize("oom", memory_preflight=message)
-        return False
+            # admission budget 已由相同估算派生，worker 只需确认当前物理 headroom。
+            required_headroom_bytes = max(
+                0,
+                int(getattr(precomputed, "compute_headroom_bytes", 0)),
+            )
+        if required_headroom_bytes <= 0:
+            return True
+        runtime_decision = gpu_mode_memory_decision(
+            self.gpu_mode_config,
+            required_headroom_bytes=required_headroom_bytes,
+            use_torch=self.use_torch,
+        )
+        if runtime_decision.cleanup_performed:
+            self.record_memory_governance_metric("preflight_cache_release")
+        physical_free_bytes = runtime_decision.free_after_bytes
+        if physical_free_bytes is None or required_headroom_bytes <= physical_free_bytes:
+            return True
+        message = (
+            f"mode={mode}, stage=runtime_headroom, device=compute, "
+            f"estimated_peak={required_headroom_bytes / _GIB:.2f} GiB, "
+            f"physical_free={physical_free_bytes / _GIB:.2f} GiB, "
+            "basis=post_cleanup_physical_headroom"
+        )
+        # 动态物理显存竞争仍走 worker 重试协议，不能固化为本次 case 的 OOM 终态。
+        self.record_memory_governance_metric("memory_preflight_defer")
+        raise GpuMemoryDeferred(message)
 
     def reset_random_state(self, seed=None):
         """Reset NumPy and framework RNGs for reproducible executions."""
@@ -2234,15 +2236,25 @@ class APITestBase:
         else:
             self.release_framework_gpu_cache("paddle")
 
-    def clear_torch_tensor(self, probe_bytes=None):
-        if not self._clear_tensor_config_cache("clear_torch_tensor"):
+    def clear_torch_tensor(
+        self,
+        probe_bytes=None,
+        *,
+        force=False,
+        required_headroom_bytes=None,
+    ):
+        # force/headroom 与配置缓存释放合并为一次 allocator 决策，避免同阶段重复同步。
+        cache_cleared = self._clear_tensor_config_cache("clear_torch_tensor")
+        if not cache_cleared and not force and required_headroom_bytes is None:
             return
         if self.gpu_mode_config.enabled:
-            gpu_mode_memory_decision(
+            return gpu_mode_memory_decision(
                 self.gpu_mode_config,
+                force=force,
                 probe_bytes=probe_bytes,
+                required_headroom_bytes=required_headroom_bytes,
             )
-        else:
+        if cache_cleared:
             self.release_framework_gpu_cache("torch")
 
     def is_forward_only(self):

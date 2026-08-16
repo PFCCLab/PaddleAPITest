@@ -20,7 +20,7 @@ import tempfile
 import threading
 import time
 from collections import OrderedDict, deque
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime
 from multiprocessing import cpu_count, set_start_method
 from pathlib import Path
@@ -87,6 +87,8 @@ class CaseGpuEstimate:
     # compute/comparison 分开记录，双卡模式不能用计算卡峰值代替对比卡预算。
     compute_bytes: int = 0
     comparison_bytes: int = 0
+    # worker 只需要首阶段非 plan 峰值做动态 headroom 检查，避免重复解析完整配置。
+    compute_headroom_bytes: int | None = None
 
 
 @dataclass
@@ -648,10 +650,16 @@ class PendingCase:
     ready_at: float = 0.0
     compute_estimate_bytes: int = 0
     comparison_estimate_bytes: int = 0
+    # None 表示调度进程未获得可信估算，worker 必须执行完整预检。
+    compute_headroom_bytes: int | None = None
 
     @property
     def gpu_estimate(self):
-        return CaseGpuEstimate(self.compute_estimate_bytes, self.comparison_estimate_bytes)
+        return CaseGpuEstimate(
+            self.compute_estimate_bytes,
+            self.comparison_estimate_bytes,
+            self.compute_headroom_bytes,
+        )
 
 
 class PendingQueue:
@@ -858,6 +866,10 @@ class WorkerTask:
     workers_on_gpu: int
     compute_budget_gib: float
     comparison_budget_gib: float = 0.0
+    compute_estimate_bytes: int = 0
+    comparison_estimate_bytes: int = 0
+    # 只跨进程传紧凑峰值，避免序列化完整配置分析结果。
+    compute_headroom_bytes: int | None = None
 
 
 @dataclass
@@ -1030,6 +1042,16 @@ def _apply_worker_task_runtime_budget(options, task, gpu_id, comparison_gpu_id=N
     options.gpu_workers_per_gpu_map = workers_map
     options.gpu_total_memory_map = total_memory_map
     os.environ["PADDLEAPITEST_WORKERS_ON_GPU"] = str(workers_on_gpu)
+    # 主进程估算失败时保留 worker 原有的完整预检，不能把未知值当成零峰值。
+    options._current_gpu_estimate = (
+        CaseGpuEstimate(
+            compute_bytes=max(0, int(task.compute_estimate_bytes)),
+            comparison_bytes=max(0, int(task.comparison_estimate_bytes)),
+            compute_headroom_bytes=max(0, int(task.compute_headroom_bytes)),
+        )
+        if task.compute_headroom_bytes is not None
+        else None
+    )
 
 
 def _worker_loop(
@@ -1093,6 +1115,8 @@ def _worker_loop(
             _apply_worker_task_runtime_budget(options, task, gpu_id, comparison_gpu_id)
             api_config_str = task.config
         else:
+            # 非批量任务没有调度器准入结果，禁止复用上一条任务的摘要。
+            options._current_gpu_estimate = None
             api_config_str = task
         result_queue.put(("ack", slot_index, os.getpid(), api_config_str))
 
@@ -2668,6 +2692,7 @@ def _pending_case_for_retry(retry_state, config, *, ready_at=0.0):
         ready_at=ready_at,
         compute_estimate_bytes=estimate.compute_bytes,
         comparison_estimate_bytes=estimate.comparison_bytes,
+        compute_headroom_bytes=estimate.compute_headroom_bytes,
     )
 
 
@@ -2781,7 +2806,20 @@ def _estimate_case_gpu_memory(api_config_str, options, *, failure_report):
         (stage.total_bytes for stage in estimate.stages if stage.device == "comparison"),
         default=0,
     )
-    return CaseGpuEstimate(compute_bytes, comparison_bytes)
+    compute_headroom_bytes = max(
+        (
+            stage.total_bytes
+            for stage in estimate.stages
+            if stage.device == "compute" and stage.plan is None
+        ),
+        default=0,
+    )
+    # admission 使用完整峰值，动态 free 检查只使用无需同时驻留的公共阶段峰值。
+    return CaseGpuEstimate(
+        compute_bytes,
+        comparison_bytes,
+        compute_headroom_bytes,
+    )
 
 
 def _build_pending_cases(api_configs, options, *, failure_report):
@@ -2793,6 +2831,7 @@ def _build_pending_cases(api_configs, options, *, failure_report):
                 config=config,
                 compute_estimate_bytes=estimate.compute_bytes,
                 comparison_estimate_bytes=estimate.comparison_bytes,
+                compute_headroom_bytes=estimate.compute_headroom_bytes,
             ),
             now=0.0,
         )
@@ -3312,6 +3351,9 @@ class ContinuousGpuBatchScheduler:
                             if dual_gpu
                             else 0.0
                         ),
+                        compute_estimate_bytes=assignment.pending.compute_estimate_bytes,
+                        comparison_estimate_bytes=assignment.pending.comparison_estimate_bytes,
+                        compute_headroom_bytes=assignment.pending.compute_headroom_bytes,
                     ),
                 )
             except Exception as err:
@@ -3764,6 +3806,13 @@ def run_test_case(api_config_str, options):
             case_context.gpu_id,
             comparison_gpu_id=case_context.comparison_gpu_id,
         )
+        precomputed_estimate = getattr(options, "_current_gpu_estimate", None)
+        if precomputed_estimate is not None:
+            # runtime config 按 case 冻结，防止常驻 worker 的下一条任务继承旧估算。
+            case_context.runtime_config = replace(
+                case_context.runtime_config,
+                gpu_memory_estimate=precomputed_estimate,
+            )
         try:
             api_config = APIConfig(api_config_str)
         except Exception as err:

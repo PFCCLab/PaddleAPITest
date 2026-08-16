@@ -566,9 +566,7 @@ class APITestAccuracy(APITestBase):
                 (torch_output, torch_out_grads)
             )
             gc.collect()
-            self.clear_torch_tensor(probe_bytes=probe_bytes)
-            gpu_mode_memory_decision(
-                self.gpu_mode_config,
+            self.clear_torch_tensor(
                 probe_bytes=probe_bytes,
                 required_headroom_bytes=probe_bytes,
             )
@@ -596,9 +594,7 @@ class APITestAccuracy(APITestBase):
 
         gc.collect()
         if self.use_gpu_mode:
-            self.clear_torch_tensor(probe_bytes=probe_bytes)
-            gpu_mode_memory_decision(
-                self.gpu_mode_config,
+            self.clear_torch_tensor(
                 force=not keep_torch_outputs_on_device,
                 probe_bytes=probe_bytes,
             )
@@ -766,9 +762,11 @@ class APITestAccuracy(APITestBase):
             probe_bytes,
         )
         if self.use_gpu_mode:
-            # 调用者完成结果重绑定后旧 GPU 树才真正失去引用，此时才能释放 Torch cache。
-            gpu_mode_memory_decision(self.gpu_mode_config, force=True)
-
+            # caller 重绑定后旧 graph 才失去最后引用，仅在此时出现压力才清 allocator cache。
+            gpu_mode_memory_decision(
+                self.gpu_mode_config,
+                probe_bytes=probe_bytes,
+            )
         paddle_success, paddle_output = self.get_paddle_output()
         if not paddle_success:
             return
