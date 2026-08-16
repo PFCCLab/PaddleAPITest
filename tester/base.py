@@ -20,7 +20,8 @@ from .gpu_memory_preflight import (
 )
 from .input_generation.binding import bind_input_parameters, split_tensor_method_arguments
 from .input_generation.materialization import (
-    iter_unique_tensor_configs,
+    clear_tensor_configs,
+    materialize_config_tree,
     tensor_config_tree_nbytes,
 )
 from .input_generation.tensor_config import (
@@ -688,22 +689,12 @@ class APITestBase:
 
     def _materialize_paddle_config_value(self, config_value, *, clear_tensor=True):
         """Materialize a Paddle config tree into live values, optionally clearing cache."""
-        if isinstance(config_value, TensorConfig):
-            paddle_tensor = config_value.get_paddle_tensor(self.api_config)
-            if clear_tensor:
-                config_value.clear_paddle_tensor()
-            return paddle_tensor
-        if isinstance(config_value, list):
-            return [
-                self._materialize_paddle_config_value(item, clear_tensor=clear_tensor)
-                for item in config_value
-            ]
-        if isinstance(config_value, tuple):
-            return tuple(
-                self._materialize_paddle_config_value(item, clear_tensor=clear_tensor)
-                for item in config_value
-            )
-        return config_value
+        return materialize_config_tree(
+            config_value,
+            self.api_config,
+            "paddle",
+            clear_tensor=clear_tensor,
+        )
 
     def build_paddle_input(self):
         """Generate Paddle inputs from config and materialize TensorConfig leaves.
@@ -1140,19 +1131,12 @@ class APITestBase:
 
     def _materialize_torch_config_value(self, config_value, *, convert_dtype=False):
         """Materialize a Torch config tree and translate explicit dtype values."""
-        if isinstance(config_value, TensorConfig):
-            torch_tensor = config_value.get_torch_tensor(self.api_config)
-            config_value.clear_torch_tensor()
-            return torch_tensor
-        if isinstance(config_value, list):
-            return [self._materialize_torch_config_value(item) for item in config_value]
-        if isinstance(config_value, tuple):
-            return tuple(self._materialize_torch_config_value(item) for item in config_value)
-        if convert_dtype or isinstance(
-            config_value, (paddle.dtype, paddle.base.libpaddle.VarDesc.VarType)
-        ):
-            return self.to_torch_dtype(config_value)
-        return config_value
+        return materialize_config_tree(
+            config_value,
+            self.api_config,
+            "torch",
+            convert_dtype=convert_dtype,
+        )
 
     def build_torch_input(self):
         """Generate Torch inputs from config and materialize TensorConfig leaves.
@@ -1944,13 +1928,12 @@ class APITestBase:
         )
 
     def _clear_tensor_config_cache(self, clear_method_name, *args):
-        # 共享 iterator 按对象身份去重，避免 merged/torch/paddle 配置别名被重复释放。
-        configs = tuple(iter_unique_tensor_configs(*self._tensor_config_roots()))
-        if not configs:
-            return False
-        for config in configs:
-            getattr(config, clear_method_name)(*args)
-        return True
+        # 共享物化模块按对象身份去重，避免 merged/torch/paddle 别名重复释放。
+        return clear_tensor_configs(
+            *self._tensor_config_roots(),
+            clear_method=clear_method_name,
+            clear_args=args,
+        )
 
     def _map_tensor_tree(self, value, tensor_mapper):
         if isinstance(value, paddle.Tensor):
@@ -2243,18 +2226,28 @@ class APITestBase:
 
     def save_original_inputs_to_cpu(self):
         """Save config inputs on CPU before either framework can mutate them."""
-        # stable snapshot 与清理必须遍历同一组唯一配置，否则别名路径会产生半清理状态。
-        for config in iter_unique_tensor_configs(*self._tensor_config_roots()):
-            config.save_cpu_copy(self.api_config)
+        # 快照和物化共用 identity 去重，保证共享 TensorConfig 只保存一次。
+        clear_tensor_configs(
+            *self._tensor_config_roots(),
+            clear_method="save_cpu_copy",
+            clear_args=(self.api_config,),
+        )
 
     def clear_original_cpu_inputs(self):
-        for config in iter_unique_tensor_configs(*self._tensor_config_roots()):
-            config.clear_cpu_copy()
+        # CPU 快照释放也走同一 owning module，避免生命周期分散回调用方。
+        clear_tensor_configs(
+            *self._tensor_config_roots(),
+            clear_method="clear_cpu_copy",
+        )
 
     def clear_generated_input_values(self):
         """框架输入取得所有权后释放 GPU 生成源，避免跨阶段长期驻留。"""
-        for config in iter_unique_tensor_configs(*self._tensor_config_roots()):
-            config.clear_generated_input_value(self.api_config)
+        # 生成值清理必须传 api_config，values.py 才能同步删除路径索引。
+        clear_tensor_configs(
+            *self._tensor_config_roots(),
+            clear_method="clear_generated_input_value",
+            clear_args=(self.api_config,),
+        )
 
     def estimate_input_bytes(self):
         """Estimate unique configured input storage bytes for memory probe gating."""

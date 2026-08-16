@@ -2,7 +2,11 @@
 
 from __future__ import annotations
 
+import copy
 from dataclasses import dataclass
+
+import paddle
+from tester.dtype_utils import to_torch_dtype
 
 from .tensor_config import (
     CAST_THROUGH_INTERMEDIATE_DTYPES,
@@ -11,6 +15,7 @@ from .tensor_config import (
     dtype_element_size,
     dtype_name,
 )
+from .values import InputValue, attach_input_values, read_input_value
 
 
 @dataclass(frozen=True)
@@ -127,6 +132,115 @@ def iter_unique_tensor_configs(*roots):
         yield from visit(root)
 
 
+def materialize_config_tree(
+    value,
+    api_config,
+    framework,
+    *,
+    clear_tensor=True,
+    convert_dtype=False,
+):
+    """Materialize one config tree through the owning framework seam."""
+    # framework 名称在这里解析，调用方不再复制叶子分支选择。
+    if framework not in {"numpy", "torch", "paddle"}:
+        raise ValueError(f"unsupported materialization framework: {framework}")
+    if isinstance(value, TensorConfig):
+        if framework == "numpy":
+            # NumPy 输入由生成值拥有，不能伪造一个不存在的框架缓存。
+            result = read_input_value(api_config, value)
+            if result is None:
+                # 缺值必须暴露为配置错误，避免后续 Paddle/Torch 报无关异常。
+                raise value._missing_input_error(api_config, "NumPy")
+            return result
+        # Paddle/Torch 叶子物化和清理必须成对发生，避免缓存跨 case 泄漏。
+        result = getattr(value, f"get_{framework}_tensor")(api_config)
+        if clear_tensor:
+            getattr(value, f"clear_{framework}_tensor")()
+        return result
+    if isinstance(value, list):
+        # 列表容器需要保持原有参数协议，只替换 TensorConfig 叶子。
+        return [
+            materialize_config_tree(
+                item,
+                api_config,
+                framework,
+                clear_tensor=clear_tensor,
+                convert_dtype=convert_dtype,
+            )
+            for item in value
+        ]
+    if isinstance(value, tuple):
+        # tuple 可能承载 API 的 shape 或多输出参数，不能降级成 list。
+        return tuple(
+            materialize_config_tree(
+                item,
+                api_config,
+                framework,
+                clear_tensor=clear_tensor,
+                convert_dtype=convert_dtype,
+            )
+            for item in value
+        )
+    if isinstance(value, dict):
+        # kwargs 和嵌套映射共享同一遍历，避免调用方遗漏 dict 分支。
+        return type(value)(
+            (
+                key,
+                materialize_config_tree(
+                    item,
+                    api_config,
+                    framework,
+                    clear_tensor=clear_tensor,
+                    convert_dtype=convert_dtype,
+                ),
+            )
+            for key, item in value.items()
+        )
+    if framework == "torch" and (
+        convert_dtype or isinstance(value, (paddle.dtype, paddle.base.libpaddle.VarDesc.VarType))
+    ):
+        # Torch 目标的 dtype 参数必须跨 Paddle 枚举转换，TensorConfig 不处理它。
+        return to_torch_dtype(value)
+    return value
+
+
+def clear_tensor_configs(*roots, clear_method, clear_args=()):
+    """Clear unique TensorConfig framework caches and report whether any existed."""
+    # merged kwargs 与原始 args 可能别名同一叶子，identity 去重是清理协议的一部分。
+    configs = tuple(iter_unique_tensor_configs(*roots))
+    for config in configs:
+        getattr(config, clear_method)(*clear_args)
+    return bool(configs)
+
+
+def reset_tensor_configs(*roots):
+    """Drop leaf framework caches before reusing a copied config tree."""
+    # 配置副本不能复用源对象的设备 Tensor，否则两次实现会共享可变状态。
+    for config in iter_unique_tensor_configs(*roots):
+        # 这些字段是 TensorConfig 唯一的框架缓存，不触碰 shape/dtype 元数据。
+        config.paddle_tensor = None
+        config.torch_tensor = None
+        config.cpu_tensor = None
+        # 非连续测试的维度扰动属于一次物化状态，复制前必须重新选择。
+        config.shuffle_dims = None
+
+
+def copy_generated_input_values(source_api_config, target_api_config):
+    """Copy logical input values and rebuild their target identity index."""
+    values = getattr(source_api_config, "_input_generation_values", None)
+    if values is None:
+        return False
+    # APIConfig 的自定义 deepcopy 不复制运行时索引，这里按稳定 path 重建它。
+    attach_input_values(
+        target_api_config,
+        tuple(
+            InputValue(item.path, copy.deepcopy(item.generated_value), item.backend_name)
+            for item in values
+        ),
+    )
+    return True
+
+
 def tensor_config_tree_numel(*roots):
     """汇总配置树中唯一 TensorConfig 的逻辑元素数。"""
     # 汇总阶段不触发任何真实 Tensor 分配。
@@ -141,8 +255,12 @@ def tensor_config_tree_nbytes(*roots, storage=True):
 __all__ = [
     "MaterializationPlan",
     "build_materialization_plan",
+    "clear_tensor_configs",
+    "copy_generated_input_values",
     "generated_value_nbytes",
     "iter_unique_tensor_configs",
+    "materialize_config_tree",
+    "reset_tensor_configs",
     "tensor_config_tree_nbytes",
     "tensor_config_tree_numel",
 ]
