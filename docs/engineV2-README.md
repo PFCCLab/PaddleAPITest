@@ -60,7 +60,7 @@
 | `--log_dir`                      | str   | 日志输出路径（默认 "tester/api_config/test_log"）                                      |
 | `--atol`                         | float | 精度测试的绝对误差容忍度，仅在启用 `--accuracy` 时有效（默认 1e-2）                    |
 | `--rtol`                         | float | 精度测试的相对误差容忍度，仅在启用 `--accuracy` 时有效（默认 1e-2）                    |
-| `--accuracy_manual_threshold_config` | str | 每 API 手动精度阈值 YAML 路径（默认空）                                             |
+| `--accuracy_manual_threshold_config` | str | 严格比较失败后的每 API 手动精度阈值 YAML 路径（默认空）                            |
 | `--record_accuracy_tolerance`                     | bool  | 启用精度误差容忍度范围测试，仅在启用 `--accuracy` 时有效（默认 False）                 |
 | `--test_backward`                | bool  | 启用反向测试，仅在启用 `--paddle_cinn` 时有效（默认 False）                            |
 | `--timeout`                      | int   | 单个测试用例执行超时秒数（默认 1800）                                                  |
@@ -69,8 +69,6 @@
 | `--custom_device_vs_gpu`        | bool  | 启用自定义设备与GPU的精度对比测试模式（默认 False）                                   |
 | `--custom_device_vs_gpu_mode`   | str   | 自定义设备与GPU对比的模式：`upload` 或 `download`（默认 `upload`）                    |
 | `--bitwise_alignment`            | bool  | 是否进行诸位对齐对比，开启后所有的api的精度对比都按照atol=0.0,rtol = 0.0的精度对比结果(默认False)|
-| `--generate_failed_tests`        | bool  | 是否为失败的测试用例生成可复现的测试文件。开启后，当测试失败时，会在`failed_tests`目录下生成独立的Python测试文件，便于后续复现和调试（默认False）|
-| `--exit_on_error`                | bool  | 是否在精度测试出现`paddle_error`或者 `accuracy_error`  错误时立即退出测试进程(exit code 为1)。默认为False，测试进程会继续执行 |
 
 双卡 accuracy 和双卡稳定性模式都要求 `--num_workers_per_gpu=1`，并选择至少两张且数量为偶数的 GPU。GPU ID 可以不连续，引擎按规范化顺序两两配对。例如：
 

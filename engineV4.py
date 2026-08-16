@@ -369,17 +369,13 @@ VALID_TEST_ARGS = {
     "atol",
     "rtol",
     "accuracy_manual_threshold_config",
-    # tester 只在严格比较失败后读取该文件。
-    "accuracy_manual_file",
     "record_accuracy_tolerance",
     "operation_mode",
     "bos_path",
     "random_seed",
     "bos_conf_path",
     "bcecmd_path",
-    "generate_failed_tests",
     "bitwise_alignment",
-    "exit_on_error",
     "use_gpu_mode",
 }
 
@@ -403,14 +399,11 @@ SANITIZER_FORWARD_ARGS = {
     "atol",
     "rtol",
     "accuracy_manual_threshold_config",
-    "accuracy_manual_file",
     "record_accuracy_tolerance",
     "test_backward",
     "show_runtime_status",
     "random_seed",
     "bitwise_alignment",
-    "generate_failed_tests",
-    "exit_on_error",
 }
 SANITIZER_FORWARD_ARGS_SORTED = tuple(sorted(SANITIZER_FORWARD_ARGS))
 
@@ -4379,14 +4372,6 @@ def _build_argument_parser():
         "--accuracy_manual_threshold_config",
         type=str,
         default="",
-        help="YAML file with per-API manual accuracy thresholds",
-    )
-    parser.add_argument(
-        "--accuracy_manual_file",
-        dest="accuracy_manual_file",
-        type=str,
-        default="",
-        # 该参数提供 known API 的二次复核，全局 atol/rtol 沿用原配置。
         help="YAML file with per-API thresholds for strict accuracy fallback",
     )
     parser.add_argument(
@@ -4437,18 +4422,6 @@ def _build_argument_parser():
         type=parse_bool,
         default=False,
         help="Use bitwise alignment for accuracy checks.",
-    )
-    parser.add_argument(
-        "--generate_failed_tests",
-        type=parse_bool,
-        default=False,
-        help="Generate reproducible test files for failed cases.",
-    )
-    parser.add_argument(
-        "--exit_on_error",
-        type=parse_bool,
-        default=False,
-        help="Exit the process when a paddle_error occurs.",
     )
     parser.add_argument(
         "--use_dump",

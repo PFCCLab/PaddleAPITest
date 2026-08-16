@@ -66,8 +66,6 @@ ENGINE_ARG_TYPES = {
     "atol": (int, float),
     "rtol": (int, float),
     "accuracy_manual_threshold_config": str,
-    # 严格逐位失败后的 API 手动阈值复核文件。
-    "accuracy_manual_file": str,
     "record_accuracy_tolerance": bool,
     "test_backward": bool,
     "timeout": int,
@@ -76,8 +74,6 @@ ENGINE_ARG_TYPES = {
     "custom_device_vs_gpu": bool,
     "custom_device_vs_gpu_mode": str,
     "bitwise_alignment": bool,
-    "generate_failed_tests": bool,
-    "exit_on_error": bool,
     "use_dump": bool,
     "dump_dir": str,
     "use_compute_sanitizer": bool,
@@ -299,8 +295,6 @@ def apply_overrides(config: dict[str, Any], args: argparse.Namespace) -> None:
         "num_workers_per_gpu": args.num_workers_per_gpu,
         "gpu_ids": args.gpu_ids,
         "accuracy_manual_threshold_config": args.accuracy_manual_threshold_config,
-        # 独立于普通 accuracy 阈值，保持 exact-first 语义。
-        "accuracy_manual_file": args.accuracy_manual_file,
     }
     for key, value in simple_engine_overrides.items():
         if value is not None:
@@ -694,11 +688,6 @@ def parse_args() -> argparse.Namespace:
         "--num-workers-per-gpu", type=int, help="覆盖 engine_args.num_workers_per_gpu"
     )
     parser.add_argument("--gpu-ids", help="覆盖 engine_args.gpu_ids")
-    parser.add_argument(
-        "--accuracy_manual_file",
-        dest="accuracy_manual_file",
-        help="覆盖 engine_args.accuracy_manual_file",
-    )
     parser.add_argument(
         "--accuracy_manual_threshold_config",
         dest="accuracy_manual_threshold_config",

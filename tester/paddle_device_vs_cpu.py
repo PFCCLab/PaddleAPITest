@@ -15,7 +15,6 @@ class APITestCustomDeviceVSCPU(APITestBase):
         )
         self.test_amp = kwargs.get("test_amp", False)
         self.custom_device_type = self._get_first_custom_device_type()
-        self.generate_failed_tests = kwargs.get("generate_failed_tests", False)
         if self.check_custom_device_available():
             self.custom_device_id = 0
         if self.check_xpu_available():
@@ -260,56 +259,12 @@ class APITestCustomDeviceVSCPU(APITestBase):
         cpu_output, cpu_grads = self.run_on_device("cpu", 0)
         if cpu_output is None:
             self.report_case_result("paddle_error", "cpu execution failed")
-            # CPU 前向/反向执行失败时，如果开启了生成失败用例，则生成可复现单测
-            if self.generate_failed_tests:
-                try:
-                    from .test_file_generator import generate_reproducible_test_file
-
-                    error_info = {
-                        "error_type": "paddle_error",
-                        "stage": "forward",
-                        "need_backward": self.need_check_grad(),
-                    }
-                    test_file_path = generate_reproducible_test_file(
-                        self.api_config,
-                        error_info,
-                        test_amp=self.test_amp,
-                        target_device="cpu",
-                        device_id=0,
-                        test_instance=self,
-                    )
-                    if test_file_path:
-                        print(f"[Generated test file] {test_file_path}", flush=True)
-                except Exception as e:
-                    print(f"[Error generating test file] {e}", flush=True)
             return
 
         # 6. Run API on target device (including forward and backward)
         tgt_output, tgt_grads = self.run_on_device(target_device, device_id)
         if tgt_output is None:
             self.report_case_result("paddle_error", f"{target_device} execution failed")
-            # 目标设备前向/反向执行失败，同样生成失败用例
-            if self.generate_failed_tests:
-                try:
-                    from .test_file_generator import generate_reproducible_test_file
-
-                    error_info = {
-                        "error_type": "paddle_error",
-                        "stage": "forward",
-                        "need_backward": self.need_check_grad(),
-                    }
-                    test_file_path = generate_reproducible_test_file(
-                        self.api_config,
-                        error_info,
-                        test_amp=self.test_amp,
-                        target_device=target_device,
-                        device_id=device_id,
-                        test_instance=self,
-                    )
-                    if test_file_path:
-                        print(f"[Generated test file] {test_file_path}", flush=True)
-                except Exception as e:
-                    print(f"[Error generating test file] {e}", flush=True)
             return
 
         # 7. Compare forward results
@@ -344,46 +299,3 @@ class APITestCustomDeviceVSCPU(APITestBase):
                 "comparison failed",
                 write_main_log=get_terminal_log_type(self.api_config.config) is None,
             )
-            # 生成可复现的单测文件
-            if self.generate_failed_tests:
-                try:
-                    from .test_file_generator import generate_reproducible_test_file
-
-                    # 确定目标设备
-                    if self.check_xpu_available():
-                        target_device = "xpu"
-                        device_id = self.xpu_device_id
-                    elif self.check_custom_device_available():
-                        target_device = self.custom_device_type
-                        device_id = self.custom_device_id
-                    else:
-                        target_device = "cpu"
-                        device_id = 0
-
-                    # 确定失败阶段
-                    stage = "unknown"
-                    if not forward_pass:
-                        stage = "forward"
-                    elif not backward_pass:
-                        stage = "backward"
-
-                    error_info = {
-                        "error_type": "accuracy_error",
-                        "stage": stage,
-                        "need_backward": self.need_check_grad(),
-                    }
-
-                    # 生成测试文件
-                    test_file_path = generate_reproducible_test_file(
-                        self.api_config,
-                        error_info,
-                        test_amp=self.test_amp,
-                        target_device=target_device,
-                        device_id=device_id,
-                        test_instance=self,
-                    )
-
-                    if test_file_path:
-                        print(f"[Generated test file] {test_file_path}", flush=True)
-                except Exception as e:
-                    print(f"[Error generating test file] {e}", flush=True)

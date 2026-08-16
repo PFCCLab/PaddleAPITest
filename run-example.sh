@@ -99,6 +99,7 @@ TEST_PARAM_ARGS=(
     # 对比阈值；bitwise_alignment 会将阈值置 0
     # --atol=0.0
     # --rtol=0.0
+    # 严格比较失败后，使用 YAML 中对应 API 的 [atol, rtol] 复核
     # --accuracy_manual_threshold_config="tester/api_config/manual_threshold.yaml"
     # --bitwise_alignment=True
     # accuracy 容差诊断：将 atol/rtol 置 0 并记录误差，比较设备沿用 GPU mode 配置
@@ -109,10 +110,6 @@ TEST_PARAM_ARGS=(
     # --random_seed=0
     # custom_device_vs_gpu 上传/下载模式
     # --custom_device_vs_gpu_mode=upload
-    # 生成失败 case 的可复现测试文件
-    # --generate_failed_tests=True
-    # paddle_error 时立即退出
-    # --exit_on_error=True
     # 控制运行时进度输出
     # --show_runtime_status=True
 )

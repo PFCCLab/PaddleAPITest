@@ -113,10 +113,6 @@ Paddle 前向和反向在 CPU 执行，Torch reference 仍在 GPU。输入生成
 
 #### `--accuracy_manual_threshold_config=PATH`
 
-读取每 API 精度阈值 YAML。默认：空。
-
-#### `--accuracy_manual_file=PATH`
-
 先执行 `atol=rtol=0.0` 的严格比较；若失败且 API 在该 YAML 的
 `manual_threshold_config` 中，则按其 `[atol, rtol]` 复核。复核通过的配置写入
 `api_config_paddle_bitwise_knows.txt` 并按已知不完全对齐跳过；默认：空。
@@ -141,11 +137,7 @@ Paddle 前向和反向在 CPU 执行，Torch reference 仍在 GPU。输入生成
 
 单 case 最大执行时间，默认 `1800` 秒；后者控制实时进度输出，设为 `False` 时只打印失败 case，默认 `True`。
 
-### 失败复现与诊断
-
-#### `--generate_failed_tests=True`、`--exit_on_error=True`
-
-前者为失败 case 生成可复现测试文件；后者在首个 `paddle_error` 时退出。默认：`False`。
+### 诊断
 
 #### `--use_dump=True|False`、`--dump_dir=PATH`
 

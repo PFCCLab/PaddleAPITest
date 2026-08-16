@@ -67,17 +67,13 @@ VALID_TEST_ARGS = {
     "atol",
     "rtol",
     "accuracy_manual_threshold_config",
-    # V2 与 engineV4 共享参数协议。
-    "accuracy_manual_file",
     "record_accuracy_tolerance",
     "operation_mode",
     "bos_path",
     "random_seed",
     "bos_conf_path",
     "bcecmd_path",
-    "generate_failed_tests",
     "bitwise_alignment",
-    "exit_on_error",
     "use_gpu_mode",
     "accuracy_dual_gpu",
     "runtime_config",
@@ -1020,14 +1016,6 @@ def main():
         "--accuracy_manual_threshold_config",
         type=str,
         default="",
-        help="YAML file with per-API manual accuracy thresholds",
-    )
-    parser.add_argument(
-        "--accuracy_manual_file",
-        dest="accuracy_manual_file",
-        type=str,
-        default="",
-        # V2 字段语义与 V4 相同。
         help="YAML file with per-API thresholds for strict accuracy fallback",
     )
     parser.add_argument(
@@ -1078,18 +1066,6 @@ def main():
         type=bool,
         default=False,
         help="Use bitwise alignment for accuracy checks.",
-    )
-    parser.add_argument(
-        "--generate_failed_tests",
-        type=parse_bool,
-        default=False,
-        help="Generate reproducible test files for failed cases.",
-    )
-    parser.add_argument(
-        "--exit_on_error",
-        type=parse_bool,
-        default=False,
-        help="Exit the process when a paddle_error occurs.",
     )
     parser.add_argument(
         "--use_dump",

@@ -124,13 +124,7 @@ def main():
         "--accuracy_manual_threshold_config",
         type=str,
         default="",
-        help="YAML file with per-API manual accuracy thresholds",
-    )
-    parser.add_argument(
-        "--exit_on_error",
-        type=parse_bool,
-        default=False,
-        help="Whether to exit the process when a paddle_error occurs.",
+        help="YAML file with per-API thresholds for strict accuracy fallback",
     )
     options = parser.parse_args()
     configure_direct_results(options.id)
@@ -176,7 +170,6 @@ def main():
                 atol=options.atol,
                 rtol=options.rtol,
                 accuracy_manual_threshold_config=options.accuracy_manual_threshold_config,
-                exit_on_error=options.exit_on_error,
             )
         else:
             case = test_class(api_config, test_amp=options.test_amp)

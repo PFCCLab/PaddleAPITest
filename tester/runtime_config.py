@@ -22,7 +22,6 @@ class GpuModeConfig:
 class TestRuntimeConfig:
     random_seed: int = 0
     bitwise_alignment: bool = False
-    exit_on_error: bool = False
     test_cpu: bool = False
     input_backend_requested: str | None = None
     input_backend_resolved: str | None = None
@@ -87,7 +86,6 @@ class TestRuntimeConfig:
         return cls(
             random_seed=int(options.random_seed),
             bitwise_alignment=bool(options.bitwise_alignment),
-            exit_on_error=bool(options.exit_on_error),
             test_cpu=bool(options.test_cpu),
             input_backend_requested=policy.requested,
             input_backend_resolved=policy.resolved,

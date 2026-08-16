@@ -117,7 +117,7 @@ python engineV4.py \
 | `--paddle_custom_device=True` | 比较自定义设备与 CPU |
 | `--custom_device_vs_gpu=True` | 通过 upload/download 流程比较自定义设备与 GPU |
 
-常用附加参数包括 `--test_amp`、`--test_cpu`、`--atol`、`--rtol`、`--accuracy_manual_threshold_config`、`--accuracy_manual_file`、`--bitwise_alignment`、`--timeout`、`--random_seed`、`--generate_failed_tests` 和 `--exit_on_error`。
+常用附加参数包括 `--test_amp`、`--test_cpu`、`--atol`、`--rtol`、`--accuracy_manual_threshold_config`、`--bitwise_alignment`、`--timeout` 和 `--random_seed`。
 
 `--test_cpu=True` 只将 Paddle 框架输入及前向、反向切到 CPU。Torch reference 始终在
 GPU 上执行；输入逻辑值生成设备和结果比较设备只由 `--use_gpu_mode` 控制。

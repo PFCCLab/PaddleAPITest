@@ -211,8 +211,8 @@ python engineV4.py \
 ### 精度差异
 
 先确认 `--atol`/`--rtol` 和 `--random_seed`，需要严格比较时使用
-`--bitwise_alignment=True`。针对已知 API 的差异，可用 `--accuracy_manual_file` 做严格失败
-后的按 API 二次阈值复核。
+`--bitwise_alignment=True`。针对已知 API 的差异，可用
+`--accuracy_manual_threshold_config` 做严格失败后的按 API 二次阈值复核。
 
 ## 回归验证
 

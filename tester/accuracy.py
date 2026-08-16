@@ -24,7 +24,6 @@ class APITestAccuracy(APITestBase):
         self.atol = kwargs.get("atol", 0)
         self.rtol = kwargs.get("rtol", 0)
         self.record_accuracy_tolerance = kwargs.get("record_accuracy_tolerance", False)
-        self.exit_on_error = kwargs.get("exit_on_error", self.runtime_config.exit_on_error)
         self.bitwise_alignment = kwargs.get(
             "bitwise_alignment", self.runtime_config.bitwise_alignment
         )
@@ -32,19 +31,12 @@ class APITestAccuracy(APITestBase):
         self.use_dual_gpu = self.use_gpu_mode and self.gpu_mode_config.dual_gpu
         self.comparison_device_id = self.gpu_mode_config.comparison_device_id
         self.accuracy_manual_threshold_config = kwargs.get("accuracy_manual_threshold_config", "")
-        self.manual_threshold_config = self._load_manual_threshold_config(
-            self.accuracy_manual_threshold_config
-        )
-        self.accuracy_manual_file = kwargs.get(
-            "accuracy_manual_file",
-            "",
-        )
         self.bitwise_knows_threshold_config = self._load_manual_threshold_config(
             # 文件缺失或格式错误必须显式失败，不能静默跳过。
-            self.accuracy_manual_file
+            self.accuracy_manual_threshold_config
         )
-        if self.accuracy_manual_file:
-            # accuracy_manual_file 使用 exact-first 协议和全局阈值边界。
+        if self.accuracy_manual_threshold_config:
+            # 手动阈值只用于严格比较失败后的已知差异复核。
             self.atol = 0.0
             self.rtol = 0.0
             self.bitwise_alignment = True
@@ -171,25 +163,9 @@ class APITestAccuracy(APITestBase):
             return self.paddle_args[0]
         return self.api_config.api_name
 
-    def get_atol(self):
-        if self.accuracy_manual_file:
-            return 0.0
-        threshold = self.manual_threshold_config.get(self._threshold_api_name())
-        if threshold is not None:
-            return threshold[0]
-        return self.atol
-
-    def get_rtol(self):
-        if self.accuracy_manual_file:
-            return 0.0
-        threshold = self.manual_threshold_config.get(self._threshold_api_name())
-        if threshold is not None:
-            return threshold[1]
-        return self.rtol
-
     def _assert_with_bitwise_knows(self, assertion, *, atol, rtol):
         """严格比较失败后，仅对 YAML 命中的 API 使用已知容差复核。"""
-        # 非零全局阈值属于原有比较路径，不触发 known 分类。
+        # known 分类要求严格阈值和有效的非零手动阈值。
         threshold = self.bitwise_knows_threshold_config.get(self._threshold_api_name())
         if (atol, rtol) != (0.0, 0.0) or threshold is None or threshold == (0.0, 0.0):
             assertion(atol, rtol)
@@ -285,7 +261,7 @@ class APITestAccuracy(APITestBase):
         self.dump_finalize(log_type or "paddle_accuracy")
         # 比较失败也属于终态，不能把 output-grad seed 留给后续 case。
         self.clear_output_grad_cache()
-        if fatal or self.exit_on_error:
+        if fatal:
             raise err
 
     def _report_structure_error(
@@ -342,8 +318,8 @@ class APITestAccuracy(APITestBase):
                             tensor_index=index,
                             tensor_count=count,
                         ),
-                        atol=self.get_atol(),
-                        rtol=self.get_rtol(),
+                        atol=self.atol,
+                        rtol=self.rtol,
                     )
                 except GpuMemoryGuardSkip:
                     # 比较卡容量不足属于资源准入结果，不能写成数值精度失败。
@@ -368,8 +344,8 @@ class APITestAccuracy(APITestBase):
                         atol=atol,
                         rtol=rtol,
                     ),
-                    atol=self.get_atol(),
-                    rtol=self.get_rtol(),
+                    atol=self.atol,
+                    rtol=self.rtol,
                 )
             except Exception as err:
                 self._report_comparison_error(err, index, count)
@@ -673,10 +649,10 @@ class APITestAccuracy(APITestBase):
                     else next(iter(self.paddle_kwargs.values()))
                 )
         except Exception as err:
-            log_type, fatal = self._report_runtime_error_and_finalize(
+            _, fatal = self._report_runtime_error_and_finalize(
                 err, "paddle_error", "forward", allow_ignore_paddle=True
             )
-            if fatal or (self.exit_on_error and log_type == "paddle_error"):
+            if fatal:
                 raise
             return False, None
 
@@ -725,10 +701,10 @@ class APITestAccuracy(APITestBase):
                     force_log_type="config_input",
                 )
                 return False, None
-            log_type, fatal = self._report_runtime_error_and_finalize(
+            _, fatal = self._report_runtime_error_and_finalize(
                 err, "paddle_error", "backward", allow_ignore_paddle=True
             )
-            if fatal or (self.exit_on_error and log_type == "paddle_error"):
+            if fatal:
                 raise
             return False, None
 

@@ -154,8 +154,6 @@ python engine.py --api_config_file=/host_home/wanghuan29/PaddleAPITest/tester/ap
 
 当测试配置中有**精度不统一**的情况，需要精度转换时，直接运行测试可能会报错，可加入`--test_amp=True`。  
 
-如果希望在引发`paddle_error`或者`accuracy_error` 错误时退出测试，可加入`--exit_on_error=True`,此时测试进程`exit_code`为1。
-
 #### B. engineV2
 
 `engineV2.py` 是为 PaddleAPITest 项目设计的高性能测试框架，支持多 GPU 并行执行，具备负载均衡、超时处理和崩溃恢复能力。相比原始的 `engine.py` 实现，它能显著提升 Paddle API 配置测试效率，加速比约为 5-10 倍。
