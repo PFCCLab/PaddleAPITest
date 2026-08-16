@@ -109,7 +109,7 @@ engine_args:
   # test_cpu: true
   # use_cached_numpy: true
   # use_gpu_mode: true
-  # test_tol: true
+  # record_accuracy_tolerance: true
   # test_backward: true
   # bitwise_alignment: true
   # generate_failed_tests: true
@@ -122,7 +122,7 @@ engine_args:
   # ========== 精度阈值 ==========
   # atol: 0.01
   # rtol: 0.01
-  # manual_threshold_config_file: "tester/api_config/manual_threshold.yaml"
+  # accuracy_manual_threshold_config: "tester/api_config/manual_threshold.yaml"
 
   # ========== GPU / worker 调度 ==========
   # dual GPU 模式要求 num_workers_per_gpu=1，选中 GPU 数量至少为 2 且为偶数；GPU ID 可不连续。

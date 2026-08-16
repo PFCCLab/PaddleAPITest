@@ -8,7 +8,7 @@ from typing import Any
 import paddle
 import torch
 
-# operator_compare 复用 V4 的 parser 和 TensorConfig，避免回退到已删除的旧 analyzer。
+# operator_compare 复用 V4 的 parser 和 TensorConfig。
 from tester.api_config.parser import APIConfig
 from tester.input_generation.tensor_config import TensorConfig
 from tester.paddle_to_torch import ConversionKind

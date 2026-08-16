@@ -16,7 +16,7 @@ def _torch_dtype_maps():
 
     # 延迟导入保持 Paddle-only 启动路径不依赖 Torch 动态库。
 
-    # 名称映射同时接受配置规范名和历史简写，不能只保留 torch.dtype 的标准拼写。
+    # 名称映射覆盖配置规范名、简写和 torch.dtype 标准拼写。
     by_name = MappingProxyType(
         {
             "bool": torch.bool,
@@ -43,7 +43,7 @@ def _torch_dtype_maps():
             "int": torch.int64,
         }
     )
-    # 值映射覆盖 NumPy、Paddle VarType 和 Python scalar type，保持原转换兼容面。
+    # 值映射覆盖 NumPy、Paddle VarType 和 Python scalar type。
     by_value = MappingProxyType(
         {
             numpy.float32: torch.float32,

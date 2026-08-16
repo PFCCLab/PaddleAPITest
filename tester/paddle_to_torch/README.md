@@ -31,7 +31,7 @@ Paddle2Torch 统一通过 `PADDLEAPITEST_IMPL` 选择参考实现。合法值为
 原融合线性专用实现变量已退场，不再读取；相关作业必须改用 `PADDLEAPITEST_IMPL`。
 
 `PADDLEAPITEST_WORKERS_ON_GPU` 用于划分单个 GPU 上每个 worker 可使用的临时 workspace，
-默认值为 `1`，并且必须是正整数。该配置在 workspace 计算时校验，不影响转换代码缓存。
+默认值为 `1`，并且必须是正整数。该配置在 workspace 计算时校验，转换代码缓存沿用现有缓存键。
 
 `mapping.json` 在转换器初始化时进行 schema 校验，并拒绝重复 JSON key。所有 API 名必须以 `paddle.` 开头；
 允许的字段为 `Rule`、`torch_api`、`set_defaults`、`paddle_torch_args_map`、`torch_args`、

@@ -34,7 +34,7 @@ SANITIZER_ERROR_EXITCODE=86
 # ── 输入输出 ──────────────────────────────────────────────────
 # NUM_GPUS!=0 时，引擎不受外部 "CUDA_VISIBLE_DEVICES" 影响
 FILE_INPUT="tester/api_config/monitor_config/dsv4_v2/test9/1M_9.txt"
-FILE_THRESHOLD_CONFIG="tester/api_config/monitor_config/dsv4_v2/test9/manual_threshold_config_file.yaml"
+FILE_THRESHOLD_CONFIG="tester/api_config/monitor_config/dsv4_v2/test9/accuracy_manual_threshold_config.yaml"
 # FILE_PATTERN="tester/api_config/5_accuracy/accuracy_*.txt"
 LOG_DIR="tester/api_config/monitor_config/dsv4_v2/test9"
 
@@ -54,13 +54,13 @@ TEST_MODE_ARGS=(
     # --paddle_torch_gpu_performance=True
     # --accuracy_stable=True
     --accuracy=True
-    --manual_threshold_config_file="$FILE_THRESHOLD_CONFIG"
+    --accuracy_manual_threshold_config="$FILE_THRESHOLD_CONFIG"
     # --test_amp=True
     # --test_cpu=True
     --use_cached_numpy=True
     # --atol=1e-2
     # --rtol=1e-2
-    # --test_tol=True
+    # --record_accuracy_tolerance=True
     # --test_backward=True
 )
 

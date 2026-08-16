@@ -41,7 +41,7 @@ RETEST_KEYS = {
     "error_configs",
     "log_dir_template",
     "skip_unavailable",
-    # Backward-compatible legacy keys. Keep accepted, but do not show in templates.
+    # Accepted keys kept out of generated templates.
     "skip_missing",
     "skip_empty",
 }
@@ -65,10 +65,10 @@ ENGINE_ARG_TYPES = {
     "use_gpu_mode": bool,
     "atol": (int, float),
     "rtol": (int, float),
-    "manual_threshold_config_file": str,
+    "accuracy_manual_threshold_config": str,
     # 严格逐位失败后的 API 手动阈值复核文件。
     "accuracy_manual_file": str,
-    "test_tol": bool,
+    "record_accuracy_tolerance": bool,
     "test_backward": bool,
     "timeout": int,
     "show_runtime_status": bool,
@@ -298,8 +298,8 @@ def apply_overrides(config: dict[str, Any], args: argparse.Namespace) -> None:
         "num_gpus": args.num_gpus,
         "num_workers_per_gpu": args.num_workers_per_gpu,
         "gpu_ids": args.gpu_ids,
-        "manual_threshold_config_file": args.manual_threshold_config_file,
-        # 独立于历史普通 accuracy 阈值，避免覆盖旧参数语义。
+        "accuracy_manual_threshold_config": args.accuracy_manual_threshold_config,
+        # 独立于普通 accuracy 阈值，保持 exact-first 语义。
         "accuracy_manual_file": args.accuracy_manual_file,
     }
     for key, value in simple_engine_overrides.items():
@@ -663,7 +663,7 @@ def run_background(
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="PaddleAPITest runner",
-        epilog="未识别的参数会自动透传给 engine；-- 后透传的旧写法也仍然支持。",
+        epilog="未识别的参数会自动透传给 engine。",
     )
     parser.add_argument("-c", "--config", default=str(DEFAULT_CONFIG), help="YAML 任务配置文件")
     parser.add_argument("--stop", action="store_true", help="终止后台任务")
@@ -700,10 +700,9 @@ def parse_args() -> argparse.Namespace:
         help="覆盖 engine_args.accuracy_manual_file",
     )
     parser.add_argument(
-        "--manual-threshold-config-file",
-        "--manual_threshold_config_file",
-        dest="manual_threshold_config_file",
-        help="覆盖 engine_args.manual_threshold_config_file",
+        "--accuracy_manual_threshold_config",
+        dest="accuracy_manual_threshold_config",
+        help="覆盖 engine_args.accuracy_manual_threshold_config",
     )
     parser.add_argument(
         "--set-env", action="append", default=[], help="追加或覆盖环境变量 KEY=VALUE"

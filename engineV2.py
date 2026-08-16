@@ -66,10 +66,10 @@ VALID_TEST_ARGS = {
     "test_backward",
     "atol",
     "rtol",
-    "manual_threshold_config_file",
-    # 保持旧引擎入口与 engineV4 的参数协议一致。
+    "accuracy_manual_threshold_config",
+    # V2 与 engineV4 共享参数协议。
     "accuracy_manual_file",
-    "test_tol",
+    "record_accuracy_tolerance",
     "operation_mode",
     "bos_path",
     "random_seed",
@@ -79,6 +79,7 @@ VALID_TEST_ARGS = {
     "bitwise_alignment",
     "exit_on_error",
     "use_gpu_mode",
+    "accuracy_dual_gpu",
     "runtime_config",
 }
 
@@ -296,7 +297,8 @@ TEST_MODE_ERROR = (
     "specify exactly one test mode: --accuracy, --paddle_only, --paddle_cinn, "
     "--paddle_gpu_performance, --torch_gpu_performance, "
     "--paddle_torch_gpu_performance, --accuracy_stable, "
-    "--accuracy_stable_dual_gpu, --paddle_custom_device, --custom_device_vs_gpu"
+    "--accuracy_dual_gpu, --accuracy_stable_dual_gpu, "
+    "--paddle_custom_device, --custom_device_vs_gpu"
 )
 
 
@@ -309,6 +311,7 @@ def _mode_uses_torch(options):
         getattr(options, opt, False)
         for opt in (
             "accuracy",
+            "accuracy_dual_gpu",
             "paddle_cinn",
             "paddle_gpu_performance",
             "torch_gpu_performance",
@@ -336,6 +339,7 @@ def _selected_test_class_name(options):
         "paddle_only": "APITestPaddleOnly",
         "paddle_cinn": "APITestCINNVSDygraph",
         "accuracy": "APITestAccuracy",
+        "accuracy_dual_gpu": "APITestAccuracy",
         "paddle_gpu_performance": "APITestPaddleGPUPerformance",
         "torch_gpu_performance": "APITestTorchGPUPerformance",
         "paddle_torch_gpu_performance": "APITestPaddleTorchGPUPerformance",
@@ -412,7 +416,7 @@ def _parse_gpu_ids(gpu_ids_arg, device_count):
 
 def validate_gpu_options(options) -> tuple:
     """Validate and normalize GPU-related options."""
-    normalize_accuracy_stable_dual_gpu_options(options)
+    normalize_dual_gpu_options(options)
     device_count = get_device_count()
     if device_count == 0:
         raise ValueError("no accelerator devices were found")
@@ -436,34 +440,47 @@ def validate_gpu_options(options) -> tuple:
             f"invalid --num_workers_per_gpu={options.num_workers_per_gpu}: "
             "expected -1 or a positive integer"
         )
-    if getattr(options, "accuracy_stable_dual_gpu", False):
+    if _dual_gpu_mode_enabled(options):
         if options.num_gpus < 2 or options.num_gpus % 2:
-            raise ValueError("--accuracy_stable_dual_gpu=True requires an even --num_gpus")
+            raise ValueError("dual-GPU accuracy mode requires an even --num_gpus")
         if options.num_workers_per_gpu != 1:
-            raise ValueError("--accuracy_stable_dual_gpu=True requires --num_workers_per_gpu=1")
+            raise ValueError("dual-GPU accuracy mode requires --num_workers_per_gpu=1")
     return tuple(gpu_ids)
 
 
-def normalize_accuracy_stable_dual_gpu_options(options):
-    """Make the dual-GPU flag a self-contained accuracy-stable GPU mode."""
-    if not getattr(options, "accuracy_stable_dual_gpu", False):
-        return
-    if not getattr(options, "use_gpu_mode", False):
-        _print_argument(
-            ARGUMENT_WARNING_PREFIX,
-            "--accuracy_stable_dual_gpu=True implies --use_gpu_mode=True; enabling GPU mode",
-        )
-        options.use_gpu_mode = True
-    options.accuracy_stable = True
+def _dual_gpu_mode_enabled(options):
+    """双卡判断负责资源拓扑，accuracy tester 继续负责结果比较。"""
+    return bool(
+        getattr(options, "accuracy_dual_gpu", False)
+        or getattr(options, "accuracy_stable_dual_gpu", False)
+    )
+
+
+def normalize_dual_gpu_options(options):
+    """双卡组合开关先展开成主模式，再进入统一互斥校验。"""
+    for option_name, base_mode in (
+        ("accuracy_dual_gpu", "accuracy"),
+        ("accuracy_stable_dual_gpu", "accuracy_stable"),
+    ):
+        if not getattr(options, option_name, False):
+            continue
+        if not getattr(options, "use_gpu_mode", False):
+            _print_argument(
+                ARGUMENT_WARNING_PREFIX,
+                f"--{option_name}=True implies --use_gpu_mode=True; enabling GPU mode",
+            )
+            options.use_gpu_mode = True
+        setattr(options, base_mode, True)
 
 
 def _mode_runs_torch_gpu_reference(options):
-    """判断兼容入口是否会真实执行 Torch GPU reference。"""
-    # 兼容入口必须与 V4 使用相同的 reference GPU 调度边界。
+    """判断 V2 是否会真实执行 Torch GPU reference。"""
+    # V2 与 V4 使用相同的 reference GPU 调度边界。
     return any(
         getattr(options, mode, False)
         for mode in (
             "accuracy",
+            "accuracy_dual_gpu",
             "accuracy_stable",
             "accuracy_stable_dual_gpu",
             "torch_gpu_performance",
@@ -505,7 +522,7 @@ def parse_bool(value):
 
 def _apply_single_config_gpu_defaults(options):
     if not options.gpu_ids and options.num_gpus == -1:
-        if getattr(options, "accuracy_stable_dual_gpu", False):
+        if _dual_gpu_mode_enabled(options):
             options.gpu_ids = "0,1"
             options.num_gpus = 2
         else:
@@ -514,7 +531,7 @@ def _apply_single_config_gpu_defaults(options):
 
 
 def _prepare_single_config_gpu(options):
-    normalize_accuracy_stable_dual_gpu_options(options)
+    normalize_dual_gpu_options(options)
     if not _requires_gpu_runtime(options):
         options.gpu_workers_per_gpu_map = {}
         options.gpu_total_memory_map = {}
@@ -523,7 +540,7 @@ def _prepare_single_config_gpu(options):
 
     _apply_single_config_gpu_defaults(options)
     gpu_ids = validate_gpu_options(options)
-    expected_gpu_count = 2 if getattr(options, "accuracy_stable_dual_gpu", False) else 1
+    expected_gpu_count = 2 if _dual_gpu_mode_enabled(options) else 1
     if len(gpu_ids) != expected_gpu_count:
         raise ValueError(
             f"single --api_config run requires exactly {expected_gpu_count} GPU(s); "
@@ -590,7 +607,7 @@ def _assign_worker_gpus(
     assigned_gpu = -1
     assigned_comparison_gpu = None
     max_available_slots = -1
-    dual_gpu = getattr(options, "accuracy_stable_dual_gpu", False)
+    dual_gpu = _dual_gpu_mode_enabled(options)
 
     if dual_gpu:
         for pair_index in range(0, len(available_gpus), 2):
@@ -701,9 +718,7 @@ def run_test_case(api_config_str, options):
         )
     gpu_id = visible_gpu_ids[0] if visible_gpu_ids else None
     comparison_gpu_id = (
-        visible_gpu_ids[1]
-        if getattr(options, "accuracy_stable_dual_gpu", False) and len(visible_gpu_ids) > 1
-        else None
+        visible_gpu_ids[1] if _dual_gpu_mode_enabled(options) and len(visible_gpu_ids) > 1 else None
     )
     log_worker.write_case_begin(
         api_config_str,
@@ -867,7 +882,7 @@ def main():
         default="",
         help=(
             "Run one API config string directly. Single-case mode uses one GPU, or one "
-            "GPU pair with --accuracy_stable_dual_gpu=True."
+            "GPU pair with --accuracy_dual_gpu=True or --accuracy_stable_dual_gpu=True."
         ),
     )
     parser.add_argument(
@@ -919,6 +934,12 @@ def main():
         type=parse_bool,
         default=False,
         help="Run stable Paddle vs corresponding Torch accuracy checks.",
+    )
+    parser.add_argument(
+        "--accuracy_dual_gpu",
+        type=parse_bool,
+        default=False,
+        help="Use one compute GPU and one full-result comparison GPU per accuracy worker.",
     )
     parser.add_argument(
         "--accuracy_stable_dual_gpu",
@@ -996,7 +1017,7 @@ def main():
         help="Relative tolerance for accuracy checks.",
     )
     parser.add_argument(
-        "--manual_threshold_config_file",
+        "--accuracy_manual_threshold_config",
         type=str,
         default="",
         help="YAML file with per-API manual accuracy thresholds",
@@ -1006,11 +1027,11 @@ def main():
         dest="accuracy_manual_file",
         type=str,
         default="",
-        # 兼容历史 engineV2 流程，字段语义与 V4 相同。
+        # V2 字段语义与 V4 相同。
         help="YAML file with per-API thresholds for strict accuracy fallback",
     )
     parser.add_argument(
-        "--test_tol",
+        "--record_accuracy_tolerance",
         type=parse_bool,
         default=False,
         help="Enable tolerance range checks in accuracy mode.",
@@ -1110,7 +1131,7 @@ def main():
             "--api_config_file_pattern, or --retest is required",
         )
         return
-    normalize_accuracy_stable_dual_gpu_options(options)
+    normalize_dual_gpu_options(options)
     if options.api_config and _requires_gpu_runtime(options):
         _apply_single_config_gpu_defaults(options)
 
@@ -1188,9 +1209,10 @@ def main():
             print(f"Failed to load BOS config file {bos_config_path}: {e}", flush=True)
             return
 
-    if options.test_tol and not options.accuracy:
+    if options.record_accuracy_tolerance and not options.accuracy:
         _print_argument(
-            ARGUMENT_WARNING_PREFIX, "--test_tol takes effect only when --accuracy=True"
+            ARGUMENT_WARNING_PREFIX,
+            "--record_accuracy_tolerance takes effect only when --accuracy=True",
         )
     if options.test_backward and not options.paddle_cinn:
         _print_argument(
@@ -1383,7 +1405,7 @@ def main():
             if not available_gpus:
                 print("No usable GPUs available.", flush=True)
                 return
-            if options.accuracy_stable_dual_gpu:
+            if _dual_gpu_mode_enabled(options):
                 if len(available_gpus) != len(gpu_ids):
                     print(
                         "Not all selected GPUs are usable; no complete dual-GPU layout.",
@@ -1404,7 +1426,7 @@ def main():
             )
         else:
             # 纯 CPU batch 不创建 GPU manager entry，也不读取 NVML 显存。
-            # 旧参数名继续控制兼容入口的 CPU worker 数，避免改变 CLI 参数面。
+            # CPU worker 数由 num_workers_per_gpu 控制。
             requested_workers = (
                 1 if options.num_workers_per_gpu == -1 else options.num_workers_per_gpu
             )

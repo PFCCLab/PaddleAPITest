@@ -281,7 +281,7 @@ def classify_runtime_error(error_msg):
     )
     if any(marker in error_msg_lower for marker in cuda_markers):
         return "paddle_cuda", True
-    # (Unimplemented): Paddle 已知不支持的功能，当前 config 无法有效验证
+    # (Unimplemented): Paddle 当前功能无法由该 config 有效验证
     if "(unimplemented)" in error_msg_lower:
         return "skip", False
     # Paddle 输出数值检查失败
@@ -349,7 +349,7 @@ class APITestBase:
         torch.cuda.synchronize(self.torch_operator_device())
 
     def check_operator_cuda_error(self):
-        """兼容只执行 Paddle 算子的 tester。"""
+        """仅执行 Paddle 算子的 tester。"""
         self.check_paddle_kernel_cuda_error()
 
     def requires_gpu_runtime(self):
@@ -1570,10 +1570,10 @@ class APITestBase:
         cache[cache_key] = working_bytes
         return working_bytes
 
-    def _comparison_device(self, actual, expected, *, test_tol, dual_gpu):
+    def _comparison_device(self, actual, expected, *, record_accuracy_tolerance, dual_gpu):
         """解析比较设备；该策略独立于两侧算子的执行设备。"""
-        # test_tol 只改变容差与日志，不得绕过 GPU mode 的比较设备协议。
-        # 非 GPU mode 回到 CPU compare，保持历史低显存路径。
+        # record_accuracy_tolerance 只改变容差与日志，不得绕过 GPU mode 的比较设备协议。
+        # 非 GPU mode 使用 CPU compare，保持低显存路径。
         # 单卡 GPU mode 允许 CPU kernel 结果显式搬到 GPU 0 后比较。
         # 双卡模式必须从结果设备解析比较卡，不允许 CPU tensor 隐式降级。
         if not self.gpu_mode_config.enabled:
@@ -1610,9 +1610,9 @@ class APITestBase:
             and self.api_config.api_name in special_accuracy_atol_rtol
         ):
             atol, rtol = special_accuracy_atol_rtol[self.api_config.api_name]
-        test_tol = getattr(self, "test_tol", False)
+        record_accuracy_tolerance = getattr(self, "record_accuracy_tolerance", False)
         is_backward = getattr(self, "is_backward", False)
-        if test_tol:
+        if record_accuracy_tolerance:
             atol, rtol = 0.0, 0.0
 
         def is_cpu_tensor(value):
@@ -1633,7 +1633,7 @@ class APITestBase:
         comparison_device = self._comparison_device(
             actual,
             expected,
-            test_tol=test_tol,
+            record_accuracy_tolerance=record_accuracy_tolerance,
             dual_gpu=dual_gpu,
         )
         comparison_device_id = comparison_device.index if comparison_device.type == "cuda" else None
@@ -1685,7 +1685,7 @@ class APITestBase:
                     comparison_device,
                     is_check_dtype,
                 )
-                if test_tol:
+                if record_accuracy_tolerance:
                     log_accuracy_tolerance(
                         "Identical",
                         self.api_config.api_name,
@@ -1698,7 +1698,7 @@ class APITestBase:
                 return
             except Exception as err:
                 error_str = str(err)
-                if test_tol:
+                if record_accuracy_tolerance:
                     error_info = error_str.split("\n", maxsplit=2)[1] if "\n" in error_str else None
                     if error_info and (
                         error_info.startswith("Tensor-likes") or error_info.startswith("Scalars")
@@ -1798,7 +1798,7 @@ class APITestBase:
                     error_msg,
                     working_bytes,
                 )
-                if test_tol:
+                if record_accuracy_tolerance:
                     log_accuracy_tolerance(
                         "Identical",
                         self.api_config.api_name,
@@ -1826,7 +1826,7 @@ class APITestBase:
                 check_dtype=is_check_dtype,
                 msg=error_msg,
             )
-            if test_tol:
+            if record_accuracy_tolerance:
                 log_accuracy_tolerance(
                     "Identical",
                     self.api_config.api_name,
@@ -1857,7 +1857,7 @@ class APITestBase:
                     actual_cpu.numpy(), expected_cpu.numpy(), atol=atol, rtol=rtol
                 )
                 return
-            if test_tol:
+            if record_accuracy_tolerance:
                 error_info = error_str.split("\n", maxsplit=2)[1] if "\n" in error_str else None
                 if error_info and (
                     error_info.startswith("Tensor-likes") or error_info.startswith("Scalars")

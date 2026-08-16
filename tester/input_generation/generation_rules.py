@@ -358,7 +358,7 @@ class InputRuleContext:
                 _generate_input_binding_value(self, tensor, generator)
 
     def generate(self, parameter_generators=None, *, default="default"):
-        # mapping 的 key 可以是名称组，用于兼容同一语义在不同 API 中的命名。
+        # mapping 的 key 可以是名称组，用于表达同一语义在不同 API 中的命名。
         if parameter_generators is None:
             parameter_generators = {}
         items = (
@@ -433,7 +433,7 @@ def _generate_input_binding_value(
 
 # Registration infrastructure.
 def _validate_input_rule_function(function: InputRuleFunction) -> None:
-    # 导入阶段即拒绝旧三参数协议，避免执行到特定 API 时才暴露迁移遗漏。
+    # 导入阶段校验三参数协议，尽早暴露注册错误。
     parameters = tuple(inspect.signature(function).parameters.values())
     if any(
         parameter.kind in {parameter.VAR_POSITIONAL, parameter.VAR_KEYWORD}

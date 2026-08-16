@@ -293,7 +293,7 @@ class GpuReservationLedger:
         return reservation
 
     def record_result(self, msg_type):
-        """按结果调整 group 并发上限；异常只收缩，不改变用户硬上限。"""
+        """按结果调整 group 并发上限；异常只收缩，且受用户硬上限约束。"""
         if msg_type == "done":
             self._success_streak += 1
             if self._success_streak >= 2 and self.target_workers < self.max_workers:
@@ -368,10 +368,10 @@ VALID_TEST_ARGS = {
     "test_backward",
     "atol",
     "rtol",
-    "manual_threshold_config_file",
+    "accuracy_manual_threshold_config",
     # tester 只在严格比较失败后读取该文件。
     "accuracy_manual_file",
-    "test_tol",
+    "record_accuracy_tolerance",
     "operation_mode",
     "bos_path",
     "random_seed",
@@ -402,9 +402,9 @@ SANITIZER_FORWARD_ARGS = {
     "use_gpu_mode",
     "atol",
     "rtol",
-    "manual_threshold_config_file",
+    "accuracy_manual_threshold_config",
     "accuracy_manual_file",
-    "test_tol",
+    "record_accuracy_tolerance",
     "test_backward",
     "show_runtime_status",
     "random_seed",
@@ -1500,7 +1500,7 @@ class WorkerPool:
                 self.slots.append(slot)
                 idx += 1
         else:
-            # breadth-first 只调整启动先后，不改变每卡 slot 数与设备映射。
+            # breadth-first 只调整启动先后；每卡 slot 数与设备映射保持稳定。
             max_rounds = max(max_workers_per_gpu.values(), default=0)
             for worker_round in range(max_rounds):
                 for gpu_id in available_gpus:
@@ -1889,7 +1889,7 @@ class WorkerPool:
             self._watchdog_pass(now=time.monotonic())
 
     def _watchdog_pass(self, *, now):
-        """遍历所有 slot 做一轮检查，单个 slot 的失败不影响其余 slot。"""
+        """遍历所有 slot 做一轮检查，单个 slot 失败后继续检查其余 slot。"""
         for slot in self.slots:
             if self._shutdown_event.is_set():
                 break
@@ -3842,9 +3842,9 @@ def _prepare_common_options(options):
         if custom_device_error is not None:
             return custom_device_error
 
-    if options.test_tol and not options.accuracy:
+    if options.record_accuracy_tolerance and not options.accuracy:
         print(
-            f"{ARGUMENT_WARNING_PREFIX} --test_tol takes effect only when --accuracy=True",
+            f"{ARGUMENT_WARNING_PREFIX} --record_accuracy_tolerance takes effect only when --accuracy=True",
             flush=True,
         )
     if options.test_backward and not options.paddle_cinn:
@@ -3871,7 +3871,7 @@ def _write_sanitizer_case_timing(duration):
         with open(timing_path, "a", encoding="utf-8") as timing_file:
             timing_file.write(f"case_execution\t{float(duration):.9f}\n")
     except (OSError, TypeError, ValueError):
-        # timing 文件不可写时不影响 sanitizer return code 和日志合并。
+        # timing 文件不可写时，sanitizer return code 和日志合并继续按主流程处理。
         # 观测目录不可写时继续沿用原有 sanitizer 结果协议。
         return
 
@@ -4376,7 +4376,7 @@ def _build_argument_parser():
         help="Relative tolerance for accuracy checks.",
     )
     parser.add_argument(
-        "--manual_threshold_config_file",
+        "--accuracy_manual_threshold_config",
         type=str,
         default="",
         help="YAML file with per-API manual accuracy thresholds",
@@ -4386,11 +4386,11 @@ def _build_argument_parser():
         dest="accuracy_manual_file",
         type=str,
         default="",
-        # 该参数不改变全局 atol/rtol，只提供 known API 的二次复核。
+        # 该参数提供 known API 的二次复核，全局 atol/rtol 沿用原配置。
         help="YAML file with per-API thresholds for strict accuracy fallback",
     )
     parser.add_argument(
-        "--test_tol",
+        "--record_accuracy_tolerance",
         type=parse_bool,
         default=False,
         help="Enable tolerance range checks in accuracy mode.",

@@ -29,30 +29,7 @@
    git clone https://github.com/PFCCLab/PaddleAPITest.git
    cd PaddleAPITest
    ```
-3. 确保 `engineV2.py` 、 `log_writer.py` 和 `run.sh` 路径正确
-
-> [!CAUTION] CAUTION 1
-> 目前 engineV2 仅支持 ***python>=3.10***，如报错 *`NameError: name 'torch' is not defined`*，请在 `run_test_case()` 函数首行手动添加导入语句：
-> ```python
-> import torch
-> import paddle
-> from tester import (APIConfig, APITestAccuracy, APITestCINNVSDygraph,
->                     APITestPaddleOnly)
-> ```
-> 
-> 问题的原因在于：多进程的 **spawn** 启动方法（start method）与旧版 Python 中函数序列化 (pickling) 存在机制缺陷
-> 
-> 在 Python 3.10 之前的版本中，当子进程的执行函数（如 `run_test_case`）在主进程中被定义并通过序列化传递到子进程时，该函数会试图在其原始定义时的全局命名空间（即主进程的全局命名空间）中寻找依赖项（如 `torch`），而不是在当前执行时的全局命名空间（即已经通过 `init_worker_gpu` 初始化过的子进程命名空间）中寻找
-> 
-> 由于 gpu 隔离的需求，主进程并没有导入 `torch` 和 `paddle`，所以当 `run_test_case` 在子进程中被反序列化并准备执行时，它找不到这些库，从而引发 `NameError`
-
-> [!CAUTION] CAUTION 2
-> 在更高 CUDA 版本下，比如 CUDA Version: 12.9，可能会出现以下报错：
-> ```bash
-> ImportError: /usr/local/cuda/lib64/libcusparse.so.12: undefined symbol: __nvJitLinkGetErrorLogSize_12_9, version libnvJitLink.so.12
-> ```
-> 
-> 解决方案是在 `init_worker_gpu()` 函数中交换 `torch` 和 `paddle` 的导入顺序，将 `torch` 置于 `paddle` 之前，具体原因未知
+3. 确保 `engineV2.py`、`log_writer.py` 和 `run-example.sh` 路径正确
 
 ## 使用指南
 
@@ -66,6 +43,7 @@
 | `--retest`                       | str   | 从当前 `--log_dir` 按分类快速复测，多个分类以逗号分隔（如 `config_input,timeout`）      |
 | `--paddle_only`                  | bool  | 运行 Paddle 测试（默认 False）                                                         |
 | `--accuracy`                     | bool  | 运行 Paddle vs Torch 精度测试（默认 False）                                            |
+| `--accuracy_dual_gpu`            | bool  | 每个 accuracy worker 使用一张计算卡和一张全量比较卡；隐式启用 accuracy 与 gpu_mode       |
 | `--paddle_cinn`                  | bool  | 运行 CINN vs Dygraph 对比测试（默认 False）                                            |
 | `--paddle_gpu_performance`       | bool  | 运行 Paddle 性能测试（默认 False）                                                     |
 | `--torch_gpu_performance`        | bool  | 运行 Torch 性能测试（默认 False）                                                      |
@@ -82,7 +60,8 @@
 | `--log_dir`                      | str   | 日志输出路径（默认 "tester/api_config/test_log"）                                      |
 | `--atol`                         | float | 精度测试的绝对误差容忍度，仅在启用 `--accuracy` 时有效（默认 1e-2）                    |
 | `--rtol`                         | float | 精度测试的相对误差容忍度，仅在启用 `--accuracy` 时有效（默认 1e-2）                    |
-| `--test_tol`                     | bool  | 启用精度误差容忍度范围测试，仅在启用 `--accuracy` 时有效（默认 False）                 |
+| `--accuracy_manual_threshold_config` | str | 每 API 手动精度阈值 YAML 路径（默认空）                                             |
+| `--record_accuracy_tolerance`                     | bool  | 启用精度误差容忍度范围测试，仅在启用 `--accuracy` 时有效（默认 False）                 |
 | `--test_backward`                | bool  | 启用反向测试，仅在启用 `--paddle_cinn` 时有效（默认 False）                            |
 | `--timeout`                      | int   | 单个测试用例执行超时秒数（默认 1800）                                                  |
 | `--show_runtime_status`          | bool  | 是否实时显示当前的测试进度（默认 True）                                               |
@@ -93,7 +72,7 @@
 | `--generate_failed_tests`        | bool  | 是否为失败的测试用例生成可复现的测试文件。开启后，当测试失败时，会在`failed_tests`目录下生成独立的Python测试文件，便于后续复现和调试（默认False）|
 | `--exit_on_error`                | bool  | 是否在精度测试出现`paddle_error`或者 `accuracy_error`  错误时立即退出测试进程(exit code 为1)。默认为False，测试进程会继续执行 |
 
-双卡稳定性模式要求 `--num_workers_per_gpu=1`，并选择至少两张且数量为偶数的 GPU。GPU ID 可以不连续，引擎按规范化顺序两两配对。例如：
+双卡 accuracy 和双卡稳定性模式都要求 `--num_workers_per_gpu=1`，并选择至少两张且数量为偶数的 GPU。GPU ID 可以不连续，引擎按规范化顺序两两配对。例如：
 
 ```bash
 python engineV2.py \
@@ -256,7 +235,6 @@ python engineV2.py --custom_device_vs_gpu=True \
 ## 注意事项
 
 1. `estimate_timeout()` 梯度阈值粒度较粗，可进一步调整 TIMEOUT_STEPS
-2. 安装 PaddlePaddle（develop） 与 PyTorch（2.6） 需确保兼容性，必须首先安装 PaddlePaddle 再安装 PyTorch
 
 ## 许可协议
 

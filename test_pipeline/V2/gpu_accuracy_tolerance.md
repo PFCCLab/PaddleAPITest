@@ -83,7 +83,7 @@ TEST_MODE_ARGS=(
     # --use_cached_numpy=True
     # --atol=1e-2
     # --rtol=1e-2
-    --test_tol=True
+    --record_accuracy_tolerance=True
 )
 
 IN_OUT_ARGS=(
@@ -135,7 +135,7 @@ exit 0
 
 若不使用 `run_tol.sh`，以测试 gpu accuracy tolerance 为例，可直接执行以下命令：（建议使用 nohup 避免终端终止时停止主进程）
 ```bash
-python engineV2.py --api_config_file_pattern="tester/api_config/5_accuracy/accuracy_*.txt" --accuracy=True --test_tol=True --num_gpus=-1 --num_workers_per_gpu=-1 --log_dir="tester/api_config/test_log_tol" >> "tester/api_config/test_log_tol/log.log" 2>&1
+python engineV2.py --api_config_file_pattern="tester/api_config/5_accuracy/accuracy_*.txt" --accuracy=True --record_accuracy_tolerance=True --num_gpus=-1 --num_workers_per_gpu=-1 --log_dir="tester/api_config/test_log_tol" >> "tester/api_config/test_log_tol/log.log" 2>&1
 ```
 
 或者直接运行 run_tol.sh：

@@ -23,7 +23,7 @@ class APITestAccuracy(APITestBase):
         self.test_amp = kwargs.get("test_amp", False)
         self.atol = kwargs.get("atol", 0)
         self.rtol = kwargs.get("rtol", 0)
-        self.test_tol = kwargs.get("test_tol", False)
+        self.record_accuracy_tolerance = kwargs.get("record_accuracy_tolerance", False)
         self.exit_on_error = kwargs.get("exit_on_error", self.runtime_config.exit_on_error)
         self.bitwise_alignment = kwargs.get(
             "bitwise_alignment", self.runtime_config.bitwise_alignment
@@ -31,12 +31,11 @@ class APITestAccuracy(APITestBase):
         self.use_gpu_mode = self.gpu_mode_config.enabled
         self.use_dual_gpu = self.use_gpu_mode and self.gpu_mode_config.dual_gpu
         self.comparison_device_id = self.gpu_mode_config.comparison_device_id
-        self.manual_threshold_config_file = kwargs.get("manual_threshold_config_file", "")
+        self.accuracy_manual_threshold_config = kwargs.get("accuracy_manual_threshold_config", "")
         self.manual_threshold_config = self._load_manual_threshold_config(
-            self.manual_threshold_config_file
+            self.accuracy_manual_threshold_config
         )
         self.accuracy_manual_file = kwargs.get(
-            # 新字段优先，避免历史参数意外放宽严格比较。
             "accuracy_manual_file",
             "",
         )
@@ -45,13 +44,13 @@ class APITestAccuracy(APITestBase):
             self.accuracy_manual_file
         )
         if self.accuracy_manual_file:
-            # 新参数定义的是 exact-first 协议，不能再被全局或历史特殊阈值放宽。
+            # accuracy_manual_file 使用 exact-first 协议和全局阈值边界。
             self.atol = 0.0
             self.rtol = 0.0
             self.bitwise_alignment = True
         # known 结果延迟到整个 case 成功后写入，避免后续梯度失败造成重复终态。
         self._bitwise_knows_detected = False
-        if self.test_tol:
+        if self.record_accuracy_tolerance:
             torch.set_printoptions(profile="short")
         self.converter = get_converter()
 
@@ -139,10 +138,10 @@ class APITestAccuracy(APITestBase):
             pass
 
     @staticmethod
-    def _load_manual_threshold_config(manual_threshold_config_file):
-        if not manual_threshold_config_file:
+    def _load_manual_threshold_config(accuracy_manual_threshold_config):
+        if not accuracy_manual_threshold_config:
             return {}
-        with open(manual_threshold_config_file, encoding="utf-8") as f:
+        with open(accuracy_manual_threshold_config, encoding="utf-8") as f:
             config = yaml.safe_load(f) or {}
 
         thresholds = config.get("manual_threshold_config") or {}

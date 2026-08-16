@@ -76,7 +76,7 @@ TEST_MODE_ARGS=(
     --use_cached_numpy=True # 开启 numpy 缓存
     # --atol=1e-2
     # --rtol=1e-2
-    # --test_tol=True
+    # --record_accuracy_tolerance=True
     # --test_backward=True # 需要测试反向时，取消此注释
 )
 

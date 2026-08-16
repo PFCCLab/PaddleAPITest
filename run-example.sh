@@ -1,13 +1,32 @@
 #!/bin/bash
+set -euo pipefail
 
-# Script to run engineV2.py
-# Usage: ./<当前脚本名>
+# ============================================================
+# PaddleAPITest 运行脚本
+#
+# 使用方式:
+#   ./<当前脚本名>              正常启动（后台）
+#   ./<当前脚本名> --stop       终止上次启动的后台进程
+#   ./<当前脚本名> --status     查看运行状态
+#
+# 配置方法: 修改下方变量 / 注释切换即可
+# ============================================================
 
-if [[ ! -f "engineV2.py" || ! -d "tester" ]]; then
-    echo "[错误] 请在 PaddleAPITest 项目根目录执行 | 缺少 engineV2.py 或 tester/"
-    exit 1
-fi
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# ── 引擎选择 ──────────────────────────────────────────────────
+ENGINE=engineV4           # 推荐 engineV4；可选 engineV2
+
+# ── 运行模式开关 ──────────────────────────────────────────────
+FOREGROUND=false          # true=前台运行(调试用，Ctrl+C终止)
+DRY_RUN=false             # true=只打印最终命令，不执行
+
+# ── compute-sanitizer（engineV4 only）──────────────────────────
+# compute-sanitizer 用于定位 CUDA kernel 的非法访存、race、同步错误等问题。
+# engineV4 为每个 worker slot 启动一个 sanitizer session，正常 case 在 session 内复用 runtime。
+# engineV2 不支持以下 sanitizer 参数；ENGINE=engineV2 时请保持 USE_COMPUTE_SANITIZER=false，并不要传入 SANITIZER_ARGS。
+# engineV4 专属公开参数：--use_compute_sanitizer、--sanitizer_command、--sanitizer_error_exitcode；
+USE_COMPUTE_SANITIZER=false
+SANITIZER_COMMAND="compute-sanitizer --target-processes all --error-exitcode=86"
+SANITIZER_ERROR_EXITCODE=86
 
 # ── Paddle Flags ──────────────────────────────────────────────
 # 这些环境变量在启动 Paddle 前生效，用于控制 Paddle 运行时行为。
@@ -22,18 +41,21 @@ export FLAGS_check_nan_inf=true
 # export FLAGS_use_accuracy_compatible_kernel=true
 
 # ── PaddleAPITest 运行策略 ────────────────────────────────────
-# PADDLEAPITEST_IMPL: FP8 blockwise 参考实现，torch（默认）| te。
+# PADDLEAPITEST_IMPL: Paddle-to-Torch 参考实现，torch（默认）| te | apex；仅支持对应实现的 Rule 生效。
 # export PADDLEAPITEST_IMPL=torch
+# PADDLEAPITEST_INPUT_BACKEND: 输入生成 backend，numpy | torch | paddle；默认按测试模式选择。
+# GPU mode 下显式 numpy 保留 CPU logical input；Paddle/Torch 算子设备由 test_cpu 控制。
+# export PADDLEAPITEST_INPUT_BACKEND=torch
 
 # ── 输入输出 ──────────────────────────────────────────────────
 # input 三选一：--api_config / --api_config_file / --api_config_file_pattern
+# NUM_GPUS!=0 时，引擎不受外部 "CUDA_VISIBLE_DEVICES" 影响
 # API_CONFIG=""
-FILE_INPUT="tester/api_config/5_accuracy/accuracy_1.txt"
-# FILE_PATTERN="tester/api_config/5_accuracy/accuracy_*.txt"
-LOG_DIR="tester/api_config/test_log"
+FILE_INPUT="cfg.txt"
+# FILE_PATTERN="cfg*.txt"
+LOG_DIR="test_log"
 
 # ── GPU / worker 调度 ─────────────────────────────────────────
-# NUM_GPUS!=0 时，engineV2 不受外部 "CUDA_VISIBLE_DEVICES" 影响。
 # dual GPU 模式要求 NUM_WORKERS_PER_GPU=1，且选中 GPU 数量至少为 2 且为偶数。
 # GPU_IDS 可不连续，引擎按规范化后的顺序两两配对。
 NUM_GPUS=-1
@@ -43,22 +65,22 @@ TIME_OUT=600
 
 # ── 测试模式：必须且只能启用一种 ───────────────────────────────
 TEST_MODE_ARGS=(
-    # Paddle vs Torch 正确性对比
-    --accuracy=True
-    # 双卡正确性对比；自身等价于 accuracy，并隐式启用 use_gpu_mode
-    # --accuracy_dual_gpu=True
-    # Paddle 单框架执行
+    # Paddle 单框架
     # --paddle_only=True
+    # Paddle vs Torch 精度测试
+    --accuracy=True
+    # 双卡精度测试；自身等价于 accuracy，并隐式启用 use_gpu_mode
+    # --accuracy_dual_gpu=True
+    # 稳定性测试
+    # --accuracy_stable=True
+    # 双卡稳定性测试；自身等价于 accuracy_stable，并隐式启用 use_gpu_mode
+    # --accuracy_stable_dual_gpu=True
     # Paddle 动态图 vs CINN；test_backward 仅此模式生效
     # --paddle_cinn=True
     # 性能测试
     # --paddle_gpu_performance=True
     # --torch_gpu_performance=True
     # --paddle_torch_gpu_performance=True
-    # 稳定性测试
-    # --accuracy_stable=True
-    # 双卡稳定性测试；自身等价于 accuracy_stable，并隐式启用 use_gpu_mode
-    # --accuracy_stable_dual_gpu=True
     # 自定义设备对比
     # --paddle_custom_device=True
     # --custom_device_vs_gpu=True
@@ -70,17 +92,17 @@ TEST_PARAM_ARGS=(
     # --test_amp=True
     # 仅 Paddle 前反向切到 CPU；Torch reference 仍在 GPU
     # --test_cpu=True
-    # forward/backward NumPy 输入缓存；仅非 gpu_mode 生效
+    # forward/backward NumPy 输入缓存；非 GPU mode 使用 NumPy backend，GPU mode 使用模式默认 backend
     # --use_cached_numpy=True
-    # GPU 生成 + GPU compare；与 test_cpu 正交，不决定算子设备
+    # GPU 生成 + GPU compare；与 test_cpu 正交，Paddle/Torch 算子设备由 test_cpu 控制
     # --use_gpu_mode=True
     # 对比阈值；bitwise_alignment 会将阈值置 0
-    # --atol=1e-2
-    # --rtol=1e-2
-    # --manual_threshold_config_file="tester/api_config/manual_threshold.yaml"
+    # --atol=0.0
+    # --rtol=0.0
+    # --accuracy_manual_threshold_config="tester/api_config/manual_threshold.yaml"
     # --bitwise_alignment=True
-    # accuracy 容差诊断，保留 CPU compare
-    # --test_tol=True
+    # accuracy 容差诊断：将 atol/rtol 置 0 并记录误差，比较设备沿用 GPU mode 配置
+    # --record_accuracy_tolerance=True
     # 仅 paddle_cinn 生效
     # --test_backward=True
     # 随机种子；非默认值时会设置 numpy seed
@@ -95,6 +117,86 @@ TEST_PARAM_ARGS=(
     # --show_runtime_status=True
 )
 
+# ============================================================
+# ========== 以下为运行逻辑，通常不需要修改 ====================
+# ============================================================
+
+if [[ ! -f "$ENGINE.py" || ! -d "tester" ]]; then
+    echo "[错误] 请在 PaddleAPITest 项目根目录执行 | 缺少 $ENGINE.py 或 tester/"
+    exit 1
+fi
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SCRIPT_FILE="${BASH_SOURCE[0]##*/}"
+SCRIPT_NAME="${SCRIPT_FILE%.sh}"
+RUN_COMMAND="./${SCRIPT_FILE}"
+PID_FILE="${SCRIPT_DIR}/.${SCRIPT_NAME}.pid"
+
+# ── 运维命令处理 ──
+case "${1:-}" in
+    --stop)
+        if [[ -f "$PID_FILE" ]]; then
+            pid=$(cat "$PID_FILE")
+            if kill -0 "$pid" 2>/dev/null; then
+                # Kill entire process group (main + all workers)
+                kill -- -"$pid" 2>/dev/null || kill "$pid" 2>/dev/null
+                echo ">>> 终止任务 | 已终止 | PGID $pid"
+            else
+                echo ">>> 终止任务 | 已结束 | PID $pid"
+            fi
+            rm -f "$PID_FILE"
+        else
+            echo ">>> 终止任务 | 无记录"
+        fi
+        exit 0
+        ;;
+    --status)
+        if [[ -f "$PID_FILE" ]]; then
+            pid=$(cat "$PID_FILE")
+            if kill -0 "$pid" 2>/dev/null; then
+                # 显示子进程（worker）
+                children=$(pgrep -P "$pid" 2>/dev/null | wc -l || true)
+                # 显示运行时长
+                elapsed=$(ps -o etime= -p "$pid" 2>/dev/null | xargs)
+                # 显示日志文件
+                log=$(ls -t "$LOG_DIR"/log_[0-9]*.log 2>/dev/null | head -1 || true)
+                echo ">>> 运行状态 | 运行中"
+                echo "进程    PID $pid | $ENGINE.py | Worker $children | 已运行 ${elapsed:-未知}"
+                [[ -n "${log:-}" ]] && echo "日志    $log"
+            else
+                echo ">>> 运行状态 | 已结束"
+                echo "进程    PID $pid"
+                rm -f "$PID_FILE"
+            fi
+        else
+            echo ">>> 运行状态 | 无记录"
+            echo "PID文件  $PID_FILE"
+        fi
+        exit 0
+        ;;
+    --help|-h)
+        echo ">>> 使用帮助 | ${RUN_COMMAND}"
+        echo "命令    无参数启动 | --status 查看状态 | --stop 终止 | --help 查看帮助"
+        echo "配置    编辑脚本顶部变量，注释或取消注释切换参数"
+        exit 0
+        ;;
+    "") ;; # 正常启动
+    *)
+        echo "[错误] 未知参数 | 参数 $1 | 帮助 ${RUN_COMMAND} --help"
+        exit 1
+        ;;
+esac
+
+# ── 防重复启动 ──
+if [[ -f "$PID_FILE" ]]; then
+    old_pid=$(cat "$PID_FILE")
+    if kill -0 "$old_pid" 2>/dev/null; then
+        echo "[警告] 任务已在运行 | PID $old_pid | 终止 ${RUN_COMMAND} --stop"
+        exit 1
+    fi
+    rm -f "$PID_FILE"
+fi
+
+# ── 组装参数 ──
 IN_OUT_ARGS=(
     # --api_config="$API_CONFIG"
     --api_config_file="$FILE_INPUT"
@@ -112,16 +214,26 @@ TIME_OUT_ARGS=(
     --timeout="$TIME_OUT"
 )
 
-# ── engineV4 only 参数说明 ─────────────────────────────────────
-# 以下参数仅 engineV4.py 支持，engineV2.py 不要传入：
-# - --use_compute_sanitizer=True: 所有 case 通过可复用 compute-sanitizer session 运行，定位 CUDA 访存/同步等问题。
-# - --sanitizer_command="compute-sanitizer --target-processes all --error-exitcode=86"
-# - --sanitizer_error_exitcode=86
-
-mkdir -p "$LOG_DIR" || {
-    echo "[错误] 无法创建日志目录 | 日志 $LOG_DIR"
+SANITIZER_ARGS=()
+if [[ "$ENGINE" == "engineV4" ]]; then
+    SANITIZER_ARGS=(
+        --use_compute_sanitizer="$USE_COMPUTE_SANITIZER"
+        --sanitizer_command="$SANITIZER_COMMAND"
+        --sanitizer_error_exitcode="$SANITIZER_ERROR_EXITCODE"
+    )
+elif [[ "$USE_COMPUTE_SANITIZER" == "true" ]]; then
+    echo "[错误] 参数不支持 | compute-sanitizer 仅支持 engineV4.py"
     exit 1
-}
+fi
+
+ALL_ARGS=(
+    "${TEST_MODE_ARGS[@]}"
+    "${TEST_PARAM_ARGS[@]}"
+    "${IN_OUT_ARGS[@]}"
+    "${PARALLEL_ARGS[@]}"
+    "${TIME_OUT_ARGS[@]}"
+    "${SANITIZER_ARGS[@]}"
+)
 
 format_option() {
     local option="$1"
@@ -141,36 +253,70 @@ COMPACT_OPTIONS+=(
     "--num_workers_per_gpu=$NUM_WORKERS_PER_GPU"
     "--timeout=$TIME_OUT"
 )
+if [[ "$USE_COMPUTE_SANITIZER" == "true" ]]; then
+    COMPACT_OPTIONS+=(
+        "--use_compute_sanitizer=true"
+        "--sanitizer_error_exitcode=$SANITIZER_ERROR_EXITCODE"
+        "--sanitizer_command='$SANITIZER_COMMAND'"
+    )
+fi
 printf -v OPTIONS_TEXT ' | %s' "${COMPACT_OPTIONS[@]}"
 OPTIONS_TEXT="${OPTIONS_TEXT:3}"
 
-echo ">>> 启动测试 | engineV2.py | 后台"
+# ── Dry-run 模式 ──
+if [[ "$DRY_RUN" == "true" ]]; then
+    printf -v COMMAND_TEXT ' %q' python "$ENGINE.py" "${ALL_ARGS[@]}"
+    echo ">>> 模拟运行 | $ENGINE.py"
+    echo "命令    ${COMMAND_TEXT:1}"
+    exit 0
+fi
+
+RUN_MODE_LABEL="后台"
+[[ "$FOREGROUND" == "true" ]] && RUN_MODE_LABEL="前台"
+echo ">>> 启动测试 | $ENGINE.py | $RUN_MODE_LABEL"
 echo "输入    $FILE_INPUT"
 echo "日志    $LOG_DIR"
 echo "参数    $OPTIONS_TEXT"
 
-# 执行程序；engineV2.py 会在 log_dir 中创建主进程日志。
-nohup python engineV2.py \
-        "${TEST_MODE_ARGS[@]}" \
-        "${TEST_PARAM_ARGS[@]}" \
-        "${IN_OUT_ARGS[@]}" \
-        "${PARALLEL_ARGS[@]}" \
-        "${TIME_OUT_ARGS[@]}" \
-        >/dev/null 2>&1 &
-
-PYTHON_PID=$!
-
-sleep 1
-if ! ps -p "$PYTHON_PID" > /dev/null; then
-    echo "[错误] 启动失败 | engineV2.py | 日志目录 $LOG_DIR"
+# ── 创建日志目录 ──
+mkdir -p "$LOG_DIR" || {
+    echo "[错误] 无法创建日志目录 | 日志 $LOG_DIR"
     exit 1
+}
+
+# ── 启动 ──
+if [[ "$FOREGROUND" == "true" ]]; then
+    echo "开始    日志目录 $LOG_DIR | Ctrl+C 终止"
+    # 忽略 shell 自身的 SIGINT，让 Ctrl+C 只作用于 python 子进程
+    trap '' INT
+    python "$ENGINE.py" "${ALL_ARGS[@]}"
+    trap - INT
+else
+    nohup setsid python "$ENGINE.py" "${ALL_ARGS[@]}" >/dev/null 2>&1 &
+    PYTHON_PID=$!
+    echo "$PYTHON_PID" > "$PID_FILE"
+
+    # 任务自然结束时清理 PID 文件；若已启动新任务，则不误删新 PID。
+    (
+        while kill -0 "$PYTHON_PID" 2>/dev/null; do
+            sleep 5
+        done
+
+        recorded_pid="$(cat "$PID_FILE" 2>/dev/null || true)"
+        if [[ "$recorded_pid" == "$PYTHON_PID" ]]; then
+            rm -f "$PID_FILE"
+        fi
+    ) >/dev/null 2>&1 &
+
+    sleep 1
+    if ! kill -0 "$PYTHON_PID" 2>/dev/null; then
+        echo "[错误] 启动失败 | $ENGINE.py | 日志目录 $LOG_DIR"
+        rm -f "$PID_FILE"
+        exit 1
+    fi
+
+    LOG_FILE="$(ls -t "$LOG_DIR"/log_[0-9]*.log 2>/dev/null | head -1 || true)"
+    echo "已启动  PID $PYTHON_PID | 日志 ${LOG_FILE:-$LOG_DIR}"
+    echo "管理    状态: ${RUN_COMMAND} --status | 终止: ${RUN_COMMAND} --stop"
+    [[ -n "$LOG_FILE" ]] && echo "跟踪    tail -f $LOG_FILE"
 fi
-
-LOG_FILE="$(ls -t "$LOG_DIR"/log_[0-9]*.log 2>/dev/null | head -1 || true)"
-echo "已启动  PID $PYTHON_PID | 日志 ${LOG_FILE:-$LOG_DIR}"
-echo "管理    终止: kill $PYTHON_PID"
-[[ -n "$LOG_FILE" ]] && echo "跟踪    tail -f $LOG_FILE"
-
-exit 0
-
-# watch -n 1 nvidia-smi --query-compute-apps=pid,process_name,used_memory,gpu_uuid --format=csv

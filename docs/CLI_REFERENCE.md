@@ -1,6 +1,6 @@
 # PaddleAPITest 命令行参考
 
-本文档说明 `engineV4.py`、`run.py`、Shell 模板和回归脚本的用户接口。直接运行 API config 使用 `engineV4.py`；需要 YAML、后台管理或多轮复测时使用 `run.py`。V2 的差异见 [engineV2 兼容运行指南](engineV2-README.md)。
+本文档说明 `engineV4.py`、`run.py`、Shell 模板和回归脚本的用户接口。直接运行 API config 使用 `engineV4.py`；需要 YAML、后台管理或多轮复测时使用 `run.py`。V2 的差异见 [engineV2 运行指南](engineV2-README.md)。
 
 ```bash
 python engineV4.py --help
@@ -99,19 +99,19 @@ Paddle 前向和反向在 CPU 执行，Torch reference 仍在 GPU。输入生成
 
 #### `--use_gpu_mode=True`
 
-在 GPU 生成输入和比较结果，并复用 CUDA allocator；不改变 Paddle 算子或 Torch reference 的执行设备。显式 NumPy backend 仍可合法降级为 CPU logical value，运行头会显示最终 backend/device。默认：`False`。
+在 GPU 生成输入和比较结果，并复用 CUDA allocator；Paddle 算子和 Torch reference 的执行设备由 `--test_cpu` 决定。显式 NumPy backend 会保留 CPU logical value，运行头会显示最终 backend/device。默认：`False`。
 
 #### `--use_cached_numpy=True`、`--test_amp=True`
 
-`--use_cached_numpy=True` 复用 NumPy output grad，并在非 GPU mode 强制使用 NumPy input
-backend；显式 Torch/Paddle backend 会被忽略并警告。GPU mode 会忽略该开关并警告。
-`--cache_numpy_auxiliary` 明确不受支持。`--test_amp=True` 启用自动混合精度检查。默认：`False`。
+`--use_cached_numpy=True` 复用 NumPy output grad；非 GPU mode 选择 NumPy input backend，GPU mode
+选择模式默认 backend 并打印 warning。
+`--test_amp=True` 启用自动混合精度检查。默认：`False`。
 
 #### `--atol=FLOAT`、`--rtol=FLOAT`
 
 绝对和相对精度阈值。默认均为 `0.01`。
 
-#### `--manual_threshold_config_file=PATH`
+#### `--accuracy_manual_threshold_config=PATH`
 
 读取每 API 精度阈值 YAML。默认：空。
 
@@ -121,9 +121,9 @@ backend；显式 Torch/Paddle backend 会被忽略并警告。GPU mode 会忽略
 `manual_threshold_config` 中，则按其 `[atol, rtol]` 复核。复核通过的配置写入
 `api_config_paddle_bitwise_knows.txt` 并按已知不完全对齐跳过；默认：空。
 
-#### `--test_tol=True`、`--test_backward=True`
+#### `--record_accuracy_tolerance=True`、`--test_backward=True`
 
-前者启用 accuracy 容差诊断，不改变比较设备；后者只在 `paddle_cinn` 中启用反向检查。默认：`False`。
+前者启用 accuracy 容差诊断，比较设备沿用 `--use_gpu_mode` 配置；后者只在 `paddle_cinn` 中启用反向检查。默认：`False`。
 
 #### `--random_seed=N`
 
@@ -197,9 +197,9 @@ python run.py [-c CONFIG] [OVERRIDES] [ENGINE_OPTIONS]
 
 覆盖对应的 `engine_args`。
 
-#### `--manual-threshold-config-file FILE`、`--manual_threshold_config_file FILE`
+#### `--accuracy_manual_threshold_config FILE`
 
-覆盖 `engine_args.manual_threshold_config_file`。
+覆盖 `engine_args.accuracy_manual_threshold_config`。
 
 #### `--set-env KEY=VALUE`
 
@@ -218,7 +218,7 @@ python run.py [-c CONFIG] [OVERRIDES] [ENGINE_OPTIONS]
 - `runner`：`engine`、`foreground`、`dry_run`、`pid_file`。
 - `input`：`api_config`、`api_config_file`、`api_config_file_pattern` 三选一。
 - `output`：`log_dir`。
-- `retest`：`enabled`、`rounds`、`error_configs`、`log_dir_template`、`skip_unavailable`；兼容 `skip_missing`、`skip_empty`。
+- `retest`：`enabled`、`rounds`、`error_configs`、`log_dir_template`、`skip_unavailable`。
 - `engine_args`：去掉 `--` 的 engineV4 参数名。
 
 所有字符串都经 `os.path.expandvars` 展开，支持 `${VAR}` 和 `$VAR`；未设置的变量保持原文。
@@ -234,11 +234,6 @@ python run.py [-c CONFIG] [OVERRIDES] [ENGINE_OPTIONS]
 #### `PADDLEAPITEST_INPUT_BACKEND`
 
 选择输入生成 backend：`numpy`、`torch`、`paddle`。未指定时由测试模式选择默认值；普通直接调用默认 NumPy，Paddle-only/CINN/Paddle performance 默认 Paddle，accuracy/Torch performance 默认 Torch。非法值会在参数阶段失败。GPU mode 下显式 NumPy 会显示为 CPU logical value。
-
-#### `USE_CACHED_NUMPY`、`USE_GPU_MODE`、`USE_DUMP`、`DUMP_DIR`
-
-`USE_CACHED_NUMPY` 与 `USE_GPU_MODE` 对应同名 CLI 开关的运行时状态。直接调用引擎时优先使用
-CLI；只设置 `DUMP_DIR` 不会启用 dump。
 
 #### `CUDA_VISIBLE_DEVICES`、`CUDA_HOME`、`CUDA_PATH`
 
@@ -279,7 +274,7 @@ RECORD_CACHE_EVENTS
 SKIP_GPU_CLEANUP
 ```
 
-引擎还会向 worker 注入 `USE_DUMP`、`DUMP_DIR`、`USE_CACHED_NUMPY`、`USE_GPU_MODE`、`CUDA_VISIBLE_DEVICES` 以传递 CLI/YAML 值；不要手动伪造 worker 状态。
+引擎还会向 worker 注入 `USE_DUMP`、`DUMP_DIR`、`USE_CACHED_NUMPY`、`USE_GPU_MODE`、`CUDA_VISIBLE_DEVICES` 以传递 CLI/YAML 值；这些变量是内部状态，不要手动伪造 worker 状态。
 
 ### 第三方运行时变量
 
@@ -287,6 +282,6 @@ SKIP_GPU_CLEANUP
 
 ## Shell 模板
 
-`run-v4.sh`、`run-example.sh`、`test_pipeline/V4/*.sh` 顶部的 `ENGINE`、`FOREGROUND`、`DRY_RUN`、`FILE_INPUT`、`FILE_PATTERN`、`LOG_DIR`、`NUM_GPUS`、`NUM_WORKERS_PER_GPU`、`GPU_IDS`、`TIME_OUT` 是脚本变量，不是引擎环境变量。模板会将它们转换为 CLI 参数。
+`run-example.sh`、`test_pipeline/V4/*.sh` 顶部的 `ENGINE`、`FOREGROUND`、`DRY_RUN`、`FILE_INPUT`、`FILE_PATTERN`、`LOG_DIR`、`NUM_GPUS`、`NUM_WORKERS_PER_GPU`、`GPU_IDS`、`TIME_OUT` 是脚本变量，不是引擎环境变量。模板会将它们转换为 CLI 参数。
 
 模板支持 `--stop`、`--status`、`--help`。设置 `FOREGROUND=true` 前台运行，设置 `DRY_RUN=true` 仅输出最终命令。

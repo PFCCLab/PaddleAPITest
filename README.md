@@ -19,13 +19,13 @@ paddle.concat(tuple(Tensor([31376, 768],"float32"),Tensor([1, 768],"float32"),),
 - Linux、Python 3.10+、CUDA 13.0
 - PaddlePaddle develop；精度、稳定性和 Torch 性能测试使用 PyTorch 2.12.0
 
-使用 [uv](https://docs.astral.sh/uv/) 创建虚拟环境，随后依次安装 CUDA 13.0 的 Paddle develop、PyTorch 和其余依赖：
+使用 [uv](https://docs.astral.sh/uv/) 创建虚拟环境，随后依次安装 CUDA 13.0 的 Paddle develop、PyTorch 和其余依赖。`requirements.txt` 中 `paddlepaddle-gpu` 和 `torchaudio` 未锁定版本：前者由下方 nightly 源选择，后者跟随该源当前可用 wheel；不要先用默认索引覆盖这两个框架包。
 
 ```bash
 uv venv --python 3.12
 source .venv/bin/activate
 uv pip install --pre paddlepaddle-gpu -i https://www.paddlepaddle.org.cn/packages/nightly/cu130/
-uv pip install torch==2.12.0 torchvision torchaudio -i https://download.pytorch.org/whl/cu130
+uv pip install torch==2.12.0 torchvision==0.27.0 torchaudio -i https://download.pytorch.org/whl/cu130
 uv pip install -r requirements.txt
 ```
 
@@ -97,7 +97,7 @@ python engineV4.py \
 
 多个分类用逗号分隔，例如 `--retest=config_input,timeout`。可用分类与 `api_config_*.txt` 对应，包括 `pass`、`skip`、`paddle_error`、`paddle_accuracy`、`paddle_bitwise`、`paddle_bitwise_knows`、`paddle_cuda`、`paddle_crash`、`oom`、`timeout`、`torch_error`、`config_input`、`config_parse` 和 `config_convert`。
 
-复测开始时，引擎会从 checkpoint、主分类、`comp/` 分类和 stable/tolerance CSV 中移除所选配置的旧结构化结果；`log_inorder.log` 保留历史 case。复测中断后，重新执行相同命令只运行尚未 checkpoint 的配置；全部完成后恢复文件自动删除。`engineV2.py` 支持相同参数。不要让多个进程同时复测同一日志目录。
+复测开始时，引擎会从 checkpoint、主分类、`comp/` 分类和 stable/tolerance CSV 中移除所选配置的旧结构化结果；`log_inorder.log` 保留历史 case。复测中断后，重新执行相同命令只运行尚未 checkpoint 的配置；全部完成后恢复文件自动删除。`engineV2.py` 也支持该复测输入和分类协议。不要让多个进程同时复测同一日志目录。
 
 ## 测试模式
 
@@ -117,7 +117,7 @@ python engineV4.py \
 | `--paddle_custom_device=True` | 比较自定义设备与 CPU |
 | `--custom_device_vs_gpu=True` | 通过 upload/download 流程比较自定义设备与 GPU |
 
-常用附加参数包括 `--test_amp`、`--test_cpu`、`--atol`、`--rtol`、`--manual_threshold_config_file`、`--accuracy_manual_file`、`--bitwise_alignment`、`--timeout`、`--random_seed`、`--generate_failed_tests` 和 `--exit_on_error`。
+常用附加参数包括 `--test_amp`、`--test_cpu`、`--atol`、`--rtol`、`--accuracy_manual_threshold_config`、`--accuracy_manual_file`、`--bitwise_alignment`、`--timeout`、`--random_seed`、`--generate_failed_tests` 和 `--exit_on_error`。
 
 `--test_cpu=True` 只将 Paddle 框架输入及前向、反向切到 CPU。Torch reference 始终在
 GPU 上执行；输入逻辑值生成设备和结果比较设备只由 `--use_gpu_mode` 控制。
@@ -130,14 +130,13 @@ GPU 上执行；输入逻辑值生成设备和结果比较设备只由 `--use_gp
 
 ### engineV2
 
-`engineV2.py` 使用 Pebble `ProcessPool`。除调度方式、engineV4 专属 compute-sanitizer
-和 `accuracy_dual_gpu` 外，其测试模式、双卡 accuracy-stable、GPU mode、动态显存管理、
+`engineV2.py` 使用 Pebble `ProcessPool`。除调度方式和 engineV4 专属 compute-sanitizer
+外，其测试模式、双卡 accuracy、双卡 accuracy-stable、GPU mode、动态显存管理、
 dump 和主要参数与 engineV4 对齐。详见 [engineV2 文档](docs/engineV2-README.md)。
 
 ### 其他入口
 
-- `engine.py`、`engineV3.py`：历史或专项兼容入口，新任务优先使用 engineV4。
-- `run-v4.sh`：可编辑的 shell 模板，支持前后台启动、状态查询和停止。
+- `run-example.sh`：可编辑的 engineV4 shell 模板，支持前后台启动、状态查询和停止。
 - `run.py`：YAML runner，负责环境变量、命令行参数、后台进程和多轮失败重测编排。
 - `test_pipeline/V4/`：0-size、1M、big tensor 等标准流水线脚本。
 
@@ -151,9 +150,9 @@ python run.py -c test_pipeline/run_config.yaml
 ## GPU Mode 与动态显存管理
 
 `--use_gpu_mode=True` 在 GPU 上生成 Tensor 逻辑值并进行结果比较，同时复用 CUDA allocator，
-适用于大规模 `accuracy_stable` 测试。它不改变算子设备。NumPy 缓存仅支持
-`--use_cached_numpy=True`：GPU mode 会忽略该开关并警告；非 GPU mode 会强制使用 NumPy
-input backend，显式 Torch/Paddle backend 会被忽略并警告。`--cache_numpy_auxiliary` 不受支持。
+适用于大规模 `accuracy_stable` 测试。算子设备由 `--test_cpu` 决定。
+`--use_cached_numpy=True` 启用 NumPy 缓存：非 GPU mode 使用 NumPy
+input backend；显式 Torch/Paddle backend 以 NumPy 为准并打印 warning。
 
 `test_cpu` 与 `use_gpu_mode` 正交，四种组合的语义如下：
 
@@ -177,7 +176,7 @@ GPU mode 不需要选择固定显存策略。框架会在 Torch/Paddle 阶段边
 框架的 allocator cache 并重新查询，只有 headroom 仍不足时才将第一轮结果逐棵转移到 CPU。
 小 shape 在显存充足时不会执行不必要的 D2H。
 
-`test_tol` 只将容差置零并记录误差诊断，不改变上述比较设备：启用 GPU mode 时仍在
+`record_accuracy_tolerance` 只将容差置零并记录误差诊断，比较设备沿用上述配置：启用 GPU mode 时在
 GPU 完成 Tensor 比较。
 
 ```bash
@@ -270,7 +269,7 @@ python engineV4.py \
   --num_gpus=1
 ```
 
-也可设置 `USE_DUMP=True` 和 `DUMP_DIR=<path>`；优先级为命令行、环境变量、默认值。只设置目录不会启用 dump。
+也可设置 `USE_DUMP=True` 和 `DUMP_DIR=<path>`；优先级为命令行、环境变量、默认值。dump 由 `USE_DUMP=True` 启用。
 
 ### Compute Sanitizer
 
@@ -313,7 +312,7 @@ PaddleAPITest/
 ├── engineV4.py                 # 推荐测试引擎
 ├── engineV2.py                 # Pebble ProcessPool 引擎
 ├── run.py                      # YAML runner
-├── run-v4.sh                   # shell 运行模板
+├── run-example.sh              # engineV4 shell 运行模板
 ├── test_pipeline/              # 标准流水线、YAML 配置和脚本
 ├── tester/
 │   ├── api_config/             # 配置集、解析、日志和 dump

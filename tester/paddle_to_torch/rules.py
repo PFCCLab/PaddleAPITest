@@ -40,7 +40,7 @@ def read_conversion_environment() -> ConversionEnvironment:
 
 
 def read_workers_on_gpu() -> int:
-    # 未配置时按单 worker 预算，保持历史运行行为。
+    # 未配置时按单 worker 预算。
     raw_workers_on_gpu = os.environ.get(WORKERS_ON_GPU_ENV_VAR, "1")
     # workspace 按 worker 数切分，零值或非整数会破坏显存预算。
     try:
@@ -8847,7 +8847,7 @@ class CopsFusedLinearParamGradAddRule(BaseRule):
     """
 
     SUPPORTED_IMPLEMENTATIONS = frozenset({"apex", "te", "torch"})
-    # 融合线性梯度以 TE 为历史对照基线，torch 和 apex 仅由环境变量显式选择。
+    # 融合线性梯度以 TE 为默认对照基线，torch 和 apex 由环境变量显式选择。
     DEFAULT_IMPLEMENTATION = "te"
 
     def apply(self, paddle_api: str) -> ConvertResult:

@@ -44,7 +44,7 @@ def _package_version(distribution_names):
 
 def _module_version(module_name, distribution_names):
     """区分未安装模块和已安装但缺少版本元数据的模块。"""
-    # Python 模块名与 wheel 发行版名并不总是一致，先查询环境提供的映射。
+    # 先查询环境提供的 Python 模块名到 wheel 发行版名映射。
     # 映射读取失败只影响展示精度，不能阻断测试启动。
     mapped_distributions = ()
     try:
@@ -90,7 +90,7 @@ def _visible_gpu_tokens(raw_value, device_count):
 
 def _visible_gpu_ids(raw_value, device_count):
     """返回数字形式的可见设备 ID；UUID 由 NVML 查询路径单独解析。"""
-    # 该兼容 helper 只返回合法数字索引，UUID 不应被错误转换为逻辑 ID。
+    # helper 只返回合法数字索引，UUID 保持原值。
     ids = []
     for token in _visible_gpu_tokens(raw_value, device_count):
         try:
@@ -125,7 +125,7 @@ def _collect_nvidia_info():
     try:
         driver = _decode_nvml_value(nvml.nvmlSystemGetDriverVersion())
     except Exception:
-        # 驱动版本缺失不影响后续逐卡采集。
+        # 驱动版本缺失时继续逐卡采集。
         driver = "unavailable"
 
     gpus = []
@@ -140,7 +140,7 @@ def _collect_nvidia_info():
                     continue
                 handle = nvml.nvmlDeviceGetHandleByIndex(physical_id)
             else:
-                # UUID 可见性需要新版 NVML 接口；旧绑定只跳过该设备而不终止采集。
+                # 缺少 UUID 接口时跳过该设备并继续采集。
                 get_by_uuid = getattr(nvml, "nvmlDeviceGetHandleByUUID", None)
                 if get_by_uuid is None:
                     continue

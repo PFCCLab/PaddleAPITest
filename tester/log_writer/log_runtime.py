@@ -67,7 +67,7 @@ def default_log_dir(*, single=False):
 
 
 def configure_direct_results(log_id):
-    """配置历史单进程引擎使用的主结果文件后缀。"""
+    """配置单进程引擎使用的主结果文件后缀。"""
     global RESULT_LOG_PATH, RESULT_LOG_SUFFIX, MAIN_LOG_SUFFIX
     TEST_LOG_PATH.mkdir(parents=True, exist_ok=True)
     suffix = f"_{log_id}" if log_id and not log_id.startswith("_") else log_id

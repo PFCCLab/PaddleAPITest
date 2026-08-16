@@ -37,7 +37,7 @@ APIConfig
 - `InputValue`：规则生成的逻辑值、来源 backend 以及对应路径。
 - 路径读取、值挂载、值查询和清理函数。
 
-`InputValue` 是规则提交后的逻辑真源；它不代表框架 Tensor 已经创建完成。
+`InputValue` 是规则提交后的逻辑真源；框架 Tensor 在 materialization 阶段创建。
 
 ### `tensor_config.py`：可变配置和 Tensor 缓存
 

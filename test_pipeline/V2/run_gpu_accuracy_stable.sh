@@ -27,7 +27,7 @@ TEST_MODE_ARGS=(
     # --use_cached_numpy=True
     # --atol=1e-2
     # --rtol=1e-2
-    # --test_tol=True
+    # --record_accuracy_tolerance=True
 )
 
 IN_OUT_ARGS=(
