@@ -11,7 +11,7 @@ from dataclasses import dataclass, replace
 import numpy
 
 from .backend_runtime import create_input_backend
-from .binding import InputApiBinding, InputGenerationContext
+from .binding import InputApiBinding, InputGenerationContext, build_input_generation_context
 from .tensor_config import (
     CAST_THROUGH_INTERMEDIATE_DTYPES,
     TensorConfig,
@@ -526,6 +526,19 @@ class InputRuleRegistry:
     def resolve(self, api_name: str) -> InputRule:
         # 未注册 API 直接返回独立默认规则，不伪造任意 API 的注册关系。
         return self._by_api.get(api_name, self._default_input_rule)
+
+    def generate(self, api_test_case) -> bool:
+        """为测试用例创建上下文并执行一次规则事务。"""
+        api_config = api_test_case.api_config
+        input_rule = self.resolve(api_config.api_name)
+        # 上下文在 registry owner 内构造，确保规则选择与提交共享同一入口。
+        input_generation_context = build_input_generation_context(
+            api_config,
+            seed=api_test_case.runtime_config.random_seed,
+            backend_policy=api_test_case.runtime_config.input_backend_policy,
+            input_max_abs=api_test_case.runtime_config.input_max_abs,
+        )
+        return input_rule.generate(input_generation_context, api_config)
 
 
 # API 输入规则集中定义，确保注册顺序和查找结果保持稳定。

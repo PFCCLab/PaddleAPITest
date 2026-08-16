@@ -19,6 +19,7 @@ from .gpu_memory_preflight import (
     should_check_grad,
 )
 from .input_generation.binding import bind_input_parameters, split_tensor_method_arguments
+from .input_generation.generation_rules import input_rules
 from .input_generation.materialization import (
     clear_tensor_configs,
     materialize_config_tree,
@@ -675,9 +676,7 @@ class APITestBase:
         return finish(arguments)
 
     def generate_input_values(self):
-        from .input_generation.dispatcher import dispatch_input_generation
-
-        return dispatch_input_generation(self)
+        return input_rules.generate(self)
 
     def _torch_execution_locals(self):
         if (

@@ -103,9 +103,9 @@ API 语义不应写进 backend。
 规则只表达“这个 API 需要什么输入”。通用数值生成放到 `value_generators.py`，框架物化放到
 `tensor_config.py` 和 `materialization.py`。
 
-### `dispatcher.py`：选择并执行规则
+### `generation_rules.py`：选择并执行规则
 
-dispatcher 根据 API 名称取得注册规则，创建上下文并执行一次生成事务。它不包含 API 规则实现。
+`InputRuleRegistry` 根据 API 名称取得注册规则，创建上下文并执行一次生成事务。规则选择、上下文构造和提交生命周期共享同一入口。
 
 ## 规则怎么写
 
