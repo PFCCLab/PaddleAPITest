@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import copy
+import fcntl
 import os
 import shlex
 import shutil
@@ -9,6 +10,8 @@ import signal
 import subprocess
 import sys
 import time
+from collections.abc import Iterator
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
@@ -32,7 +35,7 @@ DEFAULT_RETEST_ERROR_CONFIGS = [
 ]
 
 TOP_LEVEL_KEYS = {"name", "runner", "env", "input", "output", "retest", "engine_args"}
-RUNNER_KEYS = {"engine", "foreground", "dry_run", "pid_file"}
+RUNNER_KEYS = {"engine", "foreground", "dry_run"}
 INPUT_KEYS = {"api_config", "api_config_file"}
 OUTPUT_KEYS = {"log_dir"}
 RETEST_KEYS = {
@@ -124,9 +127,6 @@ def validate_yaml_config(config: dict[str, Any]) -> None:
     for key in ("foreground", "dry_run"):
         if key in runner:
             require_type(f"runner.{key}", runner[key], bool)
-    if "pid_file" in runner:
-        require_type("runner.pid_file", runner["pid_file"], str)
-
     env = ensure_mapping(config, "env")
     for key, value in env.items():
         if not isinstance(key, str):
@@ -263,10 +263,9 @@ def display_path(path: Path) -> str:
         return str(path)
 
 
-def default_pid_file(config_path: Path, config: dict[str, Any]) -> Path:
-    name = str(config.get("name") or config_path.stem)
-    safe_name = "".join(char if char.isalnum() or char in "._-" else "_" for char in name)
-    return PROJECT_ROOT / ".run" / f"{safe_name}.pid"
+def pid_file_for_log_dir(log_dir: Path) -> Path:
+    """将任务身份固定在实际写入的输出目录，而不是调用它的脚本。"""
+    return log_dir / ".paddleapitest.pid"
 
 
 def set_input_config(input_config: dict[str, Any], key: str, value: Any) -> None:
@@ -317,7 +316,7 @@ def apply_overrides(config: dict[str, Any], args: argparse.Namespace) -> None:
         engine_args[key.replace("-", "_")] = parse_engine_value(value)
 
 
-def validate_config(config_path: Path, config: dict[str, Any]) -> tuple[str, Path, Path]:
+def validate_config(config_path: Path, config: dict[str, Any]) -> tuple[str, Path]:
     if not (PROJECT_ROOT / "tester").is_dir():
         raise RuntimeError(f"请在 PaddleAPITest 项目根目录附近执行，未找到 tester/: {PROJECT_ROOT}")
 
@@ -344,13 +343,7 @@ def validate_config(config_path: Path, config: dict[str, Any]) -> tuple[str, Pat
     if not log_dir:
         raise ValueError("output.log_dir 不能为空")
 
-    pid_file_value = runner.get("pid_file")
-    pid_file = (
-        resolve_project_path(pid_file_value)
-        if pid_file_value
-        else default_pid_file(config_path, config)
-    )
-    return str(engine), engine_path, pid_file
+    return str(engine), engine_path
 
 
 def build_engine_command(engine: str, config: dict[str, Any], passthrough: list[str]) -> list[str]:
@@ -472,25 +465,59 @@ def process_running(pid: int) -> bool:
     return True
 
 
-def stop_process(pid_file: Path) -> int:
-    pid = read_pid(pid_file)
-    if pid is None:
-        print(">>> 终止任务 | 无记录")
-        return 0
-    if process_running(pid):
+@contextmanager
+def pid_file_lock(pid_file: Path) -> Iterator[None]:
+    """串行化同一输出目录的 PID 检查、启动、停止与回收。"""
+    pid_file.parent.mkdir(parents=True, exist_ok=True)
+    lock_file = pid_file.with_name(f"{pid_file.name}.lock")
+    with lock_file.open("a", encoding="utf-8") as lock:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
         try:
-            os.killpg(pid, signal.SIGTERM)
-        except ProcessLookupError:
-            pass
-        except OSError:
+            yield
+        finally:
+            fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+
+
+def clear_pid_if_matches(pid_file: Path, pid: int) -> None:
+    """只回收自身记录，避免结束的旧任务删除新任务的 PID。"""
+    with pid_file_lock(pid_file):
+        if read_pid(pid_file) == pid:
+            pid_file.unlink(missing_ok=True)
+
+
+def wait_for_process_exit(pid: int, timeout: float = 3.0) -> bool:
+    """停止信号发出后短暂等待旧进程退出，避免新任务与旧任务重叠写目录。"""
+    deadline = time.monotonic() + timeout
+    while process_running(pid) and time.monotonic() < deadline:
+        time.sleep(0.1)
+    return not process_running(pid)
+
+
+def stop_process(pid_file: Path) -> int:
+    with pid_file_lock(pid_file):
+        pid = read_pid(pid_file)
+        if pid is None:
+            print(">>> 终止任务 | 无记录")
+            return 0
+        if process_running(pid):
             try:
-                os.kill(pid, signal.SIGTERM)
+                os.killpg(pid, signal.SIGTERM)
             except ProcessLookupError:
                 pass
-        print(f">>> 终止任务 | 已终止 | PGID {pid}")
-    else:
-        print(f">>> 终止任务 | 已结束 | PID {pid}")
-    pid_file.unlink(missing_ok=True)
+            except OSError:
+                try:
+                    os.kill(pid, signal.SIGTERM)
+                except ProcessLookupError:
+                    pass
+            if not wait_for_process_exit(pid):
+                try:
+                    os.killpg(pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+            print(f">>> 终止任务 | 已终止 | PGID {pid}")
+        else:
+            print(f">>> 终止任务 | 已结束 | PID {pid}")
+        pid_file.unlink(missing_ok=True)
     return 0
 
 
@@ -507,31 +534,34 @@ def latest_log(log_dir: Path) -> Path | None:
 
 
 def show_status(pid_file: Path, engine: str, log_dir: Path) -> int:
-    pid = read_pid(pid_file)
-    if pid is None:
-        print(">>> 运行状态 | 无记录")
-        print(f"PID文件  {display_path(pid_file)}")
-        return 0
-    if not process_running(pid):
-        print(">>> 运行状态 | 已结束")
-        print(f"进程    PID {pid}")
-        pid_file.unlink(missing_ok=True)
-        return 0
+    with pid_file_lock(pid_file):
+        pid = read_pid(pid_file)
+        if pid is None:
+            print(">>> 运行状态 | 无记录")
+            print(f"PID文件  {display_path(pid_file)}")
+            return 0
+        if not process_running(pid):
+            print(">>> 运行状态 | 已结束")
+            print(f"进程    PID {pid}")
+            pid_file.unlink(missing_ok=True)
+            return 0
 
-    try:
-        children_output = subprocess.check_output(["pgrep", "-P", str(pid)], text=True)
-        children = sum(1 for line in children_output.splitlines() if line.strip())
-    except subprocess.CalledProcessError:
-        children = 0
-    try:
-        elapsed = subprocess.check_output(["ps", "-o", "etime=", "-p", str(pid)], text=True).strip()
-    except subprocess.CalledProcessError:
-        elapsed = "未知"
-    log = latest_log(log_dir)
-    print(">>> 运行状态 | 运行中")
-    print(f"进程    PID {pid} | {engine}.py | Worker {children} | 已运行 {elapsed}")
-    if log:
-        print(f"日志    {display_path(log)}")
+        try:
+            children_output = subprocess.check_output(["pgrep", "-P", str(pid)], text=True)
+            children = sum(1 for line in children_output.splitlines() if line.strip())
+        except subprocess.CalledProcessError:
+            children = 0
+        try:
+            elapsed = subprocess.check_output(
+                ["ps", "-o", "etime=", "-p", str(pid)], text=True
+            ).strip()
+        except subprocess.CalledProcessError:
+            elapsed = "未知"
+        log = latest_log(log_dir)
+        print(">>> 运行状态 | 运行中")
+        print(f"进程    PID {pid} | {engine}.py | Worker {children} | 已运行 {elapsed}")
+        if log:
+            print(f"日志    {display_path(log)}")
     return 0
 
 
@@ -540,22 +570,23 @@ def prepare_log_dir(log_dir: Path) -> Path:
     return log_dir
 
 
-def cleanup_pid_when_done(pid: int, pid_file: Path) -> None:
-    while process_running(pid):
-        time.sleep(5)
-    recorded_pid = read_pid(pid_file)
-    if recorded_pid == pid:
-        pid_file.unlink(missing_ok=True)
-
-
-def run_foreground(command: list[str], env: dict[str, str], log_dir: Path) -> int:
+def run_foreground(
+    command: list[str], env: dict[str, str], log_dir: Path, pid_file: Path, manage_command: str
+) -> int:
     print(f"开始    日志目录 {display_path(log_dir)} | Ctrl+C 终止")
-    process = subprocess.Popen(
-        command,
-        cwd=PROJECT_ROOT,
-        env=env,
-        start_new_session=True,
-    )
+    with pid_file_lock(pid_file):
+        old_pid = read_pid(pid_file)
+        if old_pid and process_running(old_pid):
+            print(f"[警告] 输出目录任务已在运行 | PID {old_pid} | 终止 {manage_command} --stop")
+            return 1
+        pid_file.unlink(missing_ok=True)
+        process = subprocess.Popen(
+            command,
+            cwd=PROJECT_ROOT,
+            env=env,
+            start_new_session=True,
+        )
+        pid_file.write_text(f"{process.pid}\n", encoding="utf-8")
     try:
         return process.wait()
     except KeyboardInterrupt:
@@ -581,6 +612,8 @@ def run_foreground(command: list[str], env: dict[str, str], log_dir: Path) -> in
                 process.wait()
         shutil.rmtree(log_dir / ".tmp", ignore_errors=True)
         return 130 if process.returncode is None or process.returncode < 0 else process.returncode
+    finally:
+        clear_pid_if_matches(pid_file, process.pid)
 
 
 def run_background(
@@ -591,26 +624,26 @@ def run_background(
     engine: str,
     manage_command: str,
 ) -> int:
-    if pid_file.exists():
+    with pid_file_lock(pid_file):
         old_pid = read_pid(pid_file)
         if old_pid and process_running(old_pid):
-            print(f"[警告] 任务已在运行 | PID {old_pid} | 终止 {manage_command} --stop")
+            print(f"[警告] 输出目录任务已在运行 | PID {old_pid} | 终止 {manage_command} --stop")
             return 1
         pid_file.unlink(missing_ok=True)
 
-    pid_file.parent.mkdir(parents=True, exist_ok=True)
-    process = subprocess.Popen(
-        command,
-        cwd=PROJECT_ROOT,
-        env=env,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-        start_new_session=True,
-    )
-    pid_file.write_text(f"{process.pid}\n", encoding="utf-8")
+        process = subprocess.Popen(
+            command,
+            cwd=PROJECT_ROOT,
+            env=env,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+        pid_file.write_text(f"{process.pid}\n", encoding="utf-8")
 
     cleaner_code = (
-        "import os,sys,time\npid=int(sys.argv[1])\npid_file=sys.argv[2]\n"
+        "import fcntl,os,sys,time\npid=int(sys.argv[1])\npid_file=sys.argv[2]\n"
+        "lock_file=sys.argv[3]\n"
         "while True:\n"
         "    try:\n"
         "        os.kill(pid, 0)\n"
@@ -619,18 +652,27 @@ def run_background(
         "    except PermissionError:\n"
         "        pass\n"
         "    time.sleep(5)\n"
-        "try:\n"
-        "    recorded=open(pid_file).read().strip()\n"
-        "except FileNotFoundError:\n"
-        "    recorded=''\n"
-        "if recorded == str(pid):\n"
+        "with open(lock_file, 'a') as lock:\n"
+        "    fcntl.flock(lock.fileno(), fcntl.LOCK_EX)\n"
         "    try:\n"
-        "        os.remove(pid_file)\n"
+        "        recorded=open(pid_file).read().strip()\n"
         "    except FileNotFoundError:\n"
-        "        pass\n"
+        "        recorded=''\n"
+        "    if recorded == str(pid):\n"
+        "        try:\n"
+        "            os.remove(pid_file)\n"
+        "        except FileNotFoundError:\n"
+        "            pass\n"
     )
     subprocess.Popen(
-        [sys.executable, "-c", cleaner_code, str(process.pid), str(pid_file)],
+        [
+            sys.executable,
+            "-c",
+            cleaner_code,
+            str(process.pid),
+            str(pid_file),
+            str(pid_file.with_name(f"{pid_file.name}.lock")),
+        ],
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
         start_new_session=True,
@@ -639,7 +681,7 @@ def run_background(
     time.sleep(1)
     if not process_running(process.pid):
         print(f"[错误] 启动失败 | {engine}.py | 日志目录 {display_path(log_dir)}")
-        pid_file.unlink(missing_ok=True)
+        clear_pid_if_matches(pid_file, process.pid)
         return 1
 
     log_file = latest_log(log_dir)
@@ -714,11 +756,12 @@ def run_once(
     force_foreground: bool = False,
     label: str | None = None,
 ) -> int:
-    engine, _engine_path, pid_file = validate_config(config_path, config)
+    engine, _engine_path = validate_config(config_path, config)
     output = ensure_mapping(config, "output")
     runner = ensure_mapping(config, "runner")
     env_config = ensure_mapping(config, "env")
     log_dir = resolve_project_path(output["log_dir"])
+    pid_file = pid_file_for_log_dir(log_dir)
     command = build_engine_command(engine, config, passthrough)
 
     env = os.environ.copy()
@@ -764,9 +807,9 @@ def run_once(
         if arg != "--" and arg.partition("=")[0] not in hidden_options
     ]
     print(f"参数    {' | '.join(display_args)}")
-    if foreground:
-        return run_foreground(command, env, log_dir)
     manage_command = f"python run.py -c {shlex.quote(display_path(config_path))}"
+    if foreground:
+        return run_foreground(command, env, log_dir, pid_file, manage_command)
     return run_background(command, env, log_dir, pid_file, engine, manage_command)
 
 
@@ -845,10 +888,11 @@ def main() -> int:
     config = load_yaml(config_path)
     apply_overrides(config, args)
     validate_yaml_config(config)
-    engine, _engine_path, pid_file = validate_config(config_path, config)
+    engine, _engine_path = validate_config(config_path, config)
 
     output = ensure_mapping(config, "output")
     log_dir = resolve_project_path(output["log_dir"])
+    pid_file = pid_file_for_log_dir(log_dir)
 
     if args.stop:
         return stop_process(pid_file)

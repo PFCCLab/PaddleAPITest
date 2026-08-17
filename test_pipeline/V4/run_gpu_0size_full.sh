@@ -52,7 +52,14 @@ if [[ ! -f "$ENGINE.py" || ! -d "tester" ]]; then
 fi
 SCRIPT_NAME="${BASH_SOURCE[0]##*/}"
 SCRIPT_NAME="${SCRIPT_NAME%.sh}"
-PID_FILE="${SCRIPT_DIR}/.${SCRIPT_NAME}.pid"
+mkdir -p "$LOG_DIR" || exit 1
+LOG_DIR="$(cd "$LOG_DIR" && pwd -P)"
+# 输出目录锁定任务身份，脚本名不参与互斥。
+PID_FILE="${LOG_DIR}/.paddleapitest.pid"
+LOCK_FILE="${PID_FILE}.lock"
+exec 9>"$LOCK_FILE"
+# 启动、停止和清理共用此锁，防止状态竞态。
+flock -x 9
 
 # ── 运维命令处理 ──
 case "${1:-}" in
@@ -62,6 +69,7 @@ case "${1:-}" in
             if kill -0 "$pid" 2>/dev/null; then
                 # Kill entire process group (main + all workers)
                 kill -- -"$pid" 2>/dev/null || kill "$pid" 2>/dev/null
+                for _ in {1..30}; do kill -0 "$pid" 2>/dev/null || break; sleep 0.1; done
                 echo "已终止进程组 PGID=$pid"
             else
                 echo "进程 PID=$pid 已不存在"
@@ -201,6 +209,7 @@ else
     nohup setsid python "$ENGINE.py" "${ALL_ARGS[@]}" >> "$LOG_FILE" 2>&1 &
     PYTHON_PID=$!
     echo "$PYTHON_PID" > "$PID_FILE"
+    flock -u 9
 
     # 任务自然结束时清理 PID 文件；若已启动新任务，则不误删新 PID。
     (
@@ -208,6 +217,7 @@ else
             sleep 5
         done
 
+        flock -x 9
         recorded_pid="$(cat "$PID_FILE" 2>/dev/null || true)"
         if [[ "$recorded_pid" == "$PYTHON_PID" ]]; then
             rm -f "$PID_FILE"

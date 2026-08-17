@@ -35,7 +35,6 @@ runner:
   foreground: false
   # true=只打印最终命令，不执行。也可用命令行 --dry-run 临时覆盖。
   dry_run: false
-  # pid_file: ".run/run_config.pid"
 
 # 可选：需要导出的环境变量。值建议写成字符串，避免 YAML 布尔值转换带来歧义。
 # Paddle Flags 在启动 Paddle 前生效，用于控制 Paddle 运行时行为：

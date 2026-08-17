@@ -203,13 +203,13 @@ python run.py [-c CONFIG] [OVERRIDES] [ENGINE_OPTIONS]
 
 顶层键为 `name`、`runner`、`env`、`input`、`output`、`retest`、`engine_args`。
 
-- `runner`：`engine`、`foreground`、`dry_run`、`pid_file`。
+- `runner`：`engine`、`foreground`、`dry_run`。
 - `input`：`api_config`、`api_config_file` 二选一。
 - `output`：`log_dir`。
 - `retest`：`enabled`、`rounds`、`error_configs`、`log_dir_template`、`skip_unavailable`。
 - `engine_args`：去掉 `--` 的 engineV4 参数名。
 
-所有字符串都经 `os.path.expandvars` 展开，支持 `${VAR}` 和 `$VAR`；未设置的变量保持原文。
+后台任务的 PID 文件固定为 `output.log_dir/.paddleapitest.pid`，同一输出目录的不同配置或脚本共享互斥状态；对应锁文件为同目录下的 `.paddleapitest.pid.lock`。`run-example.sh` 和 `test_pipeline/V4/*.sh` 使用相同约定。所有字符串都经 `os.path.expandvars` 展开，支持 `${VAR}` 和 `$VAR`；未设置的变量保持原文。
 
 ## 环境变量
 
