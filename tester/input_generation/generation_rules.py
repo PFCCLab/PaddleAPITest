@@ -760,6 +760,9 @@ def generate_max_unpool_inputs(rule: InputRuleContext):
             stride = list(stride)
         if isinstance(padding, numbers.Integral):
             padding = [padding] * dimensions
+        elif padding is None:
+            # Paddle 默认 padding 为各空间维度的零值，不能对 None 做 list 转换。
+            padding = [0] * dimensions
         else:
             padding = list(padding)
 
@@ -1347,11 +1350,23 @@ def generate_distribute_fpn_proposals_inputs(rule: InputRuleContext):
     def generate_fpn_rois_input_value(input_binding):
         num = input_binding.shape[0]
         state["num"] = num
-        rois = rule.ops.randint(1, 1024, shape=[num, 4])
-        rois[:, 0] = rois[:, 0] + rule.ops.random([num])
-        rois[:, 1] = rois[:, 1] + rule.ops.random([num])
-        rois[:, 2] = rois[:, 0] + rule.ops.randint(1, 1024, shape=[num]) + rule.ops.random([num])
-        rois[:, 3] = rois[:, 1] + rule.ops.randint(1, 1024, shape=[num]) + rule.ops.random([num])
+        # ROI 坐标需要保留随机小数，先转换到配置浮点 dtype 再做坐标联动。
+        rois = rule.ops.cast(
+            rule.ops.randint(1, 1024, shape=[num, 4]),
+            input_binding.dtype,
+        )
+        rois[:, 0] = rois[:, 0] + rule.ops.random([num], dtype=input_binding.dtype)
+        rois[:, 1] = rois[:, 1] + rule.ops.random([num], dtype=input_binding.dtype)
+        widths = rule.ops.cast(
+            rule.ops.randint(1, 1024, shape=[num]),
+            input_binding.dtype,
+        )
+        heights = rule.ops.cast(
+            rule.ops.randint(1, 1024, shape=[num]),
+            input_binding.dtype,
+        )
+        rois[:, 2] = rois[:, 0] + widths + rule.ops.random([num], dtype=input_binding.dtype)
+        rois[:, 3] = rois[:, 1] + heights + rule.ops.random([num], dtype=input_binding.dtype)
         return rois
 
     def generate_rois_num_input_value(input_binding):
@@ -1360,7 +1375,8 @@ def generate_distribute_fpn_proposals_inputs(rule: InputRuleContext):
             state["num"] = fpn_rois.shape[0]
         num = state["num"]
         remaining = input_binding.shape[0]
-        result = rule.ops.zeros(input_binding.shape)
+        # rois_num 的整型协议必须沿用配置 dtype，避免默认 float32 触发算子类型提升。
+        result = rule.ops.zeros(input_binding.shape, dtype=input_binding.dtype)
         if num > 4096 or remaining > 4096:
             if num < remaining:
                 result[:num] = 1
@@ -2230,6 +2246,9 @@ def generate_index_sample_inputs(rule: InputRuleContext):
 
     def generate_index_input_value(input_binding):
         x_dim = rule.arg("x").shape[1]
+        # 空的采样维度没有合法随机上界，只能生成空语义的零索引。
+        if x_dim == 0:
+            return rule.ops.zeros(input_binding.shape, dtype=input_binding.dtype)
         return rule.ops.randint(0, x_dim, shape=input_binding.shape)
 
     rule.generate((("index", generate_index_input_value),))
@@ -2306,6 +2325,9 @@ def generate_index_update_inputs(rule: InputRuleContext):
         if not (0 <= axis < len(x_shape)):
             raise ValueError(f"Invalid axis {axis} for shape {x_shape}")
         if len(input_binding.shape) >= 1:
+            # 目标轴为空时 index 必须全为零，避免 randint(0, 0) 抛错。
+            if x_shape[axis] == 0:
+                return rule.ops.zeros(input_binding.shape, dtype=input_binding.dtype)
             return rule.ops.cast(
                 rule.ops.randint(0, x_shape[axis], shape=input_binding.shape),
                 input_binding.dtype,
@@ -2907,9 +2929,29 @@ def generate_strided_slice_inputs(rule: InputRuleContext):
                 input_binding.dtype,
             )
         if parameter == "ends":
+            starts_arg = rule.arg("starts")
+            starts_value = None
+            if isinstance(starts_arg, (list, tuple)):
+                starts_config = starts_arg[item_index]
+                starts_binding = rule.binding_for_value(starts_config)
+                if starts_binding is not None:
+                    starts_value = rule.value(starts_binding)
+                else:
+                    starts_value = starts_config
+            else:
+                starts_binding = rule.binding_for_value(starts_arg)
+                if starts_binding is not None:
+                    starts_value = rule.value(starts_binding)
+                else:
+                    starts_value = starts_arg
+            if starts_value is None:
+                starts_value = 0
+            elif hasattr(starts_value, "item"):
+                starts_value = starts_value.item()
+            starts_value = int(starts_value)
             return rule.ops.cast(
                 rule.ops.randint(
-                    rule.value(rule.tensor("starts"))[item_index] + 1,
+                    starts_value + 1,
                     x.shape[axes[item_index]],
                     shape=input_binding.shape,
                 ),

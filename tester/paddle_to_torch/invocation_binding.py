@@ -315,18 +315,23 @@ def bind_input_parameters(
                 "variadic-expand",
                 ("x", "shape"),
             )
-    if api_name == "paddle.empty" and len(args) > 1 and all(isinstance(arg, int) for arg in args):
+    if (
+        api_name in ("paddle.empty", "paddle.zeros")
+        and len(args) > 1
+        and all(isinstance(arg, int) for arg in args)
+    ):
         # 仅整数序列采用变长 shape 协议，列表 shape 仍交由原生签名校验。
-        # empty 的多整数位置协议在直接绑定调用中也要收敛为 shape。
+        # empty/zeros 的多整数位置协议在直接绑定调用中也要收敛为 shape。
         signature_result = resolve_input_signature(api_name, api=api)
         signature = signature_result.signature
         if signature is not None:
             bound = signature.bind(list(args), **kwargs)
             if apply_defaults:
                 bound.apply_defaults()
+            source = "variadic-empty" if api_name == "paddle.empty" else "variadic-zeros"
             return InputParameterBindingResult(
                 collections.OrderedDict(bound.arguments),
-                "variadic-empty",
+                source,
                 tuple(bound.arguments),
             )
 

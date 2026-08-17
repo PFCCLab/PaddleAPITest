@@ -105,28 +105,32 @@ class APIConfig:
     def append_args(self, arg):
         # 只有连续整数才采用变长 shape 协议，避免误改其他位置参数。
         if (
-            self.api_name == "paddle.empty"
+            self.api_name in ("paddle.empty", "paddle.zeros")
             and isinstance(arg, int)
             and len(self.args) == 1
             and isinstance(self.args[0], int)
         ):
-            # empty 的连续整数位置参数表示 shape，不能让第二个整数占用 dtype。
+            # empty/zeros 的连续整数位置参数表示 shape，不能让第二个整数占用 dtype。
             self.args = [[*self.args, arg]]
             return
         if (
-            self.api_name == "paddle.empty"
+            self.api_name in ("paddle.empty", "paddle.zeros")
             and isinstance(arg, int)
             and len(self.args) == 1
             and isinstance(self.args[0], list)
             and all(isinstance(value, int) for value in self.args[0])
         ):
-            # 已经开始收集变长 shape 时，继续追加维度到同一个列表。
+            # 两个创建 API 开始收集变长 shape 后，继续追加维度到同一个列表。
             self.args[0].append(arg)
             return
         self.args.append(arg)
 
     def append_kwargs(self, name, arg):
-        if self.api_name == "paddle.empty" and name == "device" and isinstance(arg, str):
+        if (
+            self.api_name in ("paddle.empty", "paddle.zeros")
+            and name == "device"
+            and isinstance(arg, str)
+        ):
             # worker 通常只暴露一张逻辑卡，显式 cuda:N 需按可见卡数折算。
             match = re.fullmatch(r"cuda:\d+", arg)
             if match:
