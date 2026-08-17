@@ -1281,10 +1281,12 @@ def generate_reciprocal_inputs(rule: InputRuleContext):
 @input_rules.register(
     "paddle.digamma",
     "paddle.lgamma",
+    "paddle.polygamma",
     aliases=("paddle.Tensor.digamma", "paddle.Tensor.lgamma"),
 )
 def generate_gamma_function_inputs(rule: InputRuleContext):
     """输入规则：为 Gamma 派生函数生成正区间输入。"""
+    # polygamma 的 n 是普通整数；全量生成只会处理 Tensor 自变量 x，不会改写阶数。
     # 正区间同时避开 0 与全部非正整数极点，并与极点保留足够数值距离。
     rule.generate_all("uniform", low=0.5, high=10.0)
 
@@ -1361,6 +1363,72 @@ def generate_binary_cross_entropy_inputs(rule: InputRuleContext):
             (("input", "x"), generate_probability_input_value),
             (("label", "target"), generate_label_input_value),
             ("weight", generate_weight_input_value),
+        )
+    )
+
+
+@input_rules.register("paddle.nn.functional.binary_cross_entropy_with_logits")
+def generate_binary_cross_entropy_with_logits_inputs(rule: InputRuleContext):
+    """输入规则：保持 logits、软标签和权重处于有限数值域。"""
+
+    def generate_logit_input_value(input_binding):
+        # 有界 logits 既覆盖正负区域，也避免低精度 exp 路径出现不必要的溢出。
+        return rule.domain("uniform", input_binding, low=-10.0, high=10.0)
+
+    def generate_positive_weight_input_value(input_binding):
+        # weight 与 pos_weight 都是 loss 的非负缩放因子，使用严格正值保留梯度。
+        return rule.domain("uniform", input_binding, low=0.1, high=2.0)
+
+    rule.generate(
+        (
+            (("logit", "input"), generate_logit_input_value),
+            (("label", "target"), "unit_interval"),
+            (("weight", "pos_weight"), generate_positive_weight_input_value),
+        )
+    )
+
+
+@input_rules.register("paddle.nn.functional.margin_ranking_loss")
+def generate_margin_ranking_loss_inputs(rule: InputRuleContext):
+    """输入规则：为 margin ranking loss 生成二元排序标签。"""
+    rule.generate((("label", "hinge_labels"),))
+
+
+@input_rules.register("paddle.nn.functional.poisson_nll_loss")
+def generate_poisson_nll_loss_inputs(rule: InputRuleContext):
+    """输入规则：按 log_input 语义约束 Poisson 预测值与计数标签。"""
+
+    def generate_input_value(input_binding):
+        if rule.arg("log_input", True):
+            # log-rate 保持有界，避免 exp(input) 在 float16 等低精度类型中溢出。
+            return rule.domain("uniform", input_binding, low=-4.0, high=4.0)
+        # rate 路径会计算 log(input + epsilon)，严格正值避免定义域边界。
+        return rule.domain("uniform", input_binding, low=0.1, high=10.0)
+
+    def generate_label_input_value(input_binding):
+        # Poisson target 表示非负计数；连续值也属于该 API 接受的目标范围。
+        return rule.domain("uniform", input_binding, low=0.0, high=10.0)
+
+    rule.generate(
+        (
+            ("input", generate_input_value),
+            (("label", "target"), generate_label_input_value),
+        )
+    )
+
+
+@input_rules.register("paddle.nn.functional.soft_margin_loss")
+def generate_soft_margin_loss_inputs(rule: InputRuleContext):
+    """输入规则：为 soft margin loss 生成有界得分和二元标签。"""
+
+    def generate_input_value(input_binding):
+        # softplus(-label * input) 对大幅值低精度输入敏感，普通用例限制到稳定区间。
+        return rule.domain("uniform", input_binding, low=-10.0, high=10.0)
+
+    rule.generate(
+        (
+            ("input", generate_input_value),
+            ("label", "hinge_labels"),
         )
     )
 
@@ -3316,7 +3384,11 @@ def generate_multi_margin_loss_inputs(rule: InputRuleContext):
 # 分类损失规则统一处理类别轴、soft label、权重和 ignore index。
 @input_rules.register("paddle.nn.functional.dice_loss")
 def generate_dice_loss_inputs(rule: InputRuleContext):
-    """输入规则：根据输入末维生成 dice loss 标签。"""
+    """输入规则：生成概率输入并根据末维生成 dice loss 标签。"""
+
+    def generate_probability_input_value(input_binding):
+        # dice loss 接收类别概率；远离全零输入可避免空交集分母退化。
+        return rule.domain("uniform", input_binding, low=0.05, high=0.95)
 
     def generate_label_input_value(input_binding):
         tensor = rule.arg("input")
@@ -3325,7 +3397,12 @@ def generate_dice_loss_inputs(rule: InputRuleContext):
             input_binding.dtype,
         )
 
-    rule.generate((("label", generate_label_input_value),))
+    rule.generate(
+        (
+            ("input", generate_probability_input_value),
+            ("label", generate_label_input_value),
+        )
+    )
 
 
 @input_rules.register("paddle.nn.functional.nll_loss")

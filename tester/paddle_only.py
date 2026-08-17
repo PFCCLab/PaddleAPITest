@@ -52,7 +52,17 @@ class APITestPaddleOnly(APITestBase):
         return paddle_output
 
     def _check_internal_nonfinite_api_output(self, paddle_output):
-        if not self._allows_internal_nonfinite_constants():
+        allows_internal_constants = self._allows_internal_nonfinite_constants()
+        allows_empty_mean = self._allows_empty_mean_loss()
+        if not allows_internal_constants and not allows_empty_mean:
+            return
+        if allows_empty_mean:
+            leaves = list(self._iter_tensor_tree_leaves(paddle_output, tensor_type=paddle.Tensor))
+            # 豁免契约只接受唯一的 0 维 NaN；Inf、有限值和非标量结果都暴露为框架错误。
+            if len(leaves) != 1 or leaves[0].ndim != 0 or not bool(paddle.isnan(leaves[0]).item()):
+                raise RuntimeError(
+                    f"{self.api_config.api_name} did not return the expected scalar NaN"
+                )
             return
         if self.api_config.api_name in {"paddle.nan_to_num", "paddle.Tensor.nan_to_num"}:
             bound = bind_input_parameters(
@@ -169,7 +179,10 @@ class APITestPaddleOnly(APITestBase):
                 self.dump_event("paddle_input_done")
 
                 # 白名单 API 内部会短暂构造 Inf，豁免严格限定在本次前向生命周期。
-                with self._nan_inf_check_scope(allow_internal_nonfinite_constants=True):
+                with self._nan_inf_check_scope(
+                    allow_internal_nonfinite_constants=True,
+                    allow_empty_mean_loss=True,
+                ):
                     paddle_output = self._run_paddle_forward()
                 self._check_internal_nonfinite_api_output(paddle_output)
                 self._run_paddle_backward(paddle_output)

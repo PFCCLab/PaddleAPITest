@@ -3,6 +3,7 @@ from __future__ import annotations
 import collections
 import contextlib
 import gc
+import itertools
 import math
 import os
 from dataclasses import dataclass
@@ -658,7 +659,204 @@ class APITestBase:
             "paddle.Tensor.pinv",
         }
 
-    def _should_skip_nan_inf_check(self, *, allow_internal_nonfinite_constants=False):
+    @staticmethod
+    def _broadcast_tensor_config_shapes(*configs):
+        """校验 TensorConfig 广播协议并返回广播后的静态 shape。"""
+        shapes = [tuple(int(dim) for dim in config.shape) for config in configs]
+        if not shapes or any(dimension < 0 for shape in shapes for dimension in shape):
+            return None
+        result = []
+        for dimensions in itertools.zip_longest(
+            *[reversed(shape) for shape in shapes], fillvalue=1
+        ):
+            non_unit = {dimension for dimension in dimensions if dimension != 1}
+            # 0 与 1 可广播为 0；两个不同的非 1 维度仍是非法协议。
+            if len(non_unit) > 1:
+                return None
+            result.append(non_unit.pop() if non_unit else 1)
+        return tuple(reversed(result))
+
+    def _allows_empty_mean_loss(self):
+        """仅识别协议合法且未规约结果为空的 loss mean case。"""
+        api_name = self.api_config.api_name
+        loss_apis = {
+            "paddle.nn.functional.binary_cross_entropy_with_logits",
+            "paddle.nn.functional.cross_entropy",
+            "paddle.nn.functional.dice_loss",
+            "paddle.nn.functional.gaussian_nll_loss",
+            "paddle.nn.functional.kl_div",
+            "paddle.nn.functional.l1_loss",
+            "paddle.nn.functional.margin_ranking_loss",
+            "paddle.nn.functional.mse_loss",
+            "paddle.nn.functional.poisson_nll_loss",
+            "paddle.nn.functional.smooth_l1_loss",
+            "paddle.nn.functional.soft_margin_loss",
+            "paddle.nn.functional.triplet_margin_with_distance_loss",
+        }
+        if api_name not in loss_apis:
+            return False
+        try:
+            bound = bind_input_parameters(
+                api_name,
+                self.api_config.args,
+                self.api_config.kwargs,
+                api=getattr(self, "paddle_api", None),
+                apply_defaults=True,
+            )
+        except (TypeError, ValueError):
+            return False
+        if bound.source == "unresolved":
+            return False
+        arguments = bound.arguments
+        # dice_loss 没有 reduction 参数，其公开语义固定对 batch 求均值。
+        if api_name.endswith(".dice_loss"):
+            if "reduction" in arguments:
+                return False
+        elif arguments.get("reduction") != "mean":
+            return False
+
+        def tensor_config(name):
+            value = arguments.get(name)
+            return value if isinstance(value, TensorConfig) else None
+
+        def broadcast_result(*names):
+            configs = [tensor_config(name) for name in names]
+            if any(config is None for config in configs):
+                return None
+            return self._broadcast_tensor_config_shapes(*configs)
+
+        if api_name.endswith(".cross_entropy"):
+            # 交叉熵的 class 轴不是普通广播轴，hard label 可删除该轴或保留长度 1。
+            input_config = tensor_config("input")
+            label_config = tensor_config("label")
+            if input_config is None or label_config is None or len(input_config.shape) < 2:
+                return False
+            rank = len(input_config.shape)
+            axis = arguments.get("axis", -1)
+            if not isinstance(axis, int) or isinstance(axis, bool):
+                return False
+            axis = axis + rank if axis < 0 else axis
+            if axis < 0 or axis >= rank or int(input_config.shape[axis]) <= 0:
+                return False
+            if arguments.get("soft_label", False):
+                output_shape = (
+                    tuple(input_config.shape) if input_config.shape == label_config.shape else None
+                )
+            else:
+                label_shape = tuple(int(dim) for dim in label_config.shape)
+                input_shape = tuple(int(dim) for dim in input_config.shape)
+                squeezed_shape = input_shape[:axis] + input_shape[axis + 1 :]
+                retained_axis = (
+                    len(label_shape) == rank
+                    and label_shape[axis] == 1
+                    and all(
+                        label_shape[index] == input_shape[index]
+                        for index in range(rank)
+                        if index != axis
+                    )
+                )
+                output_shape = (
+                    squeezed_shape if label_shape == squeezed_shape or retained_axis else None
+                )
+            weight_value = arguments.get("weight")
+            if weight_value is not None:
+                weight = tensor_config("weight")
+                if weight is None or tuple(weight.shape) != (int(input_config.shape[axis]),):
+                    return False
+        elif api_name.endswith(".dice_loss"):
+            # dice_loss 固定压缩最后的类别轴，label 在该位置按索引协议保持为 1。
+            input_config = tensor_config("input")
+            label_config = tensor_config("label")
+            if input_config is None or label_config is None or len(input_config.shape) < 2:
+                return False
+            input_shape = tuple(int(dim) for dim in input_config.shape)
+            label_shape = tuple(int(dim) for dim in label_config.shape)
+            if label_shape != (*input_shape[:-1], 1) or input_shape[-1] <= 0:
+                return False
+            # 类别轴之外的维度先按样本聚合，最终 mean 的未规约结果只有 batch 轴。
+            output_shape = (input_shape[0],)
+        elif api_name.endswith(".triplet_margin_with_distance_loss"):
+            # 自定义距离函数的输出 shape 无法从三个输入配置可靠推断，因此不参与豁免。
+            if arguments.get("distance_function") is not None:
+                return False
+            configs = [tensor_config(name) for name in ("input", "positive", "negative")]
+            if any(config is None for config in configs):
+                return False
+            shapes = [tuple(int(dim) for dim in config.shape) for config in configs]
+            if len(shapes[0]) < 1 or any(shape != shapes[0] for shape in shapes[1:]):
+                return False
+            output_shape = shapes[0][:-1]
+        else:
+            short_name = api_name.rsplit(".", 1)[-1]
+            same_shape_names = {
+                "binary_cross_entropy_with_logits": ("logit", "label"),
+                "kl_div": ("input", "label"),
+                "margin_ranking_loss": ("input", "other", "label"),
+                "poisson_nll_loss": ("input", "label"),
+                "smooth_l1_loss": ("input", "label"),
+                "soft_margin_loss": ("input", "label"),
+            }
+            broadcast_names = {
+                "l1_loss": ("input", "label"),
+                "mse_loss": ("input", "label"),
+            }
+            if short_name == "gaussian_nll_loss":
+                # variance 只支持同 shape、末维为 1 或省略末维三种专用广播形式。
+                input_config = tensor_config("input")
+                label_config = tensor_config("label")
+                variance_config = tensor_config("variance")
+                if input_config is None or label_config is None or variance_config is None:
+                    return False
+                input_shape = tuple(int(dim) for dim in input_config.shape)
+                label_result = self._broadcast_tensor_config_shapes(input_config, label_config)
+                variance_shape = tuple(int(dim) for dim in variance_config.shape)
+                variance_valid = variance_shape == input_shape or (
+                    len(input_shape) > 0
+                    and (
+                        variance_shape == input_shape[:-1]
+                        or variance_shape == (*input_shape[:-1], 1)
+                    )
+                )
+                output_shape = (
+                    input_shape if label_result == input_shape and variance_valid else None
+                )
+            elif short_name in same_shape_names:
+                # 这些 kernel 的逐元素协议要求参与计算的主 Tensor 完全同 shape。
+                configs = [tensor_config(name) for name in same_shape_names[short_name]]
+                if any(config is None for config in configs):
+                    return False
+                shapes = [tuple(int(dim) for dim in config.shape) for config in configs]
+                output_shape = (
+                    shapes[0] if all(shape == shapes[0] for shape in shapes[1:]) else None
+                )
+            else:
+                # 仅保留 Paddle 已声明支持广播的逐元素距离 loss。
+                output_shape = broadcast_result(*broadcast_names[short_name])
+
+            if output_shape is not None and short_name == "binary_cross_entropy_with_logits":
+                # 可选权重可以广播，但不能把原本的空 loss 扩展成不同输出 shape。
+                for optional_name in ("weight", "pos_weight"):
+                    optional_value = arguments.get(optional_name)
+                    if optional_value is None:
+                        continue
+                    optional = tensor_config(optional_name)
+                    if optional is None:
+                        return False
+                    optional_shape = self._broadcast_tensor_config_shapes(
+                        TensorConfig(list(output_shape), optional.dtype), optional
+                    )
+                    if optional_shape != output_shape:
+                        return False
+
+        # 空 mean 只在未规约结果确有 0 个元素时产生预期标量 NaN。
+        return output_shape is not None and math.prod(output_shape) == 0
+
+    def _should_skip_nan_inf_check(
+        self,
+        *,
+        allow_internal_nonfinite_constants=False,
+        allow_empty_mean_loss=False,
+    ):
         """判断当前 case 是否允许产生 NaN/Inf，供 Paddle flag 临时豁免。"""
         # 显式无穷填充值是 API 语义的一部分，不应被数值检查误报为 Paddle 错误。
         # 仅检查 value/fill_value 参数，避免 norm 的 p=math.inf 等控制参数误关检查。
@@ -671,6 +869,9 @@ class APITestBase:
         if bound.source != "unresolved":
             if allow_internal_nonfinite_constants and self._allows_internal_nonfinite_constants():
                 # 白名单 API 的内部 Inf 只允许在本次前向调用期间存在，最终输出另行校验。
+                return True
+            if allow_empty_mean_loss and self._allows_empty_mean_loss():
+                # 空 loss 的 NaN 仅允许在前向 mean 内产生，最终输出由调用方恢复 flag 后验证。
                 return True
 
             for name in ("value", "fill_value", "padding_value"):
@@ -772,11 +973,17 @@ class APITestBase:
         return any(int(x_config.shape[item]) == 0 for item in normalized_axes)
 
     @contextlib.contextmanager
-    def _nan_inf_check_scope(self, *, allow_internal_nonfinite_constants=False):
+    def _nan_inf_check_scope(
+        self,
+        *,
+        allow_internal_nonfinite_constants=False,
+        allow_empty_mean_loss=False,
+    ):
         """在合法 NaN/Inf case 中临时关闭检查，并严格恢复 worker 状态。"""
         # 普通 case 不读写 Paddle flag，保持原有数值检查路径和错误分类。
         if not self._should_skip_nan_inf_check(
-            allow_internal_nonfinite_constants=allow_internal_nonfinite_constants
+            allow_internal_nonfinite_constants=allow_internal_nonfinite_constants,
+            allow_empty_mean_loss=allow_empty_mean_loss,
         ):
             yield
             return
