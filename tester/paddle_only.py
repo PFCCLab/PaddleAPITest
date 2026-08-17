@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import contextlib
-import itertools
 import math
 
 import paddle
@@ -46,7 +45,7 @@ class APITestPaddleOnly(APITestBase):
         "paddle.Tensor.var",
         "paddle.Tensor.std",
     }
-    # loss 白名单只包含可以从静态 TensorConfig 严格推导逐元素输出规模的 API。
+    # loss 白名单只限制 API 范围，是否豁免再由 reduction 和空输入配置决定。
     _EMPTY_MEAN_LOSS_APIS = {
         "paddle.nn.functional.binary_cross_entropy_with_logits",
         "paddle.nn.functional.cross_entropy",
@@ -100,198 +99,6 @@ class APITestPaddleOnly(APITestBase):
         self.dump_save("paddle_forward_output", paddle_output, framework="paddle")
         self.dump_event("paddle_forward_done")
         return paddle_output
-
-    @staticmethod
-    def _broadcast_tensor_config_shapes(*configs):
-        """校验 TensorConfig 广播协议并返回广播后的静态 shape。"""
-        # 动态负维无法证明最终结果为空，因此不得据此关闭数值检查。
-        shapes = [tuple(int(dim) for dim in config.shape) for config in configs]
-        if not shapes or any(dimension < 0 for shape in shapes for dimension in shape):
-            return None
-        result = []
-        for dimensions in itertools.zip_longest(
-            *[reversed(shape) for shape in shapes], fillvalue=1
-        ):
-            non_unit = {dimension for dimension in dimensions if dimension != 1}
-            # 0 与 1 可广播为 0；两个不同的非 1 维度属于非法协议。
-            if len(non_unit) > 1:
-                return None
-            result.append(non_unit.pop() if non_unit else 1)
-        return tuple(reversed(result))
-
-    def _is_valid_empty_mean_loss_case(self, bound):
-        """仅识别参数协议合法且逐元素 loss 为空的 mean case。"""
-        api_name = self.api_config.api_name
-        if api_name not in self._EMPTY_MEAN_LOSS_APIS:
-            return False
-        if bound.source == "unresolved":
-            return False
-        arguments = bound.arguments
-        # dice_loss 的公开语义固定对 batch 求均值，其他 loss 必须显式解析为 mean。
-        if api_name.endswith(".dice_loss"):
-            if "reduction" in arguments:
-                return False
-        elif arguments.get("reduction") != "mean":
-            return False
-
-        def tensor_config(name):
-            value = arguments.get(name)
-            return value if isinstance(value, TensorConfig) else None
-
-        def broadcast_result(*names):
-            configs = [tensor_config(name) for name in names]
-            if any(config is None for config in configs):
-                return None
-            return self._broadcast_tensor_config_shapes(*configs)
-
-        if api_name.endswith(".cross_entropy"):
-            # class 轴不是普通广播轴，hard label 可删除该轴或保留长度 1。
-            input_config = tensor_config("input")
-            label_config = tensor_config("label")
-            if input_config is None or label_config is None or len(input_config.shape) < 2:
-                return False
-            rank = len(input_config.shape)
-            axis = arguments.get("axis", -1)
-            if not isinstance(axis, int) or isinstance(axis, bool):
-                return False
-            axis = axis + rank if axis < 0 else axis
-            if axis < 0 or axis >= rank or int(input_config.shape[axis]) <= 0:
-                return False
-            input_shape = tuple(int(dim) for dim in input_config.shape)
-            label_shape = tuple(int(dim) for dim in label_config.shape)
-            if arguments.get("soft_label", False):
-                output_shape = input_shape if input_shape == label_shape else None
-            else:
-                squeezed_shape = input_shape[:axis] + input_shape[axis + 1 :]
-                retained_axis = (
-                    len(label_shape) == rank
-                    and label_shape[axis] == 1
-                    and all(
-                        label_shape[index] == input_shape[index]
-                        for index in range(rank)
-                        if index != axis
-                    )
-                )
-                output_shape = (
-                    squeezed_shape if label_shape == squeezed_shape or retained_axis else None
-                )
-            weight_value = arguments.get("weight")
-            if weight_value is not None:
-                weight = tensor_config("weight")
-                if weight is None or tuple(weight.shape) != (input_shape[axis],):
-                    return False
-        elif api_name.endswith(".dice_loss"):
-            # dice_loss 固定压缩类别轴，最终 mean 的未规约结果只保留 batch 轴。
-            input_config = tensor_config("input")
-            label_config = tensor_config("label")
-            if input_config is None or label_config is None or len(input_config.shape) < 2:
-                return False
-            input_shape = tuple(int(dim) for dim in input_config.shape)
-            label_shape = tuple(int(dim) for dim in label_config.shape)
-            if label_shape != (*input_shape[:-1], 1) or input_shape[-1] <= 0:
-                return False
-            output_shape = (input_shape[0],)
-        elif api_name.endswith(".triplet_margin_with_distance_loss"):
-            # 自定义距离函数的输出 shape 无法静态推断，因此不参与豁免。
-            if arguments.get("distance_function") is not None:
-                return False
-            configs = [tensor_config(name) for name in ("input", "positive", "negative")]
-            if any(config is None for config in configs):
-                return False
-            shapes = [tuple(int(dim) for dim in config.shape) for config in configs]
-            if len(shapes[0]) < 1 or any(shape != shapes[0] for shape in shapes[1:]):
-                return False
-            output_shape = shapes[0][:-1]
-        else:
-            short_name = api_name.rsplit(".", 1)[-1]
-            same_shape_names = {
-                "binary_cross_entropy_with_logits": ("logit", "label"),
-                "kl_div": ("input", "label"),
-                "margin_ranking_loss": ("input", "other", "label"),
-                "poisson_nll_loss": ("input", "label"),
-                "smooth_l1_loss": ("input", "label"),
-                "soft_margin_loss": ("input", "label"),
-            }
-            broadcast_names = {
-                "l1_loss": ("input", "label"),
-                "mse_loss": ("input", "label"),
-            }
-            if short_name == "gaussian_nll_loss":
-                # variance 只支持同 shape、末维为 1 或省略末维三种专用广播形式。
-                input_config = tensor_config("input")
-                label_config = tensor_config("label")
-                variance_config = tensor_config("variance")
-                if input_config is None or label_config is None or variance_config is None:
-                    return False
-                input_shape = tuple(int(dim) for dim in input_config.shape)
-                label_result = self._broadcast_tensor_config_shapes(input_config, label_config)
-                variance_shape = tuple(int(dim) for dim in variance_config.shape)
-                variance_valid = variance_shape == input_shape or (
-                    len(input_shape) > 0
-                    and (
-                        variance_shape == input_shape[:-1]
-                        or variance_shape == (*input_shape[:-1], 1)
-                    )
-                )
-                output_shape = (
-                    input_shape if label_result == input_shape and variance_valid else None
-                )
-            elif short_name in same_shape_names:
-                # 这些 kernel 的逐元素协议要求参与计算的主 Tensor 完全同 shape。
-                configs = [tensor_config(name) for name in same_shape_names[short_name]]
-                if any(config is None for config in configs):
-                    return False
-                shapes = [tuple(int(dim) for dim in config.shape) for config in configs]
-                output_shape = (
-                    shapes[0] if all(shape == shapes[0] for shape in shapes[1:]) else None
-                )
-            else:
-                # 仅保留 Paddle 已声明支持广播的逐元素距离 loss。
-                output_shape = broadcast_result(*broadcast_names[short_name])
-
-            if output_shape is not None and short_name == "binary_cross_entropy_with_logits":
-                # 可选权重不能把原本的空 loss 扩展成不同输出 shape。
-                for optional_name in ("weight", "pos_weight"):
-                    optional_value = arguments.get(optional_name)
-                    if optional_value is None:
-                        continue
-                    optional = tensor_config(optional_name)
-                    if optional is None:
-                        return False
-                    optional_shape = self._broadcast_tensor_config_shapes(
-                        TensorConfig(list(output_shape), optional.dtype), optional
-                    )
-                    if optional_shape != output_shape:
-                        return False
-
-        return output_shape is not None and math.prod(output_shape) == 0
-
-    @staticmethod
-    def _is_empty_reduction(arguments):
-        # 这里解析的是配置 shape，而不是运行时 Tensor，避免为分类提前物化输入。
-        x_config = arguments.get("x")
-        if not isinstance(x_config, TensorConfig):
-            return False
-        rank = len(x_config.shape)
-        axis = arguments.get("axis")
-        if axis is None or (isinstance(axis, (list, tuple)) and not axis):
-            # Paddle 将 None、空 list 和空 tuple 都解释为 reduce-all。
-            axes = tuple(range(rank))
-        elif isinstance(axis, int) and not isinstance(axis, bool):
-            axes = (axis,)
-        elif isinstance(axis, (list, tuple)) and all(
-            isinstance(item, int) and not isinstance(item, bool) for item in axis
-        ):
-            axes = tuple(axis)
-        else:
-            return False
-        normalized_axes = tuple(item + rank if item < 0 else item for item in axes)
-        # 非法轴和重复轴必须继续由 Paddle 报错，不能被数值豁免覆盖。
-        if any(item < 0 or item >= rank for item in normalized_axes) or len(
-            set(normalized_axes)
-        ) != len(normalized_axes):
-            return False
-        return any(int(x_config.shape[item]) == 0 for item in normalized_axes)
 
     def _nonfinite_exemption_scope(self):
         """返回 all、forward 或 None；豁免只控制检查 flag，不跳过测试流程。"""
