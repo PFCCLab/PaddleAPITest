@@ -48,7 +48,7 @@ export FLAGS_check_nan_inf=true
 # export PADDLEAPITEST_INPUT_BACKEND=torch
 
 # ── 输入输出 ──────────────────────────────────────────────────
-# input 三选一：--api_config / --api_config_file / --api_config_file_pattern
+# input 三选一：--api_config / --api_config_file / --api_config_file
 # NUM_GPUS!=0 时，引擎不受外部 "CUDA_VISIBLE_DEVICES" 影响
 # API_CONFIG=""
 FILE_INPUT="cfg.txt"
@@ -197,7 +197,7 @@ fi
 IN_OUT_ARGS=(
     # --api_config="$API_CONFIG"
     --api_config_file="$FILE_INPUT"
-    # --api_config_file_pattern="$FILE_PATTERN"
+    # --api_config_file="$FILE_PATTERN"
     --log_dir="$LOG_DIR"
 )
 

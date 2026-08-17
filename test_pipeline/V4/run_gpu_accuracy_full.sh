@@ -138,7 +138,7 @@ fi
 # ── 组装参数 ──
 IN_OUT_ARGS=(
     # --api_config_file="$FILE_INPUT"
-    --api_config_file_pattern="$FILE_PATTERN"
+    --api_config_file="$FILE_PATTERN"
     --log_dir="$LOG_DIR"
 )
 

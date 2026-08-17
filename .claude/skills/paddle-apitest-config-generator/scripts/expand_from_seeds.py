@@ -23,8 +23,6 @@ from apitest_config_utils import (
 
 
 def normalized_axis(shape: list[int], axis: int) -> int:
-    # 负轴沿用 Python 约定，统一转换后再访问 shape，错误在生成前暴露。
-    # 轴越界说明 seed 与调用参数不匹配，不能静默改用最后一维。
     resolved = axis if axis >= 0 else len(shape) + axis
     if resolved < 0 or resolved >= len(shape):
         raise ValueError(f"anchor axis {axis} is invalid for shape {shape}")
@@ -39,8 +37,6 @@ def mutate_seed(
     anchor_tensor: int,
     anchor_axis: int,
 ) -> tuple[object, tuple[str, ...]]:
-    # 每个规格都从原始 seed 的深拷贝派生，保证不同 case 之间没有共享状态。
-    # anchor_tensor/axis 只决定主关联维度，其他维度尽量维持 seed 的结构。
     config = clone_config(seed)
     tensors = config_tensors(config, tensor_type)
     if not tensors:
@@ -55,15 +51,12 @@ def mutate_seed(
     if old_anchor <= 0:
         raise ValueError(f"seed anchor dimension must be positive, got {old_anchor}")
 
-    # target 来自规格边界表，不依赖某个 API 的 hidden size 或实现常量。
     target = anchor_value(spec, index)
     mutations = [f"anchor:{old_anchor}->{target}"]
     original_shapes = [list(tensor.shape) for tensor in tensors]
-    # 只替换与旧 anchor 完全相等的维度，保护比例不同的派生维度。
     for tensor, original_shape in zip(tensors, original_shapes):
         tensor.shape = [target if dim == old_anchor else dim for dim in original_shape]
 
-    # 0size 需要显式零维，同时用非 anchor 维度乘数避免输出重复。
     if spec == "0size":
         multiplier = index + 1
         for tensor, original_shape in zip(tensors, original_shapes):
@@ -78,7 +71,6 @@ def mutate_seed(
 
 
 def generate_records(args: argparse.Namespace) -> list[CaseRecord]:
-    # 先解析全部 seed，再按 api 名筛选，保证请求缺失时能给出明确诊断。
     parsed = parse_config_lines(args.seed_file, APIConfig)
     requested = set(args.api or [])
     seeds_by_api: dict[str, list[tuple[Path, int, object]]] = {}
@@ -93,12 +85,10 @@ def generate_records(args: argparse.Namespace) -> list[CaseRecord]:
     if not seeds_by_api:
         raise ValueError("no matching seed configs found")
 
-    # 输出按 API、规格、索引排序，便于 manifest 稳定复现和差异审查。
     records = []
     for name, seeds in sorted(seeds_by_api.items()):
         for spec in args.spec:
             seen: set[str] = set()
-            # 循环复用 seed，但每次 mutate_seed 都会创建独立配置对象。
             for index in range(args.cases_per_spec):
                 path, line_number, seed = seeds[index % len(seeds)]
                 config, mutations = mutate_seed(
@@ -110,7 +100,6 @@ def generate_records(args: argparse.Namespace) -> list[CaseRecord]:
                     args.anchor_axis,
                 )
                 line = serialize_config(config, APIConfig)
-                # 某些 seed 的零维变换可能仍碰撞，追加 rank marker 只作为唯一性兜底。
                 if line in seen and spec == "0size":
                     first_tensor = config_tensors(config, TensorConfig)[0]
                     first_tensor.shape.append(index + 1)
@@ -137,7 +126,6 @@ def generate_records(args: argparse.Namespace) -> list[CaseRecord]:
 
 
 def parse_args() -> argparse.Namespace:
-    # CLI 默认生成三类规格；显式 --spec 可缩小范围以便快速验证。
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--api", action="append", help="API name or custom op_name")
     parser.add_argument("--seed-file", action="append", type=Path, required=True)
@@ -147,7 +135,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--anchor-tensor", type=int, default=0)
     parser.add_argument("--anchor-axis", type=int, default=0)
     args = parser.parse_args()
-    # argparse 的 None 与空列表语义不同，这里统一成完整默认规格集合。
     args.spec = args.spec or list(SPECS)
     if args.cases_per_spec <= 0:
         parser.error("--cases-per-spec must be positive")
@@ -155,7 +142,6 @@ def parse_args() -> argparse.Namespace:
 
 
 def main() -> None:
-    # 生成和写盘分两步，任何 case 错误都会在目录创建前终止。
     args = parse_args()
     records = generate_records(args)
     write_case_tree(args.output_dir, records)

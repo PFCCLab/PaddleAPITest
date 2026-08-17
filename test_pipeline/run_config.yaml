@@ -16,7 +16,7 @@
 # - engineV4.py / engineV2.py 继续负责 case 执行、pattern 展开、checkpoint 续跑和失败分类。
 #
 # 配置规则：
-# - input.api_config / input.api_config_file / input.api_config_file_pattern 必须且只能配置一个。
+# - input.api_config / input.api_config_file 必须且只能配置一个。
 # - output.log_dir 必填。
 # - engine_args 中未配置或注释掉的字段使用 engine 默认值。
 # - 布尔值会被 run.py 转为 --key=True/False 传给 engine。
@@ -53,10 +53,9 @@ env:
 input:
   # 单条 case 配置，直接传给 engine --api_config。
   api_config: null
-  # 单个配置文件，直接传给 engine --api_config_file。
-  api_config_file: "tester/api_config/5_accuracy/accuracy_1.txt"
-  # 多文件 glob，直接传给 engine --api_config_file_pattern。
-  api_config_file_pattern: null
+  # 配置文件、目录或 glob 输入，可写字符串或字符串数组。
+  api_config_file:
+    - tester/api_config/5_accuracy/accuracy_1.txt
 
 output:
   # 对应 engine --log_dir；run.py 主日志也写到该目录。

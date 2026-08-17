@@ -38,8 +38,7 @@
 | 参数                             | 类型  | 说明                                                                                   |
 | -------------------------------- | ----- | -------------------------------------------------------------------------------------- |
 | `--api_config`                   | str   | API 配置字符串（单条测试）                                                             |
-| `--api_config_file`              | str   | API 配置文件路径（如`tester/api_config/5_accuracy/accuracy_1.txt`）                    |
-| `--api_config_file_pattern`      | str   | API 配置文件 glob 模式，以逗号分隔（如 `tester/api_config/5_accuracy/accuracy_*.txt`） |
+| `--api_config_file`              | list  | 文件、目录或 glob 输入，可用空格或逗号分隔                                       |
 | `--retest`                       | str   | 从当前 `--log_dir` 按分类快速复测，多个分类以逗号分隔（如 `config_input,timeout`）      |
 | `--paddle_only`                  | bool  | 运行 Paddle 测试（默认 False）                                                         |
 | `--accuracy`                     | bool  | 运行 Paddle vs Torch 精度测试（默认 False）                                            |

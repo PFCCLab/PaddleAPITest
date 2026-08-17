@@ -24,7 +24,7 @@ python engineV4.py --help
 
 每次运行必须同时指定：
 
-1. 一个输入源：`--api_config`、`--api_config_file`、`--api_config_file_pattern` 或
+1. 一个输入源：`--api_config`、`--api_config_file` 或
    `--retest`。
 2. 一个主模式：例如 `--paddle_only=True` 或 `--accuracy=True`。
 
@@ -74,7 +74,7 @@ python engineV4.py \
 ```bash
 python engineV4.py \
   --paddle_only=True \
-  --api_config_file_pattern='tester/api_config/7_0_size/*.txt,tester/api_config/8_big_tensor/*.txt'
+  --api_config_file='tester/api_config/7_0_size/*.txt,tester/api_config/8_big_tensor/*.txt'
 ```
 
 未指定 `--log_dir` 时，批量模式默认写入 `logs/test_log_<timestamp>`，单条模式默认写入

@@ -1,0 +1,4 @@
+interface:
+  display_name: "PaddleAPITest Config Generator"
+  short_description: "Generate and expand PaddleAPITest API cases"
+  default_prompt: "Use $paddle-apitest-config-generator to generate broad 4096, 1M, and 0size cases for the provided Paddle API or seed configs."

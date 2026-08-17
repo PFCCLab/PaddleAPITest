@@ -26,8 +26,12 @@
       "additionalProperties": false,
       "properties": {
         "api_config": {"type": ["string", "null"], "description": "单条 case 配置，对应 --api_config。"},
-        "api_config_file": {"type": ["string", "null"], "description": "单个配置文件，对应 --api_config_file。"},
-        "api_config_file_pattern": {"type": ["string", "null"], "description": "多文件 glob，对应 --api_config_file_pattern。"}
+        "api_config_file": {
+          "type": ["string", "array", "null"],
+          "items": {"type": "string"},
+          "minItems": 1,
+          "description": "配置文件、目录或 glob 输入数组，对应 --api_config_file。"
+        }
       }
     },
     "output": {

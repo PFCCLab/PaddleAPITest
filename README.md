@@ -76,11 +76,11 @@ python engineV4.py \
 ```bash
 python engineV4.py \
   --paddle_only=True \
-  --api_config_file_pattern='tester/api_config/7_0_size/*.txt,tester/api_config/8_big_tensor/*.txt' \
+  --api_config_file='tester/api_config/7_0_size/*.txt,tester/api_config/8_big_tensor/*.txt' \
   --log_dir=tester/api_config/test_log
 ```
 
-`--api_config`、`--api_config_file`、`--api_config_file_pattern` 和下文的 `--retest` 必须且只能选择一个。完整参数以 `python engineV4.py --help` 为准。
+`--api_config`、`--api_config_file` 和下文的 `--retest` 必须且只能选择一个。完整参数以 `python engineV4.py --help` 为准。
 
 ### 快速复测分类
 
