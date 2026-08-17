@@ -5,8 +5,8 @@ from collections.abc import Callable, Mapping, Sequence
 from typing import Any
 
 import paddle
-from tester.dtype_utils import to_torch_dtype
-from tester.parameter_binding import bind_input_parameters, resolve_input_api
+from tester.api_config.dtype_utils import to_torch_dtype
+from tester.api_config.parameter_binding import bind_input_parameters, resolve_input_api
 
 
 def resolve_paddle_api(api_name: str) -> Callable[..., Any]:

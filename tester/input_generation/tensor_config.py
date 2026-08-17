@@ -6,7 +6,7 @@ import random
 
 import paddle
 import yaml
-from tester.dtype_utils import to_torch_dtype
+from tester.api_config.dtype_utils import to_torch_dtype
 
 from .values import clear_input_value, read_input_value, read_input_value_backend
 

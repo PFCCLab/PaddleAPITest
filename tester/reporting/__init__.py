@@ -1,5 +1,6 @@
-"""Paddle API 测试日志包。"""
+"""Paddle API 测试结果、日志和 dump 输出包。"""
 
+# 各输出模块按用途拆分，调用方从本包获取稳定的日志接口。
 from __future__ import annotations
 
 from . import log_aggregation as _aggregation

@@ -6,7 +6,7 @@ import os
 from dataclasses import dataclass
 from types import SimpleNamespace
 
-from tester.dtype_utils import to_torch_dtype
+from tester.api_config.dtype_utils import to_torch_dtype
 
 from .backend import (
     NumPyInputBackend,

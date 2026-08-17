@@ -6,7 +6,7 @@ import copy
 from dataclasses import dataclass
 
 import paddle
-from tester.dtype_utils import to_torch_dtype
+from tester.api_config.dtype_utils import to_torch_dtype
 
 from .tensor_config import (
     CAST_THROUGH_INTERMEDIATE_DTYPES,

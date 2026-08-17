@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import Any
 
 import yaml
-from tester.log_writer import log_runtime
+from tester.reporting import log_runtime
 
 PROJECT_ROOT = Path(__file__).resolve().parent
 DEFAULT_CONFIG = Path("test_pipeline/run_config.yaml")

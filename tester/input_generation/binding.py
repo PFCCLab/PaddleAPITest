@@ -6,7 +6,7 @@ import collections
 import hashlib
 from dataclasses import dataclass
 
-from tester.parameter_binding import bind_input_parameters
+from tester.api_config.parameter_binding import bind_input_parameters
 
 from .tensor_config import TensorConfig
 from .values import InputTensorPath, InputTensorSpec

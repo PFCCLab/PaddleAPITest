@@ -32,12 +32,12 @@ from tester import (
     APITestPaddleTorchGPUPerformance,
     APITestTorchGPUPerformance,
 )
-from tester.log_writer.log_runtime import (
+from tester.reporting.log_runtime import (
     close_process_files,
     configure_direct_results,
     read_log,
 )
-from tester.log_writer.log_worker import write_to_log
+from tester.reporting.log_worker import write_to_log
 
 
 def parse_bool(value):

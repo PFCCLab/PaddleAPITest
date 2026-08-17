@@ -35,13 +35,13 @@ from sanitizer_session import (
     encode_result,
     parse_event,
 )
-from tester.dump_writer import (
+from tester.reporting.dump_writer import (
     dump_enabled,
     parse_strict_bool,
     record_dump_terminal_status,
     resolve_dump_options,
 )
-from tester.gpu_memory_preflight import (
+from tester.runtime.gpu_memory_preflight import (
     GpuMemoryDeferred,
     estimate_gpu_memory,
     should_check_grad,
@@ -54,7 +54,7 @@ GPU_PRESSURE_TIMEOUT_ENV_VAR = "PADDLEAPITEST_GPU_PRESSURE_TIMEOUT_SECONDS"
 DEFAULT_GPU_PRESSURE_TIMEOUT_SECONDS = 600.0
 # slot 尚未 ready 的初始化态：批处理主循环据此判断是否仍有进展中 worker。
 _INITIALIZING_SLOT_STATES = frozenset({"starting", "loaded", "preparing"})
-from tester.log_writer import (
+from tester.reporting import (
     init_log,
     log_aggregation,
     log_report,
@@ -62,12 +62,12 @@ from tester.log_writer import (
     log_runtime,
     log_worker,
 )
-from tester.runtime_config import (
+from tester.runtime.runtime_config import (
     TestRuntimeConfig,
     limit_worker_layout,
     runtime_config_for_gpu,
 )
-from tester.sanitizer_output import analyze_sanitizer_output
+from tester.runtime.sanitizer_output import analyze_sanitizer_output
 
 os.environ["FLAGS_use_system_allocator"] = "1"
 os.environ["NVIDIA_TF32_OVERRIDE"] = "0"

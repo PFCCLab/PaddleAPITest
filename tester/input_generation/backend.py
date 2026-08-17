@@ -7,7 +7,7 @@ from dataclasses import dataclass, field
 from typing import Protocol, runtime_checkable
 
 import numpy
-from tester.dtype_utils import to_torch_dtype
+from tester.api_config.dtype_utils import to_torch_dtype
 
 from .value_generators import (
     INPUT_NUMPY_RANDOM_STATE,

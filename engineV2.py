@@ -38,13 +38,7 @@ if TYPE_CHECKING:
         APITestTorchGPUPerformance,
     )
 
-from tester.dump_writer import (
-    dump_enabled,
-    parse_strict_bool,
-    record_dump_terminal_status,
-    resolve_dump_options,
-)
-from tester.log_writer import (
+from tester.reporting import (
     init_log,
     log_aggregation,
     log_report,
@@ -52,7 +46,13 @@ from tester.log_writer import (
     log_runtime,
     log_worker,
 )
-from tester.runtime_config import (
+from tester.reporting.dump_writer import (
+    dump_enabled,
+    parse_strict_bool,
+    record_dump_terminal_status,
+    resolve_dump_options,
+)
+from tester.runtime.runtime_config import (
     TestRuntimeConfig,
     limit_worker_layout,
     runtime_config_for_gpu,

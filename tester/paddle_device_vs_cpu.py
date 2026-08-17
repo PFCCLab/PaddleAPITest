@@ -4,7 +4,7 @@ import paddle
 import torch
 
 from .base import APITestBase
-from .log_writer.log_worker import get_terminal_log_type
+from .reporting.log_worker import get_terminal_log_type
 
 
 class APITestCustomDeviceVSCPU(APITestBase):

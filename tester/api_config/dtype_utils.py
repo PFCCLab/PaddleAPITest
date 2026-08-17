@@ -7,6 +7,8 @@ from typing import Any
 import numpy
 import paddle
 
+# dtype 映射属于 API 配置协议，输入生成和框架转换共用同一套规范名。
+
 
 @lru_cache(maxsize=1)
 def _torch_dtype_maps():

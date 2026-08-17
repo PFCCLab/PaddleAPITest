@@ -15,9 +15,9 @@ from .base import (
     GpuMemoryGuardSkip,
     gpu_mode_memory_decision,
 )
-from .log_writer import log_comparison, log_worker
 from .paddle_to_torch import ConversionKind, get_converter
 from .paddle_to_torch.arguments import bind_paddle_arguments
+from .reporting import log_comparison, log_worker
 
 _GIB = 1024**3
 _RESULT_STREAM_WORKSPACE_BYTES = 256 * 1024**2
