@@ -20,12 +20,16 @@ else:
 
 
 class APIConfig:
+    # 兼容历史配置别名，统一交给 Paddle 原生参数名执行。
+    _KWARG_ALIASES = {"paddle.Tensor.sum": {"dim": "axis"}}
+
     def __deepcopy__(self, memo):
         cls = self.__class__
         result = cls.__new__(cls)
         memo[id(self)] = result
         result.args = copy.deepcopy(self.args)
         result.kwargs = copy.deepcopy(self.kwargs)
+        result._kwarg_alias_sources = copy.deepcopy(self._kwarg_alias_sources)
         result.api_name = self.api_name
         # 运行时设备语义随 case 副本传播，不能在稳定性或算子对比路径中退回默认设备。
         result.config = self.config
@@ -38,6 +42,7 @@ class APIConfig:
         self.config = config
         self.args = []
         self.kwargs = collections.OrderedDict()
+        self._kwarg_alias_sources = set()
 
         # 解析 paddle.Size([...]) 格式：将其替换为 [...]
         def replace_paddle_size(match):
@@ -98,9 +103,49 @@ class APIConfig:
                 self.append_args(value)
 
     def append_args(self, arg):
+        # 只有连续整数才采用变长 shape 协议，避免误改其他位置参数。
+        if (
+            self.api_name == "paddle.empty"
+            and isinstance(arg, int)
+            and len(self.args) == 1
+            and isinstance(self.args[0], int)
+        ):
+            # empty 的连续整数位置参数表示 shape，不能让第二个整数占用 dtype。
+            self.args = [[*self.args, arg]]
+            return
+        if (
+            self.api_name == "paddle.empty"
+            and isinstance(arg, int)
+            and len(self.args) == 1
+            and isinstance(self.args[0], list)
+            and all(isinstance(value, int) for value in self.args[0])
+        ):
+            # 已经开始收集变长 shape 时，继续追加维度到同一个列表。
+            self.args[0].append(arg)
+            return
         self.args.append(arg)
 
     def append_kwargs(self, name, arg):
+        if self.api_name == "paddle.empty" and name == "device" and isinstance(arg, str):
+            # worker 通常只暴露一张逻辑卡，显式 cuda:N 需按可见卡数折算。
+            match = re.fullmatch(r"cuda:\d+", arg)
+            if match:
+                device_id = int(arg.rsplit(":", 1)[1])
+                gpu_count = paddle.device.cuda.device_count()
+                # CUDA_VISIBLE_DEVICES 提供逻辑卡编号，映射必须基于可见卡数量。
+                if gpu_count > 0:
+                    device_id %= gpu_count
+                arg = f"cuda:{device_id}"
+        # 别名只在目标 API 生效，避免把其他算子的 dim 误改成 axis。
+        aliases = self._KWARG_ALIASES.get(self.api_name, {})
+        alias = aliases.get(name)
+        if alias is not None:
+            if alias in self.kwargs:
+                raise TypeError(f"{self.api_name} received both {name!r} and {alias!r} arguments")
+            name = alias
+            self._kwarg_alias_sources.add(name)
+        elif name in self._kwarg_alias_sources:
+            raise TypeError(f"{self.api_name} received both alias and {name!r} arguments")
         self.kwargs[name] = arg
 
     def dump_item_str(self, item):

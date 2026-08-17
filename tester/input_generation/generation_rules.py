@@ -2085,7 +2085,100 @@ def generate_unflatten_inputs(rule: InputRuleContext):
             input_binding.dtype,
         )
 
-    rule.generate((("axis", generate_axis_input_value),))
+    # shape 中的 0-D Tensor 是动态维度，必须和被展开维度联动，不能走通用随机值域。
+    def generate_shape_tensor_values():
+        x_config = rule.arg("x")
+        shape_config = rule.arg("shape")
+        if x_config is None or shape_config is None:
+            return
+        x_shape = tuple(int(dim) for dim in x_config.shape)
+        axis = rule.arg("axis", 0)
+        if rule.is_tensor_config(axis):
+            axis_binding = rule.binding_for_value(axis)
+            axis_value = rule.value(axis_binding) if axis_binding is not None else None
+            axis = int(axis_value.item()) if axis_value is not None else 0
+        axis = int(axis)
+        # 将负轴转换为规范下标，保证乘积校验访问同一目标维度。
+        if axis < 0:
+            axis += len(x_shape)
+        if axis < 0 or axis >= len(x_shape):
+            return
+        target = x_shape[axis]
+
+        dynamic = []
+        fixed_product = 1
+        inferred_dims = 0
+
+        # 递归拆解 shape 容器，分别记录静态维度、推导维度和动态 Tensor。
+        def collect(value):
+            nonlocal fixed_product, inferred_dims
+            if rule.is_tensor_config(value):
+                binding = rule.binding_for_value(value)
+                if binding is None:
+                    return
+                if len(binding.shape) == 0:
+                    dynamic.append((binding, 1))
+                    return
+                if len(binding.shape) != 1:
+                    raise ValueError(f"Invalid TensorConfig for unflatten shape: {binding.shape!r}")
+                count = int(binding.shape[0])
+                if count <= 0:
+                    raise ValueError(
+                        f"unflatten shape TensorConfig must contain at least one value: {binding.shape!r}"
+                    )
+                dynamic.append((binding, count))
+                return
+            if isinstance(value, (list, tuple)):
+                for item in value:
+                    collect(item)
+                return
+            value = int(value)
+            if value == -1:
+                inferred_dims += 1
+                return
+            if value < 0:
+                raise ValueError(f"unflatten shape contains unsupported dimension {value}")
+            fixed_product *= value
+
+        collect(shape_config)
+        # 没有动态 Tensor 时保留静态配置原样，让 Paddle 决定其错误语义。
+        if not dynamic:
+            return
+        # 多个 -1 无法确定唯一结果，必须在输入生成阶段拒绝。
+        if inferred_dims > 1:
+            raise ValueError("unflatten shape can contain at most one inferred dimension")
+        if fixed_product == 0:
+            if target != 0:
+                raise ValueError(
+                    f"unflatten shape fixed dimensions have product 0 but target is {target}"
+                )
+            quotient = 1
+        elif target % fixed_product:
+            raise ValueError(
+                f"unflatten shape dimensions must divide target {target}: fixed product {fixed_product}"
+            )
+        else:
+            quotient = target // fixed_product
+        if dynamic and not inferred_dims and quotient <= 0:
+            raise ValueError(
+                f"unflatten dynamic shape dimensions must be positive, got target {target}"
+            )
+        remaining = quotient if dynamic and not inferred_dims else 1
+        # 剩余乘积写入第一个动态维度，其余动态槽位用 1 保持乘积稳定。
+        for binding, count in dynamic:
+            values = [remaining] + [1] * (count - 1)
+            if len(binding.shape) == 0:
+                rule.set(binding, rule.ops.asarray(values[0], dtype=binding.dtype))
+            else:
+                value = rule.ops.asarray(values, dtype=binding.dtype)
+                if tuple(value.shape) != tuple(binding.shape):
+                    value = rule.ops.reshape(value, binding.shape)
+                rule.set(binding, value)
+
+    # 先生成 axis，再生成 shape 动态值；其余普通 Tensor 继续使用默认值域。
+    rule.generate((("axis", generate_axis_input_value),), default=None)
+    generate_shape_tensor_values()
+    rule.generate_remaining()
 
 
 @input_rules.register("paddle.topk", aliases=("paddle.Tensor.topk",))
