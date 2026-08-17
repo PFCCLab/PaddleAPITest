@@ -2683,7 +2683,8 @@ def generate_take_along_axis_inputs(rule: InputRuleContext):
     """输入规则：按目标 axis 尺寸限制 take_along_axis 索引。"""
 
     def generate_indices_input_value(input_binding):
-        arr_shape = rule.arg("arr").shape
+        # 函数参数名为 arr，Tensor method 的接收者绑定后统一为 x。
+        arr_shape = rule.arg("arr", rule.arg("x")).shape
         axis = rule.arg("axis")
         generate_axis_input_value = axis if axis >= 0 else axis + len(arr_shape)
         dim_size = arr_shape[generate_axis_input_value]
