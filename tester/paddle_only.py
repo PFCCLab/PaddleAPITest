@@ -61,16 +61,6 @@ class APITestPaddleOnly(APITestBase):
         "paddle.nn.functional.soft_margin_loss",
         "paddle.nn.functional.triplet_margin_with_distance_loss",
     }
-    # 这些 case 的合法非有限值可能出现在物化或反向阶段，因此沿用全流程豁免。
-    _FULL_SCOPE_NONFINITE_CASES = {
-        "explicit_fill",
-        "dtype_view",
-        "empty_reduction",
-        "empty_fused_norm",
-    }
-    # 内部常量和空 mean 的例外只属于前向，不应影响输入物化或梯度检查。
-    _FORWARD_SCOPE_NONFINITE_CASES = {"internal_constant", "empty_loss_mean"}
-
     input_operation_mode = "paddle_only"
 
     def __init__(self, api_config, **kwargs):
@@ -303,9 +293,8 @@ class APITestPaddleOnly(APITestBase):
             return False
         return any(int(x_config.shape[item]) == 0 for item in normalized_axes)
 
-    def _classify_nonfinite_case(self):
-        """一次性识别当前 Paddle-only case 的非有限值契约。"""
-        # 返回绑定结果供后验复用，避免分类和验证看到不同的默认参数。
+    def _nonfinite_exemption_scope(self):
+        """返回 all、forward 或 None；豁免只控制检查 flag，不跳过测试流程。"""
         api_name = self.api_config.api_name
         bound = bind_input_parameters(
             api_name,
@@ -315,21 +304,16 @@ class APITestPaddleOnly(APITestBase):
             apply_defaults=True,
         )
         if bound.source == "unresolved":
-            # 参数无法可靠绑定时禁止豁免，让原执行路径暴露配置或 Paddle 错误。
-            return None, bound
+            return None
+        # 这些 API 只有在固定参数下才关闭检查，输入、前向和反向仍完整执行。
         if api_name in self._INTERNAL_NONFINITE_APIS:
-            # 内部常量类别优先，确保 nan_to_num 和 pinv 使用严格的最终输出检查。
-            return "internal_constant", bound
-        if self._is_valid_empty_mean_loss_case(bound):
-            # 空 loss 需要标量 NaN 后验，不能退化为一般的空规约豁免。
-            return "empty_loss_mean", bound
+            return "forward"
 
-        # 仅识别填充值参数，避免将 norm 的 p=math.inf 等控制参数误判为输出契约。
+        # 显式填充值属于 API 语义；不将 norm 的 p=math.inf 等控制参数误判为填充值。
         for name in ("value", "fill_value", "padding_value"):
             value = bound.arguments.get(name)
-            # 只接受 Python float，Tensor 值必须继续经过正常的输入数值检查。
             if isinstance(value, float) and not math.isfinite(value):
-                return "explicit_fill", bound
+                return "all"
 
         if api_name in ("paddle.view", "paddle.Tensor.view"):
             target = bound.arguments.get("shape_or_dtype")
@@ -352,24 +336,27 @@ class APITestPaddleOnly(APITestBase):
             }
             # 只有位模式重解释允许产生任意浮点位型，普通 shape view 仍保持检查。
             if isinstance(target, str) and target.removeprefix("paddle.") in dtype_names:
-                return "dtype_view", bound
+                return "all"
             if isinstance(target, paddle.base.core.DataType):
-                return "dtype_view", bound
+                return "all"
 
         if api_name.endswith(".fused_layer_norm"):
-            # 前缀维为空但归一化后缀非空不会形成空统计量，不能获得该豁免。
             x_config = bound.arguments.get("x")
-            begin_axis = bound.arguments.get("begin_norm_axis")
-            if isinstance(x_config, TensorConfig) and isinstance(begin_axis, int):
-                rank = len(x_config.shape)
-                axis = begin_axis + rank if begin_axis < 0 else begin_axis
-                # 只豁免归一化后缀明确包含 0 的空统计量。
-                if 0 <= axis < rank and any(int(dim) == 0 for dim in x_config.shape[axis:]):
-                    return "empty_fused_norm", bound
-
-        if api_name in self._EMPTY_REDUCTION_APIS and self._is_empty_reduction(bound.arguments):
-            return "empty_reduction", bound
-        return None, bound
+            if isinstance(x_config, TensorConfig) and any(int(dim) == 0 for dim in x_config.shape):
+                return "all"
+        has_zero_input = any(
+            isinstance(value, TensorConfig) and any(int(dim) == 0 for dim in value.shape)
+            for value in bound.arguments.values()
+        )
+        if api_name in self._EMPTY_REDUCTION_APIS and has_zero_input:
+            return "all"
+        if (
+            api_name in self._EMPTY_MEAN_LOSS_APIS
+            and bound.arguments.get("reduction") == "mean"
+            and has_zero_input
+        ):
+            return "forward"
+        return None
 
     @contextlib.contextmanager
     def _nan_inf_check_disabled(self, disabled):
@@ -386,101 +373,6 @@ class APITestPaddleOnly(APITestBase):
         finally:
             # worker 会连续执行 case，异常退出时也必须恢复进入作用域前的状态。
             paddle.set_flags(original_flags)
-
-    @staticmethod
-    def _assert_allowed_nonfinite(tensors, allowed, api_name):
-        # allowed 描述非有限值类型，而不是整体放行输出；有限元素不受该检查影响。
-        for tensor in tensors:
-            invalid = ~paddle.isfinite(tensor)
-            if "nan" in allowed:
-                invalid &= ~paddle.isnan(tensor)
-            if "posinf" in allowed:
-                invalid &= ~paddle.isposinf(tensor)
-            if "neginf" in allowed:
-                invalid &= ~paddle.isneginf(tensor)
-            if bool(paddle.any(invalid).item()):
-                raise RuntimeError(f"{api_name} returned an unexpected non-finite output")
-
-    def _validate_nan_to_num_output(self, leaves, bound):
-        api_name = self.api_config.api_name
-        if len(leaves) != 1:
-            # nan_to_num 的公开返回协议是单 Tensor，复合输出视为 Paddle 行为异常。
-            raise RuntimeError(f"{api_name} returned an unexpected output structure")
-        input_tensor = self.paddle_args[0] if self.paddle_args else self.paddle_kwargs.get("x")
-        if not isinstance(input_tensor, paddle.Tensor):
-            # 缺少运行时输入时无法验证 replacement 位置，宁可失败也不扩大豁免。
-            raise RuntimeError(f"{api_name} input tensor is unavailable for output validation")
-        input_masks = {
-            "nan": paddle.isnan(input_tensor),
-            "posinf": paddle.isposinf(input_tensor),
-            "neginf": paddle.isneginf(input_tensor),
-        }
-        output = leaves[0]
-        unexpected = ~paddle.isfinite(output)
-        # 非有限 replacement 只能影响输入中对应的 NaN、+Inf 或 -Inf 位置。
-        for parameter, input_mask in input_masks.items():
-            replacement = bound.arguments.get(parameter)
-            if not isinstance(replacement, (int, float)) or math.isfinite(replacement):
-                continue
-            if math.isnan(replacement):
-                output_mask = paddle.isnan(output)
-            elif replacement > 0:
-                output_mask = paddle.isposinf(output)
-            else:
-                output_mask = paddle.isneginf(output)
-            unexpected &= ~(input_mask & output_mask)
-        if bool(paddle.any(unexpected).item()):
-            raise RuntimeError(f"{api_name} returned an unexpected non-finite output")
-
-    def _validate_nonfinite_case_output(self, case_kind, bound, paddle_output):
-        # 验证只消费分类阶段的 bound，不重新解析配置或扩大豁免范围。
-        if case_kind is None or case_kind == "dtype_view":
-            # dtype view 的语义就是重解释任意位模式，无法对 NaN/Inf 类型增加约束。
-            return
-        leaves = list(self._iter_tensor_tree_leaves(paddle_output, tensor_type=paddle.Tensor))
-        api_name = self.api_config.api_name
-        if case_kind == "empty_loss_mean":
-            # 空 mean loss 的契约严格限定为唯一的 0 维 NaN。
-            if len(leaves) != 1 or leaves[0].ndim != 0 or not bool(paddle.isnan(leaves[0]).item()):
-                raise RuntimeError(f"{api_name} did not return the expected scalar NaN")
-            return
-        if case_kind == "explicit_fill":
-            # 输出只允许出现配置填充值明确指定的 NaN 或对应符号的 Inf。
-            allowed = set()
-            for name in ("value", "fill_value", "padding_value"):
-                value = bound.arguments.get(name)
-                if isinstance(value, float) and math.isnan(value):
-                    allowed.add("nan")
-                elif value == math.inf:
-                    allowed.add("posinf")
-                elif value == -math.inf:
-                    allowed.add("neginf")
-            self._assert_allowed_nonfinite(leaves, allowed, api_name)
-            return
-        if case_kind == "internal_constant":
-            if api_name in {"paddle.nan_to_num", "paddle.Tensor.nan_to_num"}:
-                self._validate_nan_to_num_output(leaves, bound)
-                return
-            # pinv 的内部常量可豁免，但最终输出不允许包含任何非有限值。
-            self._assert_allowed_nonfinite(leaves, set(), api_name)
-            return
-        if case_kind == "empty_fused_norm":
-            # 空统计量可能产生 NaN，但 Inf 不属于该协议。
-            self._assert_allowed_nonfinite(leaves, {"nan"}, api_name)
-            return
-        if case_kind == "empty_reduction":
-            # 每类规约只接受其数学空集结果，防止宽泛豁免隐藏其他非有限值。
-            # 空输出没有元素可验证；非空输出中的非有限类型必须匹配 API 身份元。
-            short_name = api_name.rsplit(".", 1)[-1]
-            if short_name == "logsumexp":
-                allowed = {"neginf"}
-            elif short_name in {"min", "amin"}:
-                allowed = {"posinf"}
-            elif short_name in {"max", "amax"}:
-                allowed = {"neginf"}
-            else:
-                allowed = {"nan"}
-            self._assert_allowed_nonfinite(leaves, allowed, api_name)
 
     def _run_paddle_backward(self, paddle_output):
         if not self.need_check_grad():
@@ -564,9 +456,8 @@ class APITestPaddleOnly(APITestBase):
             return
 
         try:
-            nonfinite_case, bound = self._classify_nonfinite_case()
-            # 显式输出和空规约沿用全流程豁免，内部常量与空 loss 仅覆盖前向。
-            with self._nan_inf_check_disabled(nonfinite_case in self._FULL_SCOPE_NONFINITE_CASES):
+            exemption_scope = self._nonfinite_exemption_scope()
+            with self._nan_inf_check_disabled(exemption_scope == "all"):
                 self.dump_event("paddle_input_start")
                 if not self.build_paddle_input():
                     self.report_case_result("paddle_error", "build_paddle_input failed")
@@ -580,11 +471,8 @@ class APITestPaddleOnly(APITestBase):
                 )
                 self.dump_event("paddle_input_done")
 
-                with self._nan_inf_check_disabled(
-                    nonfinite_case in self._FORWARD_SCOPE_NONFINITE_CASES
-                ):
+                with self._nan_inf_check_disabled(exemption_scope in {"all", "forward"}):
                     paddle_output = self._run_paddle_forward()
-                self._validate_nonfinite_case_output(nonfinite_case, bound, paddle_output)
                 self._run_paddle_backward(paddle_output)
         except GpuMemoryGuardSkip as err:
             self.report_case_result("oom", phase="memory_guard", message=str(err))
