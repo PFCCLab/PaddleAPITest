@@ -23,12 +23,12 @@ APIConfig
 
 ### `binding.py`：把输入参数绑定到 Tensor
 
-- 消费 `paddle_to_torch/invocation_binding.py` 的调用绑定结果，识别嵌套容器中的 Tensor。
+- 消费 `tester/parameter_binding.py` 的调用绑定结果，识别嵌套容器中的 Tensor。
 - 为每个 Tensor 创建稳定的 `InputTensorPath`，例如 `args[0]`、`kwargs.x`、`args[1][2]`。
 - 检查同一个 `TensorConfig` 是否被多个路径重复引用。
 - 不生成随机值，也不创建 Paddle/PyTorch Tensor。
 
-### `paddle_to_torch/invocation_binding.py`：Paddle 调用绑定
+### `parameter_binding.py`：Paddle 调用参数绑定
 
 - 统一解析 API、手工 C-op 契约、默认值、variadic shape 和 Tensor receiver。
 - 执行转换与输入生成共享同一套参数绑定结果，避免各自解释签名。

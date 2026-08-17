@@ -1,4 +1,4 @@
-"""Paddle invocation binding shared by execution and input generation."""
+"""Paddle parameter binding shared by execution and input generation."""
 
 from __future__ import annotations
 

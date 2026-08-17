@@ -6,7 +6,7 @@ import collections
 import hashlib
 from dataclasses import dataclass
 
-from tester.paddle_to_torch.invocation_binding import bind_input_parameters
+from tester.parameter_binding import bind_input_parameters
 
 from .tensor_config import TensorConfig
 from .values import InputTensorPath, InputTensorSpec
@@ -121,7 +121,7 @@ def _collect_input_tensor_bindings(value, path, parameter_name, output, path_by_
             )
 
 
-def bind_api_inputs(api_config):
+def bind_input_tensors(api_config):
     # `InputApiBinding` 是规则层唯一应该直接读取的绑定对象。
     parameter_binding = bind_input_parameters(
         api_config.api_name,
@@ -165,7 +165,7 @@ def bind_api_inputs(api_config):
 def build_input_generation_context(api_config, seed, backend_policy, input_max_abs):
     # 配置文本指纹使不同调用在原生 backend 中获得稳定且隔离的随机流。
     return InputGenerationContext(
-        input_binding=bind_api_inputs(api_config),
+        input_binding=bind_input_tensors(api_config),
         config_fingerprint=hashlib.sha256(api_config.config.encode()).hexdigest(),
         seed=seed,
         backend_policy=backend_policy,
