@@ -36,17 +36,18 @@ def extract_apis(input_paths, output_file):
 
     for input_file in input_files:
         try:
-            content = input_file.read_text(encoding="utf-8")
             file_count = 0
 
-            for line in content.splitlines():
-                line = line.strip()
-                if line and "(" in line:
-                    api_name = line.split("(", 1)[0].strip()
-                    if api_name:
-                        api_names.add(api_name)
-                        file_count += 1
-                        total_processed += 1
+            # 按行读取，0-size 配置可能达到数 GB，不能整体 read_text。
+            with input_file.open(encoding="utf-8") as source_file:
+                for line in source_file:
+                    line = line.strip()
+                    if line and "(" in line:
+                        api_name = line.split("(", 1)[0].strip()
+                        if api_name:
+                            api_names.add(api_name)
+                            file_count += 1
+                            total_processed += 1
 
             print(f"Processed {file_count} APIs from {input_file}")
         except Exception as err:

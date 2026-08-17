@@ -2,12 +2,14 @@ from __future__ import annotations
 
 import argparse
 import copy
+import heapq
 import math
 import os
+import tempfile
 
 import numpy
 import paddle
-from tester.api_config.parser import analyse_configs
+from tester.api_config.parser import APIConfig
 from tester.input_generation.tensor_config import TensorConfig
 from tqdm import tqdm
 
@@ -21,6 +23,7 @@ def is_0D_tensor(tensor_config):
 
 
 def get_tensor_configs(api_config):
+    # 只展开参数容器，不改变 parser 对嵌套值的既有边界。
     tensor_configs = []
     for arg_config in api_config.args:
         if isinstance(arg_config, TensorConfig):
@@ -40,7 +43,117 @@ def get_tensor_configs(api_config):
     return tensor_configs
 
 
+def iter_api_configs(config_path):
+    """逐行解析配置，避免把全部 APIConfig 对象同时保存在内存。"""
+    with open(config_path, encoding="utf-8") as config_file:
+        for raw_line in config_file:
+            config = raw_line.strip()
+            if config and config.startswith("paddle."):
+                yield APIConfig(config)
+
+
+def _matching_close(text, start, opening, closing):
+    """返回嵌套括号的结束位置，字符串内容中的括号不参与配对。"""
+    # 需要跳过字符串中的括号，否则 callable 或字符串参数会破坏定位。
+    depth = 0
+    quote = None
+    escaped = False
+    for index in range(start, len(text)):
+        char = text[index]
+        if quote is not None:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == quote:
+                quote = None
+            continue
+        if char in ('"', "'"):
+            quote = char
+        elif char == opening:
+            depth += 1
+        elif char == closing:
+            depth -= 1
+            if depth == 0:
+                return index
+    return None
+
+
+def _find_tensor_shape_spans(config):
+    """记录规范化配置中每个 Tensor shape 列表的字符区间。"""
+    # 偏移区间只覆盖 shape 列表，保留 Tensor 外层语法和 dtype 文本。
+    spans = []
+    search_from = 0
+    marker = "Tensor("
+    while True:
+        tensor_start = config.find(marker, search_from)
+        if tensor_start < 0:
+            return spans
+        shape_start = tensor_start + len(marker)
+        size_prefix = "paddle.Size("
+        if config.startswith(size_prefix, shape_start):
+            shape_start += len(size_prefix)
+        while shape_start < len(config) and config[shape_start].isspace():
+            shape_start += 1
+        if shape_start >= len(config) or config[shape_start] != "[":
+            search_from = tensor_start + len(marker)
+            continue
+        shape_end = _matching_close(config, shape_start, "[", "]")
+        if shape_end is None:
+            return []
+        spans.append((shape_start, shape_end + 1))
+        search_from = shape_end + 1
+
+
+def _selected_positions(tensor_configs):
+    """返回全部 Tensor 维度位置，保持 0-size 覆盖范围不变。"""
+    return [
+        (index, axis)
+        for index, tensor in enumerate(tensor_configs)
+        for axis in range(len(tensor.shape))
+    ]
+
+
+def _replace_shape_spans(config, spans, replacements):
+    """按位置替换 shape，避免为每个候选重新解析 APIConfig。"""
+    # 按原始区间拼接，避免正则替换同形状 Tensor 时误伤其他位置。
+    chunks = []
+    cursor = 0
+    for index, (start, end) in enumerate(spans):
+        chunks.append(config[cursor:start])
+        chunks.append(str(replacements.get(index, config[start:end])))
+        cursor = end
+    chunks.append(config[cursor:])
+    return "".join(chunks)
+
+
+def _object_variants(api_config):
+    """字符串定位失败时的兼容路径；同一配置只深拷贝一次。"""
+    # 仅定位失败时使用对象回退，且整个配置生命周期只复制一次。
+    work_api_config = copy.deepcopy(api_config)
+    work_tensors = get_tensor_configs(work_api_config)
+    for tensor_index, axis in _selected_positions(work_tensors):
+        tensor = work_tensors[tensor_index]
+        old_value = tensor.shape[axis]
+        tensor.shape[axis] = 0
+        try:
+            yield str(work_api_config)
+        finally:
+            tensor.shape[axis] = old_value
+    if all(len(tensor.shape) == len(work_tensors[0].shape) for tensor in work_tensors):
+        for axis in range(len(work_tensors[0].shape)):
+            old_values = [tensor.shape[axis] for tensor in work_tensors]
+            try:
+                for tensor in work_tensors:
+                    tensor.shape[axis] = 0
+                yield str(work_api_config)
+            finally:
+                for tensor, old_value in zip(work_tensors, old_values, strict=True):
+                    tensor.shape[axis] = old_value
+
+
 def to_0_size_config(api_config):
+    # 同一 API/结构最多保留少量重复样本，这是原有稳定性探测协议。
     if api_config.api_name not in apis_map:
         apis_map[api_config.api_name] = {}
 
@@ -54,7 +167,6 @@ def to_0_size_config(api_config):
     if apis_map[api_config.api_name][key] > 5:
         return []
 
-    result = []
     tensor_configs = get_tensor_configs(api_config)
 
     if len(tensor_configs) == 0:
@@ -68,21 +180,35 @@ def to_0_size_config(api_config):
         if shape_len != len(tensor_config.shape):
             shape_equal = False
 
-    for i in range(len(tensor_configs)):
-        for j in range(len(tensor_configs[i].shape)):
-            tmp_api_config = copy.deepcopy(api_config)
-            tmp_tensor_configs = get_tensor_configs(tmp_api_config)
-            tmp_tensor_configs[i].shape[j] = 0
-            result.append(str(tmp_api_config))
+    # 正常路径复用 parser 的规范格式，保证与历史输出兼容。
+    canonical_config = str(api_config)
+    # 运行时 callable 的 repr 不能被 parser 重新执行，此时保留原始可解析文本。
+    runtime_repr_markers = ("<function ", "<method ", "<built-in ", "<slot wrapper ", " at 0x")
+    if any(marker in canonical_config for marker in runtime_repr_markers):
+        canonical_config = api_config.config
+    spans = _find_tensor_shape_spans(canonical_config)
+    if len(spans) != len(tensor_configs):
+        yield from _object_variants(api_config)
+        return
+
+    # 每个变体只复制字符串，不复制整棵 APIConfig 对象树。
+    for tensor_index, axis in _selected_positions(tensor_configs):
+        shape = list(tensor_configs[tensor_index].shape)
+        shape[axis] = 0
+        yield _replace_shape_spans(
+            canonical_config,
+            spans,
+            {tensor_index: shape},
+        )
 
     if shape_equal:
-        for j in range(shape_len):
-            tmp_api_config = copy.deepcopy(api_config)
-            tmp_tensor_configs = get_tensor_configs(tmp_api_config)
-            for i in range(len(tensor_configs)):
-                tmp_tensor_configs[i].shape[j] = 0
-            result.append(str(tmp_api_config))
-    return result
+        for axis in range(shape_len):
+            replacements = {}
+            for index, tensor in enumerate(tensor_configs):
+                shape = list(tensor.shape)
+                shape[axis] = 0
+                replacements[index] = shape
+            yield _replace_shape_spans(canonical_config, spans, replacements)
 
 
 apis_map = {}
@@ -173,6 +299,41 @@ def config_key(api_config):
         result = result + key + "=" + dump_item_str(value) + ", "
 
     return result
+
+
+CHUNK_BYTES = 64 * 1024 * 1024
+
+
+def _flush_chunk(lines, chunk_dir, chunk_index):
+    """将有限大小的去重块排序落盘，避免长配置常驻内存。"""
+    # 块边界按字节计算，避免单条超长配置突破内存预算。
+    if not lines:
+        return None
+    path = os.path.join(chunk_dir, f"chunk_{chunk_index:06d}.txt")
+    with open(path, "w", encoding="utf-8") as output_file:
+        for line in sorted(lines):
+            output_file.write(line + "\n")
+    return path
+
+
+def _merge_chunks(chunk_paths, output_path):
+    """归并已排序分块并再次去重，输出顺序与 dedup_config 保持一致。"""
+    # 归并输入均已排序，因此只需比较相邻行即可完成全局去重。
+    streams = [open(path, encoding="utf-8") for path in chunk_paths]
+    count = 0
+    previous = None
+    try:
+        with open(output_path, "w", encoding="utf-8") as output_file:
+            for line in heapq.merge(*(stream for stream in streams)):
+                if line == previous:
+                    continue
+                output_file.write(line)
+                previous = line
+                count += 1
+    finally:
+        for stream in streams:
+            stream.close()
+    return count
 
 
 def to_big_tensor_config(api_config):
@@ -290,16 +451,31 @@ if __name__ == "__main__":
     if output_dir:
         os.makedirs(output_dir, exist_ok=True)
 
-    config_0_size = set()
-    for input_file in args.inputs:
-        print(f"处理: {input_file}")
-        api_configs = analyse_configs(input_file)
-        config_0_size_chunk = []
-        for api_config in tqdm(api_configs):
-            config_0_size_chunk.extend(set(to_0_size_config(api_config)))
-        config_0_size = config_0_size.union(set(config_0_size_chunk))
+    output_dir = os.path.dirname(args.output) or "."
+    with tempfile.TemporaryDirectory(prefix=".0size_chunks.", dir=output_dir) as chunk_dir:
+        # 临时块位于输出目录，保证大文件处理不依赖系统 /tmp 空间。
+        chunk_paths = []
+        chunk_lines = set()
+        chunk_bytes = 0
+        chunk_index = 0
+        for input_file in args.inputs:
+            print(f"处理: {input_file}")
+            for api_config in tqdm(iter_api_configs(input_file)):
+                # 逐个变体进入有限大小的块集合，避免累计完整输出。
+                for variant in to_0_size_config(api_config):
+                    if variant in chunk_lines:
+                        continue
+                    chunk_lines.add(variant)
+                    chunk_bytes += len(variant) + 1
+                    if chunk_bytes >= CHUNK_BYTES:
+                        path = _flush_chunk(chunk_lines, chunk_dir, chunk_index)
+                        chunk_paths.append(path)
+                        chunk_index += 1
+                        chunk_lines.clear()
+                        chunk_bytes = 0
+        path = _flush_chunk(chunk_lines, chunk_dir, chunk_index)
+        if path is not None:
+            chunk_paths.append(path)
+        unique_count = _merge_chunks(chunk_paths, args.output)
 
-    with open(args.output, "w") as f:
-        f.write("\n".join(config_0_size))
-
-    print(f"输出: {args.output}，共 {len(config_0_size)} 行")
+    print(f"输出: {args.output}，共 {unique_count} 行")

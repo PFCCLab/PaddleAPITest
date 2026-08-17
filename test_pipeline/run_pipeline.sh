@@ -155,16 +155,11 @@ python "$PROCESSOR_DIR/dedup_config.py" \
     -o "$PADDLEONLY_4096_DIR/$ORIG_MERGED_NAME"
 
 # 转 0size
+# to_0_size_config 已经采用分块排序归并并输出唯一行，直接写最终路径，
+# 避免对可能达到数 GB 的中间文件再做一次全量去重。
 python "$PROCESSOR_DIR/to_0_size_config.py" \
     -i "$PADDLEONLY_4096_DIR/$ORIG_MERGED_NAME" \
-    -o "$OUTPUT_DIR/_tmp_0size.txt"
-
-# 去重 0size
-python "$PROCESSOR_DIR/dedup_config.py" \
-    -i "$OUTPUT_DIR/_tmp_0size.txt" \
     -o "$PADDLEONLY_0SIZE_DIR/0size.txt"
-
-rm -f "$OUTPUT_DIR/_tmp_0size.txt"
 
 # 指定比例时只替换保留集；未指定时完全跳过缩减，保持默认流程结果不变。
 if [ -n "$SLIM_RATIO" ]; then
@@ -177,9 +172,13 @@ if [ -n "$SLIM_RATIO" ]; then
     SLIM_REMOVED_DIR="$SLIM_TMP_DIR/removed"
     # 输入、保留和裁减目录隔离，满足 random_slim 的递归扫描约束。
     mkdir -p "$SLIM_INPUT_DIR"
-    cp "$PADDLEONLY_1M_DIR/1M.txt" "$SLIM_INPUT_DIR/1M.txt"
-    cp "$PADDLEONLY_4096_DIR/$ORIG_MERGED_NAME" "$SLIM_INPUT_DIR/4096.txt"
-    cp "$PADDLEONLY_0SIZE_DIR/0size.txt" "$SLIM_INPUT_DIR/0size.txt"
+    # 同一文件系统优先使用硬链接，避免 slim 模式复制数 GB 的 0-size 文件。
+    ln "$PADDLEONLY_1M_DIR/1M.txt" "$SLIM_INPUT_DIR/1M.txt" 2>/dev/null || \
+        cp "$PADDLEONLY_1M_DIR/1M.txt" "$SLIM_INPUT_DIR/1M.txt"
+    ln "$PADDLEONLY_4096_DIR/$ORIG_MERGED_NAME" "$SLIM_INPUT_DIR/4096.txt" 2>/dev/null || \
+        cp "$PADDLEONLY_4096_DIR/$ORIG_MERGED_NAME" "$SLIM_INPUT_DIR/4096.txt"
+    ln "$PADDLEONLY_0SIZE_DIR/0size.txt" "$SLIM_INPUT_DIR/0size.txt" 2>/dev/null || \
+        cp "$PADDLEONLY_0SIZE_DIR/0size.txt" "$SLIM_INPUT_DIR/0size.txt"
     python "$REPO_DIR/tools/random_slim_api_configs.py" \
         --input-dir "$SLIM_INPUT_DIR" \
         --kept-dir "$SLIM_KEPT_DIR" \
@@ -213,7 +212,7 @@ python "$PROCESSOR_DIR/extract_api_set.py" \
 # ============================================================================
 # 清理中间文件，只保留最终结果
 # ============================================================================
-rm -f "$DERIVED_4096" "$DERIVED_1M" "$OUTPUT_DIR/_tmp_0size.txt"
+rm -f "$DERIVED_4096" "$DERIVED_1M"
 
 echo ""
 echo "======================================================================"
