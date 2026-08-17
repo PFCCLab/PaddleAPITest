@@ -649,7 +649,16 @@ class APITestBase:
         # 主调度与 worker 共用纯配置判定，不能在两个生命周期各维护一份规则。
         return should_check_grad(self.api_config)
 
-    def _should_skip_nan_inf_check(self):
+    def _allows_internal_nonfinite_constants(self):
+        """仅允许已确认会合法构造非有限常量的公开 API 临时关闭检查。"""
+        return self.api_config.api_name in {
+            "paddle.nan_to_num",
+            "paddle.Tensor.nan_to_num",
+            "paddle.linalg.pinv",
+            "paddle.Tensor.pinv",
+        }
+
+    def _should_skip_nan_inf_check(self, *, allow_internal_nonfinite_constants=False):
         """判断当前 case 是否允许产生 NaN/Inf，供 Paddle flag 临时豁免。"""
         # 显式无穷填充值是 API 语义的一部分，不应被数值检查误报为 Paddle 错误。
         # 仅检查 value/fill_value 参数，避免 norm 的 p=math.inf 等控制参数误关检查。
@@ -660,6 +669,10 @@ class APITestBase:
             api=getattr(self, "paddle_api", None),
         )
         if bound.source != "unresolved":
+            if allow_internal_nonfinite_constants and self._allows_internal_nonfinite_constants():
+                # 白名单 API 的内部 Inf 只允许在本次前向调用期间存在，最终输出另行校验。
+                return True
+
             for name in ("value", "fill_value", "padding_value"):
                 value = bound.arguments.get(name)
                 if isinstance(value, float) and not math.isfinite(value):
@@ -721,6 +734,8 @@ class APITestBase:
                 "paddle.Tensor.mean",
                 "paddle.Tensor.min",
                 "paddle.Tensor.max",
+                "paddle.Tensor.nanmean",
+                "paddle.Tensor.nanmedian",
                 "paddle.Tensor.var",
                 "paddle.Tensor.std",
             }
@@ -728,24 +743,41 @@ class APITestBase:
         if self.api_config.api_name not in reduction_apis:
             return False
 
-        # TensorConfig 可能嵌套在位置参数、关键字参数及容器中，必须完整遍历配置树。
-        def has_zero_shape(value):
-            if isinstance(value, TensorConfig):
-                return any(int(dim) == 0 for dim in value.shape)
-            if isinstance(value, dict):
-                return any(has_zero_shape(item) for item in value.values())
-            if isinstance(value, (list, tuple)):
-                return any(has_zero_shape(item) for item in value)
+        if bound.source == "unresolved":
+            return False
+        x_config = bound.arguments.get("x")
+        if not isinstance(x_config, TensorConfig):
             return False
 
-        # 0size 规约的 NaN 是 Paddle 定义行为，保留结果并跳过全局 finite 检查。
-        return has_zero_shape(self.api_config.args) or has_zero_shape(self.api_config.kwargs)
+        rank = len(x_config.shape)
+        axis = bound.arguments.get("axis")
+        if axis is None or (isinstance(axis, (list, tuple)) and not axis):
+            axes = tuple(range(rank))
+        elif isinstance(axis, int) and not isinstance(axis, bool):
+            axes = (axis,)
+        elif isinstance(axis, (list, tuple)) and all(
+            isinstance(item, int) and not isinstance(item, bool) for item in axis
+        ):
+            axes = tuple(axis)
+        else:
+            return False
+
+        normalized_axes = tuple(item + rank if item < 0 else item for item in axes)
+        # 非法轴和重复轴应由 Paddle 正常报错，不能因输入恰有 0 维而被数值豁免掩盖。
+        if any(item < 0 or item >= rank for item in normalized_axes) or len(
+            set(normalized_axes)
+        ) != len(normalized_axes):
+            return False
+        # 只有实际规约区域为空时结果才是符合预期的非有限值；未规约的 0 维只产生空输出。
+        return any(int(x_config.shape[item]) == 0 for item in normalized_axes)
 
     @contextlib.contextmanager
-    def _nan_inf_check_scope(self):
+    def _nan_inf_check_scope(self, *, allow_internal_nonfinite_constants=False):
         """在合法 NaN/Inf case 中临时关闭检查，并严格恢复 worker 状态。"""
         # 普通 case 不读写 Paddle flag，保持原有数值检查路径和错误分类。
-        if not self._should_skip_nan_inf_check():
+        if not self._should_skip_nan_inf_check(
+            allow_internal_nonfinite_constants=allow_internal_nonfinite_constants
+        ):
             yield
             return
         flag_name = "FLAGS_check_nan_inf"

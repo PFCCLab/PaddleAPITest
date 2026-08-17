@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import math
+
 import paddle
 
+from .api_config.parameter_binding import bind_input_parameters
 from .base import APITestBase, GpuMemoryGuardSkip
 
 # from func_timeout import func_set_timeout
@@ -47,6 +50,26 @@ class APITestPaddleOnly(APITestBase):
         self.dump_save("paddle_forward_output", paddle_output, framework="paddle")
         self.dump_event("paddle_forward_done")
         return paddle_output
+
+    def _check_internal_nonfinite_api_output(self, paddle_output):
+        if not self._allows_internal_nonfinite_constants():
+            return
+        if self.api_config.api_name in {"paddle.nan_to_num", "paddle.Tensor.nan_to_num"}:
+            bound = bind_input_parameters(
+                self.api_config.api_name,
+                self.api_config.args,
+                self.api_config.kwargs,
+                api=getattr(self, "paddle_api", None),
+            )
+            for name in ("nan", "posinf", "neginf"):
+                replacement = bound.arguments.get(name)
+                if isinstance(replacement, (int, float)) and not math.isfinite(replacement):
+                    # 调用者明确要求保留非有限 replacement 时，非有限最终结果属于 API 合法语义。
+                    return
+        # flag 恢复后检查白名单 API 的最终结果，pinv 不允许任何非有限输出例外。
+        for tensor in self._iter_tensor_tree_leaves(paddle_output, tensor_type=paddle.Tensor):
+            if not bool(paddle.all(paddle.isfinite(tensor)).item()):
+                raise RuntimeError(f"{self.api_config.api_name} returned a non-finite output")
 
     def _run_paddle_backward(self, paddle_output):
         if not self.need_check_grad():
@@ -145,7 +168,10 @@ class APITestPaddleOnly(APITestBase):
                 )
                 self.dump_event("paddle_input_done")
 
-                paddle_output = self._run_paddle_forward()
+                # 白名单 API 内部会短暂构造 Inf，豁免严格限定在本次前向生命周期。
+                with self._nan_inf_check_scope(allow_internal_nonfinite_constants=True):
+                    paddle_output = self._run_paddle_forward()
+                self._check_internal_nonfinite_api_output(paddle_output)
                 self._run_paddle_backward(paddle_output)
         except GpuMemoryGuardSkip as err:
             self.report_case_result("oom", phase="memory_guard", message=str(err))

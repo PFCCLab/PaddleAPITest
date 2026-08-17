@@ -1342,8 +1342,47 @@ def generate_multiply_inputs(rule: InputRuleContext):
     "paddle.nn.functional.binary_cross_entropy",
 )
 def generate_binary_cross_entropy_inputs(rule: InputRuleContext):
-    """输入规则：将二元交叉熵输入限制在概率区间。"""
-    rule.generate_all("unit_interval")
+    """输入规则：按概率、标签和权重语义生成二元交叉熵输入。"""
+
+    def generate_probability_input_value(input_binding):
+        # input 远离 0/1，避免合法端点在反向公式中形成 0/0。
+        return rule.domain("uniform", input_binding, low=0.05, high=0.95)
+
+    def generate_label_input_value(input_binding):
+        # label 允许概率软标签，包括数学上合法的端点。
+        return rule.domain("unit_interval", input_binding)
+
+    def generate_weight_input_value(input_binding):
+        # BCE 权重只缩放 loss，使用正有限范围避免随机负权重改变损失语义。
+        return rule.domain("uniform", input_binding, low=0.1, high=1.0)
+
+    rule.generate(
+        (
+            (("input", "x"), generate_probability_input_value),
+            (("label", "target"), generate_label_input_value),
+            ("weight", generate_weight_input_value),
+        )
+    )
+
+
+@input_rules.register("paddle.nn.functional.batch_norm")
+def generate_batch_norm_inputs(rule: InputRuleContext):
+    """输入规则：保持 batch norm 统计量与仿射参数的数值语义。"""
+
+    def generate_running_var_input_value(input_binding):
+        # 推理和全局统计路径会直接开方 running_var，因此必须严格为正。
+        return rule.domain("uniform", input_binding, low=0.5, high=1.5)
+
+    def generate_weight_input_value(input_binding):
+        # 仿射 scale 保持正值可避免额外符号翻转，同时继续覆盖非单位缩放。
+        return rule.domain("uniform", input_binding, low=0.5, high=1.5)
+
+    rule.generate(
+        (
+            ("running_var", generate_running_var_input_value),
+            ("weight", generate_weight_input_value),
+        )
+    )
 
 
 @input_rules.register("paddle.nn.functional.alpha_dropout")
@@ -3679,31 +3718,52 @@ def generate_corrcoef_inputs(rule: InputRuleContext):
 
 @input_rules.register("paddle.linalg.pinv")
 def generate_pinv_inputs(rule: InputRuleContext):
-    """输入规则：按 hermitian 参数构造一般矩阵或 Hermitian 矩阵。"""
+    """输入规则：构造满秩一般矩阵或正定 Hermitian 矩阵。"""
     hermitian = bool(rule.arg("hermitian", False))
-    if not hermitian:
-        rule.generate()
-        return
 
     def generate_x_input_value(tensor):
-        if len(tensor.shape) not in [2, 3]:
-            raise ValueError("pinv only supports 2D or 3D tensors")
+        if len(tensor.shape) < 2:
+            raise ValueError("pinv input must have at least two dimensions")
         matrix = rule.normal(tensor)
-        if len(tensor.shape) == 2:
-            matrix_t = (
-                rule.ops.swapaxes(rule.ops.conj(matrix), -1, -2)
-                if tensor.dtype.startswith("complex")
-                else rule.ops.swapaxes(matrix, -1, -2)
-            )
-        else:
-            matrix_t = (
-                rule.ops.swapaxes(rule.ops.conj(matrix), -2, -1)
-                if tensor.dtype.startswith("complex")
-                else rule.ops.swapaxes(matrix, -2, -1)
-            )
-        return (matrix + matrix_t) / 2
+        if not hermitian:
+            # 连续随机的一般矩阵以概率 1 满秩，并保留矩形矩阵覆盖。
+            return matrix
+        if tensor.shape[-1] != tensor.shape[-2]:
+            raise ValueError("hermitian pinv input must be square")
+        # M M^H + I 的最小特征值有正下界，避免随机对称矩阵落在奇异点。
+        matrix_h = rule.ops.swapaxes(rule.ops.conj(matrix), -1, -2)
+        return rule.ops.matmul(matrix, matrix_h) + rule.ops.eye(
+            tensor.shape[-1], dtype=tensor.dtype
+        )
 
-    rule.generate({"x": generate_x_input_value})
+    def generate_rcond_input_value(tensor):
+        # Tensor rcond 遵守非负相对阈值语义，并避免阈值大于最大奇异值。
+        return rule.domain("uniform", tensor, low=1e-6, high=0.1)
+
+    rule.generate(
+        (
+            ("x", generate_x_input_value),
+            ("rcond", generate_rcond_input_value),
+        )
+    )
+
+
+@input_rules.register("paddle.linalg.triangular_solve")
+def generate_triangular_solve_inputs(rule: InputRuleContext):
+    """输入规则：生成方向匹配且对角稳定的三角系数矩阵。"""
+
+    def generate_x_input_value(tensor):
+        if len(tensor.shape) < 2 or tensor.shape[-1] != tensor.shape[-2]:
+            raise ValueError("triangular_solve x must contain square matrices")
+        matrix = rule.default(tensor)
+        matrix = rule.ops.triu(matrix) if rule.arg("upper", True) else rule.ops.tril(matrix)
+        if rule.arg("unitriangular", False):
+            # unitriangular 协议忽略输入对角，无需人为覆盖该区域。
+            return matrix
+        # 固定对角偏移使系数矩阵远离奇异点，同时保留非对角随机覆盖。
+        return matrix + rule.ops.eye(tensor.shape[-1], dtype=tensor.dtype) * 2
+
+    rule.generate((("x", generate_x_input_value),))
 
 
 @input_rules.register("paddle.linalg.cholesky_solve", aliases=("paddle.Tensor.cholesky_solve",))
