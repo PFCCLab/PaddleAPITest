@@ -16,6 +16,13 @@ def _single_line(value):
     return str(value).replace("\r", "\\r").replace("\n", "\\n")
 
 
+def _display_option_value(value):
+    """用稳定的单行格式展示列表参数，避免打印 Python list 语法。"""
+    if isinstance(value, (list, tuple)):
+        return ", ".join(_single_line(item) for item in value)
+    return _single_line(value)
+
+
 def format_duration(seconds):
     """按运行时长选择秒、分钟或小时单位。"""
     if seconds >= 3600:
@@ -211,14 +218,11 @@ def print_run_header(options, paddle_version):
         "custom_device_vs_gpu",
     )
     mode = next(name for name in modes if getattr(options, name))
+    source_option = ("--retest", options.retest)
     if options.api_config:
         source_option = ("--api_config", options.api_config)
     elif options.api_config_file:
         source_option = ("--api_config_file", options.api_config_file)
-    elif getattr(options, "retest", ""):
-        source_option = ("--retest", options.retest)
-    else:
-        source_option = ("--api_config_file_pattern", options.api_config_file_pattern)
 
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
     print(f">>> TEST RUN | {timestamp} | PID {os.getpid()}")
@@ -288,7 +292,9 @@ def print_run_header(options, paddle_version):
     for group_name, group_options in groups:
         print(group_name)
         for name, value in group_options:
-            display_value = str(value).lower() if isinstance(value, bool) else value
+            display_value = (
+                str(value).lower() if isinstance(value, bool) else _display_option_value(value)
+            )
             print(f"  {name}: {display_value}")
 
 

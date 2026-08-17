@@ -52,6 +52,7 @@ from tester.reporting.dump_writer import (
     record_dump_terminal_status,
     resolve_dump_options,
 )
+from tester.runtime.config_file_loader import resolve_config_files
 from tester.runtime.runtime_config import (
     TestRuntimeConfig,
     limit_worker_layout,
@@ -862,16 +863,12 @@ def main():
     parser = argparse.ArgumentParser(description="Run Paddle API test cases", allow_abbrev=False)
     parser.add_argument(
         "--api_config_file",
-        default="",
+        nargs="+",
+        default=None,
         help=(
-            "Path to a config file. Mutually exclusive with "
-            "--api_config_file_pattern, --api_config, and --retest."
+            "One or more config files, directories, or glob patterns. Mutually exclusive "
+            "with --api_config and --retest."
         ),
-    )
-    parser.add_argument(
-        "--api_config_file_pattern",
-        default="",
-        help="Glob pattern(s) for config files; comma-separated patterns are supported.",
     )
     parser.add_argument(
         "--api_config",
@@ -1097,14 +1094,12 @@ def main():
     input_sources = (
         bool(options.api_config),
         bool(options.api_config_file),
-        bool(options.api_config_file_pattern),
         bool(options.retest),
     )
     if sum(input_sources) != 1:
         _print_argument(
             ARGUMENT_ERROR_PREFIX,
-            "exactly one of --api_config, --api_config_file, "
-            "--api_config_file_pattern, or --retest is required",
+            "exactly one of --api_config, --api_config_file, or --retest is required",
         )
         return
     normalize_dual_gpu_options(options)
@@ -1141,7 +1136,7 @@ def main():
         return
     log_report.print_run_header(options, paddle_version)
     if options.use_dump:
-        if not options.api_config or options.api_config_file or options.api_config_file_pattern:
+        if not options.api_config or options.api_config_file:
             _print_argument(ARGUMENT_ERROR_PREFIX, "dump only supports single --api_config runs")
             return
         if not (options.accuracy or options.paddle_only):
@@ -1262,33 +1257,20 @@ def main():
             )
         if single_case_error is not None:
             sys.exit(1)
-    elif options.api_config_file or options.api_config_file_pattern or options.retest:
+    elif options.api_config_file or options.retest:
         # get config files
         if options.retest:
             config_files = []
-        elif options.api_config_file_pattern:
-            import glob
-
-            config_files = []
-            patterns = options.api_config_file_pattern.split(",")
-            for pattern in patterns:
-                pattern = pattern.strip()
-                config_files.extend(glob.glob(pattern))
-            if not config_files:
-                print(
-                    f"No config files found: {options.api_config_file_pattern}",
-                    flush=True,
-                )
+        else:
+            try:
+                config_files = resolve_config_files(options.api_config_file)
+            except (FileNotFoundError, ValueError) as err:
+                print(str(err), flush=True)
                 return
             config_files.sort()
             print("Config files to be tested:", flush=True)
             for i, config_file in enumerate(config_files, 1):
                 print(f"{i}. {config_file}", flush=True)
-        else:
-            if not os.path.exists(options.api_config_file):
-                print(f"No config file found: {options.api_config_file}", flush=True)
-                return
-            config_files = [options.api_config_file]
 
         init_log(options.log_dir)
 

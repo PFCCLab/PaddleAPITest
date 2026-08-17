@@ -25,19 +25,15 @@ python engineV4.py INPUT MODE [OPTIONS]
 
 直接运行一条 API config。配置含双引号时用单引号包裹。普通单条模式使用一张 GPU，双卡模式使用一对 GPU。默认：空。
 
-#### `--api_config_file=PATH`
+#### `--api_config_file=INPUT...`
 
-从文件逐行读取 API config。默认：空。
-
-#### `--api_config_file_pattern=GLOB[,GLOB...]`
-
-读取一个或多个逗号分隔 glob 匹配的文件。默认：空。
+接收一个或多个文件、目录或 glob；目录展开当前层 `.txt` 文件，glob 支持递归 `**`，多个输入可用空格或逗号分隔。默认：空。
 
 #### `--retest=CLASS[,CLASS...]`
 
 重跑 `--log_dir` 中已有的分类，例如 `config_input,timeout`；开始前会清除这些 case 的旧结构化结果。默认：空。
 
-`--api_config`、`--api_config_file`、`--api_config_file_pattern`、`--retest` 互斥，必须且只能选择一个。
+`--api_config`、`--api_config_file`、`--retest` 互斥，必须且只能选择一个。
 
 #### `--log_dir=PATH`
 
@@ -177,9 +173,9 @@ python run.py [-c CONFIG] [OVERRIDES] [ENGINE_OPTIONS]
 
 ### 输入和引擎覆盖
 
-#### `--api-config VALUE`、`-i FILE`、`--input FILE`、`--api-config-file FILE`、`--api-config-file-pattern GLOB`
+#### `--api-config VALUE`、`-i FILE...`、`--input FILE...`、`--api-config-file FILE...`
 
-分别覆盖 `input.api_config`、`input.api_config_file`、`input.api_config_file_pattern`。
+分别覆盖 `input.api_config`、`input.api_config_file`。
 
 #### `-o DIR`、`--output DIR`、`--log-dir DIR`
 
@@ -208,7 +204,7 @@ python run.py [-c CONFIG] [OVERRIDES] [ENGINE_OPTIONS]
 顶层键为 `name`、`runner`、`env`、`input`、`output`、`retest`、`engine_args`。
 
 - `runner`：`engine`、`foreground`、`dry_run`、`pid_file`。
-- `input`：`api_config`、`api_config_file`、`api_config_file_pattern` 三选一。
+- `input`：`api_config`、`api_config_file` 二选一。
 - `output`：`log_dir`。
 - `retest`：`enabled`、`rounds`、`error_configs`、`log_dir_template`、`skip_unavailable`。
 - `engine_args`：去掉 `--` 的 engineV4 参数名。

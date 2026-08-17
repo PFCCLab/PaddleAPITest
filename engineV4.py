@@ -62,6 +62,7 @@ from tester.reporting import (
     log_runtime,
     log_worker,
 )
+from tester.runtime.config_file_loader import resolve_config_files
 from tester.runtime.runtime_config import (
     TestRuntimeConfig,
     limit_worker_layout,
@@ -3689,13 +3690,11 @@ def _validate_input_sources(options):
     input_sources = (
         bool(options.api_config),
         bool(options.api_config_file),
-        bool(options.api_config_file_pattern),
         bool(options.retest),
     )
     if sum(input_sources) != 1:
         return _argument_error(
-            "exactly one of --api_config, --api_config_file, "
-            "--api_config_file_pattern, or --retest is required"
+            "exactly one of --api_config, --api_config_file, or --retest is required"
         )
     return None
 
@@ -3874,7 +3873,7 @@ def _prepare_common_options(options):
         return mode_error
 
     if options.use_dump:
-        if not options.api_config or options.api_config_file or options.api_config_file_pattern:
+        if not options.api_config or options.api_config_file:
             return _argument_error("dump only supports single --api_config runs")
         if not (options.accuracy or options.paddle_only):
             return _argument_error("dump currently supports only --accuracy or --paddle_only")
@@ -4020,24 +4019,10 @@ def _load_retest_configs(options):
 
 
 def _load_file_configs(options, finish_configs, removed_stale_logs):
-    if options.api_config_file_pattern:
-        import glob
-
-        config_files = []
-        patterns = options.api_config_file_pattern.split(",")
-        for pattern in patterns:
-            pattern = pattern.strip()
-            config_files.extend(glob.glob(pattern))
-        if not config_files:
-            raise FileNotFoundError(f"No config files found: {options.api_config_file_pattern}")
-        config_files.sort()
-        print("Config files to be tested:", flush=True)
-        for i, config_file in enumerate(config_files, 1):
-            print(f"{i}. {config_file}", flush=True)
-    else:
-        if not os.path.exists(options.api_config_file):
-            raise FileNotFoundError(f"No config file found: {options.api_config_file}")
-        config_files = [options.api_config_file]
+    config_files = resolve_config_files(options.api_config_file)
+    print("Config files to be tested:", flush=True)
+    for i, config_file in enumerate(config_files, 1):
+        print(f"{i}. {config_file}", flush=True)
 
     api_config_count = 0
     skipped_non_config = 0
@@ -4264,16 +4249,12 @@ def _build_argument_parser():
     parser = argparse.ArgumentParser(description="Run Paddle API test cases", allow_abbrev=False)
     parser.add_argument(
         "--api_config_file",
-        default="",
+        nargs="+",
+        default=None,
         help=(
-            "Path to a config file. Mutually exclusive with "
-            "--api_config_file_pattern, --api_config, and --retest."
+            "One or more config files, directories, or glob patterns. Mutually exclusive "
+            "with --api_config and --retest."
         ),
-    )
-    parser.add_argument(
-        "--api_config_file_pattern",
-        default="",
-        help="Glob pattern(s) for config files; comma-separated patterns are supported.",
     )
     parser.add_argument(
         "--api_config",
@@ -4538,7 +4519,7 @@ def main():
 
     if options.api_config:
         return _run_single_case_mode(options, start_time)
-    if options.api_config_file or options.api_config_file_pattern or options.retest:
+    if options.api_config_file or options.retest:
         return _run_batch_case_mode(options, start_time)
     return 0
 

@@ -33,7 +33,7 @@ DEFAULT_RETEST_ERROR_CONFIGS = [
 
 TOP_LEVEL_KEYS = {"name", "runner", "env", "input", "output", "retest", "engine_args"}
 RUNNER_KEYS = {"engine", "foreground", "dry_run", "pid_file"}
-INPUT_KEYS = {"api_config", "api_config_file", "api_config_file_pattern"}
+INPUT_KEYS = {"api_config", "api_config_file"}
 OUTPUT_KEYS = {"log_dir"}
 RETEST_KEYS = {
     "enabled",
@@ -80,6 +80,14 @@ ENGINE_ARG_TYPES = {
     "sanitizer_command": str,
     "sanitizer_error_exitcode": int,
 }
+
+
+def normalize_api_config_files(value: Any) -> list[str]:
+    """将 YAML 单路径和多路径写法统一为引擎需要的列表。"""
+    files = [value] if isinstance(value, str) else value
+    if not isinstance(files, list) or not files or not all(isinstance(item, str) for item in files):
+        raise TypeError("input.api_config_file 类型应为字符串或非空字符串数组")
+    return files
 
 
 def reject_unknown_keys(section: str, mapping: dict[str, Any], allowed_keys: set[str]) -> None:
@@ -130,12 +138,13 @@ def validate_yaml_config(config: dict[str, Any]) -> None:
     reject_unknown_keys("input", input_config, INPUT_KEYS)
     configured_inputs = [value for value in input_config.values() if value]
     if len(configured_inputs) != 1:
-        raise ValueError(
-            "input.api_config、input.api_config_file、input.api_config_file_pattern 必须且只能配置一个"
+        raise ValueError("input.api_config 或 input.api_config_file 必须且只能配置一个")
+    if "api_config" in input_config:
+        require_type("input.api_config", input_config["api_config"], str)
+    if "api_config_file" in input_config:
+        input_config["api_config_file"] = normalize_api_config_files(
+            input_config["api_config_file"]
         )
-    for key in INPUT_KEYS:
-        if key in input_config:
-            require_type(f"input.{key}", input_config[key], str)
 
     output = ensure_mapping(config, "output")
     reject_unknown_keys("output", output, OUTPUT_KEYS)
@@ -260,7 +269,7 @@ def default_pid_file(config_path: Path, config: dict[str, Any]) -> Path:
     return PROJECT_ROOT / ".run" / f"{safe_name}.pid"
 
 
-def set_input_config(input_config: dict[str, Any], key: str, value: str | None) -> None:
+def set_input_config(input_config: dict[str, Any], key: str, value: Any) -> None:
     if value:
         for k in INPUT_KEYS:
             input_config[k] = None
@@ -285,7 +294,6 @@ def apply_overrides(config: dict[str, Any], args: argparse.Namespace) -> None:
 
     set_input_config(input_config, "api_config", args.api_config)
     set_input_config(input_config, "api_config_file", args.api_config_file)
-    set_input_config(input_config, "api_config_file_pattern", args.api_config_file_pattern)
     if args.log_dir:
         output["log_dir"] = args.log_dir
 
@@ -326,14 +334,11 @@ def validate_config(config_path: Path, config: dict[str, Any]) -> tuple[str, Pat
 
     api_config = input_config.get("api_config")
     api_config_file = input_config.get("api_config_file")
-    api_config_pattern = input_config.get("api_config_file_pattern")
-    configured_inputs = [
-        value for value in (api_config, api_config_file, api_config_pattern) if value
-    ]
+    if api_config_file:
+        api_config_file = normalize_api_config_files(api_config_file)
+    configured_inputs = [value for value in (api_config, api_config_file) if value]
     if len(configured_inputs) != 1:
-        raise ValueError(
-            "input.api_config、input.api_config_file、input.api_config_file_pattern 必须且只能配置一个"
-        )
+        raise ValueError("input.api_config 或 input.api_config_file 必须且只能配置一个")
 
     log_dir = output.get("log_dir")
     if not log_dir:
@@ -356,13 +361,11 @@ def build_engine_command(engine: str, config: dict[str, Any], passthrough: list[
     command = [sys.executable, f"{engine}.py"]
     api_config = input_config.get("api_config")
     api_config_file = input_config.get("api_config_file")
-    api_config_pattern = input_config.get("api_config_file_pattern")
     if api_config:
         command.append(f"--api_config={api_config}")
     if api_config_file:
-        command.append(f"--api_config_file={api_config_file}")
-    if api_config_pattern:
-        command.append(f"--api_config_file_pattern={api_config_pattern}")
+        command.append("--api_config_file")
+        command.extend(normalize_api_config_files(api_config_file))
     command.append(f"--log_dir={output['log_dir']}")
 
     for key, value in engine_args.items():
@@ -379,20 +382,15 @@ def command_to_display(command: list[str]) -> str:
     return shlex.join(display_command)
 
 
-def input_value_from_config(config: dict[str, Any]) -> str | None:
+def input_value_from_config(config: dict[str, Any]) -> Any:
     input_config = ensure_mapping(config, "input")
-    return (
-        input_config.get("api_config")
-        or input_config.get("api_config_file")
-        or input_config.get("api_config_file_pattern")
-    )
+    return input_config.get("api_config") or input_config.get("api_config_file")
 
 
 def set_api_config_file(config: dict[str, Any], api_config_file: str) -> None:
     input_config = ensure_mapping(config, "input")
     input_config["api_config"] = None
-    input_config["api_config_file"] = api_config_file
-    input_config["api_config_file_pattern"] = None
+    input_config["api_config_file"] = [api_config_file]
 
 
 def retest_error_name(error_config: str) -> str:
@@ -672,9 +670,9 @@ def parse_args() -> argparse.Namespace:
         "--input",
         "--api-config-file",
         dest="api_config_file",
-        help="覆盖 input.api_config_file（-i/--input 为别名）",
+        nargs="+",
+        help="覆盖 input.api_config_file（-i/--input 为别名），可传多个文件、目录或 glob",
     )
-    parser.add_argument("--api-config-file-pattern", help="覆盖 input.api_config_file_pattern")
     parser.add_argument(
         "-o",
         "--output",
@@ -752,7 +750,6 @@ def run_once(
     hidden_options = {
         "--api_config",
         "--api_config_file",
-        "--api_config_file_pattern",
         "--log_dir",
     }
     if engine_args.get("num_gpus") == -1:

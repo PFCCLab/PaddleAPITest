@@ -92,7 +92,7 @@ TEST_MODE_ARGS=(
 
 IN_OUT_ARGS=(
     # --api_config_file="$FILE_INPUT"
-    --api_config_file_pattern="$FILE_PATTERN"
+    --api_config_file="$FILE_PATTERN"
     --log_dir="$LOG_DIR"
 )
 
@@ -167,7 +167,7 @@ TEST_MODE_ARGS=(
 
 若不使用 `run_cpu.sh`，以测试 cpu accuracy 为例，可直接执行以下命令：（建议使用 nohup 避免终端终止时停止主进程）
 ```bash
-python engineV2.py --api_config_file_pattern="tester/api_config/5_accuracy/accuracy_[1-8].txt" --accuracy=True --test_cpu=True --num_gpus=-1 --num_workers_per_gpu=-1 --log_dir="tester/api_config/test_log_cpu_accuracy" >> "tester/api_config/test_log_cpu_accuracy/log.log" 2>&1
+python engineV2.py --api_config_file="tester/api_config/5_accuracy/accuracy_[1-8].txt" --accuracy=True --test_cpu=True --num_gpus=-1 --num_workers_per_gpu=-1 --log_dir="tester/api_config/test_log_cpu_accuracy" >> "tester/api_config/test_log_cpu_accuracy/log.log" 2>&1
 ```
 
 或者直接运行 run_cpu.sh：
