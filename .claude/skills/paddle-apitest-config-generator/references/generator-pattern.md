@@ -14,7 +14,7 @@ from pathlib import Path
 SCRIPT_PATH = Path(__file__).resolve()
 for candidate in (SCRIPT_PATH.parent, *SCRIPT_PATH.parents):
     SKILL_SCRIPTS = (
-        candidate / ".claude/skills/paddle-apitest-config-generator/scripts"
+        candidate / ".agents/skills/paddle-apitest-config-generator/scripts"
     )
     if SKILL_SCRIPTS.is_dir():
         APITEST_ROOT = candidate

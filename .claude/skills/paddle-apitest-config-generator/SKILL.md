@@ -44,7 +44,7 @@ first positional argument and match `PD_BUILD_OP(...).Inputs(...).Attrs(...)` ex
 Use the bundled script for deterministic shape expansion:
 
 ```bash
-python .claude/skills/paddle-apitest-config-generator/scripts/expand_from_seeds.py \
+python .agents/skills/paddle-apitest-config-generator/scripts/expand_from_seeds.py \
   --api paddle.some_api \
   --seed-file apitest_config/path/to/seeds.txt \
   --output-dir generated_api_configs \
@@ -94,7 +94,7 @@ Record every edge/invalid reason in `violations`. When the contract is uncertain
 Run validation after every generation change:
 
 ```bash
-python .claude/skills/paddle-apitest-config-generator/scripts/validate_case_tree.py \
+python .agents/skills/paddle-apitest-config-generator/scripts/validate_case_tree.py \
   generated_api_configs \
   --expected-per-file 512 \
   --require-zero \
@@ -118,7 +118,7 @@ validator uses the bundled parser by default; inside PaddleAPITest, also run an
 authoritative compatibility pass with:
 
 ```bash
-python .claude/skills/paddle-apitest-config-generator/scripts/validate_case_tree.py \
+python .agents/skills/paddle-apitest-config-generator/scripts/validate_case_tree.py \
   generated_api_configs \
   --official-analyzer \
   --apitest-root .
