@@ -129,20 +129,10 @@ class APITestPaddleOnly(APITestBase):
             result.append(non_unit.pop() if non_unit else 1)
         return tuple(reversed(result))
 
-    def _is_valid_empty_mean_loss_case(self):
+    def _is_valid_empty_mean_loss_case(self, bound):
         """仅识别参数协议合法且逐元素 loss 为空的 mean case。"""
         api_name = self.api_config.api_name
         if api_name not in self._EMPTY_MEAN_LOSS_APIS:
-            return False
-        try:
-            bound = bind_input_parameters(
-                api_name,
-                self.api_config.args,
-                self.api_config.kwargs,
-                api=self.paddle_api,
-                apply_defaults=True,
-            )
-        except (TypeError, ValueError):
             return False
         if bound.source == "unresolved":
             return False
@@ -315,29 +305,31 @@ class APITestPaddleOnly(APITestBase):
 
     def _classify_nonfinite_case(self):
         """一次性识别当前 Paddle-only case 的非有限值契约。"""
+        # 返回绑定结果供后验复用，避免分类和验证看到不同的默认参数。
         api_name = self.api_config.api_name
         bound = bind_input_parameters(
             api_name,
             self.api_config.args,
             self.api_config.kwargs,
             api=self.paddle_api,
+            apply_defaults=True,
         )
         if bound.source == "unresolved":
             # 参数无法可靠绑定时禁止豁免，让原执行路径暴露配置或 Paddle 错误。
-            return None
+            return None, bound
         if api_name in self._INTERNAL_NONFINITE_APIS:
             # 内部常量类别优先，确保 nan_to_num 和 pinv 使用严格的最终输出检查。
-            return "internal_constant"
-        if self._is_valid_empty_mean_loss_case():
+            return "internal_constant", bound
+        if self._is_valid_empty_mean_loss_case(bound):
             # 空 loss 需要标量 NaN 后验，不能退化为一般的空规约豁免。
-            return "empty_loss_mean"
+            return "empty_loss_mean", bound
 
         # 仅识别填充值参数，避免将 norm 的 p=math.inf 等控制参数误判为输出契约。
         for name in ("value", "fill_value", "padding_value"):
             value = bound.arguments.get(name)
             # 只接受 Python float，Tensor 值必须继续经过正常的输入数值检查。
             if isinstance(value, float) and not math.isfinite(value):
-                return "explicit_fill"
+                return "explicit_fill", bound
 
         if api_name in ("paddle.view", "paddle.Tensor.view"):
             target = bound.arguments.get("shape_or_dtype")
@@ -360,9 +352,9 @@ class APITestPaddleOnly(APITestBase):
             }
             # 只有位模式重解释允许产生任意浮点位型，普通 shape view 仍保持检查。
             if isinstance(target, str) and target.removeprefix("paddle.") in dtype_names:
-                return "dtype_view"
+                return "dtype_view", bound
             if isinstance(target, paddle.base.core.DataType):
-                return "dtype_view"
+                return "dtype_view", bound
 
         if api_name.endswith(".fused_layer_norm"):
             # 前缀维为空但归一化后缀非空不会形成空统计量，不能获得该豁免。
@@ -373,11 +365,11 @@ class APITestPaddleOnly(APITestBase):
                 axis = begin_axis + rank if begin_axis < 0 else begin_axis
                 # 只豁免归一化后缀明确包含 0 的空统计量。
                 if 0 <= axis < rank and any(int(dim) == 0 for dim in x_config.shape[axis:]):
-                    return "empty_fused_norm"
+                    return "empty_fused_norm", bound
 
         if api_name in self._EMPTY_REDUCTION_APIS and self._is_empty_reduction(bound.arguments):
-            return "empty_reduction"
-        return None
+            return "empty_reduction", bound
+        return None, bound
 
     @contextlib.contextmanager
     def _nan_inf_check_disabled(self, disabled):
@@ -395,9 +387,6 @@ class APITestPaddleOnly(APITestBase):
             # worker 会连续执行 case，异常退出时也必须恢复进入作用域前的状态。
             paddle.set_flags(original_flags)
 
-    def _nonfinite_output_leaves(self, paddle_output):
-        return list(self._iter_tensor_tree_leaves(paddle_output, tensor_type=paddle.Tensor))
-
     @staticmethod
     def _assert_allowed_nonfinite(tensors, allowed, api_name):
         # allowed 描述非有限值类型，而不是整体放行输出；有限元素不受该检查影响。
@@ -412,7 +401,7 @@ class APITestPaddleOnly(APITestBase):
             if bool(paddle.any(invalid).item()):
                 raise RuntimeError(f"{api_name} returned an unexpected non-finite output")
 
-    def _validate_nan_to_num_output(self, leaves):
+    def _validate_nan_to_num_output(self, leaves, bound):
         api_name = self.api_config.api_name
         if len(leaves) != 1:
             # nan_to_num 的公开返回协议是单 Tensor，复合输出视为 Paddle 行为异常。
@@ -421,12 +410,6 @@ class APITestPaddleOnly(APITestBase):
         if not isinstance(input_tensor, paddle.Tensor):
             # 缺少运行时输入时无法验证 replacement 位置，宁可失败也不扩大豁免。
             raise RuntimeError(f"{api_name} input tensor is unavailable for output validation")
-        bound = bind_input_parameters(
-            api_name,
-            self.api_config.args,
-            self.api_config.kwargs,
-            api=self.paddle_api,
-        )
         input_masks = {
             "nan": paddle.isnan(input_tensor),
             "posinf": paddle.isposinf(input_tensor),
@@ -449,11 +432,12 @@ class APITestPaddleOnly(APITestBase):
         if bool(paddle.any(unexpected).item()):
             raise RuntimeError(f"{api_name} returned an unexpected non-finite output")
 
-    def _validate_nonfinite_case_output(self, case_kind, paddle_output):
+    def _validate_nonfinite_case_output(self, case_kind, bound, paddle_output):
+        # 验证只消费分类阶段的 bound，不重新解析配置或扩大豁免范围。
         if case_kind is None or case_kind == "dtype_view":
             # dtype view 的语义就是重解释任意位模式，无法对 NaN/Inf 类型增加约束。
             return
-        leaves = self._nonfinite_output_leaves(paddle_output)
+        leaves = list(self._iter_tensor_tree_leaves(paddle_output, tensor_type=paddle.Tensor))
         api_name = self.api_config.api_name
         if case_kind == "empty_loss_mean":
             # 空 mean loss 的契约严格限定为唯一的 0 维 NaN。
@@ -462,12 +446,6 @@ class APITestPaddleOnly(APITestBase):
             return
         if case_kind == "explicit_fill":
             # 输出只允许出现配置填充值明确指定的 NaN 或对应符号的 Inf。
-            bound = bind_input_parameters(
-                api_name,
-                self.api_config.args,
-                self.api_config.kwargs,
-                api=self.paddle_api,
-            )
             allowed = set()
             for name in ("value", "fill_value", "padding_value"):
                 value = bound.arguments.get(name)
@@ -481,7 +459,7 @@ class APITestPaddleOnly(APITestBase):
             return
         if case_kind == "internal_constant":
             if api_name in {"paddle.nan_to_num", "paddle.Tensor.nan_to_num"}:
-                self._validate_nan_to_num_output(leaves)
+                self._validate_nan_to_num_output(leaves, bound)
                 return
             # pinv 的内部常量可豁免，但最终输出不允许包含任何非有限值。
             self._assert_allowed_nonfinite(leaves, set(), api_name)
@@ -586,7 +564,7 @@ class APITestPaddleOnly(APITestBase):
             return
 
         try:
-            nonfinite_case = self._classify_nonfinite_case()
+            nonfinite_case, bound = self._classify_nonfinite_case()
             # 显式输出和空规约沿用全流程豁免，内部常量与空 loss 仅覆盖前向。
             with self._nan_inf_check_disabled(nonfinite_case in self._FULL_SCOPE_NONFINITE_CASES):
                 self.dump_event("paddle_input_start")
@@ -606,7 +584,7 @@ class APITestPaddleOnly(APITestBase):
                     nonfinite_case in self._FORWARD_SCOPE_NONFINITE_CASES
                 ):
                     paddle_output = self._run_paddle_forward()
-                self._validate_nonfinite_case_output(nonfinite_case, paddle_output)
+                self._validate_nonfinite_case_output(nonfinite_case, bound, paddle_output)
                 self._run_paddle_backward(paddle_output)
         except GpuMemoryGuardSkip as err:
             self.report_case_result("oom", phase="memory_guard", message=str(err))
