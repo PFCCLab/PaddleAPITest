@@ -74,6 +74,8 @@ class InputBackend(Protocol):
 
     def maximum(self, x, y): ...
 
+    def remainder(self, x, y): ...
+
     def abs(self, value): ...
 
     def sort(self, value): ...
@@ -220,6 +222,10 @@ class NumPyInputBackend:
 
     def maximum(self, x, y):
         return numpy.maximum(x, y)
+
+    def remainder(self, x, y):
+        # 统一取模语义，保证 GPU/CPU 生成器的循环 index 行为一致。
+        return numpy.remainder(x, y)
 
     def abs(self, value):
         return numpy.abs(value)
@@ -506,6 +512,11 @@ class TorchInputBackend:
     def maximum(self, x, y):
         torch = self._torch()
         return torch.maximum(self.asarray(x, copy=False), self.asarray(y, copy=False))
+
+    def remainder(self, x, y):
+        # 使用设备端 remainder，避免将大批量 index 拉回 CPU 计算。
+        torch = self._torch()
+        return torch.remainder(self.asarray(x, copy=False), y)
 
     def abs(self, value):
         torch = self._torch()
@@ -864,6 +875,10 @@ class PaddleInputBackend:
             )
             return paddle.cast(result, result_dtype)
         return paddle.maximum(x_tensor, y_tensor)
+
+    def remainder(self, x, y):
+        # Paddle backend 保持与 NumPy/Torch 相同的非负 index 取模结果。
+        return self._paddle().remainder(self.asarray(x, copy=False), y)
 
     def abs(self, value):
         return self._paddle().abs(self.asarray(value, copy=False))
