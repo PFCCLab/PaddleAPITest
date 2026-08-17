@@ -665,6 +665,41 @@ class APITestBase:
                 if isinstance(value, float) and not math.isfinite(value):
                     return True
 
+            if self.api_config.api_name in ("paddle.view", "paddle.Tensor.view"):
+                target = bound.arguments.get("shape_or_dtype")
+                dtype_names = {
+                    "bool",
+                    "uint8",
+                    "int8",
+                    "uint16",
+                    "int16",
+                    "uint32",
+                    "int32",
+                    "uint64",
+                    "int64",
+                    "float16",
+                    "bfloat16",
+                    "float32",
+                    "float64",
+                    "complex64",
+                    "complex128",
+                }
+                # 只有位模式重解释才允许非有限位型结果；普通 shape view 仍需检查。
+                if isinstance(target, str) and target.removeprefix("paddle.") in dtype_names:
+                    return True
+                if isinstance(target, paddle.base.core.DataType):
+                    return True
+
+            if self.api_config.api_name.endswith(".fused_layer_norm"):
+                x_config = bound.arguments.get("x")
+                begin_axis = bound.arguments.get("begin_norm_axis")
+                if isinstance(x_config, TensorConfig) and isinstance(begin_axis, int):
+                    rank = len(x_config.shape)
+                    axis = begin_axis + rank if begin_axis < 0 else begin_axis
+                    # 空归一化统计量必然产生 NaN；仅在归一化后缀明确含 0 时豁免。
+                    if 0 <= axis < rank and any(int(dim) == 0 for dim in x_config.shape[axis:]):
+                        return True
+
         # 白名单只收录空集规约可能返回 NaN/Inf 的统计 API，避免屏蔽其他算子错误。
         reduction_apis = frozenset(
             {

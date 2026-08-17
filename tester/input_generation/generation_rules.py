@@ -1254,8 +1254,39 @@ def generate_poisson_inputs(rule: InputRuleContext):
     aliases=("paddle.Tensor.sqrt",),
 )
 def generate_sqrt_inputs(rule: InputRuleContext):
-    """输入规则：为平方根生成非负输入。"""
-    rule.generate_all("uniform", low=0, high=1000)
+    """输入规则：为平方根生成严格正输入。"""
+    # sqrt 在零点前向有定义，但反向导数为 Inf，普通随机用例需避开该奇异点。
+    rule.generate_all("uniform", low=0.1, high=1000)
+
+
+@input_rules.register(
+    "paddle.acosh",
+    aliases=("paddle.Tensor.acosh",),
+)
+def generate_acosh_inputs(rule: InputRuleContext):
+    """输入规则：为反双曲余弦生成严格大于一的输入。"""
+    # acosh(1) 的前向有限但反向导数为 Inf，因此为定义域边界保留余量。
+    rule.generate_all("uniform", low=1.1, high=1000)
+
+
+@input_rules.register(
+    "paddle.reciprocal",
+    aliases=("paddle.Tensor.reciprocal",),
+)
+def generate_reciprocal_inputs(rule: InputRuleContext):
+    """输入规则：为倒数运算生成远离零点的输入。"""
+    rule.generate_all("uniform", low=0.5, high=2.0)
+
+
+@input_rules.register(
+    "paddle.digamma",
+    "paddle.lgamma",
+    aliases=("paddle.Tensor.digamma", "paddle.Tensor.lgamma"),
+)
+def generate_gamma_function_inputs(rule: InputRuleContext):
+    """输入规则：为 Gamma 派生函数生成正区间输入。"""
+    # 正区间同时避开 0 与全部非正整数极点，并与极点保留足够数值距离。
+    rule.generate_all("uniform", low=0.5, high=10.0)
 
 
 @input_rules.register(
@@ -1694,6 +1725,44 @@ def generate_dropout_inputs(rule: InputRuleContext):
 def generate_atan2_inputs(rule: InputRuleContext):
     """输入规则：避开 atan2 在原点处的不确定输入。"""
     rule.generate_all("unit_interval_plus_one")
+
+
+@input_rules.register("paddle.ldexp")
+def generate_ldexp_inputs(rule: InputRuleContext):
+    """输入规则：联动底数精度限制二进制指数范围。"""
+    x_binding = rule.tensor("x")
+    # 这里保留逻辑 dtype；backend 的 bfloat16 中间表示不能改变溢出分档。
+    x_dtype = str(x_binding.dtype).replace("paddle.", "")
+    exponent_limit = {
+        "float16": 8,
+        "bfloat16": 16,
+        "float32": 32,
+        "float64": 256,
+        "complex64": 32,
+        "complex128": 256,
+    }.get(x_dtype, 8)
+
+    def generate_x_input_value(input_binding):
+        dtype = rule._numeric_dtype(input_binding.dtype)
+        if "int" in dtype or dtype == "bool":
+            return rule.domain("random_range", input_binding, low=1, high=2)
+        return rule.domain("uniform", input_binding, low=0.5, high=1.0)
+
+    def generate_exponent_input_value(input_binding):
+        # 指数必须保持整数语义；按 x 精度留出充足溢出余量，也避免负端直接下溢。
+        value = rule.ops.randint(
+            -exponent_limit,
+            exponent_limit + 1,
+            shape=input_binding.shape,
+        )
+        return rule.ops.cast(value, input_binding.dtype)
+
+    rule.generate(
+        (
+            ("x", generate_x_input_value),
+            (("y", "exponent"), generate_exponent_input_value),
+        )
+    )
 
 
 @input_rules.register(
