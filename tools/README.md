@@ -54,7 +54,7 @@
   python tools/remove_lines_by_keyword.py -p 'tester/api_config/monitor_config/accuracy/GPU/monitoring_configs_*.txt' -k kw.txt
   ```
 
-- `random_slim_api_configs.py`：对指定 API 的配置行按稳定随机种子保留指定比例，输出保留集与被裁减集；两份集合按行无交集且并集等于输入。默认处理 `fuse_weighted_swiglu_fp8_quant`、`paddlefleet_fused_swiglu_probs_bwd`、`fp8_quant_blockwise`、`fused_act_dequant`、`moe_permute`、`moe_unpermute`，保留比例为 10%。
+- `random_slim_api_configs.py`：对指定 API 的配置行按稳定随机种子保留指定比例，输出保留集与被裁减集；两份集合按行无交集且并集等于输入。`paddle.empty` 和 `paddle.empty_like` 配置始终直接进入被裁减集。默认处理 `fuse_weighted_swiglu_fp8_quant`、`paddlefleet_fused_swiglu_probs_bwd`、`fp8_quant_blockwise`、`fused_act_dequant`、`moe_permute`、`moe_unpermute`，保留比例为 10%。
   ```bash
   python tools/random_slim_api_configs.py \
     --input-dir configs/original \

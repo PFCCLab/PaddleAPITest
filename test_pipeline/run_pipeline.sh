@@ -5,7 +5,7 @@
 # 从原始 api_config_*.txt 出发，推导1M、验证、合并去重、生成0size、提取API名。
 #
 # 用法：
-#   bash run_pipeline.sh -i <输入目录> -o <输出目录>
+#   bash run_pipeline.sh -i <输入目录> -o <输出目录> [-r <保留比例>]
 #
 # 示例：
 #   bash run_pipeline.sh -i api_config_0703 -o api_config_dedup_0703
@@ -27,13 +27,16 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # ─── 参数解析 ───
 INPUT_DIR=""
 OUTPUT_DIR=""
+SLIM_RATIO=""
 
-while getopts "i:o:h" opt; do
+while getopts "i:o:r:h" opt; do
     case $opt in
         i) INPUT_DIR="$OPTARG" ;;
         o) OUTPUT_DIR="$OPTARG" ;;
+        r) SLIM_RATIO="$OPTARG" ;;
         h)
             echo "用法: bash $0 -i <输入目录> -o <输出目录>"
+            echo "  -r  可选：目标 API 保留比例（0 到 1），指定后启用配置缩减"
             echo "  -i  输入目录（包含 api_config_*.txt）"
             echo "  -o  输出目录"
             exit 0
@@ -45,6 +48,12 @@ done
 if [ -z "$INPUT_DIR" ] || [ -z "$OUTPUT_DIR" ]; then
     echo "错误：必须指定 -i（输入目录）和 -o（输出目录）"
     echo "用法: bash $0 -i <输入目录> -o <输出目录>"
+    exit 1
+fi
+
+SLIM_RATIO_PATTERN='^(0([.][0-9]+)?|1([.]0+)?)$'
+if [ -n "$SLIM_RATIO" ] && ! [[ "$SLIM_RATIO" =~ $SLIM_RATIO_PATTERN ]]; then
+    echo "错误：-r 必须是 0 到 1 之间的小数"
     exit 1
 fi
 
@@ -156,6 +165,32 @@ python "$PROCESSOR_DIR/dedup_config.py" \
     -o "$PADDLEONLY_0SIZE_DIR/0size.txt"
 
 rm -f "$OUTPUT_DIR/_tmp_0size.txt"
+
+# 指定比例时只替换保留集；未指定时完全跳过缩减，保持默认流程结果不变。
+if [ -n "$SLIM_RATIO" ]; then
+    echo ""
+    echo "[可选] 配置缩减（保留比例: $SLIM_RATIO）..."
+    SLIM_TMP_DIR="$(mktemp -d "$OUTPUT_DIR/.slim.XXXXXX")"
+    trap 'rm -rf "$SLIM_TMP_DIR"' EXIT
+    SLIM_INPUT_DIR="$SLIM_TMP_DIR/input"
+    SLIM_KEPT_DIR="$SLIM_TMP_DIR/kept"
+    SLIM_REMOVED_DIR="$SLIM_TMP_DIR/removed"
+    # 输入、保留和裁减目录隔离，满足 random_slim 的递归扫描约束。
+    mkdir -p "$SLIM_INPUT_DIR"
+    cp "$PADDLEONLY_1M_DIR/1M.txt" "$SLIM_INPUT_DIR/1M.txt"
+    cp "$PADDLEONLY_4096_DIR/$ORIG_MERGED_NAME" "$SLIM_INPUT_DIR/4096.txt"
+    cp "$PADDLEONLY_0SIZE_DIR/0size.txt" "$SLIM_INPUT_DIR/0size.txt"
+    python "$REPO_DIR/tools/random_slim_api_configs.py" \
+        --input-dir "$SLIM_INPUT_DIR" \
+        --kept-dir "$SLIM_KEPT_DIR" \
+        --removed-dir "$SLIM_REMOVED_DIR" \
+        --keep-ratio "$SLIM_RATIO"
+    mv "$SLIM_KEPT_DIR/1M.txt" "$PADDLEONLY_1M_DIR/1M.txt"
+    mv "$SLIM_KEPT_DIR/4096.txt" "$PADDLEONLY_4096_DIR/$ORIG_MERGED_NAME"
+    mv "$SLIM_KEPT_DIR/0size.txt" "$PADDLEONLY_0SIZE_DIR/0size.txt"
+    rm -rf "$SLIM_TMP_DIR"
+    trap - EXIT
+fi
 
 # ============================================================================
 # Step 5: 提取 API 名集合

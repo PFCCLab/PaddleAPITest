@@ -21,6 +21,8 @@ DEFAULT_TARGET_APIS = (
 )
 DEFAULT_KEEP_RATIO = 0.10
 DEFAULT_SEED = "random-slim-api-configs-v1"
+ALWAYS_REMOVED_APIS = ("paddle.empty_like", "paddle.empty")
+# 这些 API 不受 keep_ratio 影响，保证集成入口的固定清理协议。
 _DIGEST_MODULUS = 1 << 128
 
 
@@ -65,6 +67,17 @@ def _matched_api(line: str, target_apis: Iterable[str]) -> str | None:
     # 目标列表的顺序也是重叠名称的优先级，报告只把一行归入一个 API。
     for api in target_apis:
         if api in line:
+            return api
+    return None
+
+
+def _always_removed_api(line: str) -> str | None:
+    # empty 配置不参与随机比例，始终进入裁减集，避免低比例时残留。
+    api_name, separator, _ = line.partition("(")
+    if not separator:
+        return None
+    for api in ALWAYS_REMOVED_APIS:
+        if api_name.strip() == api:
             return api
     return None
 
@@ -134,6 +147,7 @@ def run(
     kept_dir = kept_dir.resolve()
     removed_dir = removed_dir.resolve()
     target_apis = tuple(target_apis)
+    report_apis = tuple(dict.fromkeys((*target_apis, *ALWAYS_REMOVED_APIS)))
 
     # 三个数据目录必须物理隔离，否则递归扫描可能读到本次运行刚写出的文件。
     if not input_dir.is_dir():
@@ -167,7 +181,7 @@ def run(
         kept_path.parent.mkdir(parents=True, exist_ok=True)
         removed_path.parent.mkdir(parents=True, exist_ok=True)
         # 每个 API 同时记录两侧计数，便于审计抽样比例和确认非目标行未被裁减。
-        stats = FileStats(api_counts={api: {"kept": 0, "removed": 0} for api in target_apis})
+        stats = FileStats(api_counts={api: {"kept": 0, "removed": 0} for api in report_apis})
 
         # 单次流式读取同步写入两侧，避免大配置集合常驻内存。
         with (
@@ -177,10 +191,13 @@ def run(
         ):
             for line_number, raw_line in enumerate(source_file, start=1):
                 _record_digest(stats, "original", raw_line)
-                api = _matched_api(raw_line, target_apis)
-                # 非目标 API 无条件进入保留集，随机裁减只作用于显式目标列表。
-                keep = api is None or _should_keep(
-                    seed, relative_path, line_number, raw_line, keep_ratio
+                # 先判断固定清理项，再执行目标 API 的稳定抽样。
+                removed_api = _always_removed_api(raw_line)
+                api = removed_api or _matched_api(raw_line, target_apis)
+                # empty 系列无条件裁减，其余非目标 API 保留，目标 API 按比例抽样。
+                keep = removed_api is None and (
+                    api is None
+                    or _should_keep(seed, relative_path, line_number, raw_line, keep_ratio)
                 )
                 if keep:
                     kept_file.write(raw_line)
