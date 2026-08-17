@@ -100,7 +100,8 @@ class TestRuntimeConfig:
 
     @classmethod
     def from_options(cls, options):
-        from .input_generation.backend_runtime import resolve_input_backend_policy
+        # runtime 是 tester 的子包，输入后端模块位于 tester.input_generation。
+        from ..input_generation.backend_runtime import resolve_input_backend_policy
 
         # 双卡是 worker 设备拓扑；具体结果生命周期仍由各 accuracy tester 自己管理。
         dual_gpu = bool(

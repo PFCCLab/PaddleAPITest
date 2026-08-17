@@ -130,21 +130,23 @@ class APITestPaddleOnly(APITestBase):
             return
 
         try:
-            self.dump_event("paddle_input_start")
-            if not self.build_paddle_input():
-                self.report_case_result("paddle_error", "build_paddle_input failed")
-                self._finalize_paddle_only("paddle_error")
-                return
-            self.clear_generated_input_values()
-            self.dump_save(
-                "paddle_inputs",
-                {"args": self.paddle_args, "kwargs": self.paddle_kwargs},
-                framework="paddle",
-            )
-            self.dump_event("paddle_input_done")
+            # 合法的无穷填充和 0size 规约需覆盖输入物化及前后向全过程。
+            with self._nan_inf_check_scope():
+                self.dump_event("paddle_input_start")
+                if not self.build_paddle_input():
+                    self.report_case_result("paddle_error", "build_paddle_input failed")
+                    self._finalize_paddle_only("paddle_error")
+                    return
+                self.clear_generated_input_values()
+                self.dump_save(
+                    "paddle_inputs",
+                    {"args": self.paddle_args, "kwargs": self.paddle_kwargs},
+                    framework="paddle",
+                )
+                self.dump_event("paddle_input_done")
 
-            paddle_output = self._run_paddle_forward()
-            self._run_paddle_backward(paddle_output)
+                paddle_output = self._run_paddle_forward()
+                self._run_paddle_backward(paddle_output)
         except GpuMemoryGuardSkip as err:
             self.report_case_result("oom", phase="memory_guard", message=str(err))
             self._finalize_paddle_only("oom")

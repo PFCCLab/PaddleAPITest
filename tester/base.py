@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import collections
+import contextlib
 import gc
+import math
 import os
 from dataclasses import dataclass
 from pathlib import Path
@@ -646,6 +648,79 @@ class APITestBase:
     def need_check_grad(self):
         # 主调度与 worker 共用纯配置判定，不能在两个生命周期各维护一份规则。
         return should_check_grad(self.api_config)
+
+    def _should_skip_nan_inf_check(self):
+        """判断当前 case 是否允许产生 NaN/Inf，供 Paddle flag 临时豁免。"""
+        # 显式无穷填充值是 API 语义的一部分，不应被数值检查误报为 Paddle 错误。
+        # 仅检查 value/fill_value 参数，避免 norm 的 p=math.inf 等控制参数误关检查。
+        bound = bind_input_parameters(
+            self.api_config.api_name,
+            self.api_config.args,
+            self.api_config.kwargs,
+            api=getattr(self, "paddle_api", None),
+        )
+        if bound.source != "unresolved":
+            for name in ("value", "fill_value", "padding_value"):
+                value = bound.arguments.get(name)
+                if isinstance(value, float) and not math.isfinite(value):
+                    return True
+
+        # 白名单只收录空集规约可能返回 NaN/Inf 的统计 API，避免屏蔽其他算子错误。
+        reduction_apis = frozenset(
+            {
+                "paddle.amax",
+                "paddle.amin",
+                "paddle.logsumexp",
+                "paddle.median",
+                "paddle.mean",
+                "paddle.min",
+                "paddle.max",
+                "paddle.nanmean",
+                "paddle.nanmedian",
+                "paddle.var",
+                "paddle.std",
+                "paddle.Tensor.amax",
+                "paddle.Tensor.amin",
+                "paddle.Tensor.logsumexp",
+                "paddle.Tensor.median",
+                "paddle.Tensor.mean",
+                "paddle.Tensor.min",
+                "paddle.Tensor.max",
+                "paddle.Tensor.var",
+                "paddle.Tensor.std",
+            }
+        )
+        if self.api_config.api_name not in reduction_apis:
+            return False
+
+        # TensorConfig 可能嵌套在位置参数、关键字参数及容器中，必须完整遍历配置树。
+        def has_zero_shape(value):
+            if isinstance(value, TensorConfig):
+                return any(int(dim) == 0 for dim in value.shape)
+            if isinstance(value, dict):
+                return any(has_zero_shape(item) for item in value.values())
+            if isinstance(value, (list, tuple)):
+                return any(has_zero_shape(item) for item in value)
+            return False
+
+        # 0size 规约的 NaN 是 Paddle 定义行为，保留结果并跳过全局 finite 检查。
+        return has_zero_shape(self.api_config.args) or has_zero_shape(self.api_config.kwargs)
+
+    @contextlib.contextmanager
+    def _nan_inf_check_scope(self):
+        """在合法 NaN/Inf case 中临时关闭检查，并严格恢复 worker 状态。"""
+        # 普通 case 不读写 Paddle flag，保持原有数值检查路径和错误分类。
+        if not self._should_skip_nan_inf_check():
+            yield
+            return
+        flag_name = "FLAGS_check_nan_inf"
+        original_flags = paddle.get_flags([flag_name])
+        paddle.set_flags({flag_name: False})
+        try:
+            yield
+        finally:
+            # worker 会连续执行多个 case，退出作用域时必须恢复原状态以隔离后续任务。
+            paddle.set_flags(original_flags)
 
     def ana_api_info(self):
         return self.ana_paddle_api_info() and self.ana_torch_api_info()

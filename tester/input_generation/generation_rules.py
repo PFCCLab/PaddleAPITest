@@ -1696,6 +1696,57 @@ def generate_atan2_inputs(rule: InputRuleContext):
     rule.generate_all("unit_interval_plus_one")
 
 
+@input_rules.register(
+    "paddle.log",
+    "paddle.log10",
+    "paddle.log2",
+    "paddle.log1p",
+    "paddle.logit",
+    aliases=(
+        "paddle.Tensor.log",
+        "paddle.Tensor.log10",
+        "paddle.Tensor.log2",
+        "paddle.Tensor.log1p",
+        "paddle.Tensor.logit",
+    ),
+)
+def generate_log_domain_inputs(rule: InputRuleContext):
+    """输入规则：限制 log 类 API 的数学定义域，避免输入诱发 NaN/INF。"""
+
+    def generate_log_input_value(input_binding):
+        dtype = rule._numeric_dtype(input_binding.dtype)
+        # 整数 Tensor 不能用 uniform 后再 cast，否则小数会量化为零。
+        if "int" in dtype or dtype == "bool":
+            low, high = (0, 10) if rule.api_name.endswith("log1p") else (1, 10)
+            return rule.domain("random_range", input_binding, low=low, high=high)
+        if rule.api_name.endswith("logit"):
+            # 留出边界余量，保证 logit 的输入严格位于 (0, 1)。
+            return rule.domain("uniform", input_binding, low=0.01, high=0.99)
+        if rule.api_name.endswith("log1p"):
+            return rule.domain("uniform", input_binding, low=-0.9, high=10.0)
+        return rule.domain("uniform", input_binding, low=0.01, high=10.0)
+
+    # Tensor 方法的 receiver 名称为 self，函数式 API 通常使用 x/input。
+    rule.generate(((("x", "input", "self"), generate_log_input_value),))
+
+
+@input_rules.register(
+    "paddle.logsumexp",
+    aliases=("paddle.Tensor.logsumexp",),
+)
+def generate_logsumexp_inputs(rule: InputRuleContext):
+    """输入规则：限制 logsumexp 数据输入，保留 axis 等控制参数的默认规则。"""
+
+    def generate_logsumexp_input_value(input_binding):
+        dtype = rule._numeric_dtype(input_binding.dtype)
+        # 有限且较小的输入可避免指数溢出；超大 0size 配置仍由上层分类处理。
+        if "int" in dtype or dtype == "bool":
+            return rule.domain("random_range", input_binding, low=-10, high=10)
+        return rule.domain("uniform", input_binding, low=-10.0, high=10.0)
+
+    rule.generate(((("x", "input", "self"), generate_logsumexp_input_value),))
+
+
 @input_rules.register("paddle.bincount")
 def generate_bincount_inputs(rule: InputRuleContext):
     """输入规则：生成非负计数索引和相容权重。"""
