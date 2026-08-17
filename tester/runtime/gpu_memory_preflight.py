@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+from ..input_generation.input_copy_policy import requires_inplace_input_copy
 from ..input_generation.materialization import (
     build_materialization_plan,
     generated_value_nbytes,
@@ -158,14 +159,6 @@ def _framework_live_input_bytes(config):
     if not _is_gpu_input(config):
         return 0
     return config.nbytes(storage=True)
-
-
-def requires_inplace_input_copy(api_config):
-    # 与 build_*_input 的 API 判断保持同一协议，避免预检和执行路径分叉。
-    api_name = getattr(api_config, "api_name", "")
-    return (api_name.endswith("_") and not api_name.endswith("__")) or api_name == (
-        "paddle.Tensor.__setitem__"
-    )
 
 
 def _framework_materialization(

@@ -142,6 +142,7 @@ class InputBackendRuntime:
     def __init__(self):
         # backend implementation 不持有 cache；clear 后新一轮 prepare 必须重新探测设备。
         self._prepared = {}
+        self._input_backends = {}
         self._cached_numpy_output_grads = {}
         self._output_grad_stream_counters = {}
 
@@ -159,9 +160,23 @@ class InputBackendRuntime:
             return NumPyInputBackend(input_random_state)
         if policy.resolved == "torch":
             # Torch backend 的 device 由 policy 统一决定。
-            return TorchInputBackend(input_random_state, device=device, prepared=prepared)
+            cache_key = (policy.resolved, device)
+            backend = self._input_backends.get(cache_key)
+            if backend is None:
+                backend = TorchInputBackend(input_random_state, device=device, prepared=prepared)
+                self._input_backends[cache_key] = backend
+            else:
+                backend.reset_input_random_state(input_random_state)
+            return backend
         if policy.resolved == "paddle":
-            return PaddleInputBackend(input_random_state, device=device, prepared=prepared)
+            cache_key = (policy.resolved, device)
+            backend = self._input_backends.get(cache_key)
+            if backend is None:
+                backend = PaddleInputBackend(input_random_state, device=device, prepared=prepared)
+                self._input_backends[cache_key] = backend
+            else:
+                backend.reset_input_random_state(input_random_state)
+            return backend
         raise ValueError(f"unsupported input generation backend: {policy.resolved!r}")
 
     def prepare(self, policy):
@@ -191,6 +206,7 @@ class InputBackendRuntime:
     def clear(self):
         """Drop prepared handles and cached output gradients."""
         self._prepared.clear()
+        self._input_backends.clear()
         self._cached_numpy_output_grads.clear()
         self._output_grad_stream_counters.clear()
 

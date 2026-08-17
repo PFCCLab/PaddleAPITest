@@ -13,6 +13,7 @@ import yaml
 from .api_config.dtype_utils import to_torch_dtype
 from .api_config.parameter_binding import bind_input_parameters, split_tensor_method_arguments
 from .input_generation.generation_rules import input_rules
+from .input_generation.input_copy_policy import requires_inplace_input_copy
 from .input_generation.materialization import (
     clear_tensor_configs,
     materialize_config_tree,
@@ -31,7 +32,6 @@ from .reporting.log_schema import MAX_CSV_CONFIG_LENGTH
 from .runtime.gpu_memory_preflight import (
     GpuMemoryDeferred,
     decide_gpu_memory_preflight,
-    requires_inplace_input_copy,
     should_check_grad,
 )
 

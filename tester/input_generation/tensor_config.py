@@ -8,6 +8,7 @@ import paddle
 import yaml
 from tester.api_config.dtype_utils import to_torch_dtype
 
+from .input_copy_policy import requires_inplace_input_copy
 from .values import clear_input_value, read_input_value, read_input_value_backend
 
 
@@ -277,8 +278,12 @@ class TensorConfig:
                 value = paddle.cast(value, dtype=dtype)
             return value
         if backend == "torch" and isinstance(value, torch.Tensor):
-            torch_tensor = value.detach().to(
-                device=self._torch_source_device_for_paddle(api_config)
+            source_device = self._torch_source_device_for_paddle(api_config)
+            # 设备已经一致时避免再次调用 to；DLPack 后续仍负责框架间共享。
+            torch_tensor = (
+                value.detach()
+                if value.device == source_device
+                else value.detach().to(device=source_device)
             )
             paddle_tensor = paddle.utils.dlpack.from_dlpack(
                 torch.utils.dlpack.to_dlpack(torch_tensor)
@@ -437,7 +442,11 @@ class TensorConfig:
         value = read_input_value(api_config, self)
         backend = read_input_value_backend(api_config, self)
         if backend == "torch" and isinstance(value, torch.Tensor):
-            tensor = value.to(device=device, dtype=dtype)
+            # 同设备同 dtype 只需解除生成阶段的梯度关联，避免无意义的 to/copy。
+            if value.device == device and value.dtype == dtype:
+                tensor = value.detach()
+            else:
+                tensor = value.to(device=device, dtype=dtype)
             if requires_grad:
                 tensor = tensor.detach().requires_grad_(True)
             return tensor
@@ -447,11 +456,12 @@ class TensorConfig:
                 paddle_tensor = paddle_tensor._copy_to(paddle.CUDAPlace(device.index or 0), False)
             elif device.type == "cpu":
                 paddle_tensor = paddle_tensor._copy_to(paddle.CPUPlace(), False)
-            tensor = torch.utils.dlpack.from_dlpack(
-                paddle.utils.dlpack.to_dlpack(paddle_tensor)
-            ).to(device=device, dtype=dtype)
-            # DLPack avoids NumPy, then clone so Torch accuracy owns its input storage.
-            tensor = tensor.clone()
+            tensor = torch.utils.dlpack.from_dlpack(paddle.utils.dlpack.to_dlpack(paddle_tensor))
+            if tensor.device != device or tensor.dtype != dtype:
+                tensor = tensor.to(device=device, dtype=dtype)
+            # 原地 API 必须与 Paddle 输入隔离；其他 API 直接共享 DLPack storage。
+            if requires_inplace_input_copy(api_config):
+                tensor = tensor.clone()
             if requires_grad:
                 tensor = tensor.detach().requires_grad_(True)
             return tensor

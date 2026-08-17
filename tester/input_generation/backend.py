@@ -323,6 +323,18 @@ class TorchInputBackend:
         self._generator = self._torch_module.Generator(device=self._device)
         self._generator.manual_seed(seed)
 
+    def reset_input_random_state(self, input_random_state):
+        """重置当前 case 的私有 generator，保持跨 case 随机流独立。"""
+        stream_kind = getattr(input_random_state, "stream_kind", "")
+        if not stream_kind.startswith("output_grad:"):
+            stream_kind = "torch"
+        seed = derive_input_seed(
+            getattr(input_random_state, "seed", 0),
+            getattr(input_random_state, "config_fingerprint", ""),
+            stream_kind,
+        )
+        self._generator.manual_seed(seed)
+
     def _torch(self):
         module = getattr(self, "_torch_module", None)
         if module is not None:
@@ -640,6 +652,23 @@ class PaddleInputBackend:
             stream_kind,
         )
         # Paddle 只有设备级默认 generator；初始化私有状态后立即恢复进程原状态。
+        process_state = self._generator.get_state()
+        try:
+            self._generator.manual_seed(seed)
+            self._random_state = self._generator.get_state()
+        finally:
+            self._generator.set_state(process_state)
+
+    def reset_input_random_state(self, input_random_state):
+        """重置当前 case 的设备 generator 快照，不污染进程级随机状态。"""
+        stream_kind = getattr(input_random_state, "stream_kind", "")
+        if not stream_kind.startswith("output_grad:"):
+            stream_kind = "paddle"
+        seed = derive_input_seed(
+            getattr(input_random_state, "seed", 0),
+            getattr(input_random_state, "config_fingerprint", ""),
+            stream_kind,
+        )
         process_state = self._generator.get_state()
         try:
             self._generator.manual_seed(seed)
