@@ -787,7 +787,8 @@ class APITestAccuracyStable(APITestBase):
                 self.report_case_result("config_input", "generate_input_values failed")
                 return
         except Exception as err:
-            _, fatal = self.report_runtime_error(err, "config_input", "input")
+            # stable 模式的配置错误仍归入统一输入阶段。
+            _, fatal = self.report_runtime_error(err, "config_input", self.STAGE_INPUT)
             if fatal:
                 raise
             return
@@ -797,7 +798,7 @@ class APITestAccuracyStable(APITestBase):
             # 后续两轮只从不可变 CPU 副本重建，GPU 生成源在此结束生命周期。
             self.clear_generated_input_values()
         except Exception as err:
-            _, fatal = self.report_runtime_error(err, "config_input", "input cache")
+            _, fatal = self.report_runtime_error(err, "config_input", self.STAGE_INPUT)
             if fatal:
                 raise
             return
@@ -815,7 +816,8 @@ class APITestAccuracyStable(APITestBase):
                 ):
                     return
         except GpuMemoryGuardSkip as err:
-            self.report_case_result("oom", phase="memory_guard", message=str(err))
+            # 资源预检查失败不进入任何框架执行阶段。
+            self.report_case_result("oom", stage=self.STAGE_MEMORY_PREFLIGHT, message=str(err))
             return
 
         summary_failed = False
@@ -833,7 +835,8 @@ class APITestAccuracyStable(APITestBase):
             log_worker.write_stable_passes(self.api_config.config)
         except GpuMemoryGuardSkip as err:
             summary_failed = True
-            self.report_case_result("oom", phase="memory_guard", message=str(err))
+            # 同一资源错误协议也用于稳定模式的重复迭代。
+            self.report_case_result("oom", stage=self.STAGE_MEMORY_PREFLIGHT, message=str(err))
             return
         except Exception:
             summary_failed = True
@@ -858,6 +861,7 @@ class APITestAccuracyStable(APITestBase):
                 self.report_case_result(
                     "torch_error",
                     "build_torch_input failed",
+                    stage=self.STAGE_INPUT,
                     affected_comps=self._TORCH_AFFECTED_COMPS[iter_idx],
                 )
                 return None, None, None
@@ -887,7 +891,8 @@ class APITestAccuracyStable(APITestBase):
             _, fatal = self.report_runtime_error(
                 err,
                 "torch_error",
-                "forward",
+                # Torch 稳定性检查沿用普通 accuracy 的前向阶段。
+                self.STAGE_TORCH_FORWARD,
                 affected_comps=self._TORCH_AFFECTED_COMPS[iter_idx],
             )
             if fatal:
@@ -901,7 +906,7 @@ class APITestAccuracyStable(APITestBase):
             _, fatal = self.report_runtime_error(
                 err,
                 "torch_error",
-                "forward cuda check",
+                self.STAGE_TORCH_FORWARD_SYNC,
                 force_log_type="torch_error",
                 affected_comps=self._TORCH_AFFECTED_COMPS[iter_idx],
             )
@@ -932,7 +937,8 @@ class APITestAccuracyStable(APITestBase):
                     self.report_runtime_error(
                         err,
                         "config_input",
-                        "backward",
+                        # 梯度迭代中的 Torch 错误统一归入反向阶段。
+                        self.STAGE_TORCH_BACKWARD,
                         force_log_type="config_input",
                         affected_comps=self._TORCH_AFFECTED_COMPS[iter_idx],
                     )
@@ -941,7 +947,7 @@ class APITestAccuracyStable(APITestBase):
                     self.report_runtime_error(
                         err,
                         "oom",
-                        "backward",
+                        self.STAGE_TORCH_BACKWARD,
                         force_log_type="oom",
                         affected_comps=self._TORCH_AFFECTED_COMPS[iter_idx],
                     )
@@ -950,7 +956,7 @@ class APITestAccuracyStable(APITestBase):
                     self.report_runtime_error(
                         err,
                         "torch_error",
-                        "backward",
+                        self.STAGE_TORCH_BACKWARD,
                         force_log_type="torch_error",
                         affected_comps=self._TORCH_AFFECTED_COMPS[iter_idx],
                     )
@@ -958,7 +964,7 @@ class APITestAccuracyStable(APITestBase):
                 _, fatal = self.report_runtime_error(
                     err,
                     "torch_error",
-                    "backward",
+                    self.STAGE_TORCH_BACKWARD,
                     affected_comps=self._TORCH_AFFECTED_COMPS[iter_idx],
                 )
                 if fatal:
@@ -971,7 +977,7 @@ class APITestAccuracyStable(APITestBase):
                 self.report_runtime_error(
                     err,
                     "torch_error",
-                    "backward cuda check",
+                    self.STAGE_TORCH_BACKWARD_SYNC,
                     force_log_type="torch_error",
                     affected_comps=self._TORCH_AFFECTED_COMPS[iter_idx],
                 )
@@ -988,6 +994,7 @@ class APITestAccuracyStable(APITestBase):
                 self.report_case_result(
                     "paddle_error",
                     "build_paddle_input failed",
+                    stage=self.STAGE_INPUT,
                     affected_comps=self._PADDLE_AFFECTED_COMPS[iter_idx],
                 )
                 return None, None
@@ -1037,8 +1044,8 @@ class APITestAccuracyStable(APITestBase):
             _, fatal = self.report_runtime_error(
                 err,
                 "paddle_error",
-                "forward",
-                allow_ignore_paddle=True,
+                # Paddle 稳定性检查不再使用 dynamic/static 自由文本。
+                self.STAGE_PADDLE_FORWARD,
                 affected_comps=self._PADDLE_AFFECTED_COMPS[iter_idx],
             )
             if fatal:
@@ -1051,7 +1058,7 @@ class APITestAccuracyStable(APITestBase):
             self.report_runtime_error(
                 err,
                 "paddle_cuda",
-                "forward cuda check",
+                self.STAGE_PADDLE_FORWARD_SYNC,
                 force_log_type="paddle_cuda",
                 affected_comps=self._PADDLE_AFFECTED_COMPS[iter_idx],
             )
@@ -1078,17 +1085,9 @@ class APITestAccuracyStable(APITestBase):
                     self.report_runtime_error(
                         err,
                         "config_input",
-                        "backward",
+                        # Paddle 梯度迭代与普通反向阶段保持同一标签。
+                        self.STAGE_PADDLE_BACKWARD,
                         force_log_type="config_input",
-                        affected_comps=self._PADDLE_AFFECTED_COMPS[iter_idx],
-                    )
-                    return None, None
-                if self.should_ignore_paddle_error(err_str):
-                    self.report_runtime_error(
-                        err,
-                        "paddle_error",
-                        "backward",
-                        allow_ignore_paddle=True,
                         affected_comps=self._PADDLE_AFFECTED_COMPS[iter_idx],
                     )
                     return None, None
@@ -1096,7 +1095,7 @@ class APITestAccuracyStable(APITestBase):
                     self.report_runtime_error(
                         err,
                         "paddle_cuda",
-                        "backward",
+                        self.STAGE_PADDLE_BACKWARD,
                         force_log_type="paddle_cuda",
                         affected_comps=self._PADDLE_AFFECTED_COMPS[iter_idx],
                     )
@@ -1105,7 +1104,7 @@ class APITestAccuracyStable(APITestBase):
                     self.report_runtime_error(
                         err,
                         "oom",
-                        "backward",
+                        self.STAGE_PADDLE_BACKWARD,
                         force_log_type="oom",
                         affected_comps=self._PADDLE_AFFECTED_COMPS[iter_idx],
                     )
@@ -1113,7 +1112,7 @@ class APITestAccuracyStable(APITestBase):
                 self.report_runtime_error(
                     err,
                     "paddle_error",
-                    "backward",
+                    self.STAGE_PADDLE_BACKWARD,
                     affected_comps=self._PADDLE_AFFECTED_COMPS[iter_idx],
                 )
                 return None, None
@@ -1124,7 +1123,7 @@ class APITestAccuracyStable(APITestBase):
                 self.report_runtime_error(
                     err,
                     "paddle_cuda",
-                    "backward cuda check",
+                    self.STAGE_PADDLE_BACKWARD_SYNC,
                     force_log_type="paddle_cuda",
                     affected_comps=self._PADDLE_AFFECTED_COMPS[iter_idx],
                 )
@@ -1145,7 +1144,7 @@ class APITestAccuracyStable(APITestBase):
         log_type, fatal = self.report_runtime_error(
             err,
             "paddle_accuracy",
-            comp,
+            self.STAGE_COMPARE_BACKWARD if comp.endswith("B") else self.STAGE_COMPARE_FORWARD,
             tensor_position=tensor_position,
             affected_comps=(comp,),
         )

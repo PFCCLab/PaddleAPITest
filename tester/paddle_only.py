@@ -221,15 +221,12 @@ class APITestPaddleOnly(APITestBase):
         self,
         err,
         default_log_type,
-        phase,
-        *,
-        allow_ignore_paddle=False,
+        stage,
     ):
         log_type, fatal = self.report_runtime_error(
             err,
             default_log_type,
-            phase,
-            allow_ignore_paddle=allow_ignore_paddle,
+            stage,
         )
         self._finalize_paddle_only(log_type or default_log_type)
         return log_type, fatal
@@ -257,17 +254,27 @@ class APITestPaddleOnly(APITestBase):
                 return
             self.dump_event("numpy_input_done")
         except Exception as err:
-            _, fatal = self._report_paddle_only_error(err, "config_input", "input")
+            _, fatal = self._report_paddle_only_error(
+                err,
+                "config_input",
+                self.STAGE_INPUT,
+            )
             if fatal:
                 raise
             return
 
+        # 豁免范围在阶段边界内恢复，避免吞掉后续阶段的数值检查。
+        exemption_scope = self._nonfinite_exemption_scope()
+        # 输入失败必须单独归类，否则会被误报为前向执行失败。
         try:
-            exemption_scope = self._nonfinite_exemption_scope()
             with self._nan_inf_check_disabled(exemption_scope == "all"):
                 self.dump_event("paddle_input_start")
                 if not self.build_paddle_input():
-                    self.report_case_result("paddle_error", "build_paddle_input failed")
+                    self.report_case_result(
+                        "paddle_error",
+                        "build_paddle_input failed",
+                        stage=self.STAGE_INPUT,
+                    )
                     self._finalize_paddle_only("paddle_error")
                     return
                 self.clear_generated_input_values()
@@ -277,32 +284,62 @@ class APITestPaddleOnly(APITestBase):
                     framework="paddle",
                 )
                 self.dump_event("paddle_input_done")
+        except Exception as err:
+            _, fatal = self._report_paddle_only_error(
+                err,
+                "paddle_error",
+                self.STAGE_INPUT,
+            )
+            if fatal:
+                raise
+            return
 
-                with self._nan_inf_check_disabled(exemption_scope in {"all", "forward"}):
-                    paddle_output = self._run_paddle_forward()
+        # 前向异常不应与反向梯度异常共享同一个错误阶段。
+        try:
+            with self._nan_inf_check_disabled(exemption_scope in {"all", "forward"}):
+                paddle_output = self._run_paddle_forward()
+        except Exception as err:
+            _, fatal = self._report_paddle_only_error(
+                err,
+                "paddle_error",
+                self.STAGE_PADDLE_FORWARD,
+            )
+            if fatal:
+                raise
+            return
+
+        # 反向阶段单独处理显存保护异常和框架异常。
+        try:
+            with self._nan_inf_check_disabled(exemption_scope == "all"):
                 self._run_paddle_backward(paddle_output)
         except GpuMemoryGuardSkip as err:
-            self.report_case_result("oom", phase="memory_guard", message=str(err))
+            self.report_case_result(
+                "oom",
+                stage=self.STAGE_PADDLE_BACKWARD,
+                message=str(err),
+            )
             self._finalize_paddle_only("oom")
             return
         except Exception as err:
             _, fatal = self._report_paddle_only_error(
                 err,
                 "paddle_error",
-                "paddle_only",
-                allow_ignore_paddle=True,
+                self.STAGE_PADDLE_BACKWARD,
             )
             if fatal:
                 raise
             return
 
+        # 同步错误保留所属方向，便于定位异步 CUDA 错误。
         try:
             self.check_operator_cuda_error()
         except Exception as err:
             _, fatal = self._report_paddle_only_error(
                 err,
                 "paddle_cuda",
-                "paddle_only cuda check",
+                self.STAGE_PADDLE_BACKWARD_SYNC
+                if self.need_check_grad()
+                else self.STAGE_PADDLE_FORWARD_SYNC,
             )
             if fatal:
                 raise

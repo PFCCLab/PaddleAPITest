@@ -28,7 +28,22 @@ from .input_generation.tensor_config import (
 from .reporting import log_worker
 from .reporting.dump_writer import DEFAULT_DUMP_DIR, DumpContext, dump_enabled
 from .reporting.log_comparison import log_accuracy_tolerance
-from .reporting.log_schema import MAX_CSV_CONFIG_LENGTH
+from .reporting.log_schema import (
+    COMPARE_BACKWARD_STAGE,
+    COMPARE_FORWARD_STAGE,
+    INPUT_STAGE,
+    MAX_CSV_CONFIG_LENGTH,
+    MEMORY_PREFLIGHT_STAGE,
+    PADDLE_BACKWARD_STAGE,
+    PADDLE_BACKWARD_SYNC_STAGE,
+    PADDLE_FORWARD_STAGE,
+    PADDLE_FORWARD_SYNC_STAGE,
+    TORCH_BACKWARD_STAGE,
+    TORCH_BACKWARD_SYNC_STAGE,
+    TORCH_FORWARD_STAGE,
+    TORCH_FORWARD_SYNC_STAGE,
+    Stage,
+)
 from .runtime.gpu_memory_preflight import (
     GpuMemoryDeferred,
     decide_gpu_memory_preflight,
@@ -45,8 +60,6 @@ not_check_dtype = frozenset(config.get("not_check_dtype", []))
 rand_apis = frozenset(config.get("rand_apis", []))
 stochastic_behavior_apis = frozenset(config.get("stochastic_behavior_apis", []))
 
-paddle_error_dismiss = {}  # disabled: covered by the unified runtime error reporter
-# paddle_error_dismiss = config.get("paddle_error_dismiss", {})
 special_accuracy_atol_rtol = config.get("special_accuracy_atol_rtol", {})
 
 with (_TESTER_DIR / "api_config" / "torch_error_skip.txt").open(encoding="utf-8") as f:
@@ -309,6 +322,20 @@ def classify_runtime_error(error_msg):
 
 
 class APITestBase:
+    # tester 只引用这一组阶段常量，避免各模式重新拼接框架与执行阶段。
+    STAGE_INPUT = INPUT_STAGE
+    STAGE_PADDLE_FORWARD = PADDLE_FORWARD_STAGE
+    STAGE_PADDLE_BACKWARD = PADDLE_BACKWARD_STAGE
+    STAGE_PADDLE_FORWARD_SYNC = PADDLE_FORWARD_SYNC_STAGE
+    STAGE_PADDLE_BACKWARD_SYNC = PADDLE_BACKWARD_SYNC_STAGE
+    STAGE_TORCH_FORWARD = TORCH_FORWARD_STAGE
+    STAGE_TORCH_BACKWARD = TORCH_BACKWARD_STAGE
+    STAGE_TORCH_FORWARD_SYNC = TORCH_FORWARD_SYNC_STAGE
+    STAGE_TORCH_BACKWARD_SYNC = TORCH_BACKWARD_SYNC_STAGE
+    STAGE_COMPARE_FORWARD = COMPARE_FORWARD_STAGE
+    STAGE_COMPARE_BACKWARD = COMPARE_BACKWARD_STAGE
+    STAGE_MEMORY_PREFLIGHT = MEMORY_PREFLIGHT_STAGE
+
     def __init__(self, api_config, use_torch=True, runtime_config=None):
         # case 只能消费主进程冻结后的策略，不能在 worker 内根据环境重新选择 backend。
         if runtime_config is None:
@@ -408,8 +435,7 @@ class APITestBase:
         self,
         err,
         default_log_type,
-        phase,
-        allow_ignore_paddle=False,
+        stage: Stage,
         *,
         tensor_position=None,
         force_log_type=None,
@@ -421,20 +447,17 @@ class APITestBase:
         from classify_runtime_error().
         """
         err_msg = str(err)
-        if phase:
-            self.dump_error(f"{phase}_error", err)
+        # dump 事件保留阶段派生名，inorder 日志使用统一直接文本。
+        if stage:
+            self.dump_error(f"{stage.lower().replace(' ', '_')}_error", err)
         log_type, fatal = classify_runtime_error(err_msg)
-        if log_type is None and allow_ignore_paddle and self.should_ignore_paddle_error(err_msg):
-            log_type = "pass"
-            self.report_case_result(log_type, affected_comps=affected_comps)
-            return log_type, False
         if force_log_type is not None:
             log_type = force_log_type
         if log_type is None:
             log_type = default_log_type
         self.report_case_result(
             log_type,
-            phase=phase,
+            stage=stage,
             error=err_msg,
             tensor_position=tensor_position,
             affected_comps=affected_comps,
@@ -446,7 +469,7 @@ class APITestBase:
         log_type,
         message=None,
         *,
-        phase=None,
+        stage: Stage | None = None,
         error=None,
         tensor_position=None,
         affected_comps=None,
@@ -456,7 +479,7 @@ class APITestBase:
         log_worker.emit_case_result(
             log_type,
             self.api_config.config,
-            phase=phase,
+            stage=stage,
             message=message,
             error=error,
             tensor_position=tensor_position,
@@ -491,7 +514,11 @@ class APITestBase:
             if decision.should_skip:
                 message = decision.message()
                 self.record_memory_governance_metric("memory_preflight_oom")
-                self.report_case_result("oom", phase="preflight", message=message)
+                self.report_case_result(
+                    "oom",
+                    stage=self.STAGE_MEMORY_PREFLIGHT,
+                    message=message,
+                )
                 self.dump_finalize("oom", memory_preflight=message)
                 return False
             compute_stages = tuple(
@@ -614,7 +641,7 @@ class APITestBase:
     def report_compare_error(
         self,
         err,
-        phase,
+        stage: Stage,
         default_log_type="paddle_accuracy",
         *,
         tensor_position=None,
@@ -622,7 +649,7 @@ class APITestBase:
         log_type, fatal = self.report_runtime_error(
             err,
             default_log_type,
-            phase,
+            stage,
             tensor_position=tensor_position,
         )
         if fatal:
@@ -2260,16 +2287,6 @@ class APITestBase:
     def is_forward_only(self):
         api = self.api_config.api_name[self.api_config.api_name.rindex(".") + 1 :]
         return api in forward_only_apis
-
-    def should_ignore_paddle_error(self, error_msg):
-        dismiss_errors = paddle_error_dismiss.get(self.api_config.api_name, None)
-        if dismiss_errors is None:
-            return False
-        if isinstance(dismiss_errors, str):
-            return dismiss_errors in error_msg
-        elif isinstance(dismiss_errors, (list, tuple)):
-            return any(error in error_msg for error in dismiss_errors)
-        return False
 
     def should_check_dtype(self):
         return self.api_config.api_name not in not_check_dtype
