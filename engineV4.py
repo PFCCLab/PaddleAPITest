@@ -513,6 +513,22 @@ GPU_MEMORY_DEFER_MAX_BACKOFF_SECONDS = 30.0
 GPU_MEMORY_DEFER_RETIRE_AFTER = 2
 SANITIZER_COMPUTE_BUDGET_ENV = "PADDLEAPITEST_SANITIZER_COMPUTE_BUDGET_GIB"
 SANITIZER_COMPARISON_BUDGET_ENV = "PADDLEAPITEST_SANITIZER_COMPARISON_BUDGET_GIB"
+
+
+def _is_unavailable_gpu_error(error_msg):
+    """识别设备级初始化失败；普通 case 异常仍沿用原有重试路径。"""
+    text = str(error_msg).lower()
+    return any(
+        marker in text
+        for marker in (
+            "cudaerrordevicesunavailable",
+            "cuda error(46)",
+            "cudaerrordevicelost",
+            "cuda error(45)",
+        )
+    )
+
+
 SANITIZER_TIMING_FILE_ENV = "PADDLEAPITEST_SANITIZER_TIMING_FILE"
 # 调度只需要有限候选；窗口随最大并发放大，保留跳过大 case 的能力。
 CANDIDATE_WINDOW_PER_WORKER = 32
@@ -1501,6 +1517,8 @@ class WorkerPool:
         self._lock = threading.Lock()  # 保护 slot 状态修改
         self._spawn_lock = threading.Lock()
         self._closed = False
+        # 记录初始化阶段确认不可用的物理卡，避免故障 slot 无限复活。
+        self._quarantined_gpus: set[int] = set()
         # CPU worker 使用 gpu_id=None；只有需要 GPU 运行时时才建立 GPU 槽位。
         idx = 0
         if cpu_worker_count:
@@ -1538,12 +1556,51 @@ class WorkerPool:
     def slot_can_schedule(self, slot_index):
         # scheduler 只依赖可调度语义，不读取可变的 WorkerSlot 状态对象。
         with self._lock:
-            return self.slots[slot_index].state in {"idle", "dead", "suspended"}
+            slot = self.slots[slot_index]
+            return (
+                slot.gpu_id not in self._quarantined_gpus
+                and slot.comparison_gpu_id not in self._quarantined_gpus
+                and slot.state in {"idle", "dead", "suspended"}
+            )
 
     def slot_can_start(self, slot_index):
         # 仅离线 slot 可启动；idle slot 已持有进程，不能创建第二代 worker。
         with self._lock:
-            return self.slots[slot_index].state in {"dead", "suspended"}
+            slot = self.slots[slot_index]
+            return (
+                slot.gpu_id not in self._quarantined_gpus
+                and slot.comparison_gpu_id not in self._quarantined_gpus
+                and slot.state in {"dead", "suspended"}
+            )
+
+    def slot_is_quarantined(self, slot_index):
+        # 双卡 slot 任一设备故障都必须停止复用，避免半损坏 pair 继续进入调度。
+        with self._lock:
+            slot = self.slots[slot_index]
+            return (
+                slot.gpu_id in self._quarantined_gpus
+                or slot.comparison_gpu_id in self._quarantined_gpus
+            )
+
+    def quarantine_gpu(self, gpu_id, *, reason):
+        """隔离不可用物理卡，阻止其 slot 被重新启动或调度。"""
+        if gpu_id is None:
+            return
+        with self._lock:
+            if gpu_id in self._quarantined_gpus:
+                return
+            self._quarantined_gpus.add(gpu_id)
+            affected = [
+                slot.index
+                for slot in self.slots
+                if slot.gpu_id == gpu_id or slot.comparison_gpu_id == gpu_id
+            ]
+            for slot_index in affected:
+                slot = self.slots[slot_index]
+                # busy slot 先完成当前终态，空闲/启动 slot 立即失去复活资格。
+                if slot.state in {"dead", "suspended", "starting", "loaded", "preparing"}:
+                    slot.state = "quarantined"
+        print(f"[gpu] GPU_QUARANTINED | physical_gpu={gpu_id} | {reason}", flush=True)
 
     def slot_is_idle(self, slot_index):
         # idle 是 dispatch 的必要前置条件，状态检查由 pool 串行化。
@@ -1822,6 +1879,8 @@ class WorkerPool:
             if child_pid is not None:
                 self._kill_process_group(child_pid)
             self._join_process(process, timeout=1)
+            if _is_unavailable_gpu_error(error_msg):
+                self.quarantine_gpu(slot.gpu_id, reason=error_msg)
             # init_failed 常见于 bootstrap OOM，slot 必须退出 planned 启动屏障。
             return True
         return True
@@ -3183,8 +3242,12 @@ class ContinuousGpuBatchScheduler:
     def cancel_failed_startup(self, pending_dispatch):
         # 初始化失败只回队当前 slot，其他在途 assignment 仍可继续完成。
         for assignment_id, assignment in tuple(self.assignments.items()):
-            if assignment.dispatched or not self.pool.slot_can_start(assignment.slot_index):
+            if assignment.dispatched:
                 continue
+            if not self.pool.slot_can_start(assignment.slot_index):
+                # 普通 suspended 仍可能等待 watchdog 回收；只有 quarantine 才能回队。
+                if not self.pool.slot_is_quarantined(assignment.slot_index):
+                    continue
             self.groups[assignment.group_key]["ledger"].mark_release_pending(assignment_id)
             # 未形成业务终态的 assignment 必须回队，不能只释放 reservation。
             pending_dispatch.appendleft(assignment.pending)
@@ -3608,6 +3671,14 @@ def _run_batch_mode(
         if options.use_compute_sanitizer:
             log_worker.clean_sanitizer_case_logs()
         log_counts = log_aggregation.finalize_logs()
+        if batch_state.tested_case != all_case and batch_state.batch_exit_code == 0:
+            # 未产生全部业务终态时不能以成功退出，避免损坏 GPU 留下假成功批次。
+            batch_state.batch_exit_code = 1
+            print(
+                f"[batch] INCOMPLETE | completed={batch_state.tested_case} "
+                f"total={all_case} | remaining={max(all_case - batch_state.tested_case, 0)}",
+                flush=True,
+            )
         if (
             options.retest
             and batch_state.batch_exit_code == 0
