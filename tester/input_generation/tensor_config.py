@@ -143,7 +143,8 @@ class TensorConfig:
         memo[id(self)] = result
         result.shape = copy.deepcopy(self.shape)
         result.dtype = copy.deepcopy(self.dtype)
-        result.place = copy.deepcopy(self.place)
+        # Paddle Place 是不可变运行时句柄；旧版本无法 pickle，副本可共享其设备语义。
+        result.place = self.place
         result.is_contiguous = self.is_contiguous
         result.strides = copy.deepcopy(self.strides)
         result.paddle_tensor = None

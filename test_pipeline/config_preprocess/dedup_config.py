@@ -42,10 +42,20 @@ def main():
 
     seen = set()
     total = 0
+    blank_lines = 0
+    skipped_non_config = 0
     with open(input_path, encoding="utf-8") as f:
         for line in f:
             total += 1
-            seen.add(line.rstrip("\n"))
+            line = line.strip()
+            if not line:
+                blank_lines += 1
+                continue
+            # 与引擎入口保持相同边界，预处理产物只能包含 Paddle API 配置。
+            if not line.startswith("paddle."):
+                skipped_non_config += 1
+                continue
+            seen.add(line)
 
     unique_lines = sorted(seen)
 
@@ -53,9 +63,13 @@ def main():
         for line in unique_lines:
             f.write(line + "\n")
 
+    valid_lines = total - blank_lines - skipped_non_config
     print(f"Total lines:   {total}")
+    print(f"Blank lines:   {blank_lines}")
+    print(f"Non-config:    {skipped_non_config}")
+    print(f"Config lines:  {valid_lines}")
     print(f"Unique lines:  {len(unique_lines)}")
-    print(f"Duplicates:    {total - len(unique_lines)}")
+    print(f"Duplicates:    {valid_lines - len(unique_lines)}")
     print(f"Output:        {output_path}")
 
 

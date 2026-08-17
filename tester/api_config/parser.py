@@ -23,13 +23,34 @@ class APIConfig:
     # 兼容历史配置别名，统一交给 Paddle 原生参数名执行。
     _KWARG_ALIASES = {"paddle.Tensor.sum": {"dim": "axis"}}
 
+    @staticmethod
+    def _memoize_paddle_places(value, memo, visited):
+        value_id = id(value)
+        if value_id in visited:
+            return
+        visited.add(value_id)
+        if isinstance(value, paddle.base.libpaddle.Place):
+            # Place 是不可变运行时句柄，旧版 Paddle 无法 pickle，副本复用其设备语义。
+            memo[value_id] = value
+        elif isinstance(value, dict):
+            for key, item in value.items():
+                APIConfig._memoize_paddle_places(key, memo, visited)
+                APIConfig._memoize_paddle_places(item, memo, visited)
+        elif isinstance(value, (list, tuple, set, frozenset)):
+            for item in value:
+                APIConfig._memoize_paddle_places(item, memo, visited)
+
     def __deepcopy__(self, memo):
         cls = self.__class__
         result = cls.__new__(cls)
         memo[id(self)] = result
-        result.args = copy.deepcopy(self.args)
-        result.kwargs = copy.deepcopy(self.kwargs)
-        result._kwarg_alias_sources = copy.deepcopy(self._kwarg_alias_sources)
+        # 配置参数允许嵌套容器，visited 防止循环引用重复遍历。
+        visited = set()
+        self._memoize_paddle_places(self.args, memo, visited)
+        self._memoize_paddle_places(self.kwargs, memo, visited)
+        result.args = copy.deepcopy(self.args, memo)
+        result.kwargs = copy.deepcopy(self.kwargs, memo)
+        result._kwarg_alias_sources = copy.deepcopy(self._kwarg_alias_sources, memo)
         result.api_name = self.api_name
         # 运行时设备语义随 case 副本传播，不能在稳定性或算子对比路径中退回默认设备。
         result.config = self.config
@@ -501,7 +522,10 @@ def analyse_configs(config_path):
 
     api_configs = []
     for config in configs:
-        # print(config)
+        config = config.strip()
+        # 直接消费配置文件的工具也遵循引擎的输入过滤协议。
+        if not config or not config.startswith("paddle."):
+            continue
         api_config = APIConfig(config)
         api_configs.append(api_config)
     return api_configs
