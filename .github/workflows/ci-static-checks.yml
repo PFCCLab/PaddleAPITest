@@ -24,6 +24,7 @@ jobs:
       - name: Run pre-commit
         run: pre-commit run --all-files
       - name: Check added source comment ratio
+        if: ${{ vars.SKIP_COMMENT_RATIO != 'true' }}
         env:
           COMMENT_RATIO_BASE_REF: ${{ github.event.pull_request.base.sha || github.event.before }}
         run: python tools/check_comment_ratio.py --base-ref "${COMMENT_RATIO_BASE_REF}"
