@@ -1820,6 +1820,9 @@ def generate_put_along_axis_inputs(rule: InputRuleContext):
         axis = axis if isinstance(axis, int) else 0
         axis = axis if axis >= 0 else axis + x_dims
         indices = rule.ops.zeros(current_shape, dtype="int64")
+        # 最后一维为空时每个切片都无索引，直接返回可避免遍历巨大的前缀维度。
+        if current_shape and current_shape[-1] == 0:
+            return indices
         if 0 <= axis < x_dims:
             dim_size = x_shape[axis]
             for idx in rule.ops.ndindex(tuple(current_shape[:-1])):

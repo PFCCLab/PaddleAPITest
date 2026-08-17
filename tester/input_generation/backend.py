@@ -175,6 +175,14 @@ class NumPyInputBackend:
         return numpy.asarray(value).astype(storage_dtype) if storage_dtype is not None else value
 
     def choice(self, values, shape=None, replace=True, p=None):
+        _, numpy_shape, num_samples = _choice_shape(shape, scalar_empty=False)
+        # 零采样不依赖概率或 replacement，必须返回空结果且不推进随机流。
+        if num_samples == 0:
+            if isinstance(values, numbers.Integral):
+                population = self.arange(int(values))
+            else:
+                population = self.asarray(values)
+            return self.zeros(numpy_shape, dtype=population.dtype)
         return self.input_random_state.choice(values, shape=shape, replace=replace, p=p)
 
     def asarray(self, value, dtype=None, copy=True):
@@ -393,9 +401,13 @@ class TorchInputBackend:
         scalar, torch_shape, num_samples = _choice_shape(shape, scalar_empty=False)
 
         if isinstance(values, numbers.Integral):
-            population = torch.arange(int(values), device=self._device)
+            population = self.arange(int(values))
         else:
             population = self.asarray(values)
+
+        # 零采样绕过 randint/randperm/multinomial，避免空 population 的原生报错。
+        if num_samples == 0:
+            return self.zeros(torch_shape, dtype=population.dtype)
 
         if p is not None:
             weights = self.asarray(p, dtype="float64")
@@ -721,9 +733,13 @@ class PaddleInputBackend:
         paddle = self._paddle()
         scalar, paddle_shape, num_samples = _choice_shape(shape, scalar_empty=True)
         if isinstance(values, numbers.Integral):
-            population = paddle.arange(int(values), device=self.device)
+            population = self.arange(int(values))
         else:
             population = self.asarray(values, copy=False)
+
+        # Paddle 的 randperm(0) 会在 GPU 抛 CUDA invalid argument，空结果直接物化。
+        if num_samples == 0:
+            return self.zeros(paddle_shape, dtype=population.dtype)
 
         if p is not None:
             # 带权采样由 Paddle multinomial 消费同一私有 stream，不回落到主存数组。
