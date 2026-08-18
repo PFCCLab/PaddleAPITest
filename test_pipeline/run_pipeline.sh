@@ -63,7 +63,9 @@ OUTPUT_DIR="$(cd "$OUTPUT_DIR" && pwd)"
 PADDLEONLY_1M_DIR="$OUTPUT_DIR/paddleonly_1M"
 PADDLEONLY_0SIZE_DIR="$OUTPUT_DIR/paddleonly_0size"
 PADDLEONLY_4096_DIR="$OUTPUT_DIR/paddleonly_4096"
-mkdir -p "$PADDLEONLY_1M_DIR" "$PADDLEONLY_0SIZE_DIR" "$PADDLEONLY_4096_DIR"
+NORMALIZED_INPUT_DIR="$OUTPUT_DIR/.normalized"
+mkdir -p "$PADDLEONLY_1M_DIR" "$PADDLEONLY_0SIZE_DIR" "$PADDLEONLY_4096_DIR" \
+    "$NORMALIZED_INPUT_DIR"
 
 echo "======================================================================"
 echo "API Config 全流程处理"
@@ -87,6 +89,22 @@ if [ ! -f "$INPUT_DIR/api_config_1024.txt" ] || [ ! -f "$INPUT_DIR/api_config_20
 fi
 
 # ============================================================================
+# Step 0: 规范化输入，保证后续所有处理器每行只接收一个顶层调用
+# ============================================================================
+echo ""
+echo "[Step 0] 规范化原始配置行..."
+
+for config_name in \
+    api_config_1024.txt api_config_2048.txt api_config_4096.txt api_config_8192.txt; do
+    if [ -f "$INPUT_DIR/$config_name" ]; then
+        python "$PROCESSOR_DIR/normalize_config_lines.py" \
+            -i "$INPUT_DIR/$config_name" \
+            -o "$NORMALIZED_INPUT_DIR/$config_name" \
+            --strict
+    fi
+done
+
+# ============================================================================
 # Step 1: 推导虚假 4096 并验证（如果有真实 4096）
 # ============================================================================
 echo ""
@@ -97,15 +115,15 @@ DERIVED_4096="$OUTPUT_DIR/.derived_4096.txt"
 DERIVED_1M="$OUTPUT_DIR/.derived_1M.txt"
 
 python "$PROCESSOR_DIR/derive_api_seq.py" 4096 \
-    --small "$INPUT_DIR/api_config_1024.txt" \
-    --large "$INPUT_DIR/api_config_2048.txt" \
+    --small "$NORMALIZED_INPUT_DIR/api_config_1024.txt" \
+    --large "$NORMALIZED_INPUT_DIR/api_config_2048.txt" \
     -o "$DERIVED_4096"
 
 if [ -f "$INPUT_DIR/api_config_4096.txt" ]; then
     echo ""
     python "$PROCESSOR_DIR/verify_api_seq.py" \
         -d "$DERIVED_4096" \
-        -r "$INPUT_DIR/api_config_4096.txt"
+        -r "$NORMALIZED_INPUT_DIR/api_config_4096.txt"
 else
     echo "  [跳过验证] 未找到真实 api_config_4096.txt"
 fi
@@ -117,8 +135,8 @@ echo ""
 echo "[Step 2] 推导 1M (seq=1048576)..."
 
 python "$PROCESSOR_DIR/derive_api_seq.py" 1048576 \
-    --small "$INPUT_DIR/api_config_1024.txt" \
-    --large "$INPUT_DIR/api_config_2048.txt" \
+    --small "$NORMALIZED_INPUT_DIR/api_config_1024.txt" \
+    --large "$NORMALIZED_INPUT_DIR/api_config_2048.txt" \
     -o "$DERIVED_1M"
 
 # ============================================================================
@@ -140,7 +158,7 @@ echo "[Step 4] 筛选目标 seq + 去重，并生成 0-size..."
 ORIG_MERGED_NAME="4096.txt"
 # 1024/2048 仅作为推导锚点，8192 已废弃；三者不得进入任何最终配置集。
 if [ -f "$INPUT_DIR/api_config_4096.txt" ]; then
-    FINAL_4096_SOURCE="$INPUT_DIR/api_config_4096.txt"
+    FINAL_4096_SOURCE="$NORMALIZED_INPUT_DIR/api_config_4096.txt"
     echo "  使用真实 api_config_4096.txt"
 else
     FINAL_4096_SOURCE="$DERIVED_4096"
@@ -159,7 +177,8 @@ python "$PROCESSOR_DIR/dedup_config.py" \
 # 避免对可能达到数 GB 的中间文件再做一次全量去重。
 python "$PROCESSOR_DIR/to_0_size_config.py" \
     -i "$PADDLEONLY_4096_DIR/$ORIG_MERGED_NAME" \
-    -o "$PADDLEONLY_0SIZE_DIR/0size.txt"
+    -o "$PADDLEONLY_0SIZE_DIR/0size.txt" \
+    --strict
 
 # 指定比例时只替换保留集；未指定时完全跳过缩减，保持默认流程结果不变。
 if [ -n "$SLIM_RATIO" ]; then

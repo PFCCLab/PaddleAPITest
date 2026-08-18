@@ -9,6 +9,12 @@ import tempfile
 
 import numpy
 import paddle
+from test_pipeline.config_preprocess.config_lines import (
+    matching_close as _matching_close,
+)
+from test_pipeline.config_preprocess.config_lines import (
+    split_top_level_calls as _split_top_level_calls,
+)
 from tester.api_config.parser import APIConfig
 from tester.input_generation.tensor_config import TensorConfig
 from tqdm import tqdm
@@ -43,40 +49,46 @@ def get_tensor_configs(api_config):
     return tensor_configs
 
 
-def iter_api_configs(config_path):
-    """逐行解析配置，避免把全部 APIConfig 对象同时保存在内存。"""
+def iter_api_configs(config_path, on_reject=None):
+    """解析配置，支持一行中连续的多个顶层 API 调用。"""
+    # 未提供回调时保持严格失败语义，并附加输入文件与行号。
+    # 提供回调时记录坏配置后继续，yield 始终位于异常处理范围之外。
     with open(config_path, encoding="utf-8") as config_file:
-        for raw_line in config_file:
+        for line_number, raw_line in enumerate(config_file, start=1):
             config = raw_line.strip()
-            if config and config.startswith("paddle."):
-                yield APIConfig(config)
-
-
-def _matching_close(text, start, opening, closing):
-    """返回嵌套括号的结束位置，字符串内容中的括号不参与配对。"""
-    # 需要跳过字符串中的括号，否则 callable 或字符串参数会破坏定位。
-    depth = 0
-    quote = None
-    escaped = False
-    for index in range(start, len(text)):
-        char = text[index]
-        if quote is not None:
-            if escaped:
-                escaped = False
-            elif char == "\\":
-                escaped = True
-            elif char == quote:
-                quote = None
-            continue
-        if char in ('"', "'"):
-            quote = char
-        elif char == opening:
-            depth += 1
-        elif char == closing:
-            depth -= 1
-            if depth == 0:
-                return index
-    return None
+            if not config:
+                continue
+            if not config.startswith("paddle."):
+                error = ValueError("配置不是 paddle.* 顶层调用")
+                if on_reject is None:
+                    raise ValueError(
+                        f"{config_path}:{line_number}: {error}"
+                    ) from error
+                on_reject(config_path, line_number, config, error)
+                continue
+            try:
+                calls = _split_top_level_calls(config)
+            except ValueError as error:
+                if on_reject is None:
+                    raise ValueError(f"{config_path}:{line_number}: {error}") from error
+                on_reject(config_path, line_number, config, error)
+                continue
+            for call in calls:
+                # APIConfig 失败也必须保留文件和行号，便于定位截断配置。
+                try:
+                    api_config = APIConfig(call)
+                except Exception as error:
+                    parse_error = ValueError(
+                        f"无法解析拆分后的调用 {call[:80]!r}: "
+                        f"{type(error).__name__}: {error}"
+                    )
+                    if on_reject is None:
+                        raise ValueError(
+                            f"{config_path}:{line_number}: {parse_error}"
+                        ) from error
+                    on_reject(config_path, line_number, call, parse_error)
+                    continue
+                yield api_config
 
 
 def _find_tensor_shape_spans(config):
@@ -441,6 +453,11 @@ def parse_args():
         default="api_config_0_size.txt",
         help="输出文件路径（默认：当前目录下 api_config_0_size.txt）",
     )
+    parser.add_argument(
+        "--strict",
+        action="store_true",
+        help="扫描完成后如有无法解析的配置则返回非零状态",
+    )
     return parser.parse_args()
 
 
@@ -452,30 +469,48 @@ if __name__ == "__main__":
         os.makedirs(output_dir, exist_ok=True)
 
     output_dir = os.path.dirname(args.output) or "."
-    with tempfile.TemporaryDirectory(prefix=".0size_chunks.", dir=output_dir) as chunk_dir:
-        # 临时块位于输出目录，保证大文件处理不依赖系统 /tmp 空间。
-        chunk_paths = []
-        chunk_lines = set()
-        chunk_bytes = 0
-        chunk_index = 0
-        for input_file in args.inputs:
-            print(f"处理: {input_file}")
-            for api_config in tqdm(iter_api_configs(input_file)):
-                # 逐个变体进入有限大小的块集合，避免累计完整输出。
-                for variant in to_0_size_config(api_config):
-                    if variant in chunk_lines:
-                        continue
-                    chunk_lines.add(variant)
-                    chunk_bytes += len(variant) + 1
-                    if chunk_bytes >= CHUNK_BYTES:
-                        path = _flush_chunk(chunk_lines, chunk_dir, chunk_index)
-                        chunk_paths.append(path)
-                        chunk_index += 1
-                        chunk_lines.clear()
-                        chunk_bytes = 0
-        path = _flush_chunk(chunk_lines, chunk_dir, chunk_index)
-        if path is not None:
-            chunk_paths.append(path)
-        unique_count = _merge_chunks(chunk_paths, args.output)
+    reject_path = f"{args.output}.unparsed.txt"
+    rejected_count = [0]
+    with open(reject_path, "w", encoding="utf-8") as reject_file:
+
+        def record_reject(config_path, line_number, config, error):
+            rejected_count[0] += 1
+            reject_file.write(
+                f"{config_path}:{line_number}\t{error}\t{config}\n"
+            )
+
+        with tempfile.TemporaryDirectory(prefix=".0size_chunks.", dir=output_dir) as chunk_dir:
+            # 临时块位于输出目录，保证大文件处理不依赖系统 /tmp 空间。
+            chunk_paths = []
+            chunk_lines = set()
+            chunk_bytes = 0
+            chunk_index = 0
+            for input_file in args.inputs:
+                print(f"处理: {input_file}")
+                for api_config in tqdm(
+                    iter_api_configs(input_file, on_reject=record_reject)
+                ):
+                    # 逐个变体进入有限大小的块集合，避免累计完整输出。
+                    for variant in to_0_size_config(api_config):
+                        if variant in chunk_lines:
+                            continue
+                        chunk_lines.add(variant)
+                        chunk_bytes += len(variant) + 1
+                        if chunk_bytes >= CHUNK_BYTES:
+                            path = _flush_chunk(chunk_lines, chunk_dir, chunk_index)
+                            chunk_paths.append(path)
+                            chunk_index += 1
+                            chunk_lines.clear()
+                            chunk_bytes = 0
+            path = _flush_chunk(chunk_lines, chunk_dir, chunk_index)
+            if path is not None:
+                chunk_paths.append(path)
+            unique_count = _merge_chunks(chunk_paths, args.output)
 
     print(f"输出: {args.output}，共 {unique_count} 行")
+    if rejected_count[0]:
+        print(f"警告: {rejected_count[0]} 条配置无法解析，详见 {reject_path}")
+        if args.strict:
+            raise SystemExit(1)
+    else:
+        os.remove(reject_path)
