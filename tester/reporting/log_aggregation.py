@@ -19,9 +19,9 @@ from .log_schema import (
 _result_offsets = {}
 _inorder_offsets = {}
 _inorder_completed_offsets = {}
-_inorder_build_offset = 0
 _INORDER_STATE_FILENAME = ".inorder_state.json"
 _INORDER_BUILD_FILENAME = ".log_inorder.build"
+_COPY_BUFFER_SIZE = 4 * 1024 * 1024
 _CSV_SPECS = (
     ("tol", TOL_HEADER, ("API", "dtype", "config", "mode")),
     ("stable", STABLE_HEADER, ("API", "dtype", "config", "comp")),
@@ -29,11 +29,9 @@ _CSV_SPECS = (
 
 
 def _reset_aggregation_state():
-    global _inorder_build_offset
     _result_offsets.clear()
     _inorder_offsets.clear()
     _inorder_completed_offsets.clear()
-    _inorder_build_offset = 0
     _load_inorder_state()
 
 
@@ -51,8 +49,7 @@ def _write_inorder_state():
     state_path = _inorder_state_path()
     temp_path = state_path.with_name(f".{state_path.name}.tmp")
     state = {
-        "version": 1,
-        "build_offset": _inorder_build_offset,
+        "build_offset": _inorder_build_path().stat().st_size,
         "sources": {file_path.name: offset for file_path, offset in _inorder_offsets.items()},
     }
     try:
@@ -66,102 +63,63 @@ def _write_inorder_state():
         temp_path.unlink(missing_ok=True)
 
 
-def _ensure_inorder_build():
-    """恢复或创建聚合 build，旧的最终日志只在首次迁移时复制一次。"""
-    # build 是可回退的工作副本，正式日志只在最终发布阶段替换。
-    global _inorder_build_offset
-    build_path = _inorder_build_path()
-    if build_path.exists():
-        _inorder_build_offset = build_path.stat().st_size
-        return build_path
+def _copy_file_prefix(source_path, target_path, size):
+    """复制指定长度并持久化，供 build 恢复和最终发布共用。"""
+    remaining = size
+    with source_path.open("rb") as source, target_path.open("wb") as target:
+        while remaining:
+            chunk = source.read(min(_COPY_BUFFER_SIZE, remaining))
+            if not chunk:
+                raise ValueError(f"{source_path} ended before {size} bytes")
+            target.write(chunk)
+            remaining -= len(chunk)
+        runtime.sync_file(target)
+    runtime.sync_directory(target_path.parent)
 
-    out_path = runtime.TEST_LOG_PATH / "log_inorder.log"
-    expected_size = None
-    state_path = _inorder_state_path()
-    if state_path.exists():
-        # cleanup 重试只能重建 state 已确认的 build 前缀，不能复制目标文件尾部。
-        state = json.loads(state_path.read_text(encoding="utf-8"))
-        expected_size = int(state["build_offset"])
-    if out_path.exists():
-        with out_path.open("rb") as source, build_path.open("wb") as target:
-            remaining = expected_size
-            while remaining is None or remaining:
-                chunk_size = 4 * 1024 * 1024
-                if remaining is not None:
-                    chunk_size = min(chunk_size, remaining)
-                chunk = source.read(chunk_size)
-                if not chunk:
-                    if remaining:
-                        raise ValueError("published log ended before inorder state")
-                    break
-                target.write(chunk)
-                if remaining is not None:
-                    remaining -= len(chunk)
-            runtime.sync_file(target)
-    else:
-        with build_path.open("wb") as target:
-            runtime.sync_file(target)
-    runtime.sync_directory(build_path.parent)
-    _inorder_build_offset = build_path.stat().st_size
+
+def _prepare_inorder_build(expected_size):
+    """将 build 恢复到 state 指定的安全长度。"""
+    build_path = _inorder_build_path()
+    if not build_path.exists():
+        out_path = runtime.TEST_LOG_PATH / "log_inorder.log"
+        if expected_size:
+            if not out_path.exists():
+                raise FileNotFoundError(f"missing recoverable {build_path}")
+            _copy_file_prefix(out_path, build_path, expected_size)
+        else:
+            with build_path.open("wb") as target:
+                runtime.sync_file(target)
+            runtime.sync_directory(build_path.parent)
+
+    actual_size = build_path.stat().st_size
+    if actual_size < expected_size:
+        raise ValueError(f"inorder build is shorter than state: {actual_size} < {expected_size}")
+    if actual_size > expected_size:
+        # build 写入后、state 更新前退出时，超出安全点的尾部必须回退。
+        with build_path.open("r+b") as build_file:
+            build_file.truncate(expected_size)
+            runtime.sync_file(build_file)
     return build_path
 
 
 def _load_inorder_state():
     """加载上次聚合提交点，并截断未提交的 build 尾部。"""
-    global _inorder_build_offset
     state_path = _inorder_state_path()
-    build_path = _inorder_build_path()
-    if not state_path.exists():
-        # 无 state 时，已发布日志长度是唯一可信的 build 基线。
-        out_path = runtime.TEST_LOG_PATH / "log_inorder.log"
-        baseline_size = out_path.stat().st_size if out_path.exists() else 0
-        if not build_path.exists():
-            _ensure_inorder_build()
-        elif build_path.stat().st_size < baseline_size:
-            raise RuntimeError("inorder build is shorter than published log")
-        else:
-            with build_path.open("r+b") as build_file:
-                build_file.truncate(baseline_size)
-                runtime.sync_file(build_file)
-            runtime.sync_directory(build_path.parent)
-            _inorder_build_offset = baseline_size
-        # 首次追加前先建立基线，build 写入后崩溃才能回退到明确 offset。
-        _write_inorder_state()
-        return
-
     try:
-        state = json.loads(state_path.read_text(encoding="utf-8"))
-        if state.get("version") != 1:
-            raise ValueError(f"unsupported inorder state version: {state.get('version')}")
-        expected_size = int(state["build_offset"])
-        if not build_path.exists():
+        if state_path.exists():
+            state = json.loads(state_path.read_text(encoding="utf-8"))
+            expected_size = int(state["build_offset"])
+            for name, offset in state.get("sources", {}).items():
+                _inorder_offsets[runtime.TMP_LOG_PATH / name] = int(offset)
+        else:
+            # 无 state 时，已发布日志长度是唯一可信的 build 基线。
             out_path = runtime.TEST_LOG_PATH / "log_inorder.log"
-            if not out_path.exists() or out_path.stat().st_size < expected_size:
-                raise FileNotFoundError(f"missing recoverable {build_path}")
-            with out_path.open("rb") as source, build_path.open("wb") as target:
-                remaining = expected_size
-                while remaining:
-                    chunk = source.read(min(4 * 1024 * 1024, remaining))
-                    if not chunk:
-                        raise ValueError("published log ended before inorder state")
-                    target.write(chunk)
-                    remaining -= len(chunk)
-                runtime.sync_file(target)
-            runtime.sync_directory(build_path.parent)
-        actual_size = build_path.stat().st_size
-        if actual_size < expected_size:
-            raise ValueError(
-                f"inorder build is shorter than state: {actual_size} < {expected_size}"
-            )
-        if actual_size > expected_size:
-            # 进程可能在写 build 后、写 state 前退出，尾部必须回退。
-            with build_path.open("r+b") as build_file:
-                build_file.truncate(expected_size)
-                runtime.sync_file(build_file)
-        _inorder_build_offset = expected_size
-        for name, offset in state.get("sources", {}).items():
-            _inorder_offsets[runtime.TMP_LOG_PATH / name] = int(offset)
-    except (OSError, TypeError, ValueError, json.JSONDecodeError) as err:
+            expected_size = out_path.stat().st_size if out_path.exists() else 0
+        _prepare_inorder_build(expected_size)
+        if not state_path.exists():
+            # 首次追加前建立基线，崩溃后才能按旧 offset 回退。
+            _write_inorder_state()
+    except (OSError, TypeError, ValueError) as err:
         raise RuntimeError(f"failed to recover inorder aggregation state: {err}") from err
 
 
@@ -185,7 +143,7 @@ def _read_pending_result_bytes(file_path):
     return data, offset, file_size
 
 
-def _save_result_offsets(pending_offsets, cleanup):
+def _save_result_offsets(pending_offsets):
     """保存读取偏移；source 清理由整轮聚合成功后统一执行。"""
     _result_offsets.update(pending_offsets)
 
@@ -224,10 +182,9 @@ def mark_inorder_case_complete(pid, completed_offset):
 
 def _flush_completed_inorder_logs():
     """按 worker 增量复制完整 case，并持久化 source offset。"""
-    global _inorder_build_offset
     if not _inorder_completed_offsets:
         return True
-    out_file = _ensure_inorder_build()
+    out_file = _inorder_build_path()
     try:
         with out_file.open("ab") as out_f:
             for file_path, end_offset in list(_inorder_completed_offsets.items()):
@@ -239,7 +196,6 @@ def _flush_completed_inorder_logs():
                 runtime.sync_file(out_f)
                 _inorder_offsets[file_path] = end_offset
                 _inorder_completed_offsets.pop(file_path, None)
-            _inorder_build_offset = out_f.tell()
         _write_inorder_state()
         return True
     except Exception as err:
@@ -266,7 +222,7 @@ def _aggregate_text_logs(log_files, out_file, cleanup):
             with out_file.open("a") as f:
                 f.writelines(f"{line}\n" for line in sorted(all_lines))
                 runtime.sync_file(f)
-        _save_result_offsets(pending_offsets, cleanup)
+        _save_result_offsets(pending_offsets)
     except Exception as err:
         print(f"Error writing to {out_file}: {err}", flush=True)
         return False
@@ -286,8 +242,7 @@ def _aggregate_result_logs(cleanup, tmp_exists):
 def _aggregate_inorder_logs(cleanup, tmp_exists):
     """恢复完整 case，发布 build 后再清理 worker 临时日志。"""
     if not tmp_exists:
-        _ensure_inorder_build()
-        return True
+        return _publish_inorder_build() if cleanup else True
     if not _flush_completed_inorder_logs():
         return False
     log_files = sorted(runtime.TMP_LOG_PATH.glob("log_*.log"))
@@ -322,17 +277,12 @@ def _find_last_complete_case_end(file_path, start_offset):
 def _publish_inorder_build():
     """将已 fsync 的 build 原子发布为最终日志。"""
     # build 保留到 source 清理成功，cleanup 重试始终复用同一份内容。
-    build_path = _ensure_inorder_build()
+    build_path = _inorder_build_path()
     out_path = runtime.TEST_LOG_PATH / "log_inorder.log"
     publish_path = out_path.with_name(f".{out_path.name}.publish.tmp")
     try:
-        with build_path.open("ab") as build_file:
-            runtime.sync_file(build_file)
-        with build_path.open("rb") as source, publish_path.open("wb") as target:
-            # 发布副本独立于 build，原子替换后仍可继续 cleanup 重试。
-            while chunk := source.read(4 * 1024 * 1024):
-                target.write(chunk)
-            runtime.sync_file(target)
+        # 发布副本独立于 build，原子替换后仍可继续 cleanup 重试。
+        _copy_file_prefix(build_path, publish_path, build_path.stat().st_size)
         os.replace(publish_path, out_path)
         runtime.sync_directory(out_path.parent)
         return True
@@ -344,14 +294,10 @@ def _publish_inorder_build():
 
 
 def _cleanup_inorder_sources():
-    """最终日志发布成功后，删除或截断已消费的 worker source。"""
+    """最终日志发布成功后删除 worker source 和聚合状态。"""
     # source 删除是最后一步；之前任意失败都必须保留它用于恢复。
     for file_path in sorted(runtime.TMP_LOG_PATH.glob("log_*.log")):
         try:
-            committed_offset = _inorder_offsets.get(file_path, 0)
-            with file_path.open("r+b") as source:
-                source.truncate(committed_offset)
-                runtime.sync_file(source)
             file_path.unlink(missing_ok=True)
             _inorder_offsets.pop(file_path, None)
         except FileNotFoundError:
@@ -423,7 +369,7 @@ def _aggregate_csv_logs(log_files, out_file, header, cleanup):
             with out_file.open("a", newline="") as out_f:
                 out_f.write(buffer.getvalue())
                 runtime.sync_file(out_f)
-        _save_result_offsets(pending_offsets, cleanup)
+        _save_result_offsets(pending_offsets)
     except Exception as err:
         print(f"Error aggregating CSV into {out_file}: {err}", flush=True)
         return False
@@ -518,10 +464,6 @@ def _aggregate_comp_logs(cleanup, tmp_exists):
         for prefix in LOG_PREFIXES.values():
             log_files = list(dim_dir.glob(f"{prefix}_*.txt"))
             results.append(_aggregate_text_logs(log_files, out_dim_dir / f"{prefix}.txt", cleanup))
-        if cleanup and not any(dim_dir.iterdir()):
-            dim_dir.rmdir()
-    if cleanup and comp_tmp_dir.exists() and not any(comp_tmp_dir.iterdir()):
-        comp_tmp_dir.rmdir()
     return has_comp, all(results)
 
 

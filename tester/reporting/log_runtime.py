@@ -135,9 +135,13 @@ def close_process_files():
     for handler in handlers:
         try:
             sync_file(handler)
-            handler.close()
         except Exception as err:
-            print(f"Error closing process file: {err}", flush=True)
+            print(f"Error syncing process file: {err}", flush=True)
+        finally:
+            try:
+                handler.close()
+            except Exception as err:
+                print(f"Error closing process file: {err}", flush=True)
 
 
 def sync_file(file_obj):
