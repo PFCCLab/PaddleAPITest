@@ -76,10 +76,27 @@ def _ensure_inorder_build():
         return build_path
 
     out_path = runtime.TEST_LOG_PATH / "log_inorder.log"
+    expected_size = None
+    state_path = _inorder_state_path()
+    if state_path.exists():
+        # cleanup 重试只能重建 state 已确认的 build 前缀，不能复制目标文件尾部。
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+        expected_size = int(state["build_offset"])
     if out_path.exists():
         with out_path.open("rb") as source, build_path.open("wb") as target:
-            while chunk := source.read(4 * 1024 * 1024):
+            remaining = expected_size
+            while remaining is None or remaining:
+                chunk_size = 4 * 1024 * 1024
+                if remaining is not None:
+                    chunk_size = min(chunk_size, remaining)
+                chunk = source.read(chunk_size)
+                if not chunk:
+                    if remaining:
+                        raise ValueError("published log ended before inorder state")
+                    break
                 target.write(chunk)
+                if remaining is not None:
+                    remaining -= len(chunk)
             runtime.sync_file(target)
     else:
         with build_path.open("wb") as target:
@@ -95,7 +112,21 @@ def _load_inorder_state():
     state_path = _inorder_state_path()
     build_path = _inorder_build_path()
     if not state_path.exists():
-        _ensure_inorder_build()
+        # 无 state 时，已发布日志长度是唯一可信的 build 基线。
+        out_path = runtime.TEST_LOG_PATH / "log_inorder.log"
+        baseline_size = out_path.stat().st_size if out_path.exists() else 0
+        if not build_path.exists():
+            _ensure_inorder_build()
+        elif build_path.stat().st_size < baseline_size:
+            raise RuntimeError("inorder build is shorter than published log")
+        else:
+            with build_path.open("r+b") as build_file:
+                build_file.truncate(baseline_size)
+                runtime.sync_file(build_file)
+            runtime.sync_directory(build_path.parent)
+            _inorder_build_offset = baseline_size
+        # 首次追加前先建立基线，build 写入后崩溃才能回退到明确 offset。
+        _write_inorder_state()
         return
 
     try:
@@ -290,18 +321,26 @@ def _find_last_complete_case_end(file_path, start_offset):
 
 def _publish_inorder_build():
     """将已 fsync 的 build 原子发布为最终日志。"""
-    # rename 后即使随后被杀，目标文件也是完整 build，而非半截 append。
+    # build 保留到 source 清理成功，cleanup 重试始终复用同一份内容。
     build_path = _ensure_inorder_build()
     out_path = runtime.TEST_LOG_PATH / "log_inorder.log"
+    publish_path = out_path.with_name(f".{out_path.name}.publish.tmp")
     try:
         with build_path.open("ab") as build_file:
             runtime.sync_file(build_file)
-        os.replace(build_path, out_path)
+        with build_path.open("rb") as source, publish_path.open("wb") as target:
+            # 发布副本独立于 build，原子替换后仍可继续 cleanup 重试。
+            while chunk := source.read(4 * 1024 * 1024):
+                target.write(chunk)
+            runtime.sync_file(target)
+        os.replace(publish_path, out_path)
         runtime.sync_directory(out_path.parent)
         return True
     except Exception as err:
         print(f"Error publishing {build_path} to {out_path}: {err}", flush=True)
         return False
+    finally:
+        publish_path.unlink(missing_ok=True)
 
 
 def _cleanup_inorder_sources():
