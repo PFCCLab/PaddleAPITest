@@ -15,6 +15,9 @@ from .value_generators import (
     resolve_input_dtype,
 )
 
+# 大 Tensor 才切换目标 storage dtype，避免改变小配置既有随机序列。
+DIRECT_DTYPE_NUMEL_THRESHOLD = 1 << 20
+
 
 def _normalize_shape(shape, *, scalar_empty):
     """统一 NumPy 与原生 backend 对标量 shape 的边界表示。"""
@@ -30,6 +33,29 @@ def _choice_shape(shape, *, scalar_empty):
     scalar = shape is None
     normalized = _normalize_shape(shape, scalar_empty=scalar_empty)
     return scalar, normalized, 1 if scalar else int(numpy.prod(normalized))
+
+
+def _large_shape(shape):
+    """判断是否值得避免高精度临时 Tensor。"""
+    _, _, numel = _choice_shape(shape, scalar_empty=False)
+    return numel >= DIRECT_DTYPE_NUMEL_THRESHOLD
+
+
+def _direct_float_dtype(dtype, shape):
+    """返回大 Tensor 可直接生成的浮点 storage dtype。"""
+    # 低精度直生只对超过阈值的随机输入生效，避免改变小配置的随机序列。
+    if not _large_shape(shape):
+        return None
+    storage_dtype = resolve_input_dtype(dtype) if dtype is not None else None
+    return storage_dtype if storage_dtype in {"float16", "bfloat16"} else None
+
+
+def _direct_int32(dtype, shape, low, high):
+    """仅在边界可表达时使用 int32 原生随机算子。"""
+    # randint 边界必须能由 int32 表达，避免生成后 cast 造成索引回绕。
+    if not _large_shape(shape) or resolve_input_dtype(dtype) != "int32":
+        return False
+    return -(1 << 31) <= int(low) < int(high) <= (1 << 31)
 
 
 @runtime_checkable
@@ -367,52 +393,60 @@ class TorchInputBackend:
     def random(self, shape=None, dtype=None):
         torch = self._torch()
         torch_shape = self._torch_shape(shape)
+        direct_dtype = _direct_float_dtype(dtype, shape)
         value = torch.rand(
             torch_shape,
-            dtype=torch.float32,
+            dtype=self._torch_dtype(direct_dtype) if direct_dtype else torch.float32,
             device=self._device,
             generator=self._generator,
         )
-        return self.cast(value, dtype) if dtype is not None else value
+        return self.cast(value, dtype) if dtype is not None and not direct_dtype else value
 
     def uniform(self, low=0.0, high=1.0, shape=None, dtype=None):
         torch = self._torch()
         torch_shape = self._torch_shape(shape)
+        direct_dtype = _direct_float_dtype(dtype, shape)
         value = torch.empty(
             torch_shape,
-            dtype=self._resolve_torch_float_dtype(dtype),
+            dtype=(
+                self._torch_dtype(direct_dtype)
+                if direct_dtype
+                else self._resolve_torch_float_dtype(dtype)
+            ),
             device=self._device,
         ).uniform_(
             float(low),
             float(high),
             generator=self._generator,
         )
-        return self.cast(value, dtype) if dtype is not None else value
+        return self.cast(value, dtype) if dtype is not None and not direct_dtype else value
 
     def randint(self, low, high=None, shape=None, dtype=None):
         torch = self._torch()
         torch_shape = self._torch_shape(shape)
         if high is None:
             low, high = 0, low
+        direct_int32 = _direct_int32(dtype, shape, low, high)
         value = torch.randint(
             int(low),
             int(high),
             torch_shape,
-            dtype=torch.int64,
+            dtype=torch.int32 if direct_int32 else torch.int64,
             device=self._device,
             generator=self._generator,
         )
-        return self.cast(value, dtype) if dtype is not None else value
+        return self.cast(value, dtype) if dtype is not None and not direct_int32 else value
 
     def randn(self, *shape, dtype=None):
         torch = self._torch()
+        direct_dtype = _direct_float_dtype(dtype, shape)
         value = torch.randn(
             tuple(shape),
-            dtype=torch.float32,
+            dtype=self._torch_dtype(direct_dtype) if direct_dtype else torch.float32,
             device=self._device,
             generator=self._generator,
         )
-        return self.cast(value, dtype) if dtype is not None else value
+        return self.cast(value, dtype) if dtype is not None and not direct_dtype else value
 
     def choice(self, values, shape=None, replace=True, p=None):
         torch = self._torch()
@@ -718,45 +752,48 @@ class PaddleInputBackend:
 
     def random(self, shape=None, dtype=None):
         paddle = self._paddle()
+        direct_dtype = _direct_float_dtype(dtype, shape)
         # 默认随机原语先生成稳定 float32 storage，再按逻辑 dtype 转换。
         value = self._run_random(
             lambda: paddle.rand(
                 self._paddle_shape(shape),
-                dtype="float32",
+                dtype=direct_dtype or "float32",
                 device=self.device,
             )
         )
-        return self.cast(value, dtype) if dtype is not None else value
+        return self.cast(value, dtype) if dtype is not None and not direct_dtype else value
 
     def uniform(self, low=0.0, high=1.0, shape=None, dtype=None):
         paddle = self._paddle()
+        direct_dtype = _direct_float_dtype(dtype, shape)
         # seed=0 表示消费刚挂载的设备 generator，而不是创建算子私有固定 seed。
         value = self._run_random(
             lambda: paddle.uniform(
                 self._paddle_shape(shape),
-                dtype=self._resolve_paddle_float_dtype(dtype),
+                dtype=direct_dtype or self._resolve_paddle_float_dtype(dtype),
                 min=float(low),
                 max=float(high),
                 seed=0,
                 device=self.device,
             )
         )
-        return self.cast(value, dtype) if dtype is not None else value
+        return self.cast(value, dtype) if dtype is not None and not direct_dtype else value
 
     def randint(self, low, high=None, shape=None, dtype=None):
         if high is None:
             low, high = 0, low
         paddle = self._paddle()
+        direct_int32 = _direct_int32(dtype, shape, low, high)
         value = self._run_random(
             lambda: paddle.randint(
                 int(low),
                 int(high),
                 self._paddle_shape(shape),
-                dtype="int64",
+                dtype="int32" if direct_int32 else "int64",
                 device=self.device,
             )
         )
-        return self.cast(value, dtype) if dtype is not None else value
+        return self.cast(value, dtype) if dtype is not None and not direct_int32 else value
 
     def randn(self, *shape, dtype=None):
         paddle = self._paddle()

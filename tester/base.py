@@ -1251,6 +1251,12 @@ class APITestBase:
         max_rel_diff = -1.0
         max_rel_index = 0
         exact_compare = atol == 0.0 and rtol == 0.0
+        exact_integral_compare = exact_compare and not (
+            actual_dtype.is_floating_point
+            or actual_dtype.is_complex
+            or expected_dtype.is_floating_point
+            or expected_dtype.is_complex
+        )
         for start, actual_chunk, expected_chunk in chunks:
             if actual_chunk.dtype != expected_chunk.dtype:
                 # Match TensorLikePair._equalize_attributes without promoting
@@ -1271,6 +1277,11 @@ class APITestBase:
                 compare_dtype = torch.promote_types(actual_promote_dtype, expected_promote_dtype)
                 actual_chunk = actual_chunk.to(compare_dtype)
                 expected_chunk = expected_chunk.to(compare_dtype)
+
+            # 整数通过路径只需要融合 reduction；失败后仍走原诊断以保留 mismatch 详情。
+            if exact_integral_compare and torch.equal(actual_chunk, expected_chunk):
+                # 整数相等已由单个 reduction 完成，失败时再计算详细 mismatch。
+                continue
 
             if exact_compare:
                 equal = actual_chunk == expected_chunk
@@ -1653,6 +1664,59 @@ class APITestBase:
 
         # DLPack 只负责跨框架表示转换，转换后的 Tensor 还要统一搬到比较设备。
         # 因此 CPU kernel 与 GPU compare 的组合不会因源 Tensor 在 CPU 而退回 CPU compare。
+
+        if comparison_device.type == "cuda" and (is_cpu_tensor(actual) or is_cpu_tensor(expected)):
+            estimated_temp_bytes = self._comparison_temporary_bytes(actual, expected)
+            working_bytes = self._resolve_comparison_workspace(
+                actual,
+                estimated_temp_bytes,
+                dual_gpu,
+                comparison_device_id=comparison_device_id,
+            )
+            cpu_result_bytes = sum(
+                int(value.numel()) * _tensor_element_size(value)
+                for value in (actual, expected)
+                if is_cpu_tensor(value)
+            )
+            try:
+                free_bytes, _ = torch.cuda.mem_get_info(comparison_device_id)
+            except Exception:
+                free_bytes = 0
+            # 只有完整 CPU 结果无法和 workspace 同时驻留时，才逐 slab 搬运。
+            if cpu_result_bytes and free_bytes < cpu_result_bytes + working_bytes:
+                # 显存不足时只搬运当前 logical slab，禁止完整 CPU 结果制造峰值。
+                if tuple(actual.shape) != tuple(expected.shape):
+                    raise AssertionError(
+                        f"shape mismatch: {actual_name} {tuple(actual.shape)}, "
+                        f"{expected_name} {tuple(expected.shape)}"
+                    )
+                if is_check_dtype:
+                    actual_dtype = self._framework_tensor_torch_dtype(actual)
+                    expected_dtype = self._framework_tensor_torch_dtype(expected)
+                    if actual_dtype != expected_dtype:
+                        raise AssertionError(
+                            f"dtype mismatch: {actual_name} {actual_dtype}, "
+                            f"{expected_name} {expected_dtype}"
+                        )
+
+                def stream_error_msg(msg):
+                    return (
+                        f"Not equal to tolerance rtol={rtol}, atol={atol}\n"
+                        f"{msg}\n{actual_name}: shape={tuple(actual.shape)}\n"
+                        f"{expected_name}: shape={tuple(expected.shape)}"
+                    )
+
+                self._torch_assert_accuracy_in_logical_slabs(
+                    actual,
+                    expected,
+                    atol,
+                    rtol,
+                    stream_error_msg,
+                    working_bytes,
+                    comparison_device,
+                    is_check_dtype,
+                )
+                return
 
         if not actual.is_contiguous() or not expected.is_contiguous():
             actual_shape = tuple(actual.shape)

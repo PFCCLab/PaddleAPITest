@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+from ..input_generation.backend import DIRECT_DTYPE_NUMEL_THRESHOLD
 from ..input_generation.input_copy_policy import requires_inplace_input_copy
 from ..input_generation.materialization import (
     build_materialization_plan,
@@ -138,7 +139,13 @@ def _input_generation_peak(configs):
             source_bytes = numel * 8
             temporary_peak = max(source_bytes + generated_bytes, 2 * generated_bytes)
         else:
-            source_bytes = numel * 4
+            # 大 float16 已由 native backend 直接生成，预检不能继续计入完整 float32 源。
+            source_bytes = (
+                logical_bytes
+                if name == "float16" and numel >= DIRECT_DTYPE_NUMEL_THRESHOLD
+                else numel * 4
+            )
+            # bfloat16 当前仍使用 float32 storage，不能套用 float16 的估算。
             temporary_peak = max(
                 2 * source_bytes,
                 source_bytes + generated_bytes,
