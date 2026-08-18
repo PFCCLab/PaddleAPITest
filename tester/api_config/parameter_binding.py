@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import collections
+import functools
 import inspect
 from dataclasses import dataclass
 from pathlib import Path
@@ -176,13 +177,32 @@ def resolve_input_api(api_name):
     return resolved_api
 
 
+def _inspect_input_signature(api):
+    try:
+        return inspect.signature(api)
+    except (TypeError, ValueError):
+        return None
+
+
+@functools.lru_cache(maxsize=512)
+def _inspect_input_signature_cached(api):
+    """缓存 worker 内稳定 callable 的反射元数据。"""
+    return _inspect_input_signature(api)
+
+
+def _inspect_input_signature_with_cache(api):
+    try:
+        # callable 进入键后，运行时重绑定会自然触发新一轮反射。
+        return _inspect_input_signature_cached(api)
+    except TypeError:
+        # 不可哈希 callable 保留原语义，不因缓存支持范围而失败。
+        return _inspect_input_signature(api)
+
+
 def resolve_input_signature(api_name, api=None):
     # 可反射 API 使用真实签名；无签名 C-op 只接受明确的公共别名。
     api = api or resolve_input_api(api_name)
-    try:
-        signature = inspect.signature(api)
-    except (TypeError, ValueError):
-        signature = None
+    signature = _inspect_input_signature_with_cache(api)
     source = "signature"
     # api 参数由执行侧传入时可避免重复解析，但解析规则保持一致。
     if signature is None:
@@ -192,10 +212,8 @@ def resolve_input_signature(api_name, api=None):
                 None, "unresolved", "API has no inspectable signature or public alias"
             )
         public_api = resolve_input_api(public_api_name)
-        try:
-            signature = inspect.signature(public_api)
-        except (TypeError, ValueError):
-            signature = None
+        # 别名仍逐次解析当前 callable，避免 monkeypatch 或运行时重绑定命中旧签名。
+        signature = _inspect_input_signature_with_cache(public_api)
         if signature is None:
             return InputSignatureResult(
                 None, "unresolved", f"public alias has no signature: {public_api_name}"

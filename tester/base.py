@@ -364,7 +364,21 @@ class APITestBase:
         # 同一 case 的结果树共享设备快照，避免每个叶子重复查询 CUDA allocator。
         self.comparison_workspace_cache = {}
         if use_torch:
-            torch.set_num_threads(8)
+            # worker 数增大时按卡分摊 Torch 线程，单 worker 保持原有 8 线程默认值。
+            try:
+                workers_on_gpu = max(1, int(os.environ.get("PADDLEAPITEST_WORKERS_ON_GPU", "1")))
+            except (TypeError, ValueError):
+                workers_on_gpu = 1
+            default_torch_threads = max(1, 8 // workers_on_gpu)
+            raw_torch_threads = os.environ.get(
+                "PADDLEAPITEST_TORCH_NUM_THREADS", str(default_torch_threads)
+            )
+            try:
+                torch_threads = int(raw_torch_threads)
+            except (TypeError, ValueError):
+                # 外部环境变量可能来自调度系统，非法值仍按当前 worker 数回退。
+                torch_threads = default_torch_threads
+            torch.set_num_threads(max(1, torch_threads))
             torch.set_printoptions(threshold=100, linewidth=120)
 
     def torch_operator_device(self):

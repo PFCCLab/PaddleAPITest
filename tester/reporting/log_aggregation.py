@@ -6,6 +6,8 @@ import csv
 import io
 import json
 import os
+import tempfile
+from pathlib import Path
 
 from . import log_runtime as runtime
 from .log_schema import (
@@ -47,20 +49,30 @@ def _write_inorder_state():
     """持久化 source offset，保证删除 .tmp 前可以恢复聚合进度。"""
     # state 必须在 source 清理前落盘，主进程重启才能避免重复或丢失。
     state_path = _inorder_state_path()
-    temp_path = state_path.with_name(f".{state_path.name}.tmp")
     state = {
         "build_offset": _inorder_build_path().stat().st_size,
         "sources": {file_path.name: offset for file_path, offset in _inorder_offsets.items()},
     }
+    temp_path = None
     try:
-        with temp_path.open("w", encoding="utf-8") as state_file:
+        # 多个启动进程可能同时恢复状态，唯一临时文件避免彼此替换或清理。
+        with tempfile.NamedTemporaryFile(
+            "w",
+            encoding="utf-8",
+            dir=state_path.parent,
+            prefix=f".{state_path.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as state_file:
+            temp_path = Path(state_file.name)
             json.dump(state, state_file, sort_keys=True)
             state_file.write("\n")
             runtime.sync_file(state_file)
         os.replace(temp_path, state_path)
         runtime.sync_directory(state_path.parent)
     finally:
-        temp_path.unlink(missing_ok=True)
+        if temp_path is not None:
+            temp_path.unlink(missing_ok=True)
 
 
 def _copy_file_prefix(source_path, target_path, size):
