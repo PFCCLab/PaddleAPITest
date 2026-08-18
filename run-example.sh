@@ -315,5 +315,6 @@ else
     LOG_FILE="$(ls -t "$LOG_DIR"/log_[0-9]*.log 2>/dev/null | head -1 || true)"
     echo "已启动  PID $PYTHON_PID | 日志 ${LOG_FILE:-$LOG_DIR}"
     echo "管理    状态: ${RUN_COMMAND} --status | 终止: ${RUN_COMMAND} --stop"
-    [[ -n "$LOG_FILE" ]] && echo "跟踪    tail -f $LOG_FILE"
+    # 日志文件可能尚未创建，仍展示固定的跟踪入口供后续使用。
+    echo "跟踪    tail -f $LOG_FILE"
 fi
