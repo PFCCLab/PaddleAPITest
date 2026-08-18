@@ -31,14 +31,16 @@ class APITestPaddleGPUPerformance(APITestBase):
                 self.report_case_result("config_input", "generate_input_values failed")
                 return
         except Exception as err:
-            log_type, fatal = self.report_runtime_error(err, "config_input", "input")
+            log_type, fatal = self.report_runtime_error(err, "config_input", self.STAGE_INPUT)
             if fatal:
                 raise
             return
 
         try:
             if not self.build_paddle_input():
-                self.report_case_result("paddle_error", "build_paddle_input failed")
+                self.report_case_result(
+                    "paddle_error", "build_paddle_input failed", stage=self.STAGE_INPUT
+                )
                 return
             numel = tensor_config_tree_numel(self.api_config.args, self.api_config.kwargs)
             test_loop = 2147483647 * 20 // numel
@@ -103,15 +105,7 @@ class APITestPaddleGPUPerformance(APITestBase):
                 "\t",
                 "failed",
             )
-            if self.should_ignore_paddle_error(str(err)):
-                self.report_runtime_error(
-                    err,
-                    "paddle_error",
-                    "forward",
-                    allow_ignore_paddle=True,
-                )
-                return
-            _, fatal = self.report_runtime_error(err, "paddle_error", "forward")
+            _, fatal = self.report_runtime_error(err, "paddle_error", self.STAGE_PADDLE_FORWARD)
             if fatal:
                 raise err
             return
@@ -165,15 +159,7 @@ class APITestPaddleGPUPerformance(APITestBase):
                 "\t",
                 "failed",
             )
-            if self.should_ignore_paddle_error(str(err)):
-                self.report_runtime_error(
-                    err,
-                    "paddle_error",
-                    "backward",
-                    allow_ignore_paddle=True,
-                )
-                return
-            _, fatal = self.report_runtime_error(err, "paddle_error", "backward")
+            _, fatal = self.report_runtime_error(err, "paddle_error", self.STAGE_PADDLE_BACKWARD)
             if fatal:
                 raise err
             return

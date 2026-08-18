@@ -161,7 +161,9 @@ class APITestPaddleDeviceVSGPU(APITestCustomDeviceVSCPU):
                 return None, None
 
             if not self.build_paddle_input():
-                self.report_case_result("paddle_error", "build_paddle_input failed")
+                self.report_case_result(
+                    "paddle_error", "build_paddle_input failed", stage=self.STAGE_INPUT
+                )
                 return None, None
 
             paddle_output = self.paddle_api(*tuple(self.paddle_args), **self.paddle_kwargs)
@@ -183,7 +185,10 @@ class APITestPaddleDeviceVSGPU(APITestCustomDeviceVSCPU):
             return paddle_output, paddle_grads
 
         except Exception as e:
-            _, fatal = self.report_runtime_error(e, "paddle_error", f"paddle {paddle_device_type}")
+            stage = (
+                self.STAGE_PADDLE_BACKWARD if self.need_check_grad() else self.STAGE_PADDLE_FORWARD
+            )
+            _, fatal = self.report_runtime_error(e, "paddle_error", stage)
             if fatal:
                 raise
             return None, None
@@ -254,7 +259,7 @@ class APITestPaddleDeviceVSGPU(APITestCustomDeviceVSCPU):
                     flush=True,
                 )
             except Exception as e:
-                self.report_compare_error(e, "download forward")
+                self.report_compare_error(e, self.STAGE_COMPARE_FORWARD)
                 return False
 
             # 对比Backward梯度（如果存在且Forward通过）
@@ -298,7 +303,7 @@ class APITestPaddleDeviceVSGPU(APITestCustomDeviceVSCPU):
                         flush=True,
                     )
                 except Exception as e:
-                    self.report_compare_error(e, "download backward")
+                    self.report_compare_error(e, self.STAGE_COMPARE_BACKWARD)
                     return False
 
             print(
@@ -309,7 +314,7 @@ class APITestPaddleDeviceVSGPU(APITestCustomDeviceVSCPU):
             return True
 
         except Exception as e:
-            self.report_compare_error(e, "download compare")
+            self.report_compare_error(e, self.STAGE_COMPARE_FORWARD)
             return False
 
     def test(self):

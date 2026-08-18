@@ -674,14 +674,16 @@ class APITestPaddleTorchGPUPerformance(APITestBase):
                 self.report_case_result("config_input", "generate_input_values failed")
                 return
         except Exception as err:
-            log_type, fatal = self.report_runtime_error(err, "config_input", "input")
+            log_type, fatal = self.report_runtime_error(err, "config_input", self.STAGE_INPUT)
             if fatal:
                 raise
             return
 
         try:
             if not self.build_paddle_input():
-                self.report_case_result("paddle_error", "build_paddle_input failed")
+                self.report_case_result(
+                    "paddle_error", "build_paddle_input failed", stage=self.STAGE_INPUT
+                )
                 return
 
             if self.test_amp:
@@ -720,8 +722,7 @@ class APITestPaddleTorchGPUPerformance(APITestBase):
             _, fatal = self.report_runtime_error(
                 err,
                 "paddle_error",
-                "paddle forward",
-                allow_ignore_paddle=True,
+                self.STAGE_PADDLE_FORWARD,
             )
             if fatal:
                 raise err
@@ -766,8 +767,7 @@ class APITestPaddleTorchGPUPerformance(APITestBase):
             _, fatal = self.report_runtime_error(
                 err,
                 "paddle_error",
-                "paddle backward",
-                allow_ignore_paddle=True,
+                self.STAGE_PADDLE_BACKWARD,
             )
             if fatal:
                 raise err
@@ -782,7 +782,9 @@ class APITestPaddleTorchGPUPerformance(APITestBase):
             device = torch.device("cuda:0")
             torch.set_default_device(device)
             if not self.build_torch_input():
-                self.report_case_result("torch_error", "build_torch_input failed")
+                self.report_case_result(
+                    "torch_error", "build_torch_input failed", stage=self.STAGE_INPUT
+                )
                 return
 
             bound_arguments = bind_paddle_arguments(
@@ -838,7 +840,7 @@ class APITestPaddleTorchGPUPerformance(APITestBase):
                 torch_backward_sync,
                 combined,
             )
-            _, fatal = self.report_runtime_error(err, "torch_error", "torch forward")
+            _, fatal = self.report_runtime_error(err, "torch_error", self.STAGE_TORCH_FORWARD)
             if fatal:
                 raise err
             return
@@ -891,7 +893,7 @@ class APITestPaddleTorchGPUPerformance(APITestBase):
                 torch_backward_sync,
                 combined,
             )
-            _, fatal = self.report_runtime_error(err, "torch_error", "torch backward")
+            _, fatal = self.report_runtime_error(err, "torch_error", self.STAGE_TORCH_BACKWARD)
             if fatal:
                 raise err
             return

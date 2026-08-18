@@ -4,6 +4,46 @@ from __future__ import annotations
 
 from typing import Literal
 
+Stage = Literal[
+    "Input",
+    "Paddle forward",
+    "Paddle backward",
+    "Paddle forward sync",
+    "Paddle backward sync",
+    "Torch forward",
+    "Torch backward",
+    "Torch forward sync",
+    "Torch backward sync",
+    "Compare forward",
+    "Compare backward",
+    "Memory preflight",
+]
+
+# 输入阶段覆盖参数解析和框架输入物化。
+INPUT_STAGE: Stage = "Input"
+# Paddle 前向阶段只表示算子执行本身。
+PADDLE_FORWARD_STAGE: Stage = "Paddle forward"
+# Paddle 反向阶段覆盖梯度计算与梯度收集。
+PADDLE_BACKWARD_STAGE: Stage = "Paddle backward"
+# 前向同步单独标记 CUDA 异步错误的落点。
+PADDLE_FORWARD_SYNC_STAGE: Stage = "Paddle forward sync"
+# 反向同步单独标记 CUDA 异步错误的落点。
+PADDLE_BACKWARD_SYNC_STAGE: Stage = "Paddle backward sync"
+# Torch 前向阶段与 Paddle 阶段使用同一命名规则。
+TORCH_FORWARD_STAGE: Stage = "Torch forward"
+# Torch 反向阶段与 Paddle 阶段使用同一命名规则。
+TORCH_BACKWARD_STAGE: Stage = "Torch backward"
+# Torch 前向同步保持框架信息，避免只显示 sync。
+TORCH_FORWARD_SYNC_STAGE: Stage = "Torch forward sync"
+# Torch 反向同步保持框架信息，避免只显示 sync。
+TORCH_BACKWARD_SYNC_STAGE: Stage = "Torch backward sync"
+# 前向比较错误属于比较阶段，不归入任一执行框架。
+COMPARE_FORWARD_STAGE: Stage = "Compare forward"
+# 反向比较错误属于比较阶段，不归入任一执行框架。
+COMPARE_BACKWARD_STAGE: Stage = "Compare backward"
+# 资源预检查失败发生在算子执行之前。
+MEMORY_PREFLIGHT_STAGE: Stage = "Memory preflight"
+
 LogType = Literal[
     "checkpoint",
     "pass",

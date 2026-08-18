@@ -19,6 +19,7 @@ from .log_schema import (
     LOG_PREFIXES,
     TERMINAL_LOG_TYPES,
     LogType,
+    Stage,
 )
 
 _process_terminal_configs = {}
@@ -127,25 +128,25 @@ def format_case_result(
     log_type: LogType,
     line,
     *,
-    phase=None,
+    stage: Stage | None = None,
     message=None,
     error=None,
     tensor_position=None,
 ):
     """Format one case-level result line for terminal output."""
     head = f"[{log_type}]"
-    if phase:
-        head += f" {phase}"
+    if stage:
+        head += f" {stage}"
     fields = []
     if tensor_position:
         fields.append(f"tensor {tensor_position}")
     if message:
         fields.append(str(message))
-    if not phase and not tensor_position and message:
+    if not stage and not tensor_position and message:
         first_line = f"{head} {message} | {line}"
     else:
         prefix = " | ".join([head, *fields])
-        first_line = f"{prefix} | {line}" if phase or fields else f"{prefix} {line}"
+        first_line = f"{prefix} | {line}" if stage or fields else f"{prefix} {line}"
     if error is None:
         return first_line
     return f"{first_line}\n{error}"
@@ -155,7 +156,7 @@ def emit_case_result(
     log_type: LogType,
     line,
     *,
-    phase=None,
+    stage: Stage | None = None,
     message=None,
     error=None,
     tensor_position=None,
@@ -168,7 +169,7 @@ def emit_case_result(
         format_case_result(
             log_type,
             line,
-            phase=phase,
+            stage=stage,
             message=message,
             error=error,
             tensor_position=tensor_position,

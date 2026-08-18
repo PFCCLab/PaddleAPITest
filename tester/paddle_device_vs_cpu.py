@@ -55,12 +55,15 @@ class APITestCustomDeviceVSCPU(APITestBase):
                 print(f"build_paddle_input failed on {device_type}", flush=True)
                 return None, None
 
-            # Forward
-            if self.test_amp:
-                with paddle.amp.auto_cast():
+            try:
+                if self.test_amp:
+                    with paddle.amp.auto_cast():
+                        output = self.paddle_api(*tuple(self.paddle_args), **self.paddle_kwargs)
+                else:
                     output = self.paddle_api(*tuple(self.paddle_args), **self.paddle_kwargs)
-            else:
-                output = self.paddle_api(*tuple(self.paddle_args), **self.paddle_kwargs)
+            except Exception as err:
+                self.report_runtime_error(err, "paddle_error", self.STAGE_PADDLE_FORWARD)
+                return None, None
 
             # Backward
             out_grads = None
@@ -79,12 +82,8 @@ class APITestCustomDeviceVSCPU(APITestBase):
                             allow_unused=True,
                         )
                     except Exception as grad_err:
-                        print(
-                            f"[{device_type} backward error]",
-                            self.api_config.config,
-                            "\n",
-                            str(grad_err),
-                            flush=True,
+                        self.report_runtime_error(
+                            grad_err, "paddle_error", self.STAGE_PADDLE_BACKWARD
                         )
                         out_grads = None
                 else:
@@ -96,13 +95,7 @@ class APITestCustomDeviceVSCPU(APITestBase):
             return output, out_grads
 
         except Exception as err:
-            print(
-                f"[{device_type} error]",
-                self.api_config.config,
-                "\n",
-                str(err),
-                flush=True,
-            )
+            self.report_runtime_error(err, "paddle_error", self.STAGE_INPUT)
             return None, None
 
     def _compare_single_tensor(self, cpu_tensor, custom_tensor, tensor_name=""):
@@ -127,8 +120,12 @@ class APITestCustomDeviceVSCPU(APITestBase):
             return True
 
         except Exception as err:
-            phase = f"compare {tensor_name}" if tensor_name else "compare"
-            self.report_compare_error(err, phase)
+            stage = (
+                self.STAGE_COMPARE_BACKWARD
+                if "gradient" in tensor_name
+                else self.STAGE_COMPARE_FORWARD
+            )
+            self.report_compare_error(err, stage)
             return False
 
     def compare_outputs(self, cpu_output, custom_output):
@@ -250,7 +247,7 @@ class APITestCustomDeviceVSCPU(APITestBase):
                 self.report_case_result("config_input", "generate_input_values failed")
                 return
         except Exception as err:
-            log_type, fatal = self.report_runtime_error(err, "config_input", "input")
+            log_type, fatal = self.report_runtime_error(err, "config_input", self.STAGE_INPUT)
             if fatal:
                 raise
             return
@@ -258,13 +255,17 @@ class APITestCustomDeviceVSCPU(APITestBase):
         # 5. Run API on CPU (including forward and backward)
         cpu_output, cpu_grads = self.run_on_device("cpu", 0)
         if cpu_output is None:
-            self.report_case_result("paddle_error", "cpu execution failed")
+            self.report_case_result(
+                "paddle_error", "cpu execution failed", stage=self.STAGE_PADDLE_FORWARD
+            )
             return
 
         # 6. Run API on target device (including forward and backward)
         tgt_output, tgt_grads = self.run_on_device(target_device, device_id)
         if tgt_output is None:
-            self.report_case_result("paddle_error", f"{target_device} execution failed")
+            self.report_case_result(
+                "paddle_error", f"{target_device} execution failed", stage=self.STAGE_PADDLE_FORWARD
+            )
             return
 
         # 7. Compare forward results
@@ -277,7 +278,11 @@ class APITestCustomDeviceVSCPU(APITestBase):
             print("[Backward test begin]")
 
             if cpu_grads is None:
-                self.report_case_result("paddle_error", "cpu backward execution failed")
+                self.report_case_result(
+                    "paddle_error",
+                    "cpu backward execution failed",
+                    stage=self.STAGE_PADDLE_BACKWARD,
+                )
                 backward_pass = False
             elif tgt_grads is None:
                 self.report_case_result(

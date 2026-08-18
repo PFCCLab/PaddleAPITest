@@ -48,12 +48,13 @@ def log_accuracy_tolerance(
     tensor_count,
 ):
     """记录从 assert-close 失败消息中解析出的容差。"""
-    mode = "backward" if is_backward else "forward"
+    stage = "Compare backward" if is_backward else "Compare forward"
     print(
-        f"[tolerance] {mode} | tensor {tensor_index + 1}/{tensor_count} | {config}\n{error_msg}",
+        f"[tolerance] {stage} | tensor {tensor_index + 1}/{tensor_count} | {config}\n{error_msg}",
         flush=True,
     )
     max_abs_diff, max_rel_diff = _get_diff(error_msg, _TOL_ABS_PATTERN, _TOL_REL_PATTERN)
+    mode = "backward" if is_backward else "forward"
     row = [api, config, dtype, mode, str(max_abs_diff), str(max_rel_diff)]
     runtime.append_csv_row(
         runtime.RESULT_LOG_PATH / f"tol{runtime.RESULT_LOG_SUFFIX}.csv",
@@ -71,12 +72,12 @@ def _format_comp_line(
     **details,
 ):
     """构造稳定、单行且便于 grep 的 accuracy_stable 比较标记。"""
-    phase = "backward" if comp.endswith("B") else "forward"
+    stage = "Compare backward" if comp.endswith("B") else "Compare forward"
     base_comp = comp.removesuffix("B")
     actual_kind, actual_run, expected_kind, expected_run = base_comp
     actual_source = f"{_FRAMEWORK_NAMES[actual_kind]}#{actual_run}"
     expected_source = f"{_FRAMEWORK_NAMES[expected_kind]}#{expected_run}"
-    fields = [f"> COMP {comp}", result, phase]
+    fields = [f"> COMP {comp}", result, stage]
     if tensor_index is not None and tensor_count is not None:
         fields.append(f"tensor {tensor_index + 1}/{tensor_count}")
     fields.append(f"{actual_source} vs {expected_source}")

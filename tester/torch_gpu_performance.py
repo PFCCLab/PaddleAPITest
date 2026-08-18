@@ -45,7 +45,7 @@ class APITestTorchGPUPerformance(APITestBase):
                 self.report_case_result("config_input", "generate_input_values failed")
                 return
         except Exception as err:
-            log_type, fatal = self.report_runtime_error(err, "config_input", "input")
+            log_type, fatal = self.report_runtime_error(err, "config_input", self.STAGE_INPUT)
             if fatal:
                 raise
             return
@@ -58,7 +58,9 @@ class APITestTorchGPUPerformance(APITestBase):
             device = torch.device("cuda:0")
             torch.set_default_device(device)
             if not self.build_torch_input():
-                self.report_case_result("torch_error", "build_torch_input failed")
+                self.report_case_result(
+                    "torch_error", "build_torch_input failed", stage=self.STAGE_INPUT
+                )
                 return
 
             bound_arguments = bind_paddle_arguments(
@@ -122,7 +124,7 @@ class APITestTorchGPUPerformance(APITestBase):
                 "\tTorch\t",
                 combined,
             )
-            _, fatal = self.report_runtime_error(err, "torch_error", "forward")
+            _, fatal = self.report_runtime_error(err, "torch_error", self.STAGE_TORCH_FORWARD)
             if fatal:
                 raise err
             return
@@ -177,7 +179,7 @@ class APITestTorchGPUPerformance(APITestBase):
                 "\tTorch\t",
                 combined,
             )
-            _, fatal = self.report_runtime_error(err, "torch_error", "backward")
+            _, fatal = self.report_runtime_error(err, "torch_error", self.STAGE_TORCH_BACKWARD)
             if fatal:
                 raise err
             return

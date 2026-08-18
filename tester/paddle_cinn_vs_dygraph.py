@@ -31,13 +31,15 @@ class APITestCINNVSDygraph(APITestBase):
                 self.report_case_result("config_input", "generate_input_values failed")
                 return
         except Exception as err:
-            log_type, fatal = self.report_runtime_error(err, "config_input", "input")
+            log_type, fatal = self.report_runtime_error(err, "config_input", self.STAGE_INPUT)
             if fatal:
                 raise
             return
 
         if not self.build_paddle_input():
-            self.report_case_result("paddle_error", "build_paddle_input failed")
+            self.report_case_result(
+                "paddle_error", "build_paddle_input failed", stage=self.STAGE_INPUT
+            )
             return
 
         try:
@@ -68,8 +70,7 @@ class APITestCINNVSDygraph(APITestBase):
             _, fatal = self.report_runtime_error(
                 err,
                 "paddle_error",
-                "dynamic forward",
-                allow_ignore_paddle=True,
+                self.STAGE_PADDLE_FORWARD,
             )
             if fatal:
                 raise
@@ -78,7 +79,7 @@ class APITestCINNVSDygraph(APITestBase):
         try:
             self.check_operator_cuda_error()
         except Exception as err:
-            self.report_runtime_error(err, "paddle_cuda", "dynamic forward cuda check")
+            self.report_runtime_error(err, "paddle_cuda", self.STAGE_PADDLE_FORWARD_SYNC)
             raise
 
         need_check_grad = self.test_backward and self.need_check_grad()
@@ -107,15 +108,14 @@ class APITestCINNVSDygraph(APITestBase):
                     self.report_runtime_error(
                         err,
                         "config_input",
-                        "dynamic backward",
+                        self.STAGE_PADDLE_BACKWARD,
                         force_log_type="config_input",
                     )
                     return
                 _, fatal = self.report_runtime_error(
                     err,
                     "paddle_error",
-                    "dynamic backward",
-                    allow_ignore_paddle=True,
+                    self.STAGE_PADDLE_BACKWARD,
                 )
                 if fatal:
                     raise
@@ -124,7 +124,7 @@ class APITestCINNVSDygraph(APITestBase):
             try:
                 self.check_operator_cuda_error()
             except Exception as err:
-                self.report_runtime_error(err, "paddle_cuda", "dynamic backward cuda check")
+                self.report_runtime_error(err, "paddle_cuda", self.STAGE_PADDLE_BACKWARD_SYNC)
                 raise
 
         try:
@@ -207,15 +207,14 @@ class APITestCINNVSDygraph(APITestBase):
                 self.report_runtime_error(
                     err,
                     "config_input",
-                    "static",
+                    self.STAGE_PADDLE_BACKWARD if need_check_grad else self.STAGE_PADDLE_FORWARD,
                     force_log_type="config_input",
                 )
                 return
             _, fatal = self.report_runtime_error(
                 err,
                 "paddle_error",
-                "static",
-                allow_ignore_paddle=True,
+                self.STAGE_PADDLE_BACKWARD if need_check_grad else self.STAGE_PADDLE_FORWARD,
             )
             if fatal:
                 raise
@@ -224,7 +223,13 @@ class APITestCINNVSDygraph(APITestBase):
         try:
             self.check_operator_cuda_error()
         except Exception as err:
-            self.report_runtime_error(err, "paddle_cuda", "static cuda check")
+            self.report_runtime_error(
+                err,
+                "paddle_cuda",
+                self.STAGE_PADDLE_BACKWARD_SYNC
+                if need_check_grad
+                else self.STAGE_PADDLE_FORWARD_SYNC,
+            )
             raise
 
         if not self.compare(dynamic_fwd_output, static_fwd_output):
@@ -237,28 +242,28 @@ class APITestCINNVSDygraph(APITestBase):
         self.report_case_result("pass")
 
     def compare(self, dygraph_output, static_output, is_backward=False):
-        backward_str = "backward " if is_backward else ""
+        stage = self.STAGE_COMPARE_BACKWARD if is_backward else self.STAGE_COMPARE_FORWARD
         self.is_backward = is_backward
         if isinstance(dygraph_output, paddle.Tensor):
             if not isinstance(static_output, paddle.Tensor):
                 self.report_case_result(
                     "config_parse",
                     "match error",
-                    phase=backward_str.strip() or None,
+                    stage=stage,
                     error=f"type not match, dygraph: {type(dygraph_output)}, static: {type(static_output)}",
                 )
                 return False
             try:
                 self.paddle_assert_accuracy(dygraph_output, static_output)
             except Exception as err:
-                self.report_compare_error(err, backward_str.strip())
+                self.report_compare_error(err, stage)
                 return False
         elif isinstance(dygraph_output, (list, tuple)):
             if not isinstance(static_output, (list, tuple)):
                 self.report_case_result(
                     "config_parse",
                     "match error",
-                    phase=backward_str.strip() or None,
+                    stage=stage,
                     error=f"type not match, dygraph: {type(dygraph_output)}, static: {type(static_output)}",
                 )
                 return False
@@ -268,7 +273,7 @@ class APITestCINNVSDygraph(APITestBase):
                 self.report_case_result(
                     "config_parse",
                     "match error",
-                    phase=backward_str.strip() or None,
+                    stage=stage,
                     error=f"length not match, dygraph: {len(dygraph_output)}, static: {len(static_output)}",
                 )
                 return False
@@ -283,7 +288,7 @@ class APITestCINNVSDygraph(APITestBase):
                     self.report_case_result(
                         "config_parse",
                         "match error",
-                        phase=backward_str.strip() or None,
+                        stage=stage,
                         tensor_position=f"{i + 1}/{len(dygraph_output)}",
                         error=f"type not match, dygraph: {type(dygraph_item)}, static: {type(static_item)}",
                     )
@@ -291,9 +296,11 @@ class APITestCINNVSDygraph(APITestBase):
                 try:
                     self.paddle_assert_accuracy(dygraph_item, static_item)
                 except Exception as err:
-                    position = f"tensor {i + 1}/{len(dygraph_output)}"
-                    phase = f"{backward_str.strip()} | {position}" if backward_str else position
-                    self.report_compare_error(err, phase)
+                    self.report_compare_error(
+                        err,
+                        stage,
+                        tensor_position=f"{i + 1}/{len(dygraph_output)}",
+                    )
                     return False
         elif dygraph_output is None and static_output is None:
             pass
@@ -301,7 +308,7 @@ class APITestCINNVSDygraph(APITestBase):
             self.report_case_result(
                 "config_parse",
                 "match error",
-                phase=backward_str.strip() or None,
+                stage=stage,
                 error=f"type not match, dygraph: {type(dygraph_output)}, static: {type(static_output)}",
             )
             return False

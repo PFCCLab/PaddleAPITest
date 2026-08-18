@@ -126,16 +126,30 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SCRIPT_FILE="${BASH_SOURCE[0]##*/}"
 SCRIPT_NAME="${SCRIPT_FILE%.sh}"
 RUN_COMMAND="./${SCRIPT_FILE}"
-PID_FILE="${SCRIPT_DIR}/.${SCRIPT_NAME}.pid"
+mkdir -p "$LOG_DIR" || {
+    echo "[错误] 无法创建日志目录 | 日志 $LOG_DIR"
+    exit 1
+}
+LOG_DIR="$(cd "$LOG_DIR" && pwd -P)"
+# 输出目录锁定任务身份，脚本名不参与互斥。
+PID_FILE="${LOG_DIR}/.paddleapitest.pid"
+LOCK_FILE="${PID_FILE}.lock"
+exec 9>"$LOCK_FILE"
+# 启动、停止和清理共用此锁，防止状态竞态。
 
 # ── 运维命令处理 ──
 case "${1:-}" in
     --stop)
+        flock -x 9
         if [[ -f "$PID_FILE" ]]; then
             pid=$(cat "$PID_FILE")
             if kill -0 "$pid" 2>/dev/null; then
                 # Kill entire process group (main + all workers)
                 kill -- -"$pid" 2>/dev/null || kill "$pid" 2>/dev/null
+                for _ in {1..30}; do
+                    kill -0 "$pid" 2>/dev/null || break
+                    sleep 0.1
+                done
                 echo ">>> 终止任务 | 已终止 | PGID $pid"
             else
                 echo ">>> 终止任务 | 已结束 | PID $pid"
@@ -147,6 +161,7 @@ case "${1:-}" in
         exit 0
         ;;
     --status)
+        flock -x 9
         if [[ -f "$PID_FILE" ]]; then
             pid=$(cat "$PID_FILE")
             if kill -0 "$pid" 2>/dev/null; then
@@ -184,6 +199,7 @@ case "${1:-}" in
 esac
 
 # ── 防重复启动 ──
+flock -x 9
 if [[ -f "$PID_FILE" ]]; then
     old_pid=$(cat "$PID_FILE")
     if kill -0 "$old_pid" 2>/dev/null; then
@@ -283,6 +299,7 @@ mkdir -p "$LOG_DIR" || {
 
 # ── 启动 ──
 if [[ "$FOREGROUND" == "true" ]]; then
+    flock -u 9
     echo "开始    日志目录 $LOG_DIR | Ctrl+C 终止"
     # 忽略 shell 自身的 SIGINT，让 Ctrl+C 只作用于 python 子进程
     trap '' INT
@@ -292,6 +309,7 @@ else
     nohup setsid python "$ENGINE.py" "${ALL_ARGS[@]}" >/dev/null 2>&1 &
     PYTHON_PID=$!
     echo "$PYTHON_PID" > "$PID_FILE"
+    flock -u 9
 
     # 任务自然结束时清理 PID 文件；若已启动新任务，则不误删新 PID。
     (
@@ -299,10 +317,10 @@ else
             sleep 5
         done
 
+        exec 9>"$LOCK_FILE"
+        flock -x 9
         recorded_pid="$(cat "$PID_FILE" 2>/dev/null || true)"
-        if [[ "$recorded_pid" == "$PYTHON_PID" ]]; then
-            rm -f "$PID_FILE"
-        fi
+        [[ "$recorded_pid" == "$PYTHON_PID" ]] && rm -f "$PID_FILE"
     ) >/dev/null 2>&1 &
 
     sleep 1
