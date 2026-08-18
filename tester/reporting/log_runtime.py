@@ -134,9 +134,32 @@ def close_process_files():
     _process_file_handlers.clear()
     for handler in handlers:
         try:
+            sync_file(handler)
             handler.close()
         except Exception as err:
             print(f"Error closing process file: {err}", flush=True)
+
+
+def sync_file(file_obj):
+    """持久化已写入的日志，避免进程被杀时只剩用户态缓冲。"""
+    file_obj.flush()
+    os.fsync(file_obj.fileno())
+
+
+def sync_directory(directory):
+    """持久化目录项变更，保证原子替换后的文件名可恢复。"""
+    directory_fd = os.open(directory, os.O_RDONLY)
+    try:
+        os.fsync(directory_fd)
+    finally:
+        os.close(directory_fd)
+
+
+def sync_process_files():
+    """在 worker 报告终态前持久化该进程打开的结果分片。"""
+    # 终态消息发送前必须先落盘，否则主进程恢复时可能看不到结果行。
+    for handler in tuple(_process_file_handlers.values()):
+        sync_file(handler)
 
 
 def _get_process_file(file_path):
@@ -206,7 +229,9 @@ def write_lines_atomic(file_path, lines):
     try:
         with temp_file.open("w") as target:
             target.writelines(lines)
+            sync_file(target)
         os.replace(temp_file, file_path)
+        sync_directory(file_path.parent)
     finally:
         temp_file.unlink(missing_ok=True)
 

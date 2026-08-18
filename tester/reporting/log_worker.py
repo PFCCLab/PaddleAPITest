@@ -327,6 +327,10 @@ def write_case_end(status, api_config_str, *, duration_ms=None):
     if duration_ms is not None:
         fields.append(f"{duration_ms} ms")
     print(" | ".join(fields) + "\n", flush=True)
+    if _redirected_fds is not None:
+        # completed_offset 只有在 CASE_END 已落盘后才可交给主进程。
+        os.fsync(_redirected_fds[0])
+    runtime.sync_process_files()
     completed_offset = get_worker_log_offset()
     _clear_case_result_state(api_config_str)
     return completed_offset
@@ -350,6 +354,7 @@ def append_case_end_to_worker_log(pid, status, api_config_str):
         log_file.parent.mkdir(parents=True, exist_ok=True)
         with log_file.open("ab") as f:
             f.write(f"\n{end_line}\n\n".encode())
+            runtime.sync_file(f)
             return f.tell()
     except Exception as err:
         print(f"Error writing case end to worker log {pid}: {err}", flush=True)
