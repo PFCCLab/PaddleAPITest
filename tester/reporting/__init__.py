@@ -8,11 +8,13 @@ from . import log_runtime as _runtime
 from . import log_worker as _worker
 
 
-def init_log(log_dir):
+def init_log(log_dir, *, reset_aggregation=True):
     """初始化日志路径及进程内状态。"""
     _runtime._configure_log(log_dir)
     _worker._reset_worker_state()
-    _aggregation._reset_aggregation_state()
+    if reset_aggregation:
+        # 聚合状态只属于主进程，worker 仅写自己的日志分片。
+        _aggregation._reset_aggregation_state()
 
 
 __all__ = ("init_log",)

@@ -47,7 +47,7 @@ def _direct_float_dtype(dtype, shape):
     if not _large_shape(shape):
         return None
     storage_dtype = resolve_input_dtype(dtype) if dtype is not None else None
-    return storage_dtype if storage_dtype in {"float16", "bfloat16"} else None
+    return storage_dtype if storage_dtype == "float16" else None
 
 
 def _direct_int32(dtype, shape, low, high):
@@ -753,7 +753,7 @@ class PaddleInputBackend:
     def random(self, shape=None, dtype=None):
         paddle = self._paddle()
         direct_dtype = _direct_float_dtype(dtype, shape)
-        # 默认随机原语先生成稳定 float32 storage，再按逻辑 dtype 转换。
+        # 小配置保持稳定 float32 stream，大 float16 避免高精度临时值。
         value = self._run_random(
             lambda: paddle.rand(
                 self._paddle_shape(shape),
@@ -797,14 +797,15 @@ class PaddleInputBackend:
 
     def randn(self, *shape, dtype=None):
         paddle = self._paddle()
+        direct_dtype = _direct_float_dtype(dtype, shape)
         value = self._run_random(
             lambda: paddle.randn(
                 self._paddle_shape(shape),
-                dtype="float32",
+                dtype=direct_dtype or "float32",
                 device=self.device,
             )
         )
-        return self.cast(value, dtype) if dtype is not None else value
+        return self.cast(value, dtype) if dtype is not None and not direct_dtype else value
 
     def choice(self, values, shape=None, replace=True, p=None):
         paddle = self._paddle()
