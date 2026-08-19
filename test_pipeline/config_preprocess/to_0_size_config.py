@@ -6,6 +6,7 @@ import heapq
 import math
 import os
 import tempfile
+from typing import NamedTuple
 
 import numpy
 import paddle
@@ -130,13 +131,144 @@ def _find_tensor_shape_spans(config):
         search_from = shape_end + 1
 
 
-def _selected_positions(tensor_configs):
-    """返回全部 Tensor 维度位置，保持 0-size 覆盖范围不变。"""
+def _selected_positions(tensor_configs, collapsed):
+    """返回逐位置枚举的 Tensor 维度位置，collapsed 内的下标交由分档取样覆盖。"""
     return [
         (index, axis)
         for index, tensor in enumerate(tensor_configs)
+        if index not in collapsed
         for axis in range(len(tensor.shape))
     ]
+
+
+# 同质容器的逐位置枚举产出 O(N²) 文本，而这 N 个变体走的 kernel 分档完全相同。
+# 阈值取 256 使历史基线（同质列表最大 216 元素）的输出保持不变。
+HOMOGENEOUS_CONTAINER_LIMIT = 256
+
+
+class FoldSpec(NamedTuple):
+    """单个 API 的折叠规格。取样表只在推导它的那个 kernel 上成立，故按 API 隔离。"""
+
+    # (容器长度, 置 0 元素个数)，用于命中 kernel 的输入个数分档边界。
+    lengths: tuple[tuple[int, int], ...]
+
+# concat 前向按有效输入数 M 分 4/8/16/32/64/128/default 七档，反向按原长度 N+1
+# 分 <=4/8/16/32/64/else 六档；长度 10 还是 axis==0 直接拷贝与 functor 的边界。
+# 反向前缀和可观察 0 宽分段的位置，因此每组样本都覆盖容器首尾。
+_CONCAT_FOLD_SPEC = FoldSpec(
+    lengths=(
+        (2, 1),  # 反向 limit=3，kFixed4 档内最小可用长度（N=1 时输出全 0 会提前返回）
+        (3, 1),  # 反向 limit=4，kFixed4 上边界
+        (4, 1),  # 反向 limit=5，kFixed8 下边界
+        (7, 1),  # 反向 limit=8，kFixed8 上边界
+        (8, 1),  # 反向 limit=9，kFixed16 下边界
+        (9, 1),  # 前后向直接拷贝旁路的上边界（axis==0 时）
+        (10, 9),  # M=1，前向档 4 下边界；旁路下边界，functor 内只剩单个有效输入
+        (10, 6),  # M=4，前向档 4 上边界
+        (10, 5),  # M=5，前向档 8 下边界
+        (10, 2),  # M=8，前向档 8 上边界
+        (10, 1),  # M=9，前向档 16 下边界
+        (15, 1),  # 反向 limit=16，kFixed16 上边界
+        (16, 1),  # 反向 limit=17，kFixed32 下边界
+        (17, 1),  # M=16，前向档 16 上边界
+        (18, 1),  # M=17，前向档 32 下边界
+        (31, 1),  # 反向 limit=32，kFixed32 上边界
+        (32, 1),  # 反向 limit=33，kFixed64 下边界
+        (33, 1),  # M=32，前向档 32 上边界
+        (34, 1),  # M=33，前向档 64 下边界
+        (63, 1),  # 反向 limit=64，kFixed64 上边界
+        (64, 1),  # 反向 limit=65，kVariableLength 下边界
+        (65, 1),  # M=64，前向档 64 上边界
+        (66, 1),  # M=65，前向档 128 下边界
+        (129, 1),  # M=128，前向档 128 上边界
+        (130, 1),  # M=129，前向 default 档下边界；档内与任意更大的 M 等价
+    )
+)
+
+# add_n 只有 in_num==2 的 Eigen 特化；一般路径会用最后一个 Tensor 覆盖 lod_length，
+# 所以首尾位置都要覆盖。长度 10 是一般多输入路径的代表值，不对应新模板分档。
+_ADD_N_FOLD_SPEC = FoldSpec(
+    lengths=(
+        (2, 1),  # in_num==2 特化，首尾分别命中 length_1==0 与 length_0==0 两个分支
+        (2, 2),  # in_num==2 特化，两侧皆 0，三个分支都不进入
+        (3, 1),  # in_num==2 分界的另一侧，转入一般路径
+        (10, 1),  # 一般路径的多输入代表值，覆盖 in_data 剔除后个数大于 2 的情形
+    )
+)
+
+# 折叠规格逐 API 注册。取样表是从具体 kernel 的分支反推的，跨 API 复用既会漏掉本算子
+# 独有的分支，也会让本算子背上别人的边界，因此未注册的 API 一律不折叠、只告警。
+_API_FOLD_SPECS = {
+    "paddle.add_n": _ADD_N_FOLD_SPEC,
+    "paddle.concat": _CONCAT_FOLD_SPEC,
+}
+
+# 记录被折叠的 API 及配置条数，供收尾汇总；语义与 apis_map 一致，为模块级状态。
+folded_apis = {}
+
+# 记录容器超限但未注册折叠规格的 API，收尾告警提示其输出仍是 O(N²)。
+unfolded_apis = {}
+
+
+def _zero_placements(length, zero_count):
+    """返回容器首尾的置 0 下标；全置 0 时去重。"""
+    head = frozenset(range(zero_count))
+    tail = frozenset(range(length - zero_count, length))
+    return (head,) if head == tail else (head, tail)
+
+
+class TensorContainer(NamedTuple):
+    """纯 Tensor 容器在扁平 Tensor 列表中的位置及其参数所有权。"""
+
+    is_kwargs: bool
+    key: int | str
+    start: int
+    count: int
+
+
+def _oversized_containers(api_config, tensor_configs):
+    """定位元素超限且 shape/dtype 相同的纯 Tensor 容器。"""
+    oversized = []
+    offset = 0
+    for is_kwargs, items in (
+        (False, enumerate(api_config.args)),
+        (True, api_config.kwargs.items()),
+    ):
+        for key, arg_config in items:
+            if isinstance(arg_config, TensorConfig):
+                offset += 1
+                continue
+            if not isinstance(arg_config, (list, tuple)):
+                continue
+
+            tensor_count = sum(isinstance(item, TensorConfig) for item in arg_config)
+            start = offset
+            offset += tensor_count
+            if tensor_count != len(arg_config) or tensor_count <= HOMOGENEOUS_CONTAINER_LIMIT:
+                continue
+            tensors = tensor_configs[start : start + tensor_count]
+            first = tensors[0]
+            if all(tensor.shape == first.shape and tensor.dtype == first.dtype for tensor in tensors):
+                oversized.append(TensorContainer(is_kwargs, key, start, tensor_count))
+    return oversized
+
+
+def _length_sampled_variants(api_config, container, spec):
+    """按 kernel 输入个数分档的边界取样，替代超长同质容器的逐位置枚举。"""
+    work_api_config = copy.deepcopy(api_config)
+    owner = work_api_config.kwargs if container.is_kwargs else work_api_config.args
+    values = owner[container.key]
+    element = values[0]
+    for axis in range(len(element.shape)):
+        zero_element = copy.deepcopy(element)
+        zero_element.shape[axis] = 0
+        for length, zero_count in spec.lengths:
+            for zeros in _zero_placements(length, zero_count):
+                # 容器内元素签名一致，序列化只读取 shape 与 dtype，可共享同一对象。
+                owner[container.key] = type(values)(
+                    [zero_element if position in zeros else element for position in range(length)]
+                )
+                yield str(work_api_config)
 
 
 def _replace_shape_spans(config, spans, replacements):
@@ -152,12 +284,12 @@ def _replace_shape_spans(config, spans, replacements):
     return "".join(chunks)
 
 
-def _object_variants(api_config):
+def _object_variants(api_config, collapsed):
     """字符串定位失败时的兼容路径；同一配置只深拷贝一次。"""
     # 仅定位失败时使用对象回退，且整个配置生命周期只复制一次。
     work_api_config = copy.deepcopy(api_config)
     work_tensors = get_tensor_configs(work_api_config)
-    for tensor_index, axis in _selected_positions(work_tensors):
+    for tensor_index, axis in _selected_positions(work_tensors, collapsed):
         tensor = work_tensors[tensor_index]
         old_value = tensor.shape[axis]
         tensor.shape[axis] = 0
@@ -175,6 +307,26 @@ def _object_variants(api_config):
             finally:
                 for tensor, old_value in zip(work_tensors, old_values, strict=True):
                     tensor.shape[axis] = old_value
+
+
+def _position_variants(api_config, tensor_configs, canonical_config, spans, shape_equal, collapsed):
+    """按位置生成样本，共用字符串快速路径和对象回退路径的覆盖规则。"""
+    if len(spans) != len(tensor_configs):
+        yield from _object_variants(api_config, collapsed)
+        return
+
+    for tensor_index, axis in _selected_positions(tensor_configs, collapsed):
+        shape = list(tensor_configs[tensor_index].shape)
+        shape[axis] = 0
+        yield _replace_shape_spans(canonical_config, spans, {tensor_index: shape})
+
+    if shape_equal:
+        for axis in range(len(tensor_configs[0].shape)):
+            replacements = {
+                index: [*tensor.shape[:axis], 0, *tensor.shape[axis + 1 :]]
+                for index, tensor in enumerate(tensor_configs)
+            }
+            yield _replace_shape_spans(canonical_config, spans, replacements)
 
 
 def to_0_size_config(api_config):
@@ -209,31 +361,40 @@ def to_0_size_config(api_config):
     canonical_config = str(api_config)
     # 运行时 callable 的 repr 不能被 parser 重新执行，此时保留原始可解析文本。
     runtime_repr_markers = ("<function ", "<method ", "<built-in ", "<slot wrapper ", " at 0x")
-    if any(marker in canonical_config for marker in runtime_repr_markers):
+    canonical_reusable = not any(marker in canonical_config for marker in runtime_repr_markers)
+    if not canonical_reusable:
         canonical_config = api_config.config
+
+    # 重新序列化不可用时无法做容器截断，此时保持逐位置枚举，不牺牲覆盖。
+    oversized = _oversized_containers(api_config, tensor_configs) if canonical_reusable else []
+    spec = _API_FOLD_SPECS.get(api_config.api_name)
+    if oversized and spec is None:
+        # 取样表是从具体 kernel 的分支反推的，套用到未核对的 API 上可能漏分支，
+        # 因此未注册规格时不折叠，只记账告警，输出规模仍是 O(N²)。
+        unfolded_apis[api_config.api_name] = unfolded_apis.get(api_config.api_name, 0) + 1
+        oversized = []
+    # 折叠时保留容器的首、末两个元素：全规模下各留一条位置样本，作为不依赖 kernel
+    # 分支推导的兜底，覆盖「位置在大规模下仍有影响」这种取样表可能读漏的情况。
+    collapsed = frozenset(
+        index
+        for container in oversized
+        for index in range(container.start + 1, container.start + container.count - 1)
+    )
+    if oversized:
+        folded_apis[api_config.api_name] = folded_apis.get(api_config.api_name, 0) + 1
+
     spans = _find_tensor_shape_spans(canonical_config)
-    if len(spans) != len(tensor_configs):
-        yield from _object_variants(api_config)
-        return
+    yield from _position_variants(
+        api_config,
+        tensor_configs,
+        canonical_config,
+        spans,
+        shape_equal,
+        collapsed,
+    )
 
-    # 每个变体只复制字符串，不复制整棵 APIConfig 对象树。
-    for tensor_index, axis in _selected_positions(tensor_configs):
-        shape = list(tensor_configs[tensor_index].shape)
-        shape[axis] = 0
-        yield _replace_shape_spans(
-            canonical_config,
-            spans,
-            {tensor_index: shape},
-        )
-
-    if shape_equal:
-        for axis in range(shape_len):
-            replacements = {}
-            for index, tensor in enumerate(tensor_configs):
-                shape = list(tensor.shape)
-                shape[axis] = 0
-                replacements[index] = shape
-            yield _replace_shape_spans(canonical_config, spans, replacements)
+    for container in oversized:
+        yield from _length_sampled_variants(api_config, container, spec)
 
 
 apis_map = {}
@@ -504,3 +665,12 @@ if __name__ == "__main__":
         unique_count = _merge_chunks(chunk_paths, args.output)
 
     print(f"输出: {args.output}，共 {unique_count} 行")
+    if folded_apis:
+        print(f"超长同质容器折叠为分档取样（阈值 {HOMOGENEOUS_CONTAINER_LIMIT} 元素）:")
+        for api_name, count in sorted(folded_apis.items()):
+            print(f"  {api_name}: {count} 条")
+    if unfolded_apis:
+        print("[告警] 下列 API 的同质容器超限但未注册折叠规格，输出规模仍是 O(N²)；")
+        print("       需先核对其 kernel 按输入个数的分支，再补进 _API_FOLD_SPECS:")
+        for api_name, count in sorted(unfolded_apis.items()):
+            print(f"  {api_name}: {count} 条")
