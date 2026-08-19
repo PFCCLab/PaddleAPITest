@@ -43,15 +43,6 @@ def get_tensor_configs(api_config):
     return tensor_configs
 
 
-def iter_api_configs(config_path):
-    """逐行解析配置，避免把全部 APIConfig 对象同时保存在内存。"""
-    with open(config_path, encoding="utf-8") as config_file:
-        for raw_line in config_file:
-            config = raw_line.strip()
-            if config and config.startswith("paddle."):
-                yield APIConfig(config)
-
-
 def _matching_close(text, start, opening, closing):
     """返回嵌套括号的结束位置，字符串内容中的括号不参与配对。"""
     # 需要跳过字符串中的括号，否则 callable 或字符串参数会破坏定位。
@@ -77,6 +68,40 @@ def _matching_close(text, start, opening, closing):
             if depth == 0:
                 return index
     return None
+
+
+def _split_top_level_calls(text):
+    """将一行中连续的顶层 paddle.* 调用无损拆分。"""
+    calls = []
+    cursor = 0
+    while cursor < len(text):
+        while cursor < len(text) and text[cursor].isspace():
+            cursor += 1
+        if cursor >= len(text):
+            break
+        if not text.startswith("paddle.", cursor):
+            raise ValueError("顶层调用结束后存在无法识别的内容")
+
+        opening = text.find("(", cursor + len("paddle."))
+        next_call = text.find("paddle.", cursor + len("paddle."))
+        if opening < 0 or (next_call >= 0 and next_call < opening):
+            raise ValueError("顶层 paddle.* 调用缺少左括号")
+        closing = _matching_close(text, opening, "(", ")")
+        if closing is None:
+            raise ValueError("顶层 paddle.* 调用括号不匹配")
+        calls.append(text[cursor : closing + 1])
+        cursor = closing + 1
+    return calls
+
+
+def iter_api_configs(config_path):
+    """逐行解析配置，并拆分粘连的顶层 API 调用。"""
+    with open(config_path, encoding="utf-8") as config_file:
+        for raw_line in config_file:
+            config = raw_line.strip()
+            if config and config.startswith("paddle."):
+                for call in _split_top_level_calls(config):
+                    yield APIConfig(call)
 
 
 def _find_tensor_shape_spans(config):
