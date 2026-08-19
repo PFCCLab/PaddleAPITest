@@ -152,6 +152,7 @@ class FoldSpec(NamedTuple):
     # (容器长度, 置 0 元素个数)，用于命中 kernel 的输入个数分档边界。
     lengths: tuple[tuple[int, int], ...]
 
+
 # concat 前向按有效输入数 M 分 4/8/16/32/64/128/default 七档，反向按原长度 N+1
 # 分 <=4/8/16/32/64/else 六档；长度 10 还是 axis==0 直接拷贝与 functor 的边界。
 # 反向前缀和可观察 0 宽分段的位置，因此每组样本都覆盖容器首尾。
@@ -248,7 +249,9 @@ def _oversized_containers(api_config, tensor_configs):
                 continue
             tensors = tensor_configs[start : start + tensor_count]
             first = tensors[0]
-            if all(tensor.shape == first.shape and tensor.dtype == first.dtype for tensor in tensors):
+            if all(
+                tensor.shape == first.shape and tensor.dtype == first.dtype for tensor in tensors
+            ):
                 oversized.append(TensorContainer(is_kwargs, key, start, tensor_count))
     return oversized
 
