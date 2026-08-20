@@ -3,14 +3,13 @@
 from __future__ import annotations
 
 import hashlib
-import math
 
 import numpy
 
 from .values import InputTensorSpec
 
-# 单值生成器只消费 InputTensorSpec 和 RNG，不读取 API 名称或修改 TensorConfig。
-# `spec` 与 `rng` 是本模块内部的数值计算惯例，完整输入标识由函数名和类型提供。
+# 单值生成器只消费 InputTensorSpec 和 backend/RNG，不读取 API 名称或修改 TensorConfig。
+# `spec` 与 backend/RNG 是本模块内部的数值计算惯例，完整输入标识由函数名和类型提供。
 # 这些中间 dtype 转换要保持固定，才能保证输出字节稳定。
 _INPUT_INTERMEDIATE_DTYPES = {
     "bfloat16": "float32",
@@ -145,60 +144,30 @@ def _complex_value(dtype, shape, rng, **kwargs):
     return rng.cast(real + 1j * imag, dtype)
 
 
-# ``(rng.random(shape) - 0.5) * (2 * max_abs)`` 在大 Tensor 上会连续产生多份整块
-# float64 eager 临时。NumPy backend 的随机流是顺序流，一次 random(shape) 与按首维
-# 切块的多次 random 调用消费同一串数，因此分块 + 原地运算的输出与原表达式 bit-exact，
-# 只是把 float64 中间临时限制在单块大小。
-_SYMMETRIC_CHUNK_MIN_ELEMENTS = 1 << 24
-_SYMMETRIC_CHUNK_ELEMENTS = 1 << 22
-
-
-def _chunked_symmetric_numpy(shape, dtype, max_abs, rng):
-    """按元素数分块生成对称区间数值，避免宽 Tensor 退化为整行临时。"""
-    normalized_shape = tuple(int(extent) for extent in shape)
-    value = numpy.empty(normalized_shape, dtype=dtype)
-    flat_value = value.reshape(-1)
-    total_elements = int(flat_value.size)
-    for start in range(0, total_elements, _SYMMETRIC_CHUNK_ELEMENTS):
-        end = min(total_elements, start + _SYMMETRIC_CHUNK_ELEMENTS)
-        block = numpy.asarray(rng.random(end - start))
-        # block 是本次调用新产生的数组，原地运算不会影响任何其他生成结果。
-        block -= 0.5
-        block *= 2 * max_abs
-        flat_value[start:end] = block
-    return value
-
-
 def generate_symmetric_input_value(
     spec: InputTensorSpec,
     max_abs,
-    rng=INPUT_NUMPY_RANDOM_STATE,
+    backend,
 ) -> object:
     """生成实部和虚部分量均位于对称区间的数值。"""
     dtype = resolve_input_dtype(spec.dtype)
     if dtype.startswith("complex"):
         # max_abs 约束每个分量，复数模长允许达到 sqrt(2) 倍上界。
-        return _complex_value(dtype, spec.shape, rng, offset=-max_abs, scale=2 * max_abs)
-    if (
-        getattr(rng, "name", "numpy") == "numpy"
-        and spec.shape
-        and math.prod(spec.shape) >= _SYMMETRIC_CHUNK_MIN_ELEMENTS
-    ):
-        return _chunked_symmetric_numpy(spec.shape, dtype, max_abs, rng)
-    return rng.cast((rng.random(spec.shape) - 0.5) * (2 * max_abs), dtype)
+        return _complex_value(dtype, spec.shape, backend, offset=-max_abs, scale=2 * max_abs)
+    return backend.symmetric(spec.shape, dtype, max_abs)
 
 
 def generate_nonzero_symmetric_input_value(
     spec: InputTensorSpec,
     max_abs,
-    rng=INPUT_NUMPY_RANDOM_STATE,
+    backend,
 ) -> object:
     """生成可配置对称范围并替换量化后产生的零值。"""
     dtype = resolve_input_dtype(spec.dtype)
-    value = generate_symmetric_input_value(spec, max_abs, rng)
+    value = generate_symmetric_input_value(spec, max_abs, backend)
     # replacement 保持相同 dtype，避免低精度 Tensor 被 Python 标量提升。
-    replacement = rng.asarray(max_abs, dtype=dtype)
-    return rng.where(value == 0, replacement, value)
+    replacement = backend.asarray(max_abs, dtype=dtype)
+    return backend.where(value == 0, replacement, value)
 
 
 def generate_normal_input_value(
@@ -222,7 +191,7 @@ def generate_normal_input_value(
 
 def generate_default_input_value(
     spec: InputTensorSpec,
-    rng=INPUT_NUMPY_RANDOM_STATE,
+    backend,
     *,
     max_abs=0.6,
 ) -> object:
@@ -230,11 +199,11 @@ def generate_default_input_value(
     dtype = resolve_input_dtype(spec.dtype)
     if dtype == "bool":
         # 连续随机数 cast 到 bool 几乎恒为 True，必须直接采样二值空间。
-        return rng.cast(rng.randint(0, 2, shape=spec.shape), dtype)
+        return backend.cast(backend.randint(0, 2, shape=spec.shape), dtype)
     if "int" in dtype:
         # 运行级浮点范围不能收窄已有的整数压力测试范围。
-        return rng.cast(rng.randint(-65535, 65535, shape=spec.shape), dtype)
-    return generate_symmetric_input_value(spec, max_abs, rng)
+        return backend.cast(backend.randint(-65535, 65535, shape=spec.shape), dtype)
+    return generate_symmetric_input_value(spec, max_abs, backend)
 
 
 def generate_nonzero_input_value(spec: InputTensorSpec, rng=INPUT_NUMPY_RANDOM_STATE) -> object:
