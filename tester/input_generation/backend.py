@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import numbers
 from dataclasses import dataclass, field
 from typing import Protocol, runtime_checkable
@@ -17,6 +18,9 @@ from .value_generators import (
 
 # 大 Tensor 才切换目标 storage dtype，避免改变小配置既有随机序列。
 DIRECT_DTYPE_NUMEL_THRESHOLD = 1 << 20
+# NumPy 对称随机值按元素数限制 float64 中间块大小；原生 backend 保持整块生成。
+_SYMMETRIC_CHUNK_MIN_ELEMENTS = 1 << 24
+_SYMMETRIC_CHUNK_ELEMENTS = 1 << 22
 
 
 def _normalize_shape(shape, *, scalar_empty):
@@ -69,6 +73,8 @@ class InputBackend(Protocol):
     def random(self, shape=None, dtype=None): ...
 
     def uniform(self, low=0.0, high=1.0, shape=None, dtype=None): ...
+
+    def symmetric(self, shape, dtype, max_abs): ...
 
     def randint(self, low, high=None, shape=None, dtype=None): ...
 
@@ -186,6 +192,27 @@ class NumPyInputBackend:
         value = self.input_random_state.random(shape)
         storage_dtype = self._storage_dtype(dtype)
         return numpy.asarray(value).astype(storage_dtype) if storage_dtype is not None else value
+
+    def symmetric(self, shape, dtype, max_abs):
+        normalized_shape = _normalize_shape(shape, scalar_empty=False)
+        storage_dtype = self._storage_dtype(dtype)
+        if normalized_shape and math.prod(normalized_shape) >= _SYMMETRIC_CHUNK_MIN_ELEMENTS:
+            value = numpy.empty(normalized_shape, dtype=storage_dtype)
+            flat_value = value.reshape(-1)
+            total_elements = int(flat_value.size)
+            # 一维顺序分块保持与整块 random(shape) 相同的 RNG 消费顺序。
+            for start in range(0, total_elements, _SYMMETRIC_CHUNK_ELEMENTS):
+                end = min(total_elements, start + _SYMMETRIC_CHUNK_ELEMENTS)
+                block = numpy.asarray(self.input_random_state.random(end - start))
+                # block 是本次调用新分配的数组，原地缩放不会改变其他生成结果。
+                block -= 0.5
+                block *= 2 * max_abs
+                flat_value[start:end] = block
+            return value
+        return self.cast(
+            (self.input_random_state.random(normalized_shape) - 0.5) * (2 * max_abs),
+            dtype,
+        )
 
     def uniform(self, low=0.0, high=1.0, shape=None, dtype=None):
         value = self.input_random_state.uniform(low=low, high=high, shape=shape)
@@ -420,6 +447,10 @@ class TorchInputBackend:
             generator=self._generator,
         )
         return self.cast(value, dtype) if dtype is not None and not direct_dtype else value
+
+    def symmetric(self, shape, dtype, max_abs):
+        # Torch 保持原生 Tensor 整块生成，避免 Python 分块增加 kernel launch。
+        return self.cast((self.random(shape) - 0.5) * (2 * max_abs), dtype)
 
     def randint(self, low, high=None, shape=None, dtype=None):
         torch = self._torch()
@@ -778,6 +809,10 @@ class PaddleInputBackend:
             )
         )
         return self.cast(value, dtype) if dtype is not None and not direct_dtype else value
+
+    def symmetric(self, shape, dtype, max_abs):
+        # Paddle 保持原生 Tensor 整块生成，随机值不会回落到 NumPy 主存。
+        return self.cast((self.random(shape) - 0.5) * (2 * max_abs), dtype)
 
     def randint(self, low, high=None, shape=None, dtype=None):
         if high is None:

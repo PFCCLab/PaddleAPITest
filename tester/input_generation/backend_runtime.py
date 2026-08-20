@@ -337,7 +337,7 @@ class InputBackendRuntime:
             else:
                 # cached complex 复用公共路径，保证实部和虚部独立采样。
                 spec = InputTensorSpec(shape, dtype, None, False, None)
-                value = generate_symmetric_input_value(spec, max_abs, rng)
+                value = generate_symmetric_input_value(spec, max_abs, NumPyInputBackend(rng))
             self._cached_numpy_output_grads[key] = value
         return self._cached_numpy_output_grads[key]
 

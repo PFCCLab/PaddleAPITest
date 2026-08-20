@@ -1191,24 +1191,24 @@ def generate_moe_unpermute_inputs(rule: InputRuleContext):
         rowmap = rule.ops.full(input_binding.shape, -1, dtype="int32")
         if rule.is_tensor_config(routemap_config) and routemap_binding is not None:
             routemap = rule.value(routemap_binding)
-            expert_counts = rule.ops.asarray(
-                [rule.ops.count_nonzero(routemap == expert) for expert in range(num_experts)],
-                dtype="int64",
-            )
+            # present[row, expert] 标记该 token 是否被路由到该 expert；只按 topk 迭代，
+            # 避免 seqlen x num_experts 级别的 python 双循环。
+            present = rule.ops.zeros(input_binding.shape, dtype="int64")
+            for topk_index in range(routemap.shape[1]):
+                column = rule.ops.cast(routemap[:, topk_index], "int64")
+                selected = rule.ops.nonzero(column >= 0)[0]
+                # Paddle 不接受空高级索引，空列保持 present 全 0。
+                if selected.shape[0] == 0:
+                    continue
+                present[selected, column[selected]] = 1
+            expert_counts = rule.ops.cast(rule.ops.sum(present, axis=0), "int64")
             if int(rule.ops.sum(expert_counts)) > unzipped_seqlen:
                 raise ValueError("routemap assignments exceed hidden_states_unzipped capacity")
             expert_offsets = rule.ops.zeros(num_experts, dtype="int64")
             expert_offsets[1:] = rule.ops.cumsum(expert_counts[:-1])
-            expert_counters = rule.ops.zeros(num_experts, dtype="int64")
-            for row_index in range(seqlen):
-                for expert in range(num_experts):
-                    positions = rule.ops.nonzero(routemap[row_index] == expert)[0]
-                    if rule.ops.prod(positions.shape) == 0:
-                        continue
-                    rowmap[row_index, expert] = rule.ops.cast(
-                        expert_offsets[expert] + expert_counters[expert], "int32"
-                    )
-                    expert_counters[expert] += 1
+            # 每个 expert 内按 row 升序自增编号，等价于列向 present 的 exclusive cumsum。
+            ranks = rule.ops.cumsum(present, axis=0) - 1
+            rowmap = rule.ops.cast(rule.ops.where(present > 0, expert_offsets + ranks, -1), "int32")
         return rowmap
 
     def generate_token_prob_input_value(input_binding):
