@@ -154,19 +154,18 @@ _SYMMETRIC_CHUNK_ELEMENTS = 1 << 22
 
 
 def _chunked_symmetric_numpy(shape, dtype, max_abs, rng):
-    """按首维分块生成对称区间数值，避免整块 float64 临时。"""
-    rows = int(shape[0])
-    trailing = tuple(int(extent) for extent in shape[1:])
-    row_elements = math.prod(trailing)
-    chunk_rows = max(1, _SYMMETRIC_CHUNK_ELEMENTS // max(1, row_elements))
-    value = numpy.empty((rows, *trailing), dtype=dtype)
-    for start in range(0, rows, chunk_rows):
-        end = min(rows, start + chunk_rows)
-        block = numpy.asarray(rng.random((end - start, *trailing)))
+    """按元素数分块生成对称区间数值，避免宽 Tensor 退化为整行临时。"""
+    normalized_shape = tuple(int(extent) for extent in shape)
+    value = numpy.empty(normalized_shape, dtype=dtype)
+    flat_value = value.reshape(-1)
+    total_elements = int(flat_value.size)
+    for start in range(0, total_elements, _SYMMETRIC_CHUNK_ELEMENTS):
+        end = min(total_elements, start + _SYMMETRIC_CHUNK_ELEMENTS)
+        block = numpy.asarray(rng.random(end - start))
         # block 是本次调用新产生的数组，原地运算不会影响任何其他生成结果。
         block -= 0.5
         block *= 2 * max_abs
-        value[start:end] = block
+        flat_value[start:end] = block
     return value
 
 

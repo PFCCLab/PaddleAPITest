@@ -1197,6 +1197,9 @@ def generate_moe_unpermute_inputs(rule: InputRuleContext):
             for topk_index in range(routemap.shape[1]):
                 column = rule.ops.cast(routemap[:, topk_index], "int64")
                 selected = rule.ops.nonzero(column >= 0)[0]
+                # Paddle 不接受空高级索引，空列保持 present 全 0。
+                if selected.shape[0] == 0:
+                    continue
                 present[selected, column[selected]] = 1
             expert_counts = rule.ops.cast(rule.ops.sum(present, axis=0), "int64")
             if int(rule.ops.sum(expert_counts)) > unzipped_seqlen:
