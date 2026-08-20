@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import math
 
 import numpy
 
@@ -144,6 +145,31 @@ def _complex_value(dtype, shape, rng, **kwargs):
     return rng.cast(real + 1j * imag, dtype)
 
 
+# ``(rng.random(shape) - 0.5) * (2 * max_abs)`` 在大 Tensor 上会连续产生多份整块
+# float64 eager 临时。NumPy backend 的随机流是顺序流，一次 random(shape) 与按首维
+# 切块的多次 random 调用消费同一串数，因此分块 + 原地运算的输出与原表达式 bit-exact，
+# 只是把 float64 中间临时限制在单块大小。
+_SYMMETRIC_CHUNK_MIN_ELEMENTS = 1 << 24
+_SYMMETRIC_CHUNK_ELEMENTS = 1 << 22
+
+
+def _chunked_symmetric_numpy(shape, dtype, max_abs, rng):
+    """按首维分块生成对称区间数值，避免整块 float64 临时。"""
+    rows = int(shape[0])
+    trailing = tuple(int(extent) for extent in shape[1:])
+    row_elements = math.prod(trailing)
+    chunk_rows = max(1, _SYMMETRIC_CHUNK_ELEMENTS // max(1, row_elements))
+    value = numpy.empty((rows, *trailing), dtype=dtype)
+    for start in range(0, rows, chunk_rows):
+        end = min(rows, start + chunk_rows)
+        block = numpy.asarray(rng.random((end - start, *trailing)))
+        # block 是本次调用新产生的数组，原地运算不会影响任何其他生成结果。
+        block -= 0.5
+        block *= 2 * max_abs
+        value[start:end] = block
+    return value
+
+
 def generate_symmetric_input_value(
     spec: InputTensorSpec,
     max_abs,
@@ -154,6 +180,12 @@ def generate_symmetric_input_value(
     if dtype.startswith("complex"):
         # max_abs 约束每个分量，复数模长允许达到 sqrt(2) 倍上界。
         return _complex_value(dtype, spec.shape, rng, offset=-max_abs, scale=2 * max_abs)
+    if (
+        getattr(rng, "name", "numpy") == "numpy"
+        and spec.shape
+        and math.prod(spec.shape) >= _SYMMETRIC_CHUNK_MIN_ELEMENTS
+    ):
+        return _chunked_symmetric_numpy(spec.shape, dtype, max_abs, rng)
     return rng.cast((rng.random(spec.shape) - 0.5) * (2 * max_abs), dtype)
 
 
