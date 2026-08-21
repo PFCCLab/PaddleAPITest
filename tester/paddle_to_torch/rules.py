@@ -1565,6 +1565,36 @@ if keepdim:
         )
 
 
+class CopyRule(BaseRule):
+    PADDLE_APIS = ("paddle.Tensor.copy_",)
+
+    def apply(self, paddle_api: str) -> ConvertResult:
+        # paddle 的 copy_ 是双态算子：phi::Copy 先执行 dst->Resize(src.dims())，所以 shape
+        # 相同时才是缓冲区级原地拷贝，shape 不同时 dst 整体接管 src 的形状；且 dtype 必须
+        # 完全一致（Tensor::copy_ 的 PADDLE_ENFORCE_EQ）。torch.Tensor.copy_ 相反：dst 保留
+        # 自己的 shape 并把 src 广播过来，dtype 自动 cast。两者仅在 shape+dtype 全同时等价，
+        # 因此按 shape 分派，shape 不同时改用 set_ 才能同时换形状和内容。
+        core = """
+if x.dtype != other.dtype:
+    raise RuntimeError(
+        f"Tensor has different data type ({other.dtype} vs {x.dtype}), "
+        f"Tensor Copy cannot be performed!"
+    )
+with torch.no_grad():
+    if list(x.shape) == list(other.shape):
+        x.copy_(other, non_blocking=not blocking)
+    else:
+        # paddle 的梯度只累到 dst，不建立回传 src 的边，因此 detach 后再 clone。
+        x.set_(other.detach().clone().to(device=x.device))
+result = x
+"""
+        return self.build_result(
+            paddle_api,
+            kind=ConversionKind.COMPOSITE,
+            core=core,
+        )
+
+
 # d
 class DotRule(BaseRule):
     PADDLE_APIS = (
@@ -7608,6 +7638,24 @@ result = torch.linalg.solve_triangular(x,y,upper=upper,left=True,unitriangular=u
         )
 
 
+class TruncNormalRule(BaseRule):
+    PADDLE_APIS = ("paddle.nn.init.trunc_normal_",)
+
+    def apply(self, paddle_api: str) -> ConvertResult:
+        # 两侧签名逐参对应 (tensor, mean, std, a, b)，torch 侧多一个可选 generator；
+        # 原地语义也一致（返回值 is 入参）。这里显式返回入参而不依赖 GenericRule 的
+        # 名字后缀推断，避免 paddle.nn.init.* 这类非 Tensor 方法走到 receiver 分支。
+        core = """
+torch.nn.init.trunc_normal_(tensor, mean=mean, std=std, a=a, b=b)
+result = tensor
+"""
+        return self.build_result(
+            paddle_api,
+            kind=ConversionKind.DIRECT,
+            core=core,
+        )
+
+
 class TolistRule(BaseRule):
     PADDLE_APIS = ("paddle.tolist",)
 
@@ -8529,25 +8577,25 @@ result = torch.reshape(x, shape)
 class CopsScaleRule(BaseRule):
     PADDLE_APIS = ("paddle._C_ops.scale_", "paddle.Tensor.scale_")
 
-    """paddle._C_ops.scale_(x, scale, bias, bias_after_scale) → in-place scale+bias on x
+    """Map Paddle's in-place scale operation to an in-place Torch composite.
 
-    forward: if bias_after_scale: result = scale*x + bias  else: result = scale*(x+bias)
-    Wrapped in torch.no_grad() to avoid leaf-variable in-place errors.
-    backward not comparable (Paddle in-place op doesn't propagate correctly);
-    listed in forward_only_apis.
+    Paddle casts ``scale`` and ``bias`` to an integral input dtype before the
+    arithmetic. Torch rejects float scalars in integral in-place arithmetic,
+    so the reference explicitly creates dtype-matched scalar tensors there.
     """
 
     def apply(self, paddle_api: str) -> ConvertResult:
         core = """
-x               = x
-scale           = float(scale)
-bias            = float(bias)
-bias_after_scale = bias_after_scale
-with torch.no_grad():
-    if bias_after_scale:
-        x.mul_(scale).add_(bias)
-    else:
-        x.add_(bias).mul_(scale)
+x = x
+scale = float(scale)
+bias = float(bias)
+if not (x.is_floating_point() or x.is_complex()):
+    scale = torch.as_tensor(scale, dtype=x.dtype, device=x.device)
+    bias = torch.as_tensor(bias, dtype=x.dtype, device=x.device)
+if bias_after_scale:
+    x.mul_(scale).add_(bias)
+else:
+    x.add_(bias).mul_(scale)
 result = x
 """
         return self.build_result(

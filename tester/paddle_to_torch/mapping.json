@@ -3667,6 +3667,16 @@
     "paddle.nn.functional.zeropad2d": {
         "Rule": "Zeropad2dRule"
     },
+    "paddle.nn.init.trunc_normal_": {
+        "Rule": "TruncNormalRule",
+        "torch_api": "torch.nn.init.trunc_normal_",
+        "set_defaults": {
+            "mean": 0.0,
+            "std": 1.0,
+            "a": -2.0,
+            "b": 2.0
+        }
+    },
     "paddle.nn.quant.weight_only_linear": {
         "Rule": "WeightOnlyLinearRule"
     },
@@ -5128,12 +5138,9 @@
         "torch_api": "torch.Tensor.contiguous"
     },
     "paddle.Tensor.copy_": {
+        "Rule": "CopyRule",
         "torch_api": "torch.Tensor.copy_",
-        "torch_args": [],
-        "torch_kwargs": {
-            "other": "other",
-            "non_blocking": "not blocking"
-        }
+        "description": "shape 相同 -> x.copy_(other)；shape 不同 -> x.set_(other.detach().clone())"
     },
     "paddle.Tensor.flatten_": {
         "Rule": "CopsFlattenRule"
