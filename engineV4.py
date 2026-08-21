@@ -54,16 +54,6 @@ GPU_PRESSURE_TIMEOUT_ENV_VAR = "PADDLEAPITEST_GPU_PRESSURE_TIMEOUT_SECONDS"
 DEFAULT_GPU_PRESSURE_TIMEOUT_SECONDS = 600.0
 # slot 尚未 ready 的初始化态：批处理主循环据此判断是否仍有进展中 worker。
 _INITIALIZING_SLOT_STATES = frozenset({"starting", "loaded", "preparing"})
-_SLOT_STARTABLE_STATES = frozenset({"dead", "suspended"})
-_SLOT_SCHEDULABLE_STATES = frozenset({"idle", "dead", "suspended"})
-_SERVICEABLE_SLOT_STATES = _INITIALIZING_SLOT_STATES | frozenset({"idle", "busy"})
-# 初始化连续失败的退避阶梯；失败次数超出阶梯长度后重复使用最后一档作为封顶间隔。
-WORKER_INIT_BACKOFF_SECONDS = (5.0, 15.0, 30.0, 60.0)
-# 连续初始化失败达到上限的 slot 不再复活，避免单个故障 slot 反复吞掉同一个 case。
-MAX_SLOT_INIT_FAILURES_ENV_VAR = "PADDLEAPITEST_MAX_SLOT_INIT_FAILURES"
-DEFAULT_MAX_SLOT_INIT_FAILURES = 5
-# 初始化超时的现场只存在于被杀之前，诊断开关默认开启以便偶发故障可事后归因。
-INIT_TIMEOUT_DIAGNOSTICS_ENV_VAR = "PADDLEAPITEST_INIT_TIMEOUT_DIAGNOSTICS"
 from tester.reporting import (
     init_log,
     log_aggregation,
@@ -168,34 +158,6 @@ def read_gpu_pressure_timeout(environ=None):
             f"got {raw_value!r}"
         )
     return timeout
-
-
-def read_max_slot_init_failures(environ=None):
-    # 0 表示只退避、永不放弃 slot；非法值在批次启动阶段就失败，不留给调度循环。
-    source = os.environ if environ is None else environ
-    raw_value = source.get(
-        MAX_SLOT_INIT_FAILURES_ENV_VAR,
-        str(DEFAULT_MAX_SLOT_INIT_FAILURES),
-    )
-    try:
-        max_failures = int(raw_value)
-    except (TypeError, ValueError) as err:
-        raise ValueError(
-            f"{MAX_SLOT_INIT_FAILURES_ENV_VAR} must be a non-negative integer, got {raw_value!r}"
-        ) from err
-    if max_failures < 0:
-        raise ValueError(
-            f"{MAX_SLOT_INIT_FAILURES_ENV_VAR} must be a non-negative integer, got {raw_value!r}"
-        )
-    return max_failures
-
-
-def slot_init_backoff_seconds(init_failures):
-    """把连续失败次数映射到退避间隔，超出阶梯长度后停在封顶值。"""
-    if init_failures <= 0:
-        return 0.0
-    index = min(init_failures, len(WORKER_INIT_BACKOFF_SECONDS)) - 1
-    return WORKER_INIT_BACKOFF_SECONDS[index]
 
 
 def parse_sanitizer_timing_file(path):
@@ -1008,10 +970,7 @@ class WorkerSlot:
     task_start_time: float | None = None
     child_pid: int | None = None
     started_at: float | None = None
-    state: str = "dead"  # dead、starting、loaded、preparing、idle、busy、suspended、retired
-    # 连续初始化失败次数，ready 后清零；与 retry_not_before 共同构成复活退避。
-    init_failures: int = 0
-    retry_not_before: float = 0.0
+    state: str = "dead"  # dead、starting、loaded、preparing、idle、busy、suspended
 
 
 def _import_optional_runtime_module(module_name):
@@ -1111,65 +1070,6 @@ def _apply_worker_task_runtime_budget(options, task, gpu_id, comparison_gpu_id=N
         if task.compute_headroom_bytes is not None
         else None
     )
-
-
-def _collect_process_group_pids(child_pid):
-    """列出 sanitizer child 所在进程组的全部成员，wrapper 之外的现场也要留档。"""
-    # 进程组由 SanitizerSession 用 start_new_session 建立，组 ID 等于 child PID。
-    if child_pid is None:
-        return ()
-    try:
-        completed = subprocess.run(
-            ["ps", "-o", "pid=", "-g", str(child_pid)],
-            capture_output=True,
-            text=True,
-            timeout=10,
-        )
-    except (OSError, subprocess.SubprocessError):
-        return ()
-    return tuple(line.strip() for line in completed.stdout.splitlines() if line.strip())
-
-
-def _run_diagnostic_command(command, *, timeout=15):
-    """执行单条诊断命令；诊断失败只记录原因，不能影响故障 slot 的回收。"""
-    try:
-        completed = subprocess.run(command, capture_output=True, text=True, timeout=timeout)
-    except FileNotFoundError:
-        return f"$ {shlex.join(command)}\n[missing command]\n"
-    except (OSError, subprocess.SubprocessError) as err:
-        return f"$ {shlex.join(command)}\n[failed] {type(err).__name__}: {err}\n"
-    return f"$ {shlex.join(command)}\n{completed.stdout}{completed.stderr}\n"
-
-
-def _dump_init_timeout_diagnostics(*, slot_index, phase, worker_pid, child_pid):
-    """把初始化超时现场落盘：偶发挂死只有这一次机会记录栈和进程状态。"""
-    # 该函数运行在 watchdog 线程，任何异常都不能让超时回收流程中断。
-    if os.environ.get(INIT_TIMEOUT_DIAGNOSTICS_ENV_VAR, "1") == "0":
-        return
-    try:
-        pids = [str(pid) for pid in (worker_pid, child_pid) if pid is not None]
-        pids.extend(pid for pid in _collect_process_group_pids(child_pid) if pid not in pids)
-        sections = [
-            f"slot={slot_index} phase={phase} worker_pid={worker_pid} child_pid={child_pid}\n",
-            _run_diagnostic_command(
-                ["ps", "-o", "pid,ppid,pgid,stat,wchan:24,pcpu,etime,args", *pids]
-            ),
-        ]
-        for pid in pids:
-            # py-spy 只能抓 Python 栈，wchan/syscall 补齐卡在内核或库层的情况。
-            sections.append(_run_diagnostic_command(["py-spy", "dump", "--pid", pid], timeout=30))
-            for proc_file in ("stat", "wchan", "syscall"):
-                sections.append(_run_diagnostic_command(["cat", f"/proc/{pid}/{proc_file}"]))
-        dump_dir = log_runtime.TEST_LOG_PATH / "init_timeout"
-        dump_dir.mkdir(parents=True, exist_ok=True)
-        dump_path = dump_dir / f"slot_{slot_index}_{time.strftime('%Y%m%d_%H%M%S')}.txt"
-        dump_path.write_text("\n".join(sections), encoding="utf-8")
-        print(f"[worker] INIT_TIMEOUT_DUMP | slot {slot_index} | {dump_path}", flush=True)
-    except Exception as err:
-        print(
-            f"[worker] INIT_TIMEOUT_DUMP_FAILED | slot {slot_index} | {type(err).__name__}: {err}",
-            flush=True,
-        )
 
 
 def _worker_loop(
@@ -1621,8 +1521,6 @@ class WorkerPool:
         self._closed = False
         # 记录初始化阶段确认不可用的物理卡，避免故障 slot 无限复活。
         self._quarantined_gpus: set[int] = set()
-        # 初始化连续失败上限在建池时固定，运行期不因环境变量改动而漂移。
-        self._max_init_failures = read_max_slot_init_failures()
         # CPU worker 使用 gpu_id=None；只有需要 GPU 运行时时才建立 GPU 槽位。
         idx = 0
         if cpu_worker_count:
@@ -1657,80 +1555,34 @@ class WorkerPool:
         """返回 scheduler 需要的设备拓扑，不暴露 WorkerSlot 实例。"""
         return tuple((slot.index, slot.gpu_id, slot.comparison_gpu_id) for slot in self.slots)
 
-    def _slot_device_quarantined(self, slot):
-        # 双卡 slot 任一设备被隔离即整体失效，两个判定必须共用同一份规则。
-        return (
-            slot.gpu_id in self._quarantined_gpus
-            or slot.comparison_gpu_id in self._quarantined_gpus
-        )
-
-    def _slot_in_backoff(self, slot, now):
-        # 只有需要新建进程的 slot 受退避约束；idle slot 已持有可用 worker。
-        return slot.state in _SLOT_STARTABLE_STATES and now < slot.retry_not_before
-
-    def _slot_available(self, slot, allowed_states, now):
-        return (
-            not self._slot_device_quarantined(slot)
-            and slot.state in allowed_states
-            and not self._slot_in_backoff(slot, now)
-        )
-
     def slot_can_schedule(self, slot_index):
         # scheduler 只依赖可调度语义，不读取可变的 WorkerSlot 状态对象。
-        now = time.monotonic()
-        with self._lock:
-            return self._slot_available(self.slots[slot_index], _SLOT_SCHEDULABLE_STATES, now)
-
-    def slot_can_start(self, slot_index):
-        # 仅离线 slot 可启动；idle slot 已持有进程，不能创建第二代 worker。
-        now = time.monotonic()
-        with self._lock:
-            return self._slot_available(self.slots[slot_index], _SLOT_STARTABLE_STATES, now)
-
-    def slot_startup_parked(self, slot_index):
-        """slot 短期内不会再启动：对应 assignment 必须回队，不能继续占着 reservation。"""
-        # 退避与 retire 都会让 slot 长时间无法启动，这与等待 watchdog 回收有本质区别。
-        now = time.monotonic()
         with self._lock:
             slot = self.slots[slot_index]
             return (
-                self._slot_device_quarantined(slot)
-                or slot.state == "retired"
-                or self._slot_in_backoff(slot, now)
+                slot.gpu_id not in self._quarantined_gpus
+                and slot.comparison_gpu_id not in self._quarantined_gpus
+                and slot.state in {"idle", "dead", "suspended"}
             )
 
-    def has_serviceable_slots(self):
-        """是否仍有 slot 能承接 pending case；退避只是暂时不可用，retire 才是永久失能。"""
-        # 判定结果决定批次是否立即以失败退出，因此不能把 quarantined/retired 算作可用。
+    def slot_can_start(self, slot_index):
+        # 仅离线 slot 可启动；idle slot 已持有进程，不能创建第二代 worker。
         with self._lock:
-            return any(
-                slot.state in _SERVICEABLE_SLOT_STATES
-                or (
-                    slot.state in _SLOT_STARTABLE_STATES and not self._slot_device_quarantined(slot)
-                )
-                for slot in self.slots
+            slot = self.slots[slot_index]
+            return (
+                slot.gpu_id not in self._quarantined_gpus
+                and slot.comparison_gpu_id not in self._quarantined_gpus
+                and slot.state in {"dead", "suspended"}
             )
-
-    def schedulable_slot_order(self, slot_indices):
-        """按 idle 优先、失败次数递增排序可调度 slot，避免故障 slot 长期垄断队首。"""
-        # 排序在锁内一次完成，scheduler 不会看到半更新的 slot 状态组合。
-        now = time.monotonic()
-        with self._lock:
-            candidates = [
-                (
-                    0 if self.slots[slot_index].state == "idle" else 1,
-                    self.slots[slot_index].init_failures,
-                    self.slots[slot_index].index,
-                )
-                for slot_index in slot_indices
-                if self._slot_available(self.slots[slot_index], _SLOT_SCHEDULABLE_STATES, now)
-            ]
-        return tuple(slot_index for _, _, slot_index in sorted(candidates))
 
     def slot_is_quarantined(self, slot_index):
         # 双卡 slot 任一设备故障都必须停止复用，避免半损坏 pair 继续进入调度。
         with self._lock:
-            return self._slot_device_quarantined(self.slots[slot_index])
+            slot = self.slots[slot_index]
+            return (
+                slot.gpu_id in self._quarantined_gpus
+                or slot.comparison_gpu_id in self._quarantined_gpus
+            )
 
     def quarantine_gpu(self, gpu_id, *, reason):
         """隔离不可用物理卡，阻止其 slot 被重新启动或调度。"""
@@ -1748,14 +1600,7 @@ class WorkerPool:
             for slot_index in affected:
                 slot = self.slots[slot_index]
                 # busy slot 先完成当前终态，空闲/启动 slot 立即失去复活资格。
-                if slot.state in {
-                    "dead",
-                    "suspended",
-                    "retired",
-                    "starting",
-                    "loaded",
-                    "preparing",
-                }:
+                if slot.state in {"dead", "suspended", "starting", "loaded", "preparing"}:
                     slot.state = "quarantined"
         print(f"[gpu] GPU_QUARANTINED | physical_gpu={gpu_id} | {reason}", flush=True)
 
@@ -1818,20 +1663,6 @@ class WorkerPool:
         slot.child_pid = None
         slot.started_at = None
 
-    def _record_init_failure(self, slot, *, now):
-        """累计初始化失败并设置复活退避；返回该 slot 是否已被永久退役。"""
-        # 只统计初始化阶段的失败：case 级 timeout/crash 不代表 slot 无法启动。
-        slot.init_failures += 1
-        slot.retry_not_before = now + slot_init_backoff_seconds(slot.init_failures)
-        if self._max_init_failures and slot.init_failures >= self._max_init_failures:
-            slot.state = "retired"
-        return slot.state == "retired"
-
-    def _clear_init_failures(self, slot):
-        # ready 意味着这一代 worker 完整走通初始化，历史失败不再影响后续复活。
-        slot.init_failures = 0
-        slot.retry_not_before = 0.0
-
     def _close_queue(self, q, *, cancel_join=False):
         """关闭 multiprocessing 队列，避免清理错误掩盖测试结果。"""
         if q is None:
@@ -1857,11 +1688,6 @@ class WorkerPool:
         with self._spawn_lock:
             # 只有主调度线程在显存准入后调用；锁只防止关闭流程并发穿透。
             if self._closed or self._shutdown_event.is_set():
-                return None
-            # 退避与 retire 在此统一生效，纯 CPU 循环的无条件重建也受同一约束。
-            if slot.state == "retired":
-                return None
-            if slot.state in {"dead", "suspended"} and time.monotonic() < slot.retry_not_before:
                 return None
             if slot.process is not None and slot.process.is_alive():
                 return None
@@ -2015,7 +1841,6 @@ class WorkerPool:
                 if slot.state == "preparing":
                     slot.state = "idle"
                     slot.started_at = None
-                    self._clear_init_failures(slot)
                 return True
             if msg_type == "ack":
                 config = msg[3]
@@ -2044,7 +1869,6 @@ class WorkerPool:
                 process = slot.process
                 child_pid = slot.child_pid
                 self._suspend_slot(slot)
-                self._record_init_failure(slot, now=time.monotonic())
 
         if late_child_pid is not None:
             self._kill_process_group(late_child_pid)
@@ -2054,7 +1878,6 @@ class WorkerPool:
                 f"[worker] INIT_FAILED | slot {slot_idx} | phase {phase} | {error_msg}",
                 flush=True,
             )
-            self._report_init_failure_state(slot)
             if child_pid is not None:
                 self._kill_process_group(child_pid)
             self._join_process(process, timeout=1)
@@ -2063,23 +1886,6 @@ class WorkerPool:
             # init_failed 常见于 bootstrap OOM，slot 必须退出 planned 启动屏障。
             return True
         return True
-
-    def _report_init_failure_state(self, slot):
-        """把退避与退役结果写进日志，故障 slot 的处置过程必须可追溯。"""
-        # 退避间隔来自失败次数，日志同时给出下一次可启动的相对时刻。
-        if slot.state == "retired":
-            print(
-                f"[worker] SLOT_RETIRED | slot {slot.index} | "
-                f"{slot.init_failures} consecutive init failures | no further restart",
-                flush=True,
-            )
-            return
-        print(
-            f"[worker] SLOT_INIT_BACKOFF | slot {slot.index} | "
-            f"failures {slot.init_failures} | retry in "
-            f"{slot_init_backoff_seconds(slot.init_failures):.0f} s",
-            flush=True,
-        )
 
     def dispatch(self, slot_index, config):
         """向指定 worker slot 派发任务，并返回该 slot 当前 worker 的 PID token。"""
@@ -2229,9 +2035,7 @@ class WorkerPool:
                 else:
                     failure = "timeout"
                 child_pid = slot.child_pid
-                worker_pid = process.pid
                 self._suspend_slot(slot)
-                self._record_init_failure(slot, now=now)
             elif event == "timeout":
                 if slot.state != "busy" or slot.process is None:
                     return False
@@ -2258,14 +2062,6 @@ class WorkerPool:
             else:
                 raise ValueError(f"unknown worker lifecycle event: {event!r}")
 
-        if event == "initializing" and failure == "timeout":
-            # 现场只存在于 kill 之前：先抓栈与进程组状态，再回收 wrapper 和 child。
-            _dump_init_timeout_diagnostics(
-                slot_index=slot.index,
-                phase=phase,
-                worker_pid=worker_pid,
-                child_pid=child_pid,
-            )
         if child_pid is not None:
             self._kill_process_group(child_pid)
         if event == "initializing":
@@ -2283,7 +2079,6 @@ class WorkerPool:
                     flush=True,
                 )
                 self._kill_process(process)
-            self._report_init_failure_state(slot)
             # 不在 watchdog 内重建；下一轮先取消 assignment 并观察显存稳定。
             return True
         if event == "timeout":
@@ -3332,22 +3127,6 @@ def _handle_batch_result(
         log_aggregation.aggregate_logs()
 
 
-def _abort_without_serviceable_slots(*, pool, batch_state, pending_count):
-    """所有 slot 都失能而 case 还没跑完时立即以失败退出，不等压力超时。"""
-    # 退避-重启循环会反复刷新初始化状态，PRESSURE_TIMEOUT 的连续阻塞窗口永远攒不满，
-    # 因此"无可用 slot"必须由这里独立判定，否则批次会挂死而不是报错。
-    if pending_count <= 0 or pool.has_serviceable_slots():
-        return False
-    print(
-        f"[worker] NO_SERVICEABLE_SLOT | {pending_count} case(s) not finished | "
-        "all slots retired or quarantined",
-        flush=True,
-    )
-    batch_state.batch_exit_code = 1
-    batch_state.abort_run = True
-    return True
-
-
 def _run_cpu_batch_loop(
     pool,
     options,
@@ -3413,12 +3192,6 @@ def _run_cpu_batch_loop(
         if pending_dispatch and not batch_state.abort_run:
             for slot_index in pool.suspended_slot_indices():
                 pool.start_worker(slot_index)
-        if _abort_without_serviceable_slots(
-            pool=pool,
-            batch_state=batch_state,
-            pending_count=len(pending_dispatch) + batch_state.active_tasks,
-        ):
-            break
         # CPU replacement 不再参与首次全量屏障，模块加载完成后即可独立 preparation。
         pool.start_loaded_preparations(range(pool.total_workers))
         refill_idle_workers()
@@ -3474,9 +3247,8 @@ class ContinuousGpuBatchScheduler:
             if assignment.dispatched:
                 continue
             if not self.pool.slot_can_start(assignment.slot_index):
-                # 等待 watchdog 回收的 suspended 保留 assignment；退避、退役和
-                # quarantine 都意味着短期内不会重启，必须立即回队换 slot。
-                if not self.pool.slot_startup_parked(assignment.slot_index):
+                # 普通 suspended 仍可能等待 watchdog 回收；只有 quarantine 才能回队。
+                if not self.pool.slot_is_quarantined(assignment.slot_index):
                     continue
             self.groups[assignment.group_key]["ledger"].mark_release_pending(assignment_id)
             # 未形成业务终态的 assignment 必须回队，不能只释放 reservation。
@@ -3496,11 +3268,11 @@ class ContinuousGpuBatchScheduler:
         for group_key, group in self.groups.items():
             ledger = group["ledger"]
             ledger.update_snapshots(snapshots_reader(group_key))
-            # idle 优先、失败次数递增：健康 worker 先被使用，故障 slot 不再垄断队首。
             idle_slots = [
                 slot_index
-                for slot_index in self.pool.schedulable_slot_order(group["slot_indices"])
-                if not any(
+                for slot_index in group["slot_indices"]
+                if self.pool.slot_can_schedule(slot_index)
+                and not any(
                     assignment.slot_index == slot_index for assignment in self.assignments.values()
                 )
             ]
@@ -3757,12 +3529,6 @@ def _run_continuous_gpu_batch_loop(
         now = time.monotonic()
         planning_snapshots_reader = _memoized_snapshot_reader(_read_gpu_memory_snapshots)
         scheduler.cancel_failed_startup(pending_dispatch)
-        if _abort_without_serviceable_slots(
-            pool=pool,
-            batch_state=batch_state,
-            pending_count=len(pending_dispatch) + len(scheduler.assignments),
-        ):
-            break
         scheduler.reclaim(planning_snapshots_reader, now=now)
         scheduler.schedule(
             pending_dispatch,
