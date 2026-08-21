@@ -64,6 +64,8 @@ MAX_SLOT_INIT_FAILURES_ENV_VAR = "PADDLEAPITEST_MAX_SLOT_INIT_FAILURES"
 DEFAULT_MAX_SLOT_INIT_FAILURES = 5
 # 初始化超时的现场只存在于被杀之前，诊断开关默认开启以便偶发故障可事后归因。
 INIT_TIMEOUT_DIAGNOSTICS_ENV_VAR = "PADDLEAPITEST_INIT_TIMEOUT_DIAGNOSTICS"
+# 单次现场采集的总预算，避免按进程数累加阻塞 watchdog。
+INIT_TIMEOUT_DIAGNOSTICS_BUDGET_SECONDS = 10.0
 from tester.reporting import (
     init_log,
     log_aggregation,
@@ -1113,7 +1115,7 @@ def _apply_worker_task_runtime_budget(options, task, gpu_id, comparison_gpu_id=N
     )
 
 
-def _collect_process_group_pids(child_pid):
+def _collect_process_group_pids(child_pid, *, timeout=10):
     """列出 sanitizer child 所在进程组的全部成员，wrapper 之外的现场也要留档。"""
     # 进程组由 SanitizerSession 用 start_new_session 建立，组 ID 等于 child PID。
     if child_pid is None:
@@ -1123,15 +1125,20 @@ def _collect_process_group_pids(child_pid):
             ["ps", "-o", "pid=", "-g", str(child_pid)],
             capture_output=True,
             text=True,
-            timeout=10,
+            timeout=timeout,
         )
     except (OSError, subprocess.SubprocessError):
         return ()
     return tuple(line.strip() for line in completed.stdout.splitlines() if line.strip())
 
 
-def _run_diagnostic_command(command, *, timeout=15):
+def _run_diagnostic_command(command, *, timeout=15, deadline=None):
     """执行单条诊断命令；诊断失败只记录原因，不能影响故障 slot 的回收。"""
+    if deadline is not None:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return f"$ {shlex.join(command)}\n[diagnostic budget exceeded]\n"
+        timeout = min(timeout, max(0.05, remaining))
     try:
         completed = subprocess.run(command, capture_output=True, text=True, timeout=timeout)
     except FileNotFoundError:
@@ -1147,19 +1154,36 @@ def _dump_init_timeout_diagnostics(*, slot_index, phase, worker_pid, child_pid):
     if os.environ.get(INIT_TIMEOUT_DIAGNOSTICS_ENV_VAR, "1") == "0":
         return
     try:
+        deadline = time.monotonic() + INIT_TIMEOUT_DIAGNOSTICS_BUDGET_SECONDS
         pids = [str(pid) for pid in (worker_pid, child_pid) if pid is not None]
-        pids.extend(pid for pid in _collect_process_group_pids(child_pid) if pid not in pids)
+        remaining = max(0.05, deadline - time.monotonic())
+        pids.extend(
+            pid
+            for pid in _collect_process_group_pids(child_pid, timeout=remaining)
+            if pid not in pids
+        )
         sections = [
             f"slot={slot_index} phase={phase} worker_pid={worker_pid} child_pid={child_pid}\n",
             _run_diagnostic_command(
-                ["ps", "-o", "pid,ppid,pgid,stat,wchan:24,pcpu,etime,args", *pids]
+                ["ps", "-o", "pid,ppid,pgid,stat,wchan:24,pcpu,etime,args", *pids],
+                deadline=deadline,
             ),
         ]
         for pid in pids:
+            if time.monotonic() >= deadline:
+                break
             # py-spy 只能抓 Python 栈，wchan/syscall 补齐卡在内核或库层的情况。
-            sections.append(_run_diagnostic_command(["py-spy", "dump", "--pid", pid], timeout=30))
+            sections.append(
+                _run_diagnostic_command(
+                    ["py-spy", "dump", "--pid", pid], timeout=30, deadline=deadline
+                )
+            )
             for proc_file in ("stat", "wchan", "syscall"):
-                sections.append(_run_diagnostic_command(["cat", f"/proc/{pid}/{proc_file}"]))
+                if time.monotonic() >= deadline:
+                    break
+                sections.append(
+                    _run_diagnostic_command(["cat", f"/proc/{pid}/{proc_file}"], deadline=deadline)
+                )
         dump_dir = log_runtime.TEST_LOG_PATH / "init_timeout"
         dump_dir.mkdir(parents=True, exist_ok=True)
         dump_path = dump_dir / f"slot_{slot_index}_{time.strftime('%Y%m%d_%H%M%S')}.txt"
@@ -1703,13 +1727,15 @@ class WorkerPool:
         """是否仍有 slot 能承接 pending case；退避只是暂时不可用，retire 才是永久失能。"""
         # 判定结果决定批次是否立即以失败退出，因此不能把 quarantined/retired 算作可用。
         with self._lock:
-            return any(
-                slot.state in _SERVICEABLE_SLOT_STATES
-                or (
-                    slot.state in _SLOT_STARTABLE_STATES and not self._slot_device_quarantined(slot)
-                )
-                for slot in self.slots
-            )
+            for slot in self.slots:
+                # busy slot 仍有在途业务，不能因同卡另一个 slot 被隔离而提前中止。
+                if slot.state == "busy":
+                    return True
+                if self._slot_device_quarantined(slot):
+                    continue
+                if slot.state in _SERVICEABLE_SLOT_STATES or slot.state in _SLOT_STARTABLE_STATES:
+                    return True
+            return False
 
     def schedulable_slot_order(self, slot_indices):
         """按 idle 优先、失败次数递增排序可调度 slot，避免故障 slot 长期垄断队首。"""
@@ -1914,6 +1940,7 @@ class WorkerPool:
     def start_loaded_preparations(self, slot_indices):
         """按物理设备放行已完成模块加载的 worker preparation。"""
         started_count = 0
+        failed_slots = []
         with self._lock:
             # 同卡 preparation 串行，双卡 slot 必须同时占住其计算与对比设备。
             preparing_gpu_ids = {
@@ -1937,8 +1964,12 @@ class WorkerPool:
                 try:
                     slot.input_queue.put(WORKER_PREPARE_RUNTIME)
                 except (OSError, EOFError, ValueError) as err:
-                    # 握手队列损坏时交给统一退役路径，不能让单 slot 失败中止整批。
+                    # 握手队列损坏也属于初始化失败，必须进入退避/退役状态机。
+                    process = slot.process
+                    child_pid = slot.child_pid
                     self._suspend_slot(slot)
+                    self._record_init_failure(slot, now=time.monotonic())
+                    failed_slots.append((slot, process, child_pid))
                     print(
                         f"[worker] PREPARE_DISPATCH_FAILED | slot {slot.index} | "
                         f"{type(err).__name__}: {err}",
@@ -1947,6 +1978,12 @@ class WorkerPool:
                     continue
                 preparing_gpu_ids.update(slot_gpu_ids)
                 started_count += 1
+        for slot, process, child_pid in failed_slots:
+            if child_pid is not None:
+                self._kill_process_group(child_pid)
+            if process is not None:
+                self._kill_process(process)
+            self._report_init_failure_state(slot)
         return started_count
 
     def retire_slots(self, slot_indices):
@@ -2058,6 +2095,9 @@ class WorkerPool:
             if child_pid is not None:
                 self._kill_process_group(child_pid)
             self._join_process(process, timeout=1)
+            if process.is_alive():
+                # init_failed 后 watchdog 不再检查 suspended slot，不能留下存活 wrapper。
+                self._kill_process(process)
             if _is_unavailable_gpu_error(error_msg):
                 self.quarantine_gpu(slot.gpu_id, reason=error_msg)
             # init_failed 常见于 bootstrap OOM，slot 必须退出 planned 启动屏障。
