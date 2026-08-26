@@ -9561,6 +9561,12 @@ elif op_name == "fused_swiglu_weighted_clamp_bwd":
     probs = arg2
     d_out = arg3
     _cv = float(arg4) if arg4 is not None else 0.0
+    import math as _math
+    if not _math.isfinite(_cv) or _cv <= 0.0:
+        raise ValueError(
+            "fused_swiglu_weighted_clamp_bwd: clamp_value must be finite "
+            "and greater than zero"
+        )
 
     # 形状/dtype 约束取自 CheckFusedSwiGLUInputs 与 FusedSwiGLUWeightedBackwardImpl。
     if x.ndim != 2:
@@ -9679,8 +9685,45 @@ elif op_name in ("fuse_weighted_swiglu_fp8_quant", "fuse_weighted_swiglu_fp8_qua
     _FP8_MAX = torch.finfo(torch.float8_e4m3fn).max
     _TILE = 128
 
-    _rows = _x.shape[0]
-    _cols = _x.shape[1]
+    if _x.ndim < 2:
+        raise ValueError(
+            "fuse_weighted_swiglu_fp8_quant expects X to have at least 2 dimensions, "
+            f"but got {tuple(_x.shape)}"
+        )
+    if _x.dtype != torch.bfloat16:
+        raise TypeError(
+            "fuse_weighted_swiglu_fp8_quant expects X to be bfloat16, "
+            f"but got {_x.dtype}"
+        )
+    if _prob is not None and torch.is_tensor(_prob) and _prob.dtype != torch.float32:
+        raise TypeError(
+            "fuse_weighted_swiglu_fp8_quant expects prob to be float32, "
+            f"but got {_prob.dtype}"
+        )
+    if _x.shape[-1] % 2 != 0:
+        raise ValueError(
+            "fuse_weighted_swiglu_fp8_quant expects the last X dimension to be even, "
+            f"but got {tuple(_x.shape)}"
+        )
+    if _use_ue8m0 and _x.ndim != 2:
+        raise ValueError(
+            "fuse_weighted_swiglu_fp8_quant with use_ue8m0 expects 2-D X, "
+            f"but got {tuple(_x.shape)}"
+        )
+
+    _rows = 1
+    for _dim in _x.shape[:-1]:
+        _rows *= _dim
+    _cols = _x.shape[-1]
+    _x_2d = _x.reshape(_rows, _cols)
+    _prob_flat = None
+    if _prob is not None and torch.is_tensor(_prob) and _prob.numel() > 0:
+        if _prob.numel() != _rows:
+            raise ValueError(
+                "fuse_weighted_swiglu_fp8_quant expects one probability per flattened "
+                f"input row ({_rows}), but got shape {tuple(_prob.shape)}"
+            )
+        _prob_flat = _prob.reshape(-1)
     _half_cols = _cols // 2
     _num_col_blocks = (_half_cols + _TILE - 1) // _TILE
     _dev = _x.device
@@ -9699,15 +9742,15 @@ elif op_name in ("fuse_weighted_swiglu_fp8_quant", "fuse_weighted_swiglu_fp8_qua
     with torch.no_grad():
         for _row_start in range(0, _rows, _row_chunk):
             _row_end = min(_rows, _row_start + _row_chunk)
-            _lhs = _x[_row_start:_row_end, :_half_cols].to(torch.float32)
-            _rhs = _x[_row_start:_row_end, _half_cols:].to(torch.float32)
+            _lhs = _x_2d[_row_start:_row_end, :_half_cols].to(torch.float32)
+            _rhs = _x_2d[_row_start:_row_end, _half_cols:].to(torch.float32)
             if _has_clamp:
                 _lhs.clamp_(max=_cv)
                 _rhs.clamp_(min=-_cv, max=_cv)
             _lhs.mul_(torch.sigmoid(_lhs)).mul_(_rhs)
             del _rhs
-            if _prob is not None and torch.is_tensor(_prob) and _prob.numel() > 0:
-                _lhs.mul_(_prob[_row_start:_row_end].to(torch.float32).unsqueeze(-1))
+            if _prob_flat is not None:
+                _lhs.mul_(_prob_flat[_row_start:_row_end].to(torch.float32).unsqueeze(-1))
 
             if _full_blocks:
                 _blocks = _lhs[:, :_full_cols].reshape(

@@ -8,7 +8,6 @@ import paddle
 from tester.api_config.dtype_utils import to_torch_dtype
 from tester.api_config.parameter_binding import bind_input_parameters, resolve_input_api
 
-
 # bool 是 int 的子类，必须与 int 一起排除，否则 False/True 会被当成 BOOL/INT16 码。
 _NON_DTYPE_SCALAR_TYPES = (bool, int, float, complex)
 
