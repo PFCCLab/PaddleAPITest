@@ -378,6 +378,16 @@
             "y": "other"
         }
     },
+    "paddle.baddbmm": {
+        "torch_api": "torch.baddbmm",
+        "paddle_torch_args_map": {
+            "input": "input",
+            "x": "batch1",
+            "y": "batch2",
+            "beta": "beta",
+            "alpha": "alpha"
+        }
+    },
     "paddle.bmm": {
         "Rule": "BmmRule",
         "torch_api": "torch.bmm",
@@ -432,6 +442,13 @@
     },
     "paddle.Tensor.cast": {
         "Rule": "CastRule"
+    },
+    "paddle.cat": {
+        "torch_api": "torch.cat",
+        "paddle_torch_args_map": {
+            "x": "tensors",
+            "axis": "dim"
+        }
     },
     "paddle.cdist": {
         "torch_api": "torch.cdist",
@@ -491,6 +508,14 @@
             "max": "None"
         },
         "paddle_torch_args_map": {
+            "min": "min",
+            "max": "max"
+        }
+    },
+    "paddle.clamp": {
+        "torch_api": "torch.clamp",
+        "paddle_torch_args_map": {
+            "x": "input",
             "min": "min",
             "max": "max"
         }
@@ -3667,6 +3692,14 @@
     "paddle.nn.functional.zeropad2d": {
         "Rule": "Zeropad2dRule"
     },
+    "paddle.nn.init.normal_": {
+        "torch_api": "torch.nn.init.normal_",
+        "paddle_torch_args_map": {
+            "tensor": "tensor",
+            "mean": "mean",
+            "std": "std"
+        }
+    },
     "paddle.nn.init.trunc_normal_": {
         "Rule": "TruncNormalRule",
         "torch_api": "torch.nn.init.trunc_normal_",
@@ -4242,6 +4275,16 @@
         }
     },
     "paddle.standard_normal": {
+        "torch_api": "torch.randn",
+        "set_defaults": {
+            "dtype": "None"
+        },
+        "paddle_torch_args_map": {
+            "shape": "size",
+            "dtype": "dtype"
+        }
+    },
+    "paddle.randn": {
         "torch_api": "torch.randn",
         "set_defaults": {
             "dtype": "None"
