@@ -9185,7 +9185,11 @@ result = [dx, dy]
 
 
 class CopsSquaredL2NormRule(BaseRule):
-    PADDLE_APIS = ("paddle._C_ops.squared_l2_norm",)
+    # Python 包装入口在动态图/PIR 下直接委托同一 C++ kernel。
+    PADDLE_APIS = (
+        "paddle._C_ops.squared_l2_norm",
+        "paddle.nn.clip._squared_l2_norm",
+    )
 
     """paddle._C_ops.squared_l2_norm(x) → (x * x).sum() with shape [1] to match Paddle output"""
 
