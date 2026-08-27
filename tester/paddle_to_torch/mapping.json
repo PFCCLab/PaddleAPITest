@@ -5116,6 +5116,9 @@
     "paddle._C_ops.squared_l2_norm": {
         "Rule": "CopsSquaredL2NormRule"
     },
+    "paddle.nn.clip._squared_l2_norm": {
+        "Rule": "CopsSquaredL2NormRule"
+    },
     "paddle._C_ops.subtract_": {
         "Rule": "CopsSubtractRule"
     },
