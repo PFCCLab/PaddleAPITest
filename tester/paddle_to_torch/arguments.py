@@ -8,6 +8,9 @@ import paddle
 from tester.api_config.dtype_utils import to_torch_dtype
 from tester.api_config.parameter_binding import bind_input_parameters, resolve_input_api
 
+# bool 是 int 的子类，必须与 int 一起排除，否则 False/True 会被当成 BOOL/INT16 码。
+_NON_DTYPE_SCALAR_TYPES = (bool, int, float, complex)
+
 
 def resolve_paddle_api(api_name: str) -> Callable[..., Any]:
     return resolve_input_api(api_name)
@@ -24,6 +27,14 @@ def _normalize_dtype_value(name: str, value: Any) -> Any:
         return [_normalize_dtype_value(name, item) for item in value]
     if isinstance(value, tuple):
         return tuple(_normalize_dtype_value(name, item) for item in value)
+    if isinstance(value, _NON_DTYPE_SCALAR_TYPES):
+        # 参数名只能说明“可能是 dtype”：paddle.Tensor.view 的 shape_or_dtype 是
+        # Sequence[int] | DTypeLike 联合参数，形状分量同样会走到这里。而 VarType
+        # 枚举与 int 相等且同 hash，to_torch_dtype 的 by_value 查表会把 0~6 当成
+        # dtype 码（1 -> torch.int16），把 view([1, 4096, -1]) 破坏成
+        # view([torch.int16, 4096, -1])。因此纯 Python 数值一律按原值透传，
+        # 真正的 dtype 值仍由下面的名称/类型分支处理。
+        return value
     if "dtype" in name or isinstance(value, paddle.dtype):
         return to_torch_dtype(value, strict=False)
     return value

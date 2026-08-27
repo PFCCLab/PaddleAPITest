@@ -127,7 +127,19 @@ INPUT_MANUAL_PARAMETER_NAMES = {
     "paddle._C_ops.matmul_grad": ("x", "y", "dout", "transpose_x", "transpose_y"),
     "paddle._C_ops.squared_l2_norm": ("x",),
     "paddle._C_ops.swiglu_grad": ("x", "y", "dout"),
-    "paddle._C_ops._run_custom_op": ("op_name", "arg1", "arg2", "arg3", "arg4"),
+    # 槽位数按 paddlefleet_ops 已注册算子的最大参数个数（tokens_unzip_stable 为 9）取齐。
+    "paddle._C_ops._run_custom_op": (
+        "op_name",
+        "arg1",
+        "arg2",
+        "arg3",
+        "arg4",
+        "arg5",
+        "arg6",
+        "arg7",
+        "arg8",
+        "arg9",
+    ),
     "paddle._C_ops.uniform": ("shape", "dtype", "min", "max", "seed", "place"),
 }
 
@@ -135,7 +147,7 @@ INPUT_MANUAL_PARAMETER_NAMES = {
 INPUT_MANUAL_PARAMETER_DEFAULTS = {
     # 默认值仅在 apply_defaults=True 的执行调用中展开。
     "paddle.Tensor.copy_": {"blocking": True},
-    "paddle._C_ops._run_custom_op": {"arg1": None, "arg2": None, "arg3": None, "arg4": None},
+    "paddle._C_ops._run_custom_op": {f"arg{index}": None for index in range(1, 10)},
     "paddle._C_ops.full_": {"place": None},
     "paddle._C_ops.gaussian": {"place": None},
     "paddle._C_ops.uniform": {"dtype": None, "min": 0, "max": 1.0, "seed": 0, "place": None},
