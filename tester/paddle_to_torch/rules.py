@@ -9316,6 +9316,41 @@ arg7    = arg7
 arg8    = arg8
 arg9    = arg9
 
+def _cuda_fminf(a, b):
+    # CUDA fminf 遇到单侧 NaN 时返回另一侧，不能直接使用 torch.minimum。
+    result = torch.minimum(a, b)
+    return torch.where(torch.isnan(a), b, result)
+
+def _cuda_fmaxf(a, b):
+    # CUDA fmaxf 与 fminf 的 NaN 规则对称，保持 kernel 的异常值语义。
+    result = torch.maximum(a, b)
+    return torch.where(torch.isnan(a), b, result)
+
+def _cuda_swiglu_clamp(
+    gate, value, clamp_value, inplace=False, clamp_tensor=None
+):
+    if clamp_tensor is None:
+        clamp_tensor = torch.as_tensor(
+            clamp_value, dtype=gate.dtype, device=gate.device
+        )
+    # fminf/fmaxf(NaN, scalar) 返回 scalar；此处 scalar NaN 时返回原输入。
+    if clamp_value != clamp_value:
+        return gate, value
+    # 非负 clamp 可以原地复刻 fminf/fmaxf，避免大 shape 的多份 where 临时量。
+    if inplace and clamp_value >= 0.0:
+        gate_nan = torch.isnan(gate)
+        value_nan = torch.isnan(value)
+        gate.clamp_(max=clamp_tensor)
+        value.clamp_(min=-clamp_tensor, max=clamp_tensor)
+        gate.masked_fill_(gate_nan, clamp_tensor)
+        value.masked_fill_(value_nan, clamp_tensor)
+        return gate, value
+    gate_eff = _cuda_fminf(gate, clamp_tensor)
+    value_eff = _cuda_fmaxf(
+        _cuda_fminf(value, clamp_tensor), -clamp_tensor
+    )
+    return gate_eff, value_eff
+
 if op_name == "fused_swiglu_bwd":
     # _run_custom_op("fused_swiglu_bwd", dy, x)
     # fwd: out = silu(x1) * x2  where x is split into (x1, x2) along last dim
@@ -9347,20 +9382,47 @@ elif op_name == "fused_swiglu_scale_clamp":
     # _run_custom_op("fused_swiglu_scale_clamp", x, scale, max_val)
     # clamp 语义对齐 PaddleFleet fusions/fused_swiglu_scale.py::
     # fused_swiglu_scale_forward (gate 只截上限, value 对称截断),
-    # 精度顺序对齐 CUDA kernel VectorizedFusedSwiGLUFwd 以做到 bit 级一致:
+    # 运算顺序按 CUDA kernel VectorizedFusedSwiGLUFwd 复刻；sigmoid/归约仍可能有
+    # 约 1--2 ULP 的差异，因此不能承诺逐位一致:
     #   g = min(gate, cv); v = clamp(value, -cv, cv)
     #   out = (T)((g * sigmoid(g)) * v * s)   # 全程 fp32, 只在最后舍入一次
     # 注意: fleet 的 CPU/XPU fallback 写成
     #   (silu(g)*v).cast(x.dtype) * scale.cast(x.dtype)
-    # 比 kernel 多两次 bf16 舍入, 与 CUDA 算子本身不 bit 一致, 故这里按 kernel 写。
+    # 比 kernel 多两次 bf16 舍入, 与 CUDA 算子本身不一致, 故这里按 kernel 写。
     x       = arg1   # shape [..., 2D]
     scale   = arg2   # scalar or tensor [..., 1] or [...,]
     max_val = arg3   # scalar
     _cv = float(max_val)
+    if x.ndim != 2:
+        raise ValueError(
+            "(InvalidArgument) fused_swiglu_scale_clamp expects 2-D X, "
+            f"but got {tuple(x.shape)}"
+        )
+    if x.shape[-1] % 2 != 0:
+        raise ValueError(
+            "(InvalidArgument) fused_swiglu_scale_clamp expects an even "
+            f"last dimension, but got {tuple(x.shape)}"
+        )
     _hidden = x.shape[-1] // 2
-    _x_fp32 = x.to(torch.float32)
-    _gate = torch.clamp(_x_fp32[..., :_hidden], max=_cv)
-    _val = torch.clamp(_x_fp32[..., _hidden:], min=-_cv, max=_cv)
+    if x.dtype not in (torch.bfloat16, torch.float32):
+        raise TypeError(
+            "fused_swiglu_scale_clamp only supports bfloat16 or float32 X, "
+            f"but got {x.dtype}"
+        )
+    _vec_size = 8 if x.dtype == torch.bfloat16 else 4
+    if x.shape[0] > 0 and _hidden % _vec_size != 0:
+        raise ValueError(
+            "(InvalidArgument) fused_swiglu_scale_clamp expects hidden_size "
+            f"divisible by {_vec_size}, but got {_hidden}"
+        )
+    # fp32 输入的 .to(torch.float32) 可能复用叶子存储，必须复制后再原地截断。
+    _x_fp32 = x.to(torch.float32, copy=True)
+    _gate, _val = _cuda_swiglu_clamp(
+        _x_fp32[..., :_hidden],
+        _x_fp32[..., _hidden:],
+        _cv,
+        inplace=True,
+    )
     if torch.is_tensor(scale):
         _scale_exp = scale.to(torch.float32)
     else:
@@ -9388,12 +9450,42 @@ elif op_name == "fused_swiglu_scale_clamp_bwd":
     dy      = arg3   # shape [..., D] (gradient of forward output)
     max_val = arg4   # scalar
     _cv = float(max_val)
+    if x.ndim != 2:
+        raise ValueError(
+            "(InvalidArgument) fused_swiglu_scale_clamp_bwd expects 2-D X, "
+            f"but got {tuple(x.shape)}"
+        )
+    if x.shape[-1] % 2 != 0:
+        raise ValueError(
+            "(InvalidArgument) fused_swiglu_scale_clamp_bwd expects an even "
+            f"last dimension, but got {tuple(x.shape)}"
+        )
     _hidden = x.shape[-1] // 2
+    if x.dtype not in (torch.bfloat16, torch.float32):
+        raise TypeError(
+            "fused_swiglu_scale_clamp_bwd only supports bfloat16 or float32 X, "
+            f"but got {x.dtype}"
+        )
+    _vec_size = 8 if x.dtype == torch.bfloat16 else 4
+    if x.shape[0] > 0 and _hidden % _vec_size != 0:
+        raise ValueError(
+            "(InvalidArgument) fused_swiglu_scale_clamp_bwd expects hidden_size "
+            f"divisible by {_vec_size}, but got {_hidden}"
+        )
+    if x.shape[0] > 0 and _hidden == 0:
+        # Host wrapper returns an uninitialized d_scale buffer for this shape.
+        raise NotImplementedError(
+            "(Unimplemented) fused_swiglu_scale_clamp_bwd has an uninitialized "
+            "d_scale output when hidden_size is zero"
+        )
     _x_fp32 = x.to(torch.float32)
     _gate_raw = _x_fp32[..., :_hidden]
     _val_raw = _x_fp32[..., _hidden:]
-    _gate = torch.clamp(_gate_raw, max=_cv)
-    _val = torch.clamp(_val_raw, min=-_cv, max=_cv)
+    _gate, _val = _cuda_swiglu_clamp(
+        _gate_raw,
+        _val_raw,
+        _cv,
+    )
     # kernel 中掩码是 float, 保持 fp32 避免额外的 dtype 提升
     _g_mask = (_gate_raw <= _cv).to(torch.float32)
     _v_mask = ((_val_raw <= _cv) & (_val_raw >= -_cv)).to(torch.float32)
@@ -9560,13 +9652,12 @@ elif op_name == "fused_swiglu_weighted_clamp_bwd":
     x     = arg1
     probs = arg2
     d_out = arg3
-    _cv = float(arg4) if arg4 is not None else 0.0
-    import math as _math
-    if not _math.isfinite(_cv) or _cv <= 0.0:
+    if arg4 is None:
         raise ValueError(
-            "fused_swiglu_weighted_clamp_bwd: clamp_value must be finite "
-            "and greater than zero"
+            "(InvalidArgument) fused_swiglu_weighted_clamp_bwd requires "
+            "clamp_value"
         )
+    _cv = float(arg4)
 
     # 形状/dtype 约束取自 CheckFusedSwiGLUInputs 与 FusedSwiGLUWeightedBackwardImpl。
     if x.ndim != 2:
@@ -9606,13 +9697,25 @@ elif op_name == "fused_swiglu_weighted_clamp_bwd":
             "fused_swiglu_weighted_clamp_bwd expects DOut to share X's dtype, "
             f"but got {d_out.dtype} and {x.dtype}"
         )
+    _vec_size = 8 if x.dtype == torch.bfloat16 else 4
+    if _rows > 0 and _hidden % _vec_size != 0:
+        raise ValueError(
+            "(InvalidArgument) fused_swiglu_weighted_clamp_bwd expects "
+            f"hidden_size divisible by {_vec_size}, but got {_hidden}"
+        )
 
     _x_dtype = x.dtype
     _probs_dtype = probs.dtype
     _probs_shape = [_rows, 1]
-    if _rows == 0 or _hidden == 0:
-        # rows/hidden 为 0 时 kernel 不启动，Paddle 直接返回未初始化的 d_x/out
-        # 以及 zeros 的 d_probs；这里统一用 0 占位。
+    # 分块循环复用同一个标量 tensor，避免每个 chunk 重建 clamp 参数。
+    _clamp_tensor = torch.as_tensor(_cv, dtype=torch.float32, device=x.device)
+    if _rows > 0 and _hidden == 0:
+        # Paddle host wrapper 对 d_probs 使用 empty，内容未定义，不能伪造零值比较。
+        raise NotImplementedError(
+            "(Unimplemented) fused_swiglu_weighted_clamp_bwd has an "
+            "uninitialized d_probs output when hidden_size is zero"
+        )
+    if _rows == 0:
         result = [
             torch.zeros_like(x),
             torch.zeros(_probs_shape, dtype=_probs_dtype, device=x.device),
@@ -9630,7 +9733,12 @@ elif op_name == "fused_swiglu_weighted_clamp_bwd":
         _probs_flat = probs.reshape(-1)
         # 每行同时存活约 14 个 fp32 [chunk, hidden] 中间量，另有 3 份 x.dtype 写出。
         _workspace_bytes = _adaptive_workspace_bytes(torch, locals())
-        _bytes_per_row = max(1, _hidden * (4 * 14 + x.element_size() * 3))
+        # 该分支始终使用非原地 helper，按 fminf/fmaxf 的临时量峰值估算。
+        _clamp_extra_bytes = 4 * 8
+        _bytes_per_row = max(
+            1,
+            _hidden * (4 * 14 + x.element_size() * 3 + _clamp_extra_bytes),
+        )
         _row_chunk = max(1, min(_rows, _workspace_bytes // _bytes_per_row))
         _one = torch.ones((), dtype=torch.float32, device=x.device)
         with torch.no_grad():
@@ -9638,8 +9746,12 @@ elif op_name == "fused_swiglu_weighted_clamp_bwd":
                 _row_end = min(_rows, _row_start + _row_chunk)
                 _gate_raw = x[_row_start:_row_end, :_hidden].to(torch.float32)
                 _val_raw = x[_row_start:_row_end, _hidden:].to(torch.float32)
-                _gate = torch.clamp(_gate_raw, max=_cv)
-                _val = torch.clamp(_val_raw, min=-_cv, max=_cv)
+                _gate, _val = _cuda_swiglu_clamp(
+                    _gate_raw,
+                    _val_raw,
+                    _cv,
+                    clamp_tensor=_clamp_tensor,
+                )
                 _g_mask = (_gate_raw <= _cv).to(torch.float32)
                 _v_mask = ((_val_raw <= _cv) & (_val_raw >= -_cv)).to(torch.float32)
                 _sig = torch.sigmoid(_gate)
@@ -9671,7 +9783,8 @@ elif op_name == "fused_swiglu_weighted_clamp_bwd":
 elif op_name in ("fuse_weighted_swiglu_fp8_quant", "fuse_weighted_swiglu_fp8_quant_clamp"):
     # fuse_weighted_swiglu_fp8_quant(x, prob, using_pow2_scaling, use_ue8m0)
     # fuse_weighted_swiglu_fp8_quant_clamp(x, prob, using_pow2_scaling, use_ue8m0, clamp_value)
-    # Returns: [output_fp8 (rows, cols/2), scale (rows, ceil(cols/2/128))]
+    # Returns: [output_fp8 (rows, cols/2), scale (rows, ceil(cols/2/128))];
+    # UE8M0 packs every four scale exponents into one int32 column.
     # SwiGLU(x[:, :cols/2], x[:, cols/2:]) * prob -> block-wise 1x128 FP8 quant
     # 两个变体共用 FusedWeightedSwigluActQuantImpl, 只差 kHasClamp 模板参数, 见
     # paddlefleet_ops/_extensions/fuse_weighted_swiglu_fp8_quant.cu::fast_swiglu:
@@ -9681,7 +9794,12 @@ elif op_name in ("fuse_weighted_swiglu_fp8_quant", "fuse_weighted_swiglu_fp8_qua
     _using_pow2_scaling = bool(arg3) if arg3 is not None else False
     _use_ue8m0 = bool(arg4) if arg4 is not None else False
     _has_clamp = op_name.endswith("_clamp")
-    _cv = float(arg5) if _has_clamp and arg5 is not None else 0.0
+    if _has_clamp and arg5 is None:
+        raise ValueError(
+            "(InvalidArgument) fuse_weighted_swiglu_fp8_quant_clamp requires "
+            "clamp_value"
+        )
+    _cv = float(arg5) if _has_clamp else 0.0
     _FP8_MAX = torch.finfo(torch.float8_e4m3fn).max
     _TILE = 128
 
@@ -9716,17 +9834,41 @@ elif op_name in ("fuse_weighted_swiglu_fp8_quant", "fuse_weighted_swiglu_fp8_qua
         _rows *= _dim
     _cols = _x.shape[-1]
     _x_2d = _x.reshape(_rows, _cols)
+    if _use_ue8m0 and _cols % 1024 != 0:
+        raise ValueError(
+            "(InvalidArgument) fuse_weighted_swiglu_fp8_quant with use_ue8m0 "
+            "requires the last X dimension divisible by 1024"
+        )
+    if _use_ue8m0 and _rows % 4 != 0:
+        # Host wrapper pads scale rows with empty storage; padded values are undefined.
+        raise NotImplementedError(
+            "(Unimplemented) use_ue8m0 scale has undefined padded rows when "
+            "the flattened row count is not divisible by 4"
+        )
     _prob_flat = None
-    if _prob is not None and torch.is_tensor(_prob) and _prob.numel() > 0:
-        if _prob.numel() != _rows:
+    if _prob is not None:
+        if not torch.is_tensor(_prob):
+            raise TypeError("fuse_weighted_swiglu_fp8_quant expects prob Tensor or None")
+        if (
+            _prob.ndim < 1
+            or _prob.shape[0] != _rows
+            or _prob.numel() != _rows
+        ):
             raise ValueError(
-                "fuse_weighted_swiglu_fp8_quant expects one probability per flattened "
-                f"input row ({_rows}), but got shape {tuple(_prob.shape)}"
+                "fuse_weighted_swiglu_fp8_quant expects prob.shape[0] == rows "
+                f"and one value per row ({_rows}), but got {tuple(_prob.shape)}"
             )
         _prob_flat = _prob.reshape(-1)
     _half_cols = _cols // 2
     _num_col_blocks = (_half_cols + _TILE - 1) // _TILE
     _dev = _x.device
+    _clamp_inplace = _has_clamp and _cv >= 0.0
+    # clamp 分支的标量参数在所有 row chunk 间共享。
+    _clamp_tensor = (
+        torch.as_tensor(_cv, dtype=torch.float32, device=_dev)
+        if _has_clamp
+        else None
+    )
 
     _output_fp8 = torch.empty([_rows, _half_cols], dtype=torch.float8_e4m3fn, device=_dev)
     _scale_out = torch.empty([_rows, _num_col_blocks], dtype=torch.float32, device=_dev)
@@ -9734,9 +9876,15 @@ elif op_name in ("fuse_weighted_swiglu_fp8_quant", "fuse_weighted_swiglu_fp8_qua
     _full_blocks = _half_cols // _TILE
     _full_cols = _full_blocks * _TILE
     # LHS, RHS, and the sigmoid temporary can overlap. Include the FP8 cast
-    # temporary.
+    # temporary and account for clamp NaN masks/negative-clamp temporaries.
     _workspace_bytes = _adaptive_workspace_bytes(torch, locals())
-    _bytes_per_row = max(1, _half_cols * (4 * 3 + 1))
+    _clamp_extra_bytes = (
+        (2 if _clamp_inplace else 4 * 8) if _has_clamp else 0
+    )
+    _bytes_per_row = max(
+        1,
+        _half_cols * (4 * 3 + 1 + _clamp_extra_bytes),
+    )
     _row_chunk = max(1, min(_rows, _workspace_bytes // _bytes_per_row))
 
     with torch.no_grad():
@@ -9745,8 +9893,13 @@ elif op_name in ("fuse_weighted_swiglu_fp8_quant", "fuse_weighted_swiglu_fp8_qua
             _lhs = _x_2d[_row_start:_row_end, :_half_cols].to(torch.float32)
             _rhs = _x_2d[_row_start:_row_end, _half_cols:].to(torch.float32)
             if _has_clamp:
-                _lhs.clamp_(max=_cv)
-                _rhs.clamp_(min=-_cv, max=_cv)
+                _lhs, _rhs = _cuda_swiglu_clamp(
+                    _lhs,
+                    _rhs,
+                    _cv,
+                    inplace=_clamp_inplace,
+                    clamp_tensor=_clamp_tensor,
+                )
             _lhs.mul_(torch.sigmoid(_lhs)).mul_(_rhs)
             del _rhs
             if _prob_flat is not None:
@@ -9756,7 +9909,9 @@ elif op_name in ("fuse_weighted_swiglu_fp8_quant", "fuse_weighted_swiglu_fp8_qua
                 _blocks = _lhs[:, :_full_cols].reshape(
                     _row_end - _row_start, _full_blocks, _TILE
                 )
-                _amax = _blocks.abs().amax(dim=-1).clamp_(min=1e-10)
+                _amax = _blocks.abs().amax(dim=-1)
+                # ComputeScaleImpl(eps=0) defines an all-zero block's scale as 1.
+                _amax.masked_fill_(_amax == 0, _FP8_MAX)
                 _quant_scale = _FP8_MAX / _amax
                 if _using_pow2_scaling:
                     _quant_scale.log2_().floor_().exp2_()
@@ -9769,7 +9924,8 @@ elif op_name in ("fuse_weighted_swiglu_fp8_quant", "fuse_weighted_swiglu_fp8_qua
 
             if _full_cols < _half_cols:
                 _tail = _lhs[:, _full_cols:]
-                _tail_amax = _tail.abs().amax(dim=-1).clamp_(min=1e-10)
+                _tail_amax = _tail.abs().amax(dim=-1)
+                _tail_amax.masked_fill_(_tail_amax == 0, _FP8_MAX)
                 _tail_scale = _FP8_MAX / _tail_amax
                 if _using_pow2_scaling:
                     _tail_scale.log2_().floor_().exp2_()
@@ -9783,8 +9939,8 @@ elif op_name in ("fuse_weighted_swiglu_fp8_quant", "fuse_weighted_swiglu_fp8_qua
 
     if _use_ue8m0:
         # Pack 4 exponent columns into 1 int32 (ue8m0 format)
-        _log2_inv = torch.log2(_scale_out).round().to(torch.int32) + 127
-        _log2_inv = _log2_inv.clamp(0, 254)
+        # Kernel stores the raw IEEE-754 exponent bits of inv_scale, not rounded log2.
+        _log2_inv = (_scale_out.view(torch.int32) >> 23) & 0xFF
         _pack_cols = _log2_inv.shape[-1]
         _pad_c = (4 - (_pack_cols % 4)) % 4
         if _pad_c:
@@ -9869,6 +10025,7 @@ elif op_name in ("fuse_stack_fp8_quant", "fuse_stack_transpose_fp8_quant"):
             _tiles = _chunk.reshape(
                 _block_end - _block_start, _TILE, _num_col_blocks, _TILE
             ).permute(0, 2, 1, 3)
+            # fuse_stack kernel passes the default eps=1e-10 to ComputeScale.
             _amax = _tiles.abs().amax(dim=(2, 3)).clamp_(min=1e-10)
             _quant_scale = _FP8_MAX / _amax
             if _using_pow2_scaling or _using_ue8m0_scale:
@@ -9887,8 +10044,8 @@ elif op_name in ("fuse_stack_fp8_quant", "fuse_stack_transpose_fp8_quant"):
 
     # Scale output
     if _using_ue8m0_scale:
-        _log2_inv = torch.log2(_inv_scale).round().to(torch.int32) + 127
-        _log2_inv = _log2_inv.clamp(0, 254)
+        # Kernel stores the raw IEEE-754 exponent bits of inv_scale, not rounded log2.
+        _log2_inv = (_inv_scale.view(torch.int32) >> 23) & 0xFF
         _scale_out = _log2_inv.unsqueeze(1).expand(-1, _TILE, -1).reshape(
             _num_row_blocks * _TILE, _num_col_blocks
         )[:_out_rows]

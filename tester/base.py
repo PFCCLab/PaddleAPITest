@@ -1611,6 +1611,9 @@ class APITestBase:
             and self.api_config.api_name in special_accuracy_atol_rtol
         ):
             atol, rtol = special_accuracy_atol_rtol[self.api_config.api_name]
+        if self._is_ue8m0_scale_output(tensor_index):
+            # 打包 exponent 的数值距离没有浮点相对误差含义，强制精确比较。
+            atol, rtol = 0.0, 0.0
         record_accuracy_tolerance = getattr(self, "record_accuracy_tolerance", False)
         is_backward = getattr(self, "is_backward", False)
         if record_accuracy_tolerance:
@@ -2292,3 +2295,20 @@ class APITestBase:
 
     def should_check_dtype(self):
         return self.api_config.api_name not in not_check_dtype
+
+    def _is_ue8m0_scale_output(self, tensor_index):
+        """UE8M0 scale 是位域 int32，必须按整数逐位比较而不是 allclose。"""
+        if self.api_config.api_name != "paddle._C_ops._run_custom_op":
+            return False
+        args = getattr(self, "paddle_args", ())
+        if not args or tensor_index != 1:
+            return False
+        op_name = args[0]
+        if op_name in (
+            "fuse_weighted_swiglu_fp8_quant",
+            "fuse_weighted_swiglu_fp8_quant_clamp",
+        ):
+            return len(args) > 4 and bool(args[4])
+        if op_name in ("fuse_stack_fp8_quant", "fuse_stack_transpose_fp8_quant"):
+            return len(args) > 3 and bool(args[3])
+        return False
