@@ -3955,6 +3955,12 @@
     "paddle.Tensor.reshape": {
         "Rule": "ReshapeRule"
     },
+    "paddle.reshape_": {
+        "Rule": "ReshapeInplaceRule"
+    },
+    "paddle.Tensor.reshape_": {
+        "Rule": "ReshapeInplaceRule"
+    },
     "paddle.reverse": {
         "Rule": "ReverseRule"
     },
@@ -5151,7 +5157,7 @@
         "Rule": "CopsPutAlongAxisRule"
     },
     "paddle._C_ops.reshape_": {
-        "Rule": "CopsReshapeRule"
+        "Rule": "ReshapeInplaceRule"
     },
     "paddle._C_ops.scale_": {
         "Rule": "CopsScaleRule"

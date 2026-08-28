@@ -2957,7 +2957,10 @@ def generate_reshape_inputs(rule: InputRuleContext):
                     for index, item in enumerate(candidate):
                         if isinstance(item, numbers.Integral):
                             if item == 0:
-                                state["maxvalue"] //= shape[index]
+                                # 0 表示抄 x 同位置维度；index 越界属于无效配置，
+                                # 这里不能崩，要让 Paddle 去报 InvalidArgument。
+                                if index < len(shape):
+                                    state["maxvalue"] //= shape[index]
                             elif item != -1:
                                 state["maxvalue"] //= int(item)
                         elif rule.is_tensor_config(item):
