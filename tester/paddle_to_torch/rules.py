@@ -6164,6 +6164,86 @@ result = out.view(target.shape)
         )
 
 
+# paddle/phi/infermeta/unary.cc ValidateShape 的逐条复刻，reshape 系列共用。
+# 归一化后 shape 里不再有 0 或 -1，torch.reshape 只需处理确定形状。
+# 三处必须在此拦下的语义（torch 的报错文本不在 classify_runtime_error 白名单里，
+# 直接交给 torch 会把无效配置误报成 torch_error）：
+#   - shape 里的 0 表示抄输入同位置维度，index 必须落在输入维度内，zero-size 输入例外；
+#   - zero-size 输入下 -1 按非零维乘积之比推导，不是 in_size // capacity（那样恒为 0）；
+#   - -1 只允许一个，其余负数一律非法。
+_RESHAPE_VALIDATE_SHAPE = """
+if isinstance(shape, torch.Tensor):
+    shape = shape.tolist()
+else:
+    shape = list(shape)
+in_size = x.numel()
+in_dims = list(x.shape)
+out_shape = [0] * len(shape)
+capacity = 1
+shape_zero_cnt = 0
+unk_dim_idx = -1
+for i, s in enumerate(shape):
+    if s == -1:
+        if unk_dim_idx != -1:
+            raise ValueError(
+                "(InvalidArgument) Only one dimension value of 'shape' in "
+                "ReshapeOp can be -1"
+            )
+        unk_dim_idx = i
+        out_shape[i] = -1
+    elif s == 0:
+        shape_zero_cnt += 1
+        if i < len(in_dims):
+            out_shape[i] = 0 if in_size == 0 else in_dims[i]
+        elif in_size != 0:
+            raise ValueError(
+                "(InvalidArgument) If The index of 0 in `shape` >= the input "
+                "tensor X's dimensions, It can only be Zero-Sized Tensor"
+            )
+        capacity *= out_shape[i]
+    elif s < 0:
+        raise ValueError(
+            "(InvalidArgument) Each dimension value of 'shape' in ReshapeOp "
+            "must not be negative except one unknown dimension"
+        )
+    else:
+        out_shape[i] = s
+        capacity *= s
+if capacity == 0 and unk_dim_idx != -1:
+    in_zero_cnt = 0
+    in_pdt = 1
+    for d in in_dims:
+        if d == 0:
+            in_zero_cnt += 1
+        else:
+            in_pdt *= d
+    shape_pdt = 1
+    for s in shape:
+        if s != 0 and s != -1:
+            shape_pdt *= s
+    if shape_zero_cnt == in_zero_cnt and in_pdt % shape_pdt == 0:
+        out_shape[unk_dim_idx] = in_pdt // shape_pdt
+    else:
+        raise ValueError(
+            "(InvalidArgument) can not reshape, because the unspecified "
+            "dimension can be any number and is ambiguous"
+        )
+elif unk_dim_idx != -1:
+    if in_size % capacity != 0:
+        raise ValueError(
+            "(InvalidArgument) The 'shape' in ReshapeOp is invalid because "
+            "the input size is not divisible by the known dimensions"
+        )
+    out_shape[unk_dim_idx] = in_size // capacity
+elif capacity != in_size:
+    raise ValueError(
+        "(InvalidArgument) The 'shape' in ReshapeOp is invalid because "
+        "the input size does not equal the shape capacity"
+    )
+shape = out_shape
+"""
+
+
 class ReshapeRule(BaseRule):
     PADDLE_APIS = (
         "paddle.reshape",
@@ -6171,29 +6251,51 @@ class ReshapeRule(BaseRule):
     )
 
     def apply(self, paddle_api: str) -> ConvertResult:
-        preprocess = """
-if isinstance(shape, torch.Tensor):
-    shape = shape.tolist()
-elif isinstance(shape, tuple):
-    shape = list(shape)
-elements = x.numel()
-for i, s in enumerate(shape):
-    if s == 0 and elements != 0:
-        shape[i] = x.shape[i]
-        elements = elements // x.shape[i]
-    elif s != -1 and s != 0:
-        elements = elements // s
-for i, s in enumerate(shape):
-    if s == -1:
-        shape[i] = elements
-"""
         core = """
 result = torch.reshape(x, shape)
 """
         return self.build_result(
             paddle_api,
             kind=ConversionKind.DIRECT,
-            preprocess=preprocess,
+            preprocess=_RESHAPE_VALIDATE_SHAPE,
+            core=core,
+        )
+
+
+class ReshapeInplaceRule(BaseRule):
+    PADDLE_APIS = (
+        "paddle.reshape_",
+        "paddle.Tensor.reshape_",
+        "paddle._C_ops.reshape_",
+    )
+
+    def apply(self, paddle_api: str) -> ConvertResult:
+        # torch 没有 reshape_ kernel，只能组合。Paddle 侧限制 reshape_ 的三道门禁里，
+        # 只有门 1 属于单 API 语义，必须在这里对齐：
+        #   门 1 paddle/fluid/eager/utils.cc CheckInplace —— 需要梯度的叶子 Tensor 直接抛
+        #        InvalidArgument；但 python/paddle/tensor/manipulation.py 在目标 shape 与
+        #        原 shape 相同时先短路返回 x，不进 C++，所以 shape 未变时不该报错。
+        #   门 2 inplace version 校验取决于上游算子的反向依赖，单 API 参考实现里没有上游。
+        #   门 3 静态图退化为 reshape，与动态图单 API 比对无关。
+        core = """
+if list(x.shape) == shape:
+    # 门 1 的短路口：Paddle 在 Python 层直接返回 x，不触发 CheckInplace
+    result = x
+else:
+    if x.requires_grad and x.is_leaf:
+        raise RuntimeError(
+            "Leaf Var () that doesn't stop gradient can't use inplace strategy."
+        )
+    # set_ 不能包 no_grad：包了以后 x 保留旧 grad_fn 而 shape 已变，反向会校验失败。
+    # 不包时 set_ 把 grad_fn 置为 NotImplemented，而 harness 只对 x 自身求 grad
+    # （outputs 与 inputs 同对象），autograd 直接返回 grad_output，与 Paddle 一致。
+    x.set_(torch.reshape(x, shape))
+    result = x
+"""
+        return self.build_result(
+            paddle_api,
+            kind=ConversionKind.COMPOSITE,
+            preprocess=_RESHAPE_VALIDATE_SHAPE,
             core=core,
         )
 
@@ -8547,38 +8649,6 @@ result = arr
         return self.build_result(
             paddle_api,
             kind=ConversionKind.COMPOSITE,
-            core=core,
-        )
-
-
-class CopsReshapeRule(BaseRule):
-    PADDLE_APIS = ("paddle._C_ops.reshape_",)
-
-    """paddle._C_ops.reshape_(x, shape) → torch.reshape (in-place via set_)"""
-
-    def apply(self, paddle_api: str) -> ConvertResult:
-        core = """
-x     = x
-shape = shape
-if isinstance(shape, torch.Tensor):
-    shape = shape.tolist()
-elif isinstance(shape, tuple):
-    shape = list(shape)
-elements = x.numel()
-for i, s in enumerate(shape):
-    if s == 0 and elements != 0:
-        shape[i] = x.shape[i]
-        elements = elements // x.shape[i]
-    elif s != -1 and s != 0:
-        elements = elements // s
-for i, s in enumerate(shape):
-    if s == -1:
-        shape[i] = elements
-result = torch.reshape(x, shape)
-"""
-        return self.build_result(
-            paddle_api,
-            kind=ConversionKind.DIRECT,
             core=core,
         )
 
