@@ -5783,7 +5783,9 @@ def infer_broadcast_shape(input, index, dim):
             return None
     return broadcast_shape
 
-if broadcast == True:
+if broadcast == True and 0 not in tuple(index.shape):
+    # paddle 在 `0 in indices.shape` 时直接返回 arr 的副本：不广播、不校验 values。
+    # 空 index 无法 expand 到 broadcast_shape，这里必须同样短路。
     broadcast_shape = infer_broadcast_shape(input, indices, axis)
     if broadcast_shape:
         index = torch.broadcast_to(index, broadcast_shape)
@@ -8522,17 +8524,24 @@ def _infer_broadcast_shape(inp, idx, dim):
 index = indices
 src   = values
 dim   = axis
-if broadcast:
-    bshape = _infer_broadcast_shape(arr, indices, axis)
-    if bshape:
-        index = torch.broadcast_to(index, bshape)
-        src   = torch.broadcast_to(src, bshape)
-index = index.to(dtype=torch.int64)
-with torch.no_grad():
-    if reduce == "assign":
-        arr.scatter_(dim, index, src)
-    else:
-        arr.scatter_reduce_(dim, index, src, reduce, include_self=include_self)
+# paddle 在 `0 in indices.shape` 时直接原样返回 arr：不广播、不校验 values。
+# torch 侧必须同样短路，否则空 index 无法 expand 到 broadcast_shape
+# （例如 arr=[8192,32] / index=[0,10] 会报 "expanded size (8192) must match
+# the existing size (0)"），而原生 torch.scatter_ 在此本就是 no-op。
+if 0 in tuple(index.shape):
+    pass
+else:
+    if broadcast:
+        bshape = _infer_broadcast_shape(arr, indices, axis)
+        if bshape:
+            index = torch.broadcast_to(index, bshape)
+            src   = torch.broadcast_to(src, bshape)
+    index = index.to(dtype=torch.int64)
+    with torch.no_grad():
+        if reduce == "assign":
+            arr.scatter_(dim, index, src)
+        else:
+            arr.scatter_reduce_(dim, index, src, reduce, include_self=include_self)
 result = arr
 """
         return self.build_result(
