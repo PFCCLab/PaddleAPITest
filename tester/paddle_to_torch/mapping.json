@@ -2200,7 +2200,11 @@
     },
     "paddle.Tensor.max": {
         "Rule": "ReduceRule",
-        "torch_api": "torch.Tensor.max",
+        "torch_api": "torch.amax",
+        "set_defaults": {
+            "axis": "None",
+            "keepdim": "False"
+        },
         "paddle_torch_args_map": {
             "axis": "dim",
             "keepdim": "keepdim"
@@ -2251,7 +2255,12 @@
         }
     },
     "paddle.Tensor.min": {
-        "torch_api": "torch.Tensor.min",
+        "Rule": "ReduceRule",
+        "torch_api": "torch.amin",
+        "set_defaults": {
+            "axis": "None",
+            "keepdim": "False"
+        },
         "paddle_torch_args_map": {
             "axis": "dim",
             "keepdim": "keepdim"

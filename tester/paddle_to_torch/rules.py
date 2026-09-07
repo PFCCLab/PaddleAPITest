@@ -6421,6 +6421,7 @@ class ReduceRule(BaseRule):
         "paddle.mean",
         "paddle.Tensor.mean",
         "paddle.min",
+        "paddle.Tensor.min",
         "paddle.prod",
         "paddle.sum",
     )
@@ -6494,15 +6495,18 @@ if isinstance(axis, tuple) and not keepdim:
         elif paddle_api == "paddle.sum":
             core = "result = torch.sum(x, dim=axis, keepdim=keepdim, dtype=dtype)"
             post = ""
-        elif paddle_api == "paddle.Tensor.max":
-            core = """
+        elif paddle_api in {"paddle.Tensor.max", "paddle.Tensor.min"}:
+            core = f"""
+# torch.max/min(dim=) return (values, indices); paddle only returns values.
 if axis is None:
-    result = torch.max(x)
+    result = {self.torch_api}(x)
 else:
-    _max_result = torch.max(x, dim=axis, keepdim=keepdim)
-    result = _max_result.values
+    result = {self.torch_api}(x, dim=axis, keepdim=keepdim)
 """
-            post = ""
+            post = """
+if axis is None and keepdim:
+    result = result.view([1] * x.dim())
+"""
         else:
             core = f"result = {self.torch_api}(x, dim=axis, keepdim=keepdim)"
             post = ""
