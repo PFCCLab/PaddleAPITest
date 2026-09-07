@@ -6227,7 +6227,17 @@ if capacity == 0 and unk_dim_idx != -1:
             "dimension can be any number and is ambiguous"
         )
 elif unk_dim_idx != -1:
+    if in_size % capacity != 0:
+        raise ValueError(
+            "(InvalidArgument) The 'shape' in ReshapeOp is invalid because "
+            "the input size is not divisible by the known dimensions"
+        )
     out_shape[unk_dim_idx] = in_size // capacity
+elif capacity != in_size:
+    raise ValueError(
+        "(InvalidArgument) The 'shape' in ReshapeOp is invalid because "
+        "the input size does not equal the shape capacity"
+    )
 shape = out_shape
 """
 
