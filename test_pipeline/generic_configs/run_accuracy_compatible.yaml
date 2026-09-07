@@ -8,6 +8,7 @@ runner:
   foreground: true
 env:
   FLAGS_use_accuracy_compatible_kernel: "1"
+  FLAGS_cudnn_deterministic: "1"
 input:
   api_config_file: "${APITEST_MODEL}/accuracy_compatible/accuracy_compatible.txt"
 output:

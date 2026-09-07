@@ -346,6 +346,11 @@ class BaseRule(ABC):
             paddle_api,
             Code(
                 preprocess=[
+                    # Keep Torch deterministic algorithms in lockstep with Paddle.
+                    "import paddle",
+                    "if paddle.get_flags('FLAGS_cudnn_deterministic')"
+                    "['FLAGS_cudnn_deterministic']:",
+                    "    torch.use_deterministic_algorithms(True)",
                     *self._build_default_code(),
                     *code_lines(preprocess),
                     *self._build_argument_map_code(ensure_args=generate_standard_call),
