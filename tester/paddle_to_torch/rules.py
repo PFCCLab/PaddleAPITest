@@ -426,9 +426,12 @@ class AsStridedRule(BaseRule):
         # Paddle 的 offset 是字节数，Torch 的 storage_offset 是元素序号，不能直接透传。
         preprocess = """
 _storage_offset = locals().get("offset", 0)
-# 缺省 offset 由绑定器补成 0，独立转换调用也保持相同语义。
-if _storage_offset is None:
-    _storage_offset = 0
+# 绑定器只会把省略的 offset 补成 0；显式 None 或其他非整数值必须保留失败语义。
+import numbers
+if isinstance(_storage_offset, bool) or not isinstance(_storage_offset, numbers.Integral):
+    raise TypeError(
+        f"Paddle as_strided offset must be an integer, got {type(_storage_offset).__name__}"
+    )
 _storage_offset = int(_storage_offset)
 _item_size = int(x.element_size())
 # 非法偏移提前失败，避免 Torch 以不同单位产生静默错位。
