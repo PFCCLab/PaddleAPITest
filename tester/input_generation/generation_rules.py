@@ -2937,7 +2937,15 @@ def generate_sample_neighbors_inputs(rule: InputRuleContext):
 
 
 # 变形规则通过共享状态联动源 Tensor 与目标 shape。
-@input_rules.register("paddle.reshape", aliases=("paddle.Tensor.reshape",))
+@input_rules.register(
+    "paddle.reshape",
+    aliases=(
+        "paddle.Tensor.reshape",
+        "paddle.reshape_",
+        "paddle.Tensor.reshape_",
+        "paddle._C_ops.reshape_",
+    ),
+)
 def generate_reshape_inputs(rule: InputRuleContext):
     """输入规则：生成元素总数与源 Tensor 一致的 reshape shape。"""
     state = {
@@ -2948,7 +2956,7 @@ def generate_reshape_inputs(rule: InputRuleContext):
 
     def initialize_from_x(input_binding):
         shape = input_binding.shape
-        if 0 not in shape and state["shape"] is None:
+        if state["shape"] is None:
             state["shape"] = shape
             state["maxvalue"] = shape_numel(shape)
             state["tensornum"] = 0
@@ -2957,7 +2965,10 @@ def generate_reshape_inputs(rule: InputRuleContext):
                     for index, item in enumerate(candidate):
                         if isinstance(item, numbers.Integral):
                             if item == 0:
-                                state["maxvalue"] //= shape[index]
+                                # 0 表示抄 x 同位置维度；index 越界属于无效配置，
+                                # 这里不能崩，要让 Paddle 去报 InvalidArgument。
+                                if index < len(shape) and shape[index] != 0:
+                                    state["maxvalue"] //= shape[index]
                             elif item != -1:
                                 state["maxvalue"] //= int(item)
                         elif rule.is_tensor_config(item):
@@ -2970,6 +2981,9 @@ def generate_reshape_inputs(rule: InputRuleContext):
         dtype = "int32"
         shape = input_binding.shape
         maxvalue = state["maxvalue"]
+        if maxvalue == 0:
+            # zero-size 输入的目标 shape 至少要保留一个零维，避免构造非零容量。
+            return rule.ops.zeros(shape, dtype=dtype)
         if shape not in ((), (1,)):
             result = rule.ops.zeros(shape, dtype=dtype)
             for index in range(shape[0]):
