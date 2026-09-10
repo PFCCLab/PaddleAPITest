@@ -424,6 +424,47 @@ class GenericRule(BaseRule, register=False):
         )
 
 
+class AsStridedRule(BaseRule):
+    PADDLE_APIS = ("paddle.as_strided", "paddle.Tensor.as_strided")
+
+    def apply(self, paddle_api: str) -> ConvertResult:
+        # Paddle 的 offset 是字节数，Torch 的 storage_offset 是元素序号，不能直接透传。
+        preprocess = """
+_storage_offset = locals().get("offset", 0)
+# 绑定器只会把省略的 offset 补成 0；显式 None 或其他非整数值必须保留失败语义。
+import numbers
+if isinstance(_storage_offset, bool) or not isinstance(_storage_offset, numbers.Integral):
+    raise TypeError(
+        f"Paddle as_strided offset must be an integer, got {type(_storage_offset).__name__}"
+    )
+_storage_offset = int(_storage_offset)
+_item_size = int(x.element_size())
+# 非法偏移提前失败，避免 Torch 以不同单位产生静默错位。
+if _storage_offset < 0 or _storage_offset % _item_size:
+    raise ValueError(
+        f"Paddle as_strided offset must be a non-negative multiple of itemsize, "
+        f"got offset={_storage_offset}, itemsize={_item_size}"
+    )
+_storage_offset //= _item_size
+"""
+        # 共享参数绑定器把 Tensor receiver 统一命名为 x，函数与方法只需切换调用入口。
+        if paddle_api == "paddle.Tensor.as_strided":
+            core = (
+                "result = x.as_strided(size=shape, stride=stride, storage_offset=_storage_offset)"
+            )
+        else:
+            core = (
+                "result = torch.as_strided("
+                "input=x, size=shape, stride=stride, storage_offset=_storage_offset)"
+            )
+        return self.build_result(
+            paddle_api,
+            kind=ConversionKind.DIRECT,
+            preprocess=preprocess,
+            core=core,
+        )
+
+
 # a
 class AsComplexRule(BaseRule):
     PADDLE_APIS = ("paddle.as_complex",)

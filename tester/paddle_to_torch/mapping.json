@@ -229,14 +229,14 @@
         }
     },
     "paddle.as_strided": {
+        "Rule": "AsStridedRule",
         "torch_api": "torch.as_strided",
-        "paddle_torch_args_map": {
-            "x": "input",
-            "shape": "size",
-            "stride": "stride",
-            "offset": "storage_offset"
-        },
-        "description": "result = torch.as_strided(input=x, size=shape, stride=stride, storage_offset=offset)"
+        "description": "Paddle byte offset is converted to Torch element offset"
+    },
+    "paddle.Tensor.as_strided": {
+        "Rule": "AsStridedRule",
+        "torch_api": "torch.Tensor.as_strided",
+        "description": "Paddle byte offset is converted to Torch element offset"
     },
     "paddle.asin": {
         "torch_api": "torch.arcsin",
