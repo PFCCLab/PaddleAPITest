@@ -3453,14 +3453,8 @@ elif index.dim() > 1:
             index = index.unsqueeze(0)
     result = torch.gather(x, axis, index)
 else:
-    ans = []
-    for i in index:
-        temp = torch.narrow(x, axis, i.reshape([]), 1)
-        ans.append(torch.squeeze(temp, axis))
-    if len(ans) == 0:
-        result = torch.zeros([x.shape[0],0])
-    else:
-        result = torch.stack(ans,axis)
+    # 1-D index：生成器保证 index 非负且在界内，故 index_select 与 paddle.gather 语义一致
+    result = torch.index_select(x, axis, index)
 """
         return self.build_result(
             paddle_api,
