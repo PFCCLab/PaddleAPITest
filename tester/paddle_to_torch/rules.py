@@ -2582,6 +2582,12 @@ def _fp8_quant_blockwise_impl(inp, eps, power2, scale_transpose, ue8m0, method, 
         exp = torch.floor(torch.log2(safe)).to(torch.int32) + 127
         exp = torch.clamp(exp, 0, 255)
         packed = (exp[..., 0] | (exp[..., 1] << 8) | (exp[..., 2] << 16) | (exp[..., 3] << 24)).to(torch.int32)
+        if method == "128x128":
+            # Paddle's ue8m0 128x128 layout does NOT divide M by 128: it copies
+            # each 128x128 block scale across all 128 rows of the block, so the
+            # M axis stays `m` instead of ceil(m/128). Mirror that expansion
+            # (packed is (sm, packed_n) here) before the optional transpose.
+            packed = packed.repeat_interleave(128, dim=0)[:m]
         scale = packed.transpose(0, 1).contiguous() if scale_transpose else packed.contiguous()
     return q, scale
 
