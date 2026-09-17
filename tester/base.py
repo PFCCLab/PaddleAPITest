@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import collections
+import contextlib
 import gc
 import os
 from dataclasses import dataclass
@@ -100,7 +101,36 @@ CUDA_OOM = frozenset(
 GPU_MEMORY_PROBE_MIN_BYTES = 256 << 20
 COMPARISON_WORKSPACE_FAST_PATH_BYTES = 256 << 20
 DEFAULT_COMPARISON_WORKSPACE_BYTES = 1 << 30
+# Floor for a single bounded-compare chunk. Without it, when mem_get_info reports
+# a tiny free size (caching allocators reserve most memory on large cases), the
+# derived workspace collapses to the per-element floor and chunk_numel becomes ~1,
+# so the Python chunk loop iterates once per element and pegs a single core for
+# billions of elements. A 256 MiB working set keeps the iteration count bounded.
+MIN_COMPARISON_CHUNK_BYTES = 256 << 20
 _GIB = 1024**3
+
+
+@contextlib.contextmanager
+def _suspend_default_device():
+    """Clear torch.set_default_device's global mode for the duration.
+
+    set_default_device installs a DeviceContext whose __torch_function__ runs on
+    every torch op to inject a default device into factory constructors. During
+    bounded comparison the operands already carry an explicit device and the loop
+    uses no factory constructors, so the mode only adds per-op Python dispatch
+    overhead. Suspending it is a pure speedup with no behavioral change.
+    """
+    import torch.utils._device as _torch_device_mod
+
+    saved = _torch_device_mod.CURRENT_DEVICE
+    if saved is None:
+        yield
+        return
+    torch.set_default_device(None)
+    try:
+        yield
+    finally:
+        torch.set_default_device(saved)
 
 
 def _dtype_element_size(dtype):
@@ -1199,7 +1229,8 @@ class APITestBase:
         temp_bytes_per_element = max(
             32, 4 * max(actual.element_size(), expected.element_size()) + 16
         )
-        chunk_numel = max(1, working_bytes // temp_bytes_per_element)
+        min_chunk_numel = max(1, MIN_COMPARISON_CHUNK_BYTES // temp_bytes_per_element)
+        chunk_numel = max(min_chunk_numel, working_bytes // temp_bytes_per_element)
         actual_flat = actual.reshape(-1)
         expected_flat = expected.reshape(-1)
         actual_numel = actual_flat.numel()
@@ -1209,16 +1240,17 @@ class APITestBase:
                 end = min(actual_numel, start + chunk_numel)
                 yield start, actual_flat[start:end], expected_flat[start:end]
 
-        self._torch_assert_accuracy_from_chunks(
-            chunks(),
-            actual_numel,
-            tuple(actual.shape),
-            actual.dtype,
-            expected.dtype,
-            atol,
-            rtol,
-            error_msg,
-        )
+        with _suspend_default_device():
+            self._torch_assert_accuracy_from_chunks(
+                chunks(),
+                actual_numel,
+                tuple(actual.shape),
+                actual.dtype,
+                expected.dtype,
+                atol,
+                rtol,
+                error_msg,
+            )
 
     def _torch_assert_accuracy_from_chunks(
         self,
@@ -1420,28 +1452,30 @@ class APITestBase:
             32,
             4 * max(_tensor_element_size(actual), _tensor_element_size(expected)) + 16,
         )
-        max_numel = max(1, working_bytes // temp_bytes_per_element)
+        min_numel = max(1, MIN_COMPARISON_CHUNK_BYTES // temp_bytes_per_element)
+        max_numel = max(min_numel, working_bytes // temp_bytes_per_element)
         shape = tuple(actual.shape)
         actual_numel = int(actual.numel())
 
         if not check_dtype and actual_dtype != expected_dtype:
-            for index in self._logical_slab_indices(shape, max_numel):
-                actual_chunk = self._logical_slab_to_torch(actual, index, comparison_device)
-                expected_chunk = self._logical_slab_to_torch(expected, index, comparison_device)
+            with _suspend_default_device():
+                for index in self._logical_slab_indices(shape, max_numel):
+                    actual_chunk = self._logical_slab_to_torch(actual, index, comparison_device)
+                    expected_chunk = self._logical_slab_to_torch(expected, index, comparison_device)
 
-                def slab_error_msg(msg, *, slab_index=index):
-                    return error_msg(f"logical slab {slab_index}: {msg}")
+                    def slab_error_msg(msg, *, slab_index=index):
+                        return error_msg(f"logical slab {slab_index}: {msg}")
 
-                torch.testing.assert_close(
-                    actual_chunk,
-                    expected_chunk,
-                    rtol=rtol,
-                    atol=atol,
-                    equal_nan=True,
-                    check_device=False,
-                    check_dtype=False,
-                    msg=slab_error_msg,
-                )
+                    torch.testing.assert_close(
+                        actual_chunk,
+                        expected_chunk,
+                        rtol=rtol,
+                        atol=atol,
+                        equal_nan=True,
+                        check_device=False,
+                        check_dtype=False,
+                        msg=slab_error_msg,
+                    )
             return
 
         def chunks():
@@ -1456,16 +1490,17 @@ class APITestBase:
                 yield offset, actual_chunk, expected_chunk
                 offset += actual_chunk.numel()
 
-        self._torch_assert_accuracy_from_chunks(
-            chunks(),
-            actual_numel,
-            shape,
-            actual_dtype,
-            expected_dtype,
-            atol,
-            rtol,
-            error_msg,
-        )
+        with _suspend_default_device():
+            self._torch_assert_accuracy_from_chunks(
+                chunks(),
+                actual_numel,
+                shape,
+                actual_dtype,
+                expected_dtype,
+                atol,
+                rtol,
+                error_msg,
+            )
 
     @staticmethod
     def _comparison_cuda_device_id(value):

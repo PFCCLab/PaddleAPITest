@@ -3128,10 +3128,53 @@ def _estimate_case_gpu_memory(api_config_str, options, *, failure_report):
     )
 
 
-def _build_pending_cases(api_configs, options, *, failure_report):
+def _single_gpu_admission_ceiling(snapshots):
+    """单张（假设全空）计算卡的最大可准入字节。
+
+    准入用 free-safety，而此处用 total-safety 表示卡完全空闲时的理论上限：case 的
+    准入估算一旦超过它，任何调度组合都放不下（即使独占整卡），不应长期占据 pending。
+    返回 None（无快照）时调用方跳过拒绝逻辑，保持原有行为。
+    """
+    policy = GpuSchedulingPolicy()
+    ceilings = [
+        max(0, snapshot.total_bytes - policy.safety_reserve_bytes(snapshot))
+        for snapshot in snapshots.values()
+    ]
+    return max(ceilings) if ceilings else None
+
+
+def _emit_oversize_rejections(rejected, ceiling_bytes):
+    """把永远放不下的 case 判 oom 终态并 checkpoint；返回已处理条数。"""
+    if not rejected:
+        return 0
+    # 建队早于首个 worker 重建 .tmp，主进程需自行确保结果分片目录存在再写。
+    log_runtime.result_file("checkpoint").parent.mkdir(parents=True, exist_ok=True)
+    for config, admission_bytes in rejected:
+        message = (
+            f"gpu memory admission {admission_bytes / GIB:.1f} GiB exceeds single-GPU "
+            f"ceiling {ceiling_bytes / GIB:.1f} GiB"
+        )
+        log_worker.emit_case_result("oom", config, message=message)
+        log_worker.write_to_log("checkpoint", config)
+    return len(rejected)
+
+
+def _build_pending_cases(api_configs, options, *, failure_report, admission_ceiling_bytes=None):
+    # 只做入队/拒绝的纯决策，把被拒 case 连同准入估算回传给调用方统一落终态。
     pending_cases = PendingQueue()
+    policy = GpuSchedulingPolicy()
+    rejected = []
     for config in api_configs:
         estimate = _estimate_case_gpu_memory(config, options, failure_report=failure_report)
+        if admission_ceiling_bytes is not None:
+            # 计算卡与对比卡分别落在不同物理卡上，取二者准入的较大值判定是否超单卡上限。
+            admission_bytes = max(
+                policy.case_admission_bytes(estimate.compute_bytes),
+                policy.case_admission_bytes(estimate.comparison_bytes),
+            )
+            if admission_bytes > admission_ceiling_bytes:
+                rejected.append((config, admission_bytes))
+                continue
         pending_cases.append(
             PendingCase(
                 config=config,
@@ -3141,7 +3184,7 @@ def _build_pending_cases(api_configs, options, *, failure_report):
             ),
             now=0.0,
         )
-    return pending_cases
+    return pending_cases, rejected
 
 
 class BatchTerminalCoordinator:
@@ -3760,11 +3803,7 @@ def _run_continuous_gpu_batch_loop(
 ):
     # 主循环顺序固定为回收、准入、启动、派发、收终态，避免状态逆向迁移。
     estimate_failures = GpuEstimateFailureReport()
-    pending_dispatch = _build_pending_cases(api_configs, options, failure_report=estimate_failures)
-    estimate_failures.emit(all_case)
-    retry_state.case_memory_estimates = {
-        pending.config: pending.gpu_estimate for pending in pending_dispatch.iter_all()
-    }
+    # 先采样显存，据此算出单卡（全空）准入上限，供建队时拒绝永远放不下的 case。
     initial_snapshots = _read_gpu_memory_snapshots(
         tuple(
             gpu_id
@@ -3773,6 +3812,21 @@ def _run_continuous_gpu_batch_loop(
             if gpu_id is not None
         )
     )
+    admission_ceiling_bytes = _single_gpu_admission_ceiling(initial_snapshots)
+    pending_dispatch, oversize_rejections = _build_pending_cases(
+        api_configs,
+        options,
+        failure_report=estimate_failures,
+        admission_ceiling_bytes=admission_ceiling_bytes,
+    )
+    # 被拒 case 判 oom 终态并 checkpoint，计入已测数以保持 completed/total 自洽。
+    batch_state.tested_case += _emit_oversize_rejections(
+        oversize_rejections, admission_ceiling_bytes
+    )
+    estimate_failures.emit(all_case)
+    retry_state.case_memory_estimates = {
+        pending.config: pending.gpu_estimate for pending in pending_dispatch.iter_all()
+    }
     scheduler = ContinuousGpuBatchScheduler(pool, initial_snapshots)
     terminal = BatchTerminalCoordinator(
         pool=pool,
