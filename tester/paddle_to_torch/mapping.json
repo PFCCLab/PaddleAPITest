@@ -3138,6 +3138,14 @@
             "inplace": "inplace"
         }
     },
+    "paddle.compat.nn.functional.linear": {
+        "torch_api": "torch.nn.functional.linear",
+        "paddle_torch_args_map": {
+            "input": "input",
+            "weight": "weight",
+            "bias": "bias"
+        }
+    },
     "paddle.nn.functional.linear": {
         "Rule": "LinearRule",
         "torch_api": "torch.nn.functional.linear",
