@@ -252,6 +252,31 @@ def _canonicalize_tensor_receiver(api_name, arguments, parameter_names):
     return arguments, parameter_names
 
 
+def _expand_variadic_positional(signature, args, kwargs):
+    # inspect 不允许把 VAR_POSITIONAL 形参按关键字传入。输入生成阶段会把变长位置
+    # 实参按形参名收进 kwargs（如 paddle.einsum 的 operands），回绑时必须先按形参
+    # 顺序展开回位置实参，否则 signature.bind 会以 "unexpected keyword argument" 失败。
+    var_positional = next(
+        (p.name for p in signature.parameters.values() if p.kind is p.VAR_POSITIONAL),
+        None,
+    )
+    if var_positional is None or var_positional not in kwargs:
+        return args, kwargs
+    kwargs = dict(kwargs)
+    variadic = kwargs.pop(var_positional)
+    rebuilt = list(args)
+    for parameter in signature.parameters.values():
+        if parameter.kind is parameter.VAR_POSITIONAL:
+            rebuilt.extend(variadic if isinstance(variadic, (list, tuple)) else [variadic])
+        elif (
+            parameter.kind in (parameter.POSITIONAL_ONLY, parameter.POSITIONAL_OR_KEYWORD)
+            and parameter.name in kwargs
+        ):
+            # 变长参数前的普通位置形参若也落在 kwargs，需要先补回位置，保持顺序。
+            rebuilt.append(kwargs.pop(parameter.name))
+    return rebuilt, kwargs
+
+
 def _validate_variadic_shape_kwargs(kwargs):
     # 变长 shape 绕过 inspect.bind，仍需保留未知关键字的失败语义。
     unexpected = set(kwargs) - {"name"}
@@ -368,6 +393,8 @@ def bind_input_parameters(
         bound = signature.bind(*args[:positional_count], **kwargs)
     else:
         # 公共 API 的异常直接保留 inspect.bind 语义，供上层分类。
+        # 先把按名收集的变长位置实参展开回位置，避免 *args 形参被当成关键字。
+        args, kwargs = _expand_variadic_positional(signature, args, kwargs)
         bound = signature.bind(*args, **kwargs)
     if apply_defaults:
         # 仅 Torch 执行需要完整默认集，生成阶段保持用户实际输入集合。
