@@ -19,6 +19,14 @@ ENGINE=engineV4           # 推荐 engineV4；可选 engineV2
 FOREGROUND=false          # true=前台运行(调试用，Ctrl+C终止)
 DRY_RUN=false             # true=只打印最终命令，不执行
 
+# ── Hang 自动续跑 ─────────────────────────────────────────────
+# engineV4 遇 sanitizer 子进程偶发死锁会触发 PRESSURE_TIMEOUT(exit 1) 或 watchdog
+# os._exit(2) 干净退出；此时重跑同命令会读 checkpoint 跳过已完成 case，分段跑完。
+# true=hang 后自动续跑；false=退出即结束（原行为）。
+AUTO_RESUME_ON_HANG=false
+MAX_AUTO_RESUME_RETRIES=5          # 单次启动最大续跑次数
+RESUME_COOLDOWN_SECONDS=10        # 续跑前冷却（让 GPU/CUDA driver 完全释放）
+
 # ── compute-sanitizer（engineV4 only）──────────────────────────
 # compute-sanitizer 用于定位 CUDA kernel 的非法访存、race、同步错误等问题。
 # engineV4 为每个 worker slot 启动一个 sanitizer session，正常 case 在 session 内复用 runtime。
@@ -303,15 +311,60 @@ if [[ "$FOREGROUND" == "true" ]]; then
     echo "开始    日志目录 $LOG_DIR | Ctrl+C 终止"
     # 忽略 shell 自身的 SIGINT，让 Ctrl+C 只作用于 python 子进程
     trap '' INT
-    python "$ENGINE.py" "${ALL_ARGS[@]}"
+    # Hang 自动续跑：hang 类退出码（1/2）重跑同命令，engineV4 读 checkpoint 跳过已完成 case
+    attempt=0
+    max_attempt=1
+    rc=0
+    [[ "$AUTO_RESUME_ON_HANG" == "true" ]] && max_attempt="$MAX_AUTO_RESUME_RETRIES"
+    while [[ "$attempt" -lt "$max_attempt" ]]; do
+        attempt=$((attempt + 1))
+        python "$ENGINE.py" "${ALL_ARGS[@]}"
+        rc=$?
+        [[ "$rc" -eq 0 ]] && break
+        if [[ "$AUTO_RESUME_ON_HANG" != "true" || "$rc" -ne 1 && "$rc" -ne 2 ]]; then
+            echo "[退出] $ENGINE.py 退出码 $rc（不续跑）"
+            break
+        fi
+        if [[ "$attempt" -lt "$max_attempt" ]]; then
+            echo "[续跑] $ENGINE.py 退出码 $rc（hang），${RESUME_COOLDOWN_SECONDS}s 后续跑（$attempt/$max_attempt）"
+            sleep "$RESUME_COOLDOWN_SECONDS"
+        else
+            echo "[退出] $ENGINE.py 退出码 $rc，已达续跑上限 $max_attempt"
+        fi
+    done
     trap - INT
+    exit "$rc"
 else
-    nohup setsid python "$ENGINE.py" "${ALL_ARGS[@]}" >/dev/null 2>&1 &
+    # 后台模式：续跑循环放进 nohup setsid 子 shell，--stop 通过 PID 文件 kill 整个进程组
+    # 用临时脚本文件避免 nohup setsid bash -c 的引号嵌套地狱
+    RESUME_SCRIPT="$(mktemp "${LOG_DIR}/.resume.XXXXXX.sh")"
+    cat > "$RESUME_SCRIPT" <<EOF
+#!/bin/bash
+attempt=0
+max_attempt=1
+rc=0
+[[ "$AUTO_RESUME_ON_HANG" == "true" ]] && max_attempt="$MAX_AUTO_RESUME_RETRIES"
+while [[ \$attempt -lt \$max_attempt ]]; do
+    attempt=\$((attempt + 1))
+    python "$ENGINE.py" "\$@" </dev/null >/dev/null 2>&1
+    rc=\$?
+    [[ \$rc -eq 0 ]] && break
+    if [[ "$AUTO_RESUME_ON_HANG" != "true" || \$rc -ne 1 && \$rc -ne 2 ]]; then break; fi
+    if [[ \$attempt -lt \$max_attempt ]]; then
+        echo "[\$(date +%H:%M:%S)] [续跑] hang 退出码 \$rc，${RESUME_COOLDOWN_SECONDS}s 后续跑（\$attempt/\$max_attempt）" >>"$LOG_DIR/.resume.log"
+        sleep "$RESUME_COOLDOWN_SECONDS"
+    fi
+done
+echo "[\$(date +%H:%M:%S)] [结束] 最终退出码 \$rc" >>"$LOG_DIR/.resume.log"
+exit \$rc
+EOF
+    chmod +x "$RESUME_SCRIPT"
+    nohup setsid bash "$RESUME_SCRIPT" -- "${ALL_ARGS[@]}" &
     PYTHON_PID=$!
     echo "$PYTHON_PID" > "$PID_FILE"
     flock -u 9
 
-    # 任务自然结束时清理 PID 文件；若已启动新任务，则不误删新 PID。
+    # 任务自然结束时清理 PID 文件与临时脚本；若已启动新任务，则不误删新 PID。
     (
         while kill -0 "$PYTHON_PID" 2>/dev/null; do
             sleep 5
@@ -321,12 +374,13 @@ else
         flock -x 9
         recorded_pid="$(cat "$PID_FILE" 2>/dev/null || true)"
         [[ "$recorded_pid" == "$PYTHON_PID" ]] && rm -f "$PID_FILE"
+        rm -f "$RESUME_SCRIPT"
     ) >/dev/null 2>&1 &
 
     sleep 1
     if ! kill -0 "$PYTHON_PID" 2>/dev/null; then
         echo "[错误] 启动失败 | $ENGINE.py | 日志目录 $LOG_DIR"
-        rm -f "$PID_FILE"
+        rm -f "$PID_FILE" "$RESUME_SCRIPT"
         exit 1
     fi
 
