@@ -24,7 +24,7 @@ DRY_RUN=false             # true=只打印最终命令，不执行
 # os._exit(2) 干净退出；此时重跑同命令会读 checkpoint 跳过已完成 case，分段跑完。
 # true=hang 后自动续跑；false=退出即结束（原行为）。
 AUTO_RESUME_ON_HANG=false
-MAX_AUTO_RESUME_RETRIES=5          # 单次启动最大续跑次数
+MAX_AUTO_RESUME_RETRIES=50         # 单次启动最大续跑次数
 RESUME_COOLDOWN_SECONDS=10        # 续跑前冷却（让 GPU/CUDA driver 完全释放）
 
 # ── compute-sanitizer（engineV4 only）──────────────────────────
