@@ -20,15 +20,15 @@ import tempfile
 import threading
 import time
 from collections import OrderedDict, deque
+
+# ThreadPoolExecutor 仅用于给进程内 NVML 采样加超时边界。
+from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import TimeoutError as FuturesTimeoutError
 from dataclasses import dataclass, field, replace
 from datetime import datetime
 from multiprocessing import cpu_count, set_start_method
 from pathlib import Path
 from types import SimpleNamespace
-
-# ThreadPoolExecutor 仅用于给进程内 NVML 采样加超时边界。
-from concurrent.futures import ThreadPoolExecutor
-from concurrent.futures import TimeoutError as FuturesTimeoutError
 
 import numpy as np
 import pynvml
@@ -211,13 +211,11 @@ def read_max_slot_startup_churns(environ=None):
         max_churns = int(raw_value)
     except (TypeError, ValueError) as err:
         raise ValueError(
-            f"{MAX_SLOT_STARTUP_CHURNS_ENV_VAR} must be a non-negative integer, "
-            f"got {raw_value!r}"
+            f"{MAX_SLOT_STARTUP_CHURNS_ENV_VAR} must be a non-negative integer, got {raw_value!r}"
         ) from err
     if max_churns < 0:
         raise ValueError(
-            f"{MAX_SLOT_STARTUP_CHURNS_ENV_VAR} must be a non-negative integer, "
-            f"got {raw_value!r}"
+            f"{MAX_SLOT_STARTUP_CHURNS_ENV_VAR} must be a non-negative integer, got {raw_value!r}"
         )
     return max_churns
 
@@ -233,13 +231,11 @@ def read_no_progress_timeout(options, environ=None):
         timeout = float(raw_value)
     except (TypeError, ValueError) as err:
         raise ValueError(
-            f"{NO_PROGRESS_TIMEOUT_ENV_VAR} must be a finite non-negative number, "
-            f"got {raw_value!r}"
+            f"{NO_PROGRESS_TIMEOUT_ENV_VAR} must be a finite non-negative number, got {raw_value!r}"
         ) from err
     if not math.isfinite(timeout) or timeout < 0:
         raise ValueError(
-            f"{NO_PROGRESS_TIMEOUT_ENV_VAR} must be a finite non-negative number, "
-            f"got {raw_value!r}"
+            f"{NO_PROGRESS_TIMEOUT_ENV_VAR} must be a finite non-negative number, got {raw_value!r}"
         )
     return timeout
 
@@ -2044,7 +2040,9 @@ class WorkerPool:
             # busy 的在途 worker 仍可能正常完成终态，不能提前判死整卡。
             if any(s.state in {"idle", "busy", *_INITIALIZING_SLOT_STATES} for s in siblings):
                 return
-            if any(s.state == "suspended" and s.retry_not_before < time.monotonic() for s in siblings):
+            if any(
+                s.state == "suspended" and s.retry_not_before < time.monotonic() for s in siblings
+            ):
                 return
         self.quarantine_gpu(gpu_id, reason=reason)
 
@@ -2118,9 +2116,7 @@ class WorkerPool:
                 if was_initializing:
                     # 初始化态换血走独立 churn 计数：这条路径不会经过
                     # init_failures，必须在此补记，否则 slot 会无限换血。
-                    churn_retired = self._record_startup_churn(
-                        slot, now=time.monotonic()
-                    )
+                    churn_retired = self._record_startup_churn(slot, now=time.monotonic())
             if churn_retired:
                 print(
                     f"[worker] SLOT_RETIRED | slot {slot_index} | "
@@ -3664,15 +3660,17 @@ class NoProgressWatchdog:
         except Exception as err:
             # 诊断失败不能阻止退出路径继续执行。
             print(
-                f"NO_PROGRESS_WATCHDOG | slot dump failed | "
-                f"{type(err).__name__}: {err}",
+                f"NO_PROGRESS_WATCHDOG | slot dump failed | {type(err).__name__}: {err}",
                 flush=True,
             )
         # 显存采样绝不能走有卡死嫌疑的进程内 pynvml，只用带超时的子进程。
         try:
             output = subprocess.run(
-                ["nvidia-smi", "--query-gpu=index,memory.used,memory.total",
-                 "--format=csv,noheader,nounits"],
+                [
+                    "nvidia-smi",
+                    "--query-gpu=index,memory.used,memory.total",
+                    "--format=csv,noheader,nounits",
+                ],
                 capture_output=True,
                 text=True,
                 timeout=10,
@@ -3682,8 +3680,7 @@ class NoProgressWatchdog:
                     print(f"NO_PROGRESS_WATCHDOG | gpu {line.strip()}", flush=True)
         except Exception as err:
             print(
-                f"NO_PROGRESS_WATCHDOG | nvidia-smi failed | "
-                f"{type(err).__name__}: {err}",
+                f"NO_PROGRESS_WATCHDOG | nvidia-smi failed | {type(err).__name__}: {err}",
                 flush=True,
             )
 
@@ -3700,8 +3697,7 @@ class NoProgressWatchdog:
             self._pool.shutdown(force=True)
         except Exception as err:
             print(
-                f"NO_PROGRESS_WATCHDOG | pool shutdown failed | "
-                f"{type(err).__name__}: {err}",
+                f"NO_PROGRESS_WATCHDOG | pool shutdown failed | {type(err).__name__}: {err}",
                 flush=True,
             )
         # 有界等待主线程自然退出；超时则强制退出，避免连本线程一起挂死。
@@ -3730,9 +3726,7 @@ class NoProgressWatchdog:
         # 0 超时表示关闭；批次正常结束也由 stop 事件收口线程。
         if self._timeout_seconds <= 0:
             return None
-        self._thread = threading.Thread(
-            target=self._loop, daemon=True, name="no-progress-watchdog"
-        )
+        self._thread = threading.Thread(target=self._loop, daemon=True, name="no-progress-watchdog")
         self._thread.start()
         return self._thread
 
