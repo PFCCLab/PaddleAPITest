@@ -20,6 +20,10 @@ import tempfile
 import threading
 import time
 from collections import OrderedDict, deque
+
+# ThreadPoolExecutor 仅用于给进程内 NVML 采样加超时边界。
+from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import TimeoutError as FuturesTimeoutError
 from dataclasses import dataclass, field, replace
 from datetime import datetime
 from multiprocessing import cpu_count, set_start_method
@@ -62,6 +66,10 @@ WORKER_INIT_BACKOFF_SECONDS = (5.0, 15.0, 30.0, 60.0)
 # 连续初始化失败达到上限的 slot 不再复活，避免单个故障 slot 反复吞掉同一个 case。
 MAX_SLOT_INIT_FAILURES_ENV_VAR = "PADDLEAPITEST_MAX_SLOT_INIT_FAILURES"
 DEFAULT_MAX_SLOT_INIT_FAILURES = 5
+# ledger 二次确认失败触发的换血同样有上限：这条路径不经过 init_failures，
+# 不加独立计数的话 slot 会以 serviceable 身份无限换血，是批次永挂的直接根因之一。
+MAX_SLOT_STARTUP_CHURNS_ENV_VAR = "PADDLEAPITEST_MAX_SLOT_STARTUP_CHURNS"
+DEFAULT_MAX_SLOT_STARTUP_CHURNS = 3
 # 初始化超时的现场只存在于被杀之前，诊断开关默认开启以便偶发故障可事后归因。
 INIT_TIMEOUT_DIAGNOSTICS_ENV_VAR = "PADDLEAPITEST_INIT_TIMEOUT_DIAGNOSTICS"
 # 单次现场采集的总预算，避免按进程数累加阻塞 watchdog。
@@ -190,6 +198,46 @@ def read_max_slot_init_failures(environ=None):
             f"{MAX_SLOT_INIT_FAILURES_ENV_VAR} must be a non-negative integer, got {raw_value!r}"
         )
     return max_failures
+
+
+def read_max_slot_startup_churns(environ=None):
+    # 0 表示只退避、永不因换血退役 slot；非法值在批次启动阶段就失败。
+    source = os.environ if environ is None else environ
+    raw_value = source.get(
+        MAX_SLOT_STARTUP_CHURNS_ENV_VAR,
+        str(DEFAULT_MAX_SLOT_STARTUP_CHURNS),
+    )
+    try:
+        max_churns = int(raw_value)
+    except (TypeError, ValueError) as err:
+        raise ValueError(
+            f"{MAX_SLOT_STARTUP_CHURNS_ENV_VAR} must be a non-negative integer, got {raw_value!r}"
+        ) from err
+    if max_churns < 0:
+        raise ValueError(
+            f"{MAX_SLOT_STARTUP_CHURNS_ENV_VAR} must be a non-negative integer, got {raw_value!r}"
+        )
+    return max_churns
+
+
+def read_no_progress_timeout(options, environ=None):
+    """解析全局无进展超时；默认取 2 倍 case timeout 与 1800s 的较大者。"""
+    source = os.environ if environ is None else environ
+    raw_value = source.get(NO_PROGRESS_TIMEOUT_ENV_VAR)
+    if raw_value is None:
+        case_timeout = float(getattr(options, "timeout", 0) or 0)
+        return max(2.0 * case_timeout, DEFAULT_NO_PROGRESS_TIMEOUT_SECONDS)
+    try:
+        timeout = float(raw_value)
+    except (TypeError, ValueError) as err:
+        raise ValueError(
+            f"{NO_PROGRESS_TIMEOUT_ENV_VAR} must be a finite non-negative number, got {raw_value!r}"
+        ) from err
+    if not math.isfinite(timeout) or timeout < 0:
+        raise ValueError(
+            f"{NO_PROGRESS_TIMEOUT_ENV_VAR} must be a finite non-negative number, got {raw_value!r}"
+        )
+    return timeout
 
 
 def slot_init_backoff_seconds(init_failures):
@@ -544,6 +592,13 @@ MAX_EXTERNAL_KILL_RETRIES_PER_CASE = 1
 MAX_TOTAL_EXTERNAL_KILL_EVENTS = 3
 # 初始 warmup 与单个 slot 复活共用的启动超时预算。
 WORKER_STARTUP_TIMEOUT = 180
+# 全局 no-progress watchdog：独立于主循环存活，专治主进程卡 NVML/join/select
+# 时既有 watchdog 全盲的场景。0 表示关闭。
+NO_PROGRESS_TIMEOUT_ENV_VAR = "PADDLEAPITEST_NO_PROGRESS_TIMEOUT_SECONDS"
+DEFAULT_NO_PROGRESS_TIMEOUT_SECONDS = 1800.0
+NO_PROGRESS_CHECK_INTERVAL_SECONDS = 10.0
+# watchdog 触发后给主线程自然退出的宽限期，超时则强制 os._exit(2)。
+NO_PROGRESS_EXIT_GRACE_SECONDS = 60.0
 FORECAST_MIN_INTERVAL_SECONDS = 60
 FORECAST_MAX_INTERVAL_SECONDS = 30 * 60
 FORECAST_TARGET_CASES = 100
@@ -697,6 +752,9 @@ class BatchRunState:
     test_started_at: float | None = None
     last_forecast_at: float | None = None
     last_forecast_case: int = 0
+    # 累计派发数：与 tested_case 共同构成 no-progress watchdog 的 progress 定义，
+    # 单调递增，只由主循环写入、watchdog 只读。
+    total_dispatched: int = 0
 
 
 @dataclass(frozen=True)
@@ -1013,6 +1071,8 @@ class WorkerSlot:
     state: str = "dead"  # dead、starting、loaded、preparing、idle、busy、suspended、retired
     # 连续初始化失败次数，ready 后清零；与 retry_not_before 共同构成复活退避。
     init_failures: int = 0
+    # ledger 二次确认失败导致的换血次数，ready 后清零；与 init_failures 分开计数。
+    startup_churns: int = 0
     retry_not_before: float = 0.0
 
 
@@ -1647,6 +1707,8 @@ class WorkerPool:
         self._quarantined_gpus: set[int] = set()
         # 初始化连续失败上限在建池时固定，运行期不因环境变量改动而漂移。
         self._max_init_failures = read_max_slot_init_failures()
+        # 换血上限与 init_failures 同理：建池时定格，避免运行期被环境变量扰动。
+        self._max_startup_churns = read_max_slot_startup_churns()
         # CPU worker 使用 gpu_id=None；只有需要 GPU 运行时时才建立 GPU 槽位。
         idx = 0
         if cpu_worker_count:
@@ -1856,7 +1918,21 @@ class WorkerPool:
     def _clear_init_failures(self, slot):
         # ready 意味着这一代 worker 完整走通初始化，历史失败不再影响后续复活。
         slot.init_failures = 0
+        slot.startup_churns = 0
         slot.retry_not_before = 0.0
+
+    def _record_startup_churn(self, slot, *, now):
+        """累计 ledger 二次确认失败的换血次数；达到上限时永久退役 slot。"""
+        # 只有初始化态的换血才计入 churn：idle 收缩是显存压力下的正常行为，
+        # 不能与"起不来又换不掉"的故障换血混在同一计数里。
+        if slot.state not in _INITIALIZING_SLOT_STATES:
+            return False
+        slot.startup_churns += 1
+        # 换血失败与初始化失败共用退避阶梯，重启节奏保持一致。
+        slot.retry_not_before = now + slot_init_backoff_seconds(slot.startup_churns)
+        if self._max_startup_churns and slot.startup_churns >= self._max_startup_churns:
+            slot.state = "retired"
+        return slot.state == "retired"
 
     def _close_queue(self, q, *, cancel_join=False):
         """关闭 multiprocessing 队列，避免清理错误掩盖测试结果。"""
@@ -1892,6 +1968,20 @@ class WorkerPool:
             if slot.process is not None and slot.process.is_alive():
                 return None
             if slot.process is not None:
+                # 重启门槛：上一代 PID 必须已从 /proc 消失；仍存活说明旧进程
+                # 还持有 CUDA context，此时拉新进程只会叠加显存占用。
+                if os.path.exists(f"/proc/{slot.process.pid}"):
+                    print(
+                        f"[worker] PREVIOUS_WORKER_ALIVE | slot {slot_index} | "
+                        f"pid {slot.process.pid} still in /proc; skip restart",
+                        flush=True,
+                    )
+                    # 旧进程不消失说明资源无法恢复；同一 GPU 上全部 slot 都
+                    # 因此卡住时必须隔离该卡，而不是让调度器无限重试。
+                    self._quarantine_gpu_if_all_slots_retired_or_stuck(
+                        slot, reason="worker termination 后 GPU resource recovery failed"
+                    )
+                    return None
                 self._join_process(slot.process, timeout=1)
             self._close_queue(slot.input_queue, cancel_join=True)
             slot.input_queue = mp.Queue()
@@ -1936,6 +2026,25 @@ class WorkerPool:
             slot.started_at = spawn_started_at
             # spawn 起点必须早于 p.start，才能覆盖 Python spawn 和 import 开销。
             return p.pid
+
+    def _quarantine_gpu_if_all_slots_retired_or_stuck(self, slot, *, reason):
+        """同一物理卡的全部 slot 都无法恢复时隔离该卡，避免无限换血。"""
+        # 只在锁内做判定；quarantine_gpu 自身会再取锁，必须放在锁外调用。
+        gpu_id = slot.gpu_id
+        if gpu_id is None:
+            return
+        with self._lock:
+            siblings = [s for s in self.slots if s.gpu_id == gpu_id]
+            if not siblings:
+                return
+            # busy 的在途 worker 仍可能正常完成终态，不能提前判死整卡。
+            if any(s.state in {"idle", "busy", *_INITIALIZING_SLOT_STATES} for s in siblings):
+                return
+            if any(
+                s.state == "suspended" and s.retry_not_before < time.monotonic() for s in siblings
+            ):
+                return
+        self.quarantine_gpu(gpu_id, reason=reason)
 
     def start_loaded_preparations(self, slot_indices):
         """按物理设备放行已完成模块加载的 worker preparation。"""
@@ -1990,10 +2099,12 @@ class WorkerPool:
         """停止空闲或启动中的进程；显存是否回收由 GPU 调度器另行确认。"""
         for slot_index in slot_indices:
             slot = self.slots[slot_index]
+            churn_retired = False
             with self._lock:
                 # 先在锁内定格状态并置为 suspended，watchdog 的 busy/idle 分支
                 # 随即不再命中该 slot，避免主动退役被误记为 PADDLE_CRASH。
                 was_idle = slot.state == "idle"
+                was_initializing = slot.state in _INITIALIZING_SLOT_STATES
                 process = slot.process
                 input_queue = slot.input_queue
                 # child 可能持有主要 CUDA context，必须在 child_pid 被清空前终止。
@@ -2002,6 +2113,16 @@ class WorkerPool:
                 slot.input_queue = None
                 slot.process = None
                 self._suspend_slot(slot)
+                if was_initializing:
+                    # 初始化态换血走独立 churn 计数：这条路径不会经过
+                    # init_failures，必须在此补记，否则 slot 会无限换血。
+                    churn_retired = self._record_startup_churn(slot, now=time.monotonic())
+            if churn_retired:
+                print(
+                    f"[worker] SLOT_RETIRED | slot {slot_index} | "
+                    f"{slot.startup_churns} startup churns | no further restart",
+                    flush=True,
+                )
             # 阻塞式回收放在锁外，避免 watchdog 被 join/SIGKILL 长时间挡住。
             if process is not None and process.is_alive():
                 if was_idle and input_queue is not None:
@@ -2365,6 +2486,23 @@ class WorkerPool:
                 os.kill(pid, signal.SIGKILL)
             except (ProcessLookupError, OSError):
                 pass
+        self._confirm_process_group_reaped(pid)
+
+    def _confirm_process_group_reaped(self, pid, *, timeout=10.0, interval=0.05):
+        """轮询 /proc 确认进程组已消失；未消失的现场必须留档而不是静默通过。"""
+        # CUDA 死锁进程对 SIGKILL 的响应可能远慢于普通进程，清理不确认会让
+        # "旧 PID 未消失即可重启"的路径悄悄复活出双倍占用。
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if not os.path.exists(f"/proc/{pid}"):
+                return True
+            time.sleep(interval)
+        print(
+            f"[worker] CHILD_GROUP_UNREAPED | pid {pid} | still present after "
+            f"{timeout:.0f} s SIGKILL",
+            flush=True,
+        )
+        return False
 
     def _kill_slot_child(self, slot):
         if slot.child_pid is not None:
@@ -2390,6 +2528,22 @@ class WorkerPool:
         """SIGKILL 一个进程（CUDA 死锁进程通常不会响应 SIGTERM）。"""
         self._sigkill_process(process)
         self._join_process(process, timeout=5)
+        try:
+            unkillable = process.is_alive()
+        except Exception:
+            return
+        if unkillable:
+            # SIGKILL 后仍存活意味着进程已不可回收，必须就地退役 slot，
+            # 否则下一轮重建会在同一 slot 上叠出第二份显存占用。
+            print(
+                f"[worker] WORKER_UNKILLABLE | pid {process.pid} | slot retired",
+                flush=True,
+            )
+            with self._lock:
+                for slot in self.slots:
+                    if slot.process is process:
+                        slot.state = "retired"
+                        break
 
     def shutdown(self, force=False):
         """停止所有 worker 并释放 multiprocessing 队列。"""
@@ -2584,7 +2738,29 @@ def _read_device_memory_bytes(gpu_id):
     raise RuntimeError("No supported accelerator (GPU / XPU / Iluvatar) detected.")
 
 
-def _read_gpu_memory_snapshots(gpu_ids):
+def _read_gpu_memory_snapshots(gpu_ids, *, timeout=30.0):
+    """带超时地读取物理显存；NVML 永卡时降级为本轮跳过而不是挂死主循环。"""
+    gpu_ids = tuple(gpu_ids)
+    if not gpu_ids:
+        return {}
+    # 单线程 executor 隔离卡死嫌疑的进程内 NVML 调用；主循环只等有限时间。
+    executor = ThreadPoolExecutor(max_workers=1)
+    try:
+        future = executor.submit(_read_gpu_memory_snapshots_unbounded, gpu_ids)
+        return future.result(timeout=timeout)
+    except FuturesTimeoutError:
+        print(
+            f"[gpu] NVML_READ_TIMEOUT | {timeout:.0f} s | skip snapshots for "
+            f"{len(gpu_ids)} gpu(s) this round",
+            flush=True,
+        )
+        return {}
+    finally:
+        # shutdown(wait=False) 保证超时路径不会在卡死的 NVML 调用上二次阻塞。
+        executor.shutdown(wait=False)
+
+
+def _read_gpu_memory_snapshots_unbounded(gpu_ids):
     snapshots = {}
     for gpu_id in gpu_ids:
         # 始终重新读取物理 used；外部进程和退出进程的遗留显存都会反映在 free。
@@ -3431,6 +3607,136 @@ def _abort_without_serviceable_slots(*, pool, batch_state, pending_count):
     return True
 
 
+class NoProgressWatchdog:
+    """全局无进展看门狗：独立 daemon 线程，不依赖主循环存活。
+
+    与 pool-watchdog 的分工：后者只查单 slot 超时，且依赖主循环活着才能算
+    blocked；主进程卡 NVML/join/select 时它和 GpuPressureTimeout 全盲，
+    本类就是这条三态死循环的兜底。
+    """
+
+    def __init__(self, pool, batch_state, options):
+        self._pool = pool
+        self._batch_state = batch_state
+        # progress 采样只读 tested_case/total_dispatched；两者均由主循环单点
+        # 更新，GIL 下 int 读写原子，watchdog 只读无锁。
+        self._last_progress_value = 0
+        self._last_progress_at = time.monotonic()
+        self._timeout_seconds = read_no_progress_timeout(options)
+        self._triggered = False
+        self._stop_event = threading.Event()
+        self._thread = None
+
+    def _progress_value(self):
+        return self._batch_state.tested_case + self._batch_state.total_dispatched
+
+    def _diagnose(self):
+        """打印完整现场：slot 状态表 + GPU 显存（nvidia-smi 子进程，带超时）。"""
+        state = self._batch_state
+        print(
+            f"NO_PROGRESS_WATCHDOG | no progress for {self._timeout_seconds:.0f} s | "
+            f"tested={state.tested_case} | active={state.active_tasks} | "
+            f"dispatched_total={state.total_dispatched}",
+            flush=True,
+        )
+        try:
+            with self._pool._lock:
+                for slot in self._pool.slots:
+                    process = slot.process
+                    pid = process.pid if process is not None else None
+                    alive = process.is_alive() if process is not None else False
+                    uptime = (
+                        f"{time.monotonic() - slot.started_at:.0f}s"
+                        if slot.started_at is not None
+                        else "-"
+                    )
+                    print(
+                        f"NO_PROGRESS_WATCHDOG | slot {slot.index} | state={slot.state} | "
+                        f"pid={pid} alive={alive} | task={slot.current_task} | "
+                        f"init_failures={slot.init_failures} "
+                        f"startup_churns={slot.startup_churns} | uptime={uptime}",
+                        flush=True,
+                    )
+        except Exception as err:
+            # 诊断失败不能阻止退出路径继续执行。
+            print(
+                f"NO_PROGRESS_WATCHDOG | slot dump failed | {type(err).__name__}: {err}",
+                flush=True,
+            )
+        # 显存采样绝不能走有卡死嫌疑的进程内 pynvml，只用带超时的子进程。
+        try:
+            output = subprocess.run(
+                [
+                    "nvidia-smi",
+                    "--query-gpu=index,memory.used,memory.total",
+                    "--format=csv,noheader,nounits",
+                ],
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+            if output.returncode == 0:
+                for line in output.stdout.strip().splitlines():
+                    print(f"NO_PROGRESS_WATCHDOG | gpu {line.strip()}", flush=True)
+        except Exception as err:
+            print(
+                f"NO_PROGRESS_WATCHDOG | nvidia-smi failed | {type(err).__name__}: {err}",
+                flush=True,
+            )
+
+    def _trigger(self):
+        if self._triggered:
+            return
+        self._triggered = True
+        self._diagnose()
+        # 先置失败语义再 shutdown：已完成 case 的 checkpoint 本就已落盘，
+        # 这里不写 checkpoint，避免与可能还活着的主循环并发写竞态。
+        self._batch_state.abort_run = True
+        self._batch_state.batch_exit_code = 1
+        try:
+            self._pool.shutdown(force=True)
+        except Exception as err:
+            print(
+                f"NO_PROGRESS_WATCHDOG | pool shutdown failed | {type(err).__name__}: {err}",
+                flush=True,
+            )
+        # 有界等待主线程自然退出；超时则强制退出，避免连本线程一起挂死。
+        if not self._stop_event.wait(NO_PROGRESS_EXIT_GRACE_SECONDS):
+            for stream in (sys.stdout, sys.stderr):
+                try:
+                    stream.flush()
+                except Exception:
+                    pass
+            os._exit(2)
+
+    def _loop(self):
+        while not self._stop_event.wait(NO_PROGRESS_CHECK_INTERVAL_SECONDS):
+            if self._triggered or self._batch_state.abort_run:
+                return
+            current = self._progress_value()
+            if current != self._last_progress_value:
+                self._last_progress_value = current
+                self._last_progress_at = time.monotonic()
+                continue
+            if time.monotonic() - self._last_progress_at >= self._timeout_seconds:
+                self._trigger()
+                return
+
+    def start(self):
+        # 0 超时表示关闭；批次正常结束也由 stop 事件收口线程。
+        if self._timeout_seconds <= 0:
+            return None
+        self._thread = threading.Thread(target=self._loop, daemon=True, name="no-progress-watchdog")
+        self._thread.start()
+        return self._thread
+
+    def stop(self):
+        self._stop_event.set()
+        if self._thread is not None and self._thread.is_alive():
+            # 线程只做只读巡检，短暂 join 即可回收。
+            self._thread.join(timeout=2)
+
+
 def _run_cpu_batch_loop(
     pool,
     options,
@@ -3474,6 +3780,8 @@ def _run_cpu_batch_loop(
             on_dispatch=terminal.register,
         )
         batch_state.active_tasks += dispatched
+        # 派发本身就是进展：即使 case 尚未终态，watchdog 也不应误判无进展。
+        batch_state.total_dispatched += dispatched
         if dispatched and batch_state.test_started_at is None:
             batch_state.test_started_at = time.monotonic()
             batch_state.last_forecast_at = batch_state.test_started_at
@@ -3874,6 +4182,8 @@ def _run_continuous_gpu_batch_loop(
         if dispatched:
             # active_tasks 只统计已真正 put 到 worker 队列的 case。
             batch_state.active_tasks += dispatched
+            # 派发即进展：no-progress watchdog 据此刷新，不等待终态。
+            batch_state.total_dispatched += dispatched
             if batch_state.test_started_at is None:
                 batch_state.test_started_at = now
                 batch_state.last_forecast_at = now
@@ -3963,29 +4273,37 @@ def _run_batch_mode(
 
         print(f"Workers: lazy | {pool.total_workers} logical slots", flush=True)
         pool.start()
-        if cpu_worker_count:
-            _run_cpu_batch_loop(
-                pool,
-                options,
-                api_configs,
-                all_case,
-                checkpointed_case,
-                batch_state,
-                retry_state,
-                max_total_external_kills,
-            )
-            return batch_state.batch_exit_code
+        # 全局 no-progress watchdog 覆盖 CPU/GPU 两条批次路径；主循环三态死循环
+        # （NVML/join/select 永等）时它是唯一能拉响警报并强制退出的机制。
+        no_progress_watchdog = NoProgressWatchdog(pool, batch_state, options)
+        no_progress_watchdog.start()
+        try:
+            if cpu_worker_count:
+                _run_cpu_batch_loop(
+                    pool,
+                    options,
+                    api_configs,
+                    all_case,
+                    checkpointed_case,
+                    batch_state,
+                    retry_state,
+                    max_total_external_kills,
+                )
+                return batch_state.batch_exit_code
 
-        _run_continuous_gpu_batch_loop(
-            pool=pool,
-            options=options,
-            api_configs=api_configs,
-            all_case=all_case,
-            checkpointed_case=checkpointed_case,
-            batch_state=batch_state,
-            retry_state=retry_state,
-            max_total_external_kills=max_total_external_kills,
-        )
+            _run_continuous_gpu_batch_loop(
+                pool=pool,
+                options=options,
+                api_configs=api_configs,
+                all_case=all_case,
+                checkpointed_case=checkpointed_case,
+                batch_state=batch_state,
+                retry_state=retry_state,
+                max_total_external_kills=max_total_external_kills,
+            )
+        finally:
+            # 正常收尾必须停掉巡检线程，避免 daemon 线程在解释器退出阶段误触发。
+            no_progress_watchdog.stop()
 
     except Exception as e:
         print(f"Unexpected error: {e}", flush=True)
