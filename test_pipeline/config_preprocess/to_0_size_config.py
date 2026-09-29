@@ -332,6 +332,80 @@ def _position_variants(api_config, tensor_configs, canonical_config, spans, shap
             yield _replace_shape_spans(canonical_config, spans, replacements)
 
 
+# moe_permute/moe_unpermute 的 token 维与非 Tensor 参数强耦合：permute 的 tokens_per_expert
+# 之和必须等于 token 数，unpermute 的 total_zipped_tokens 必须等于 zipped 组的行数。逐位置置 0
+# 无法感知这层耦合，会产出自相矛盾的配置（unpermute 直接维度报错，permute 语义失真）。且实测
+# 这两个算子的特征维置 0 一律被 kernel 拒绝（hidden 维与 topk 都要求 > 0），故只发 token 维变体。
+def _zero_len_list_param(work_api_config, name):
+    """将命名 list 参数（位置或 kwarg）整体置 0，保留长度。"""
+    if name in work_api_config.kwargs and isinstance(work_api_config.kwargs[name], list):
+        work_api_config.kwargs[name] = [0] * len(work_api_config.kwargs[name])
+        return
+    for index, value in enumerate(work_api_config.args):
+        if isinstance(value, list):
+            work_api_config.args[index] = [0] * len(value)
+            return
+
+
+def _set_int_param(work_api_config, name, value, positional_index):
+    """将命名标量参数（kwarg 优先，否则按固定位置）设为 value。"""
+    if name in work_api_config.kwargs:
+        work_api_config.kwargs[name] = value
+        return
+    if positional_index < len(work_api_config.args) and isinstance(
+        work_api_config.args[positional_index], int
+    ):
+        work_api_config.args[positional_index] = value
+
+
+def _moe_permute_variants(api_config):
+    """token 数置 0：所有 Tensor 的 axis0 归零，tokens_per_expert 同步整体置 0。"""
+    tensor_indices = [
+        index for index, value in enumerate(api_config.args) if isinstance(value, TensorConfig)
+    ]
+    if not tensor_indices:
+        return
+    work_api_config = copy.deepcopy(api_config)
+    for index in tensor_indices:
+        work_api_config.args[index].shape[0] = 0
+    _zero_len_list_param(work_api_config, "tokens_per_expert")
+    yield str(work_api_config)
+
+
+# unpermute 有两个独立 token 维：permuted 组 {arg0, arg3} 与 zipped 组 {arg1, arg2}。实测只置
+# 其一或同时置 0 均被 kernel 接受，故三种边界都发；zipped 组置 0 时联动 total_zipped_tokens。
+_UNPERMUTE_PERMUTED_GROUP = (0, 3)
+_UNPERMUTE_ZIPPED_GROUP = (1, 2)
+
+
+def _moe_unpermute_variants(api_config):
+    if len(api_config.args) < 4 or not all(
+        isinstance(api_config.args[index], TensorConfig) for index in range(4)
+    ):
+        return
+    zipped_rows = api_config.args[_UNPERMUTE_ZIPPED_GROUP[0]].shape[0]
+
+    def build(zero_groups, total_zipped_tokens):
+        work_api_config = copy.deepcopy(api_config)
+        for group in zero_groups:
+            for index in group:
+                work_api_config.args[index].shape[0] = 0
+        # total_zipped_tokens 的位置形固定紧跟在 4 个 Tensor 之后。
+        _set_int_param(work_api_config, "total_zipped_tokens", total_zipped_tokens, 4)
+        return str(work_api_config)
+
+    yield build((_UNPERMUTE_PERMUTED_GROUP,), zipped_rows)  # 仅 permuted 组置 0
+    yield build((_UNPERMUTE_ZIPPED_GROUP,), 0)  # 仅 zipped 组置 0
+    yield build((_UNPERMUTE_PERMUTED_GROUP, _UNPERMUTE_ZIPPED_GROUP), 0)  # 两组同置 0
+
+
+# 逐 API 注册耦合生成器；未注册的 API 一律走下方通用逐位置枚举，行为字节不变。
+_COUPLED_API_SPECS = {
+    "paddle.nn.functional.moe_permute": _moe_permute_variants,
+    "paddle.nn.functional.moe_unpermute": _moe_unpermute_variants,
+}
+
+
 def to_0_size_config(api_config):
     # 同一 API/结构最多保留少量重复样本，这是原有稳定性探测协议。
     if api_config.api_name not in apis_map:
@@ -359,6 +433,12 @@ def to_0_size_config(api_config):
             return []
         if shape_len != len(tensor_config.shape):
             shape_equal = False
+
+    # moe_permute/unpermute 的 token 维与非 Tensor 参数耦合，交由专用生成器；其它 API 不受影响。
+    coupled_variants = _COUPLED_API_SPECS.get(api_config.api_name)
+    if coupled_variants is not None:
+        yield from coupled_variants(api_config)
+        return
 
     # 正常路径复用 parser 的规范格式，保证与历史输出兼容。
     canonical_config = str(api_config)
