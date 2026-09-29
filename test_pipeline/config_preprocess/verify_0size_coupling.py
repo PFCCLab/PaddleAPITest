@@ -49,7 +49,7 @@ def _find_int_param(api_config, name, positional_index):
 
 
 def check_permute(api_config):
-    """返回违规原因列表，空列表表示通过。"""
+    """返回违规原因列表，空列表表示通过。约束取自 generation_rules 的输入规则。"""
     reasons = []
     tensors = _tensor_args(api_config)
     if not tensors:
@@ -58,12 +58,26 @@ def check_permute(api_config):
     if len(token_dims) != 1:
         reasons.append(f"各输入 Tensor 的 axis0 不一致: {sorted(token_dims)}")
     token_num = tensors[0].shape[0]
+    # probs 为最后一个 Tensor 参数，其 shape[1] 即 topk（与 routemap 共享）。
+    topk = tensors[-1].shape[1] if len(tensors[-1].shape) >= 2 else None
+    num_experts = _find_int_param(api_config, "num_experts", 4)
     tokens_per_expert = _find_list_param(api_config, "tokens_per_expert")
     if tokens_per_expert is None:
         reasons.append("缺少 tokens_per_expert")
-    elif sum(tokens_per_expert) != token_num:
+        return reasons
+    if num_experts is not None and len(tokens_per_expert) != num_experts:
         reasons.append(
-            f"sum(tokens_per_expert)={sum(tokens_per_expert)} != token 数 {token_num}"
+            f"len(tokens_per_expert)={len(tokens_per_expert)} != num_experts {num_experts}"
+        )
+    if any(
+        not isinstance(count, int) or count < 0 or count > token_num for count in tokens_per_expert
+    ):
+        reasons.append(
+            f"tokens_per_expert 存在越界元素（需 0<=count<={token_num}）: {tokens_per_expert}"
+        )
+    if topk is not None and sum(tokens_per_expert) > token_num * topk:
+        reasons.append(
+            f"sum(tokens_per_expert)={sum(tokens_per_expert)} > T*topk={token_num * topk}"
         )
     return reasons
 
@@ -75,12 +89,17 @@ def check_unpermute(api_config):
         return ["前 4 个位置参数不是 Tensor"]
     permuted_rows = tensors[0].shape[0]
     if tensors[3].shape[0] != permuted_rows:
-        reasons.append(
-            f"permuted 组 axis0 不一致: arg0={permuted_rows} arg3={tensors[3].shape[0]}"
-        )
+        reasons.append(f"permuted 组 axis0 不一致: arg0={permuted_rows} arg3={tensors[3].shape[0]}")
     zipped_rows = tensors[1].shape[0]
     if tensors[2].shape[0] != zipped_rows:
         reasons.append(f"zipped 组 axis0 不一致: arg1={zipped_rows} arg2={tensors[2].shape[0]}")
+    num_experts = _find_int_param(api_config, "num_experts", 5)
+    if (
+        num_experts is not None
+        and len(tensors[1].shape) >= 2
+        and tensors[1].shape[1] != num_experts
+    ):
+        reasons.append(f"rowmap.shape[1]={tensors[1].shape[1]} != num_experts {num_experts}")
     total_zipped_tokens = _find_int_param(api_config, "total_zipped_tokens", 4)
     if total_zipped_tokens is None:
         reasons.append("缺少 total_zipped_tokens")

@@ -358,18 +358,49 @@ def _set_int_param(work_api_config, name, value, positional_index):
         work_api_config.args[positional_index] = value
 
 
+def _find_tokens_per_expert(api_config):
+    """返回 (owner, key) 指向 tokens_per_expert 列表（kwarg 优先，否则位置）；找不到返回 (None, None)。"""
+    if "tokens_per_expert" in api_config.kwargs and isinstance(
+        api_config.kwargs["tokens_per_expert"], list
+    ):
+        return api_config.kwargs, "tokens_per_expert"
+    for index, value in enumerate(api_config.args):
+        if isinstance(value, list):
+            return api_config.args, index
+    return None, None
+
+
 def _moe_permute_variants(api_config):
-    """token 数置 0：所有 Tensor 的 axis0 归零，tokens_per_expert 同步整体置 0。"""
     tensor_indices = [
         index for index, value in enumerate(api_config.args) if isinstance(value, TensorConfig)
     ]
     if not tensor_indices:
         return
+
+    # 位置 1：token 数置 0——所有 Tensor 的 axis0 归零，tokens_per_expert 同步整体置 0。
     work_api_config = copy.deepcopy(api_config)
     for index in tensor_indices:
         work_api_config.args[index].shape[0] = 0
     _zero_len_list_param(work_api_config, "tokens_per_expert")
     yield str(work_api_config)
+
+    # 位置 2：空专家——单个 tokens_per_expert[i] 置 0（T 与所有 Tensor 不变）。sum 只会变
+    # 小仍合法，输入规则会按新分布重造 routemap，TE 参考的一致性校验天然通过。
+    # 专家之间仅差在前缀偏移，首/尾两个位置已覆盖 offset 全移与不移两种边界，故只取首尾。
+    owner, key = _find_tokens_per_expert(api_config)
+    if owner is not None:
+        counts = owner[key]
+        for expert_index in sorted({0, len(counts) - 1}) if counts else ():
+            if counts[expert_index] == 0:
+                continue
+            variant = copy.deepcopy(api_config)
+            variant_owner, variant_key = _find_tokens_per_expert(variant)
+            if variant_owner is None:
+                continue
+            new_counts = list(variant_owner[variant_key])
+            new_counts[expert_index] = 0
+            variant_owner[variant_key] = new_counts
+            yield str(variant)
 
 
 # unpermute 有两个独立 token 维：permuted 组 {arg0, arg3} 与 zipped 组 {arg1, arg2}。实测只置
