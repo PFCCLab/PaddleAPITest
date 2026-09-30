@@ -19,6 +19,17 @@ else:
     from tester.input_generation.tensor_config import TensorConfig
 
 
+def _strip_trailing_comment(config):
+    """去除配置行尾的 ``#`` 注释，跳过双引号内的 ``#``。"""
+    in_quote = False
+    for i, ch in enumerate(config):
+        if ch == '"':
+            in_quote = not in_quote
+        elif ch == "#" and not in_quote:
+            return config[:i].rstrip()
+    return config
+
+
 class APIConfig:
     # 兼容历史配置别名，统一交给 Paddle 原生参数名执行。
     _KWARG_ALIASES = {"paddle.Tensor.sum": {"dim": "axis"}}
@@ -60,6 +71,7 @@ class APIConfig:
 
     def __init__(self, config):
         config = config.replace("\n", "")
+        config = _strip_trailing_comment(config)
         self.config = config
         self.args = []
         self.kwargs = collections.OrderedDict()

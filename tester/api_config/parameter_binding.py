@@ -127,6 +127,7 @@ INPUT_MANUAL_PARAMETER_NAMES = {
     "paddle._C_ops.matmul_grad": ("x", "y", "dout", "transpose_x", "transpose_y"),
     "paddle._C_ops.squared_l2_norm": ("x",),
     "paddle._C_ops.swiglu_grad": ("x", "y", "dout"),
+    "paddle._C_ops.layer_norm": ("x", "scale", "bias", "epsilon", "begin_norm_axis"),
     # 槽位数按 paddlefleet_ops 已注册算子的最大参数个数（tokens_unzip_stable 为 9）取齐。
     "paddle._C_ops._run_custom_op": (
         "op_name",

@@ -5158,6 +5158,9 @@
     "paddle._C_ops.gaussian": {
         "Rule": "CopsGaussianRule"
     },
+    "paddle._C_ops.layer_norm": {
+        "Rule": "CopsLayerNormRule"
+    },
     "paddle._C_ops.matmul": {
         "Rule": "CopsMatmulRule"
     },

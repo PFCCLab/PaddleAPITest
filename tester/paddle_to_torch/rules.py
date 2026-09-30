@@ -9417,6 +9417,39 @@ result = torch.empty(list(shape), dtype=torch_dtype).uniform_(float(mn), float(m
         )
 
 
+class CopsLayerNormRule(BaseRule):
+    PADDLE_APIS = ("paddle._C_ops.layer_norm",)
+
+    """paddle._C_ops.layer_norm(x, scale, bias, epsilon, begin_norm_axis)
+
+    Maps to torch.nn.functional.layer_norm by deriving normalized_shape from
+    x.shape[begin_norm_axis:] and renaming scale/bias to weight/bias.
+    """
+
+    def apply(self, paddle_api: str) -> ConvertResult:
+        preprocess = """
+_axis = int(begin_norm_axis)
+if _axis < 0:
+    _axis = x.dim() + _axis
+normalized_shape = list(x.shape[_axis:])
+weight = scale
+if weight is not None:
+    weight = weight.view(normalized_shape).to(x.dtype)
+if bias is not None:
+    bias = bias.view(normalized_shape).to(x.dtype)
+eps = float(epsilon)
+"""
+        core = """
+result = torch.nn.functional.layer_norm(x, normalized_shape, weight, bias, eps)
+"""
+        return self.build_result(
+            paddle_api,
+            kind=ConversionKind.COMPOSITE,
+            preprocess=preprocess.splitlines(),
+            core=core,
+        )
+
+
 class CopsRunCustomOpRule(BaseRule):
     PADDLE_APIS = ("paddle._C_ops._run_custom_op",)
 
