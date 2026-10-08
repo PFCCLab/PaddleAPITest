@@ -354,6 +354,13 @@ class APIConfig:
                 args.append(value)
                 continue
 
+            # 原始 dump 可能把 shape 写成裸元组 (d0, d1, ...)；按 shape 列表解析，
+            # 与 bare-list / paddle.Size([...]) 两种写法保持一致。
+            if tensor_str[pos] == "(":
+                value, pos = self.get_tuple(tensor_str, pos)
+                args.append(list(value))
+                continue
+
             key = None
             token, pos = self.get_token(tensor_str, pos)
             if pos is None:
