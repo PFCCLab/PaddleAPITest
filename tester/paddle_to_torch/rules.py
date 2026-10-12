@@ -2384,7 +2384,7 @@ def _te_fp8_quant_blockwise(inp, eps, power2, scale_transpose, ue8m0, method):
         pad_c = (4 - (cols_s % 4)) % 4
         if pad_c:
             _base = torch.nn.functional.pad(_base, (0, pad_c))
-        b = _base.reshape(*_base.shape[:-1], -1, 4)
+        b = _base.reshape(*_base.shape[:-1], _base.shape[-1] // 4, 4)
         safe = torch.clamp(b, min=torch.finfo(torch.float32).tiny)
         exp = torch.floor(torch.log2(safe)).to(torch.int32) + 127
         exp = torch.clamp(exp, 0, 255)
@@ -2577,7 +2577,7 @@ def _fp8_quant_blockwise_impl(inp, eps, power2, scale_transpose, ue8m0, method, 
         pad_c = (4 - (cols_s % 4)) % 4
         if pad_c:
             base = torch.nn.functional.pad(base, (0, pad_c))
-        b = base.reshape(*base.shape[:-1], -1, 4)
+        b = base.reshape(*base.shape[:-1], base.shape[-1] // 4, 4)
         safe = torch.clamp(b, min=torch.finfo(torch.float32).tiny)
         exp = torch.floor(torch.log2(safe)).to(torch.int32) + 127
         exp = torch.clamp(exp, 0, 255)
@@ -2651,7 +2651,9 @@ else:
                 _scale_chunk = torch.stack(
                     [(_packed >> _shift) & 0xFF for _shift in (0, 8, 16, 24)],
                     dim=-1,
-                ).reshape(_packed.shape[0], -1)
+                # Explicit last dim (packed cols * 4): -1 is ambiguous when the
+                # scale chunk has 0 elements (e.g. a [0, C] x_scale).
+                ).reshape(_packed.shape[0], _packed.shape[-1] * 4)
                 _scale_chunk = _scale_chunk[:, :_num_scale_blocks].to(torch.float32)
                 _scale_chunk.sub_(127.0).exp2_()
             else:
@@ -10286,7 +10288,11 @@ elif op_name in ("fuse_stack_fp8_quant", "fuse_stack_transpose_fp8_quant"):
         _pad_c = (4 - (_pack_cols % 4)) % 4
         if _pad_c:
             _scale_out = torch.nn.functional.pad(_scale_out, (0, _pad_c))
-        _scale_out = _scale_out.reshape(_scale_out.shape[0], -1, 4)
+        # shape[-1] is padded to a multiple of 4 right above, so // 4 is exact
+        # and avoids the ambiguous -1 when the tensor has 0 elements (0-size inputs).
+        _scale_out = _scale_out.reshape(
+            _scale_out.shape[0], _scale_out.shape[-1] // 4, 4
+        )
         _scale_out = (_scale_out[..., 0] | (_scale_out[..., 1] << 8) | (_scale_out[..., 2] << 16) | (_scale_out[..., 3] << 24)).to(torch.int32)
         if _output_scale_transpose:
             _scale_out = _scale_out.t().contiguous()
