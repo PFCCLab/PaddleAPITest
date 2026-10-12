@@ -15,6 +15,7 @@ INPUT_BASE_CONFIG = Path(__file__).resolve().parents[1] / "base_config.yaml"
 # C-op 公共别名是绑定协议的一部分，避免调用方各自解释无签名算子。
 INPUT_C_OP_PUBLIC_ALIASES = {
     # 公开别名只用于恢复稳定参数名，不改变实际执行的 C-op。
+    "paddle._C_ops.add": "paddle.add",
     "paddle._C_ops.add_": "paddle.add",
     "paddle._C_ops.bitwise_not": "paddle.bitwise_not",
     "paddle._C_ops.clip": "paddle.clip",
@@ -115,6 +116,17 @@ INPUT_MANUAL_PARAMETER_NAMES = {
         "amsgrad",
     ),
     "paddle._C_ops.full_": ("x", "shape", "value", "dtype", "place"),
+    # conv2d C-op 位置协议：显式 padding 与 padding_algorithm 分离，无法借公共别名绑定。
+    "paddle._C_ops.conv2d": (
+        "input",
+        "filter",
+        "strides",
+        "paddings",
+        "padding_algorithm",
+        "dilations",
+        "groups",
+        "data_format",
+    ),
     "paddle._C_ops.fused_linear_param_grad_add": (
         "x",
         "dout",

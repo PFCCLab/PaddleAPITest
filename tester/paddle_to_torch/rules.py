@@ -9450,6 +9450,72 @@ result = torch.nn.functional.layer_norm(x, normalized_shape, weight, bias, eps)
         )
 
 
+class CopsConv2dRule(BaseRule):
+    PADDLE_APIS = ("paddle._C_ops.conv2d",)
+
+    """paddle._C_ops.conv2d(input, filter, strides, paddings, padding_algorithm,
+    dilations, groups, data_format)
+
+    C-op 协议与公共 conv2d 不同：paddings 与 padding_algorithm 分离。
+    EXPLICIT 下 paddings 为 [h, w] 对称或 [t, b, l, r] 非对称；VALID 置 0；
+    SAME 需显式 pad 成 torch 可表达的固定 padding（out = ceil(in/stride)，
+    pad_total = dilation*(k-1) - (out-1)*stride - ... 的公共推导见下），
+    pad_before = pad_total // 2 与 TF 约定一致（实测逐位验证）。
+    NHWC 布局在前后各做一次 permute，filter 恒为 OIHW。
+    """
+
+    def apply(self, paddle_api: str) -> ConvertResult:
+        preprocess = """
+if data_format == "NHWC":
+    input = input.permute(0, 3, 1, 2)
+strides = tuple(strides) if isinstance(strides, list) else strides
+dilations = tuple(dilations) if isinstance(dilations, list) else dilations
+if padding_algorithm == "VALID":
+    paddings = 0
+elif padding_algorithm == "SAME":
+    # SAME 通用推导：out = ceil(in/stride)，
+    # pad_total = max(0, (out-1)*stride + k_eff - in)，k_eff = dilation*(k-1)+1；
+    # pad_before = pad_total // 2（TF 约定，与 Paddle 实测逐位一致）。
+    if isinstance(strides, int):
+        _strides = (strides, strides)
+    else:
+        _strides = tuple(strides)
+    if isinstance(dilations, int):
+        _dil = (dilations, dilations)
+    else:
+        _dil = tuple(dilations)
+    _pad = []
+    for _size, _s, _d, _k in zip(input.shape[2:], _strides, _dil, filter.shape[2:]):
+        _out = -(-int(_size) // int(_s))
+        _pad_total = max(0, (_out - 1) * int(_s) + int(_d) * (int(_k) - 1) + 1 - int(_size))
+        _before = _pad_total // 2
+        _pad.append(_before)
+        _pad.append(_pad_total - _before)
+    _pad_h_t, _pad_h_b, _pad_w_l, _pad_w_r = _pad
+    input = torch.nn.functional.pad(input, (_pad_w_l, _pad_w_r, _pad_h_t, _pad_h_b))
+    paddings = 0
+else:  # EXPLICIT
+    if isinstance(paddings, int):
+        paddings = (paddings, paddings)
+    elif len(paddings) == 2:  # [pad_height, pad_width]
+        paddings = tuple(paddings)
+    elif len(paddings) == 4:  # [pad_top, pad_bottom, pad_left, pad_right]
+        _pad_t, _pad_b, _pad_l, _pad_r = paddings
+        input = torch.nn.functional.pad(input, (_pad_l, _pad_r, _pad_t, _pad_b))
+        paddings = 0
+"""
+        postprocess = """
+if data_format == "NHWC":
+    result = result.permute(0, 2, 3, 1)
+"""
+        return self.build_result(
+            paddle_api,
+            kind=ConversionKind.DIRECT,
+            preprocess=preprocess.splitlines(),
+            postprocess=postprocess,
+        )
+
+
 class CopsRunCustomOpRule(BaseRule):
     PADDLE_APIS = ("paddle._C_ops._run_custom_op",)
 
