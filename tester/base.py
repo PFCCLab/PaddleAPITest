@@ -108,6 +108,36 @@ DEFAULT_COMPARISON_WORKSPACE_BYTES = 1 << 30
 # billions of elements. A 256 MiB working set keeps the iteration count bounded.
 MIN_COMPARISON_CHUNK_BYTES = 256 << 20
 _GIB = 1024**3
+# Torch CPU 线程数的默认上限：超过后 isclose 等 elementwise 比较受内存带宽限制、收益递减，
+# 且避免大核机器上单 worker 占满全部核。可用 PADDLEAPITEST_TORCH_THREAD_CAP 覆盖。
+_TORCH_THREAD_CAP_DEFAULT = 16
+
+
+def _resolve_torch_thread_count():
+    """按机器核数在所有并发 worker 间分摊 Torch CPU 线程数。
+
+    旧逻辑 ``8 // workers_on_gpu`` 把每卡核数写死为 8，大核机器上严重欠用（例如 180 核
+    / 4 workers 只给 2 线程）。这里改为 ``cpu_count // total_workers``，其中 total_workers
+    是全机并发 worker 数（engineV4 通过 PADDLEAPITEST_TOTAL_WORKERS 下发）。显式设置
+    PADDLEAPITEST_TORCH_THREADS 时直接采用；无 total-workers 信息时退回按 workers_on_gpu
+    分摊（相当于单卡）。线程数只影响速度、不影响比较判定。
+    """
+    explicit = os.environ.get("PADDLEAPITEST_TORCH_THREADS")
+    if explicit:
+        try:
+            return max(1, int(explicit))
+        except ValueError:
+            pass
+    cpu_count = os.cpu_count() or 8
+    workers_on_gpu = max(1, int(os.environ.get("PADDLEAPITEST_WORKERS_ON_GPU", "1")))
+    total_workers = max(1, int(os.environ.get("PADDLEAPITEST_TOTAL_WORKERS", str(workers_on_gpu))))
+    try:
+        cap = max(
+            1, int(os.environ.get("PADDLEAPITEST_TORCH_THREAD_CAP", _TORCH_THREAD_CAP_DEFAULT))
+        )
+    except ValueError:
+        cap = _TORCH_THREAD_CAP_DEFAULT
+    return max(1, min(cap, cpu_count // total_workers))
 
 
 @contextlib.contextmanager
@@ -394,9 +424,8 @@ class APITestBase:
         # 同一 case 的结果树共享设备快照，避免每个叶子重复查询 CUDA allocator。
         self.comparison_workspace_cache = {}
         if use_torch:
-            # worker 数增大时按卡分摊 Torch 线程，单 worker 保持原有 8 线程默认值。
-            workers_on_gpu = max(1, int(os.environ.get("PADDLEAPITEST_WORKERS_ON_GPU", "1")))
-            torch.set_num_threads(max(1, 8 // workers_on_gpu))
+            # 按全机并发 worker 数分摊 Torch CPU 线程，充分利用大核机器又不超订。
+            torch.set_num_threads(_resolve_torch_thread_count())
             torch.set_printoptions(threshold=100, linewidth=120)
 
     def torch_operator_device(self):
