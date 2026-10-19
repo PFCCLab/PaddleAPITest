@@ -4771,7 +4771,7 @@ mode = mode
 if axis is None:
     x_flat = x.flatten()
     length = x_flat.numel()
-    if length % 2 == 0 and mode == 'avg':
+    if length > 0 and length % 2 == 0 and mode == 'avg':
         sorted_x = torch.sort(x_flat, stable=True).values
         mid = length // 2
         median = (sorted_x[mid - 1] + sorted_x[mid]) / 2
@@ -5387,7 +5387,7 @@ if axis is None:
     valid_mask = ~torch.isnan(x_flat)
     valid_x = x_flat[valid_mask]
     length = valid_x.numel()
-    if length % 2 == 0 and mode == "avg":
+    if length > 0 and length % 2 == 0 and mode == "avg":
         sorted_x = torch.sort(valid_x).values
         mid = length // 2
         median = (sorted_x[mid - 1] + sorted_x[mid]) / 2
