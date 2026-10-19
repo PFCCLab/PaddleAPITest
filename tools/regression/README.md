@@ -60,6 +60,8 @@ GPU_IDS=0 REGRESSION_NUM_GPUS=1 REGRESSION_WORKERS_PER_GPU=2 \
 - `oom`
 - `timeout`
 - `torch_error`
+- `torch_only_error`
+- `both_error`
 - `config_input`
 - `config_parse`
 - `config_convert`

@@ -154,8 +154,10 @@ python engineV4.py \
 ```
 
 常用分类包括 `pass`、`skip`、`paddle_error`、`paddle_accuracy`、`paddle_cuda`、
-`paddle_crash`、`oom`、`timeout`、`torch_error`、`config_input`、`config_parse` 和
-`config_convert`。复测开始前，引擎会清理所选 case 的旧结构化结果；`log_inorder.log` 会
+`paddle_crash`、`oom`、`timeout`、`torch_error`、`torch_only_error`、`both_error`、
+`config_input`、`config_parse` 和 `config_convert`。accuracy 模式在 torch 输入/前向失败后
+仍会执行 paddle 前向与反向，并按两侧结果合并：paddle 成功记 `torch_only_error`，两侧都被
+识别为非法 config 记 `config_input`，其余两侧都失败记 `both_error`。复测开始前，引擎会清理所选 case 的旧结构化结果；`log_inorder.log` 会
 保留已完成 case 记录。
 
 ## 输出与调试

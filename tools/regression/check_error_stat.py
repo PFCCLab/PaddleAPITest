@@ -16,6 +16,8 @@ RESULT_FILES = {
     "oom": "api_config_oom.txt",
     "timeout": "api_config_timeout.txt",
     "torch_error": "api_config_torch_error.txt",
+    "torch_only_error": "api_config_torch_only_error.txt",
+    "both_error": "api_config_both_error.txt",
     "config_input": "api_config_config_input.txt",
     "config_parse": "api_config_config_parse.txt",
     "config_convert": "api_config_config_convert.txt",

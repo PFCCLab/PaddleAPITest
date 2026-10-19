@@ -35,6 +35,8 @@ SUMMARY_GROUPS = {
     "retest": ("oom", "timeout"),
     "test_issue": (
         "torch_error",
+        "torch_only_error",
+        "both_error",
         "config_input",
         "config_parse",
         "config_convert",

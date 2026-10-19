@@ -57,6 +57,10 @@ LogType = Literal[
     "oom",
     "timeout",
     "torch_error",
+    # torch 失败后仍执行 paddle 才能判定的两个终态；torch_error 保留给 torch 反向失败
+    # 及 accuracy_stable 等未接入合并判定的路径。
+    "torch_only_error",
+    "both_error",
     "config_input",
     "config_parse",
     "config_convert",
@@ -75,6 +79,8 @@ LOG_PREFIXES: dict[LogType, str] = {
     "oom": "api_config_oom",
     "timeout": "api_config_timeout",
     "torch_error": "api_config_torch_error",
+    "torch_only_error": "api_config_torch_only_error",
+    "both_error": "api_config_both_error",
     "config_input": "api_config_config_input",
     "config_parse": "api_config_config_parse",
     "config_convert": "api_config_config_convert",
@@ -117,6 +123,9 @@ FINAL_RESULT_PRIORITY = (
     "paddle_bitwise_knows",
     "paddle_bitwise",
     "torch_error",
+    # 两侧都失败比仅 torch 失败严重，合并判定后优先展示。
+    "both_error",
+    "torch_only_error",
     "config_input",
     "config_parse",
     "config_convert",

@@ -95,7 +95,7 @@ python engineV4.py \
   --gpu_ids=0-3
 ```
 
-多个分类用逗号分隔，例如 `--retest=config_input,timeout`。可用分类与 `api_config_*.txt` 对应，包括 `pass`、`skip`、`paddle_error`、`paddle_accuracy`、`paddle_bitwise`、`paddle_bitwise_knows`、`paddle_cuda`、`paddle_crash`、`oom`、`timeout`、`torch_error`、`config_input`、`config_parse` 和 `config_convert`。
+多个分类用逗号分隔，例如 `--retest=config_input,timeout`。可用分类与 `api_config_*.txt` 对应，包括 `pass`、`skip`、`paddle_error`、`paddle_accuracy`、`paddle_bitwise`、`paddle_bitwise_knows`、`paddle_cuda`、`paddle_crash`、`oom`、`timeout`、`torch_error`、`torch_only_error`、`both_error`、`config_input`、`config_parse` 和 `config_convert`。其中 `torch_only_error`（torch 失败但 paddle 成功）和 `both_error`（两侧都失败且不是一致的非法 config）由 accuracy 模式在 torch 失败后继续执行 paddle 合并得出。
 
 复测开始时，引擎会从 checkpoint、主分类、`comp/` 分类和 stable/tolerance CSV 中移除所选配置的旧结构化结果；`log_inorder.log` 保留历史 case。复测中断后，重新执行相同命令只运行尚未 checkpoint 的配置；全部完成后恢复文件自动删除。`engineV2.py` 也支持该复测输入和分类协议。不要让多个进程同时复测同一日志目录。
 
