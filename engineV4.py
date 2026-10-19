@@ -1129,6 +1129,12 @@ def _init_worker_runtime(
         os.environ["CUDA_VISIBLE_DEVICES"] = _visible_gpu_ids(gpu_id, comparison_gpu_id)
         workers_on_gpu = (getattr(options, "gpu_workers_per_gpu_map", {}) or {}).get(gpu_id, 1)
         os.environ["PADDLEAPITEST_WORKERS_ON_GPU"] = str(workers_on_gpu)
+        # 全机并发 worker 总数（各卡 worker 数之和），供 Torch 线程按真实并发分摊核数。
+        worker_map = getattr(options, "gpu_workers_per_gpu_map", {}) or {}
+        total_workers = (
+            sum(max(1, int(v)) for v in worker_map.values()) if worker_map else int(workers_on_gpu)
+        )
+        os.environ["PADDLEAPITEST_TOTAL_WORKERS"] = str(max(1, total_workers))
     if slot_index is not None and gpu_id is not None:
         # backend 导入和准备阶段即可读取稳定 slot，复活 worker 也遵循同一初始化协议。
         os.environ["PADDLEAPITEST_WORKER_SLOT"] = str(slot_index)
