@@ -1408,6 +1408,9 @@
     "paddle.increment": {
         "Rule": "IncrementRule"
     },
+    "paddle.incubate.nn.functional.batched_gemm": {
+        "Rule": "BatchedGemmRule"
+    },
     "paddle.incubate.nn.functional.blha_get_max_len": {
         "Rule": "BlhaGetMaxLenRule"
     },
