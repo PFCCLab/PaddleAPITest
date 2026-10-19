@@ -10314,4 +10314,65 @@ else:
         )
 
 
+class BatchedGemmRule(BaseRule):
+    PADDLE_APIS = ("paddle.incubate.nn.functional.batched_gemm",)
+
+    """paddle.incubate.nn.functional.batched_gemm(lhs, rhs, batch_sizes,
+    trans_lhs=False, trans_rhs=False) -> grouped GEMM.
+
+    Three layouts selected by (trans_lhs, trans_rhs), per BatchedGemmInferMeta:
+      (F, F) group forward : lhs[Mt,K]  x rhs[E,K,N]              -> [Mt, N]
+      (F, T) lhs_grad       : lhs[Mt,N]  x rhs[E,K,N] (last-2D ^T) -> [Mt, K]
+      (T, F) weight_grad    : per-group lhs[Mi,K]^T x rhs[Mi,N]    -> [E, K, N]
+    (T, T) is rejected by Paddle. The runtime output dtype equals the input
+    dtype (bf16->bf16, fp32->fp32); torch.matmul already preserves it, so no
+    explicit cast is applied (the BFLOAT16 in BatchedGemmInferMeta is overridden
+    by the dynamic-mode kernel data_type=lhs).
+    No backward is registered for this op (Paddle output is stop_gradient=True),
+    so comparison is forward-only. The reference is wrapped in torch.no_grad()
+    to mirror that non-differentiable behaviour (otherwise torch.matmul would
+    produce gradients that Paddle does not, yielding a backward type-mismatch).
+    Reference uses a per-group loop (the only layout-faithful option;
+    torch._grouped_mm has sm90 / alignment constraints).
+    """
+
+    def apply(self, paddle_api: str) -> ConvertResult:
+        core = """
+_bs = [int(b) for b in batch_sizes]
+_tl = bool(trans_lhs)
+_tr = bool(trans_rhs)
+if _tl and _tr:
+    raise ValueError("batched_gemm does not support trans_lhs and trans_rhs both True")
+_E = len(_bs)
+_outs = []
+_off = 0
+with torch.no_grad():
+    if not _tl:
+        _N = rhs.shape[1] if _tr else rhs.shape[2]
+        for _i in range(_E):
+            _m = _bs[_i]
+            _l = lhs[_off:_off + _m]
+            _off += _m
+            _r = rhs[_i].transpose(-1, -2) if _tr else rhs[_i]
+            _outs.append(torch.matmul(_l, _r))
+        _out = torch.cat(_outs, dim=0) if _outs else lhs.new_zeros((0, _N))
+    else:
+        _K = lhs.shape[1]
+        _N = rhs.shape[1]
+        for _i in range(_E):
+            _m = _bs[_i]
+            _l = lhs[_off:_off + _m]
+            _r = rhs[_off:_off + _m]
+            _off += _m
+            _outs.append(torch.matmul(_l.transpose(-1, -2), _r))
+        _out = torch.stack(_outs, dim=0) if _outs else lhs.new_zeros((0, _K, _N))
+    result = _out
+"""
+        return self.build_result(
+            paddle_api,
+            kind=ConversionKind.COMPOSITE,
+            core=core,
+        )
+
+
 _RULE_REGISTRY_FROZEN = True
