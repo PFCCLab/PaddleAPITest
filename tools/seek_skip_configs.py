@@ -22,6 +22,8 @@ LOG_PREFIXES = {
     "oom": "api_config_oom",
     "timeout": "api_config_timeout",
     "torch_error": "api_config_torch_error",
+    "torch_only_error": "api_config_torch_only_error",
+    "both_error": "api_config_both_error",
     "config_input": "api_config_config_input",
     "config_parse": "api_config_config_parse",
     "config_convert": "api_config_config_convert",

@@ -29,6 +29,8 @@ DEFAULT_RETEST_ERROR_CONFIGS = [
     "api_config_oom.txt",
     "api_config_timeout.txt",
     "api_config_torch_error.txt",
+    "api_config_torch_only_error.txt",
+    "api_config_both_error.txt",
     "api_config_config_input.txt",
     "api_config_config_parse.txt",
     "api_config_config_convert.txt",

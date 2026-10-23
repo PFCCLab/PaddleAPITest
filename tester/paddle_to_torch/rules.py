@@ -2390,7 +2390,7 @@ def _te_fp8_quant_blockwise(inp, eps, power2, scale_transpose, ue8m0, method):
         pad_c = (4 - (cols_s % 4)) % 4
         if pad_c:
             _base = torch.nn.functional.pad(_base, (0, pad_c))
-        b = _base.reshape(*_base.shape[:-1], -1, 4)
+        b = _base.reshape(*_base.shape[:-1], _base.shape[-1] // 4, 4)
         safe = torch.clamp(b, min=torch.finfo(torch.float32).tiny)
         exp = torch.floor(torch.log2(safe)).to(torch.int32) + 127
         exp = torch.clamp(exp, 0, 255)
@@ -2583,7 +2583,7 @@ def _fp8_quant_blockwise_impl(inp, eps, power2, scale_transpose, ue8m0, method, 
         pad_c = (4 - (cols_s % 4)) % 4
         if pad_c:
             base = torch.nn.functional.pad(base, (0, pad_c))
-        b = base.reshape(*base.shape[:-1], -1, 4)
+        b = base.reshape(*base.shape[:-1], base.shape[-1] // 4, 4)
         safe = torch.clamp(b, min=torch.finfo(torch.float32).tiny)
         exp = torch.floor(torch.log2(safe)).to(torch.int32) + 127
         exp = torch.clamp(exp, 0, 255)
@@ -2657,7 +2657,9 @@ else:
                 _scale_chunk = torch.stack(
                     [(_packed >> _shift) & 0xFF for _shift in (0, 8, 16, 24)],
                     dim=-1,
-                ).reshape(_packed.shape[0], -1)
+                # Explicit last dim (packed cols * 4): -1 is ambiguous when the
+                # scale chunk has 0 elements (e.g. a [0, C] x_scale).
+                ).reshape(_packed.shape[0], _packed.shape[-1] * 4)
                 _scale_chunk = _scale_chunk[:, :_num_scale_blocks].to(torch.float32)
                 _scale_chunk.sub_(127.0).exp2_()
             else:
@@ -4775,7 +4777,7 @@ mode = mode
 if axis is None:
     x_flat = x.flatten()
     length = x_flat.numel()
-    if length % 2 == 0 and mode == 'avg':
+    if length > 0 and length % 2 == 0 and mode == 'avg':
         sorted_x = torch.sort(x_flat, stable=True).values
         mid = length // 2
         median = (sorted_x[mid - 1] + sorted_x[mid]) / 2
@@ -5391,7 +5393,7 @@ if axis is None:
     valid_mask = ~torch.isnan(x_flat)
     valid_x = x_flat[valid_mask]
     length = valid_x.numel()
-    if length % 2 == 0 and mode == "avg":
+    if length > 0 and length % 2 == 0 and mode == "avg":
         sorted_x = torch.sort(valid_x).values
         mid = length // 2
         median = (sorted_x[mid - 1] + sorted_x[mid]) / 2
@@ -9423,6 +9425,105 @@ result = torch.empty(list(shape), dtype=torch_dtype).uniform_(float(mn), float(m
         )
 
 
+class CopsLayerNormRule(BaseRule):
+    PADDLE_APIS = ("paddle._C_ops.layer_norm",)
+
+    """paddle._C_ops.layer_norm(x, scale, bias, epsilon, begin_norm_axis)
+
+    Maps to torch.nn.functional.layer_norm by deriving normalized_shape from
+    x.shape[begin_norm_axis:] and renaming scale/bias to weight/bias.
+    """
+
+    def apply(self, paddle_api: str) -> ConvertResult:
+        preprocess = """
+_axis = int(begin_norm_axis)
+if _axis < 0:
+    _axis = x.dim() + _axis
+normalized_shape = list(x.shape[_axis:])
+weight = scale
+if weight is not None:
+    weight = weight.view(normalized_shape).to(x.dtype)
+if bias is not None:
+    bias = bias.view(normalized_shape).to(x.dtype)
+eps = float(epsilon)
+"""
+        core = """
+result = torch.nn.functional.layer_norm(x, normalized_shape, weight, bias, eps)
+"""
+        return self.build_result(
+            paddle_api,
+            kind=ConversionKind.COMPOSITE,
+            preprocess=preprocess.splitlines(),
+            core=core,
+        )
+
+
+class CopsConv2dRule(BaseRule):
+    PADDLE_APIS = ("paddle._C_ops.conv2d",)
+
+    """paddle._C_ops.conv2d(input, filter, strides, paddings, padding_algorithm,
+    dilations, groups, data_format)
+
+    C-op 协议与公共 conv2d 不同：paddings 与 padding_algorithm 分离。
+    EXPLICIT 下 paddings 为 [h, w] 对称或 [t, b, l, r] 非对称；VALID 置 0；
+    SAME 需显式 pad 成 torch 可表达的固定 padding（out = ceil(in/stride)，
+    pad_total = dilation*(k-1) - (out-1)*stride - ... 的公共推导见下），
+    pad_before = pad_total // 2 与 TF 约定一致（实测逐位验证）。
+    NHWC 布局在前后各做一次 permute，filter 恒为 OIHW。
+    """
+
+    def apply(self, paddle_api: str) -> ConvertResult:
+        preprocess = """
+if data_format == "NHWC":
+    input = input.permute(0, 3, 1, 2)
+strides = tuple(strides) if isinstance(strides, list) else strides
+dilations = tuple(dilations) if isinstance(dilations, list) else dilations
+if padding_algorithm == "VALID":
+    paddings = 0
+elif padding_algorithm == "SAME":
+    # SAME 通用推导：out = ceil(in/stride)，
+    # pad_total = max(0, (out-1)*stride + k_eff - in)，k_eff = dilation*(k-1)+1；
+    # pad_before = pad_total // 2（TF 约定，与 Paddle 实测逐位一致）。
+    if isinstance(strides, int):
+        _strides = (strides, strides)
+    else:
+        _strides = tuple(strides)
+    if isinstance(dilations, int):
+        _dil = (dilations, dilations)
+    else:
+        _dil = tuple(dilations)
+    _pad = []
+    for _size, _s, _d, _k in zip(input.shape[2:], _strides, _dil, filter.shape[2:]):
+        _out = -(-int(_size) // int(_s))
+        _pad_total = max(0, (_out - 1) * int(_s) + int(_d) * (int(_k) - 1) + 1 - int(_size))
+        _before = _pad_total // 2
+        _pad.append(_before)
+        _pad.append(_pad_total - _before)
+    _pad_h_t, _pad_h_b, _pad_w_l, _pad_w_r = _pad
+    input = torch.nn.functional.pad(input, (_pad_w_l, _pad_w_r, _pad_h_t, _pad_h_b))
+    paddings = 0
+else:  # EXPLICIT
+    if isinstance(paddings, int):
+        paddings = (paddings, paddings)
+    elif len(paddings) == 2:  # [pad_height, pad_width]
+        paddings = tuple(paddings)
+    elif len(paddings) == 4:  # [pad_top, pad_bottom, pad_left, pad_right]
+        _pad_t, _pad_b, _pad_l, _pad_r = paddings
+        input = torch.nn.functional.pad(input, (_pad_l, _pad_r, _pad_t, _pad_b))
+        paddings = 0
+"""
+        postprocess = """
+if data_format == "NHWC":
+    result = result.permute(0, 2, 3, 1)
+"""
+        return self.build_result(
+            paddle_api,
+            kind=ConversionKind.DIRECT,
+            preprocess=preprocess.splitlines(),
+            postprocess=postprocess,
+        )
+
+
 class CopsRunCustomOpRule(BaseRule):
     PADDLE_APIS = ("paddle._C_ops._run_custom_op",)
 
@@ -10193,7 +10294,11 @@ elif op_name in ("fuse_stack_fp8_quant", "fuse_stack_transpose_fp8_quant"):
         _pad_c = (4 - (_pack_cols % 4)) % 4
         if _pad_c:
             _scale_out = torch.nn.functional.pad(_scale_out, (0, _pad_c))
-        _scale_out = _scale_out.reshape(_scale_out.shape[0], -1, 4)
+        # shape[-1] is padded to a multiple of 4 right above, so // 4 is exact
+        # and avoids the ambiguous -1 when the tensor has 0 elements (0-size inputs).
+        _scale_out = _scale_out.reshape(
+            _scale_out.shape[0], _scale_out.shape[-1] // 4, 4
+        )
         _scale_out = (_scale_out[..., 0] | (_scale_out[..., 1] << 8) | (_scale_out[..., 2] << 16) | (_scale_out[..., 3] << 24)).to(torch.int32)
         if _output_scale_transpose:
             _scale_out = _scale_out.t().contiguous()
@@ -10212,6 +10317,67 @@ else:
             kind=ConversionKind.COMPOSITE,
             core=core,
             workspace_required=True,
+        )
+
+
+class BatchedGemmRule(BaseRule):
+    PADDLE_APIS = ("paddle.incubate.nn.functional.batched_gemm",)
+
+    """paddle.incubate.nn.functional.batched_gemm(lhs, rhs, batch_sizes,
+    trans_lhs=False, trans_rhs=False) -> grouped GEMM.
+
+    Three layouts selected by (trans_lhs, trans_rhs), per BatchedGemmInferMeta:
+      (F, F) group forward : lhs[Mt,K]  x rhs[E,K,N]              -> [Mt, N]
+      (F, T) lhs_grad       : lhs[Mt,N]  x rhs[E,K,N] (last-2D ^T) -> [Mt, K]
+      (T, F) weight_grad    : per-group lhs[Mi,K]^T x rhs[Mi,N]    -> [E, K, N]
+    (T, T) is rejected by Paddle. The runtime output dtype equals the input
+    dtype (bf16->bf16, fp32->fp32); torch.matmul already preserves it, so no
+    explicit cast is applied (the BFLOAT16 in BatchedGemmInferMeta is overridden
+    by the dynamic-mode kernel data_type=lhs).
+    No backward is registered for this op (Paddle output is stop_gradient=True),
+    so comparison is forward-only. The reference is wrapped in torch.no_grad()
+    to mirror that non-differentiable behaviour (otherwise torch.matmul would
+    produce gradients that Paddle does not, yielding a backward type-mismatch).
+    Reference uses a per-group loop (the only layout-faithful option;
+    torch._grouped_mm has sm90 / alignment constraints).
+    """
+
+    def apply(self, paddle_api: str) -> ConvertResult:
+        core = """
+_bs = [int(b) for b in batch_sizes]
+_tl = bool(trans_lhs)
+_tr = bool(trans_rhs)
+if _tl and _tr:
+    raise ValueError("batched_gemm does not support trans_lhs and trans_rhs both True")
+_E = len(_bs)
+_outs = []
+_off = 0
+with torch.no_grad():
+    if not _tl:
+        _N = rhs.shape[1] if _tr else rhs.shape[2]
+        for _i in range(_E):
+            _m = _bs[_i]
+            _l = lhs[_off:_off + _m]
+            _off += _m
+            _r = rhs[_i].transpose(-1, -2) if _tr else rhs[_i]
+            _outs.append(torch.matmul(_l, _r))
+        _out = torch.cat(_outs, dim=0) if _outs else lhs.new_zeros((0, _N))
+    else:
+        _K = lhs.shape[1]
+        _N = rhs.shape[1]
+        for _i in range(_E):
+            _m = _bs[_i]
+            _l = lhs[_off:_off + _m]
+            _r = rhs[_off:_off + _m]
+            _off += _m
+            _outs.append(torch.matmul(_l.transpose(-1, -2), _r))
+        _out = torch.stack(_outs, dim=0) if _outs else lhs.new_zeros((0, _K, _N))
+    result = _out
+"""
+        return self.build_result(
+            paddle_api,
+            kind=ConversionKind.COMPOSITE,
+            core=core,
         )
 
 

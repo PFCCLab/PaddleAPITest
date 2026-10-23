@@ -65,6 +65,15 @@ class InputNumPyRandomState:
     def abs(self, value):
         return numpy.abs(value)
 
+    def make_pcg64(self, stream_suffix=""):
+        """返回一个确定性 PCG64 Generator，供大张量快路径使用。
+
+        全局状态没有显式 seed，从已播种的全局流取一个 32bit 熵派生 SeedSequence；
+        这既保持给定全局 seed 下的可复现性，又推进全局流（与原路径一样消费随机性）。
+        """
+        seed = int(numpy.random.randint(0, 1 << 32))
+        return numpy.random.Generator(numpy.random.PCG64(numpy.random.SeedSequence(seed)))
+
 
 INPUT_NUMPY_RANDOM_STATE = InputNumPyRandomState()
 
@@ -98,6 +107,13 @@ class InputConfigRandomState(InputNumPyRandomState):
 
     def choice(self, values, shape=None, replace=True, p=None):
         return self._state.choice(values, size=shape, replace=replace, p=p)
+
+    def make_pcg64(self, stream_suffix=""):
+        # 从 stream identity 派生确定性 seed，与 self._state 同源但独立流，叠加 suffix 区分用途。
+        seed = derive_input_seed(
+            self.seed, self.config_fingerprint, f"{self.stream_kind}{stream_suffix}"
+        )
+        return numpy.random.Generator(numpy.random.PCG64(numpy.random.SeedSequence(seed)))
 
 
 def create_input_config_random_state(

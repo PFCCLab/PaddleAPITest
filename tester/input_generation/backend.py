@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import math
 import numbers
+import os
 from dataclasses import dataclass, field
 from typing import Protocol, runtime_checkable
 
@@ -21,6 +22,16 @@ DIRECT_DTYPE_NUMEL_THRESHOLD = 1 << 20
 # NumPy 对称随机值按元素数限制 float64 中间块大小；原生 backend 保持整块生成。
 _SYMMETRIC_CHUNK_MIN_ELEMENTS = 1 << 24
 _SYMMETRIC_CHUNK_ELEMENTS = 1 << 22
+
+
+def _fast_input_gen_enabled():
+    """大浮点张量快路径开关（默认开启，可设 PADDLEAPITEST_FAST_INPUT_GEN=0 关闭）。
+
+    快路径用 PCG64 + dtype 感知的生成精度（fp64 仍用 float64，其余浮点用 float32 直生），
+    显著降低大张量 symmetric/output-grad 的 numpy 造数耗时。它会改变具体随机值
+    （分布与确定性不变），需据此重建基线；关闭后回到 legacy RandomState 路径。
+    """
+    return os.environ.get("PADDLEAPITEST_FAST_INPUT_GEN", "1") != "0"
 
 
 def _normalize_shape(shape, *, scalar_empty):
@@ -196,6 +207,15 @@ class NumPyInputBackend:
     def symmetric(self, shape, dtype, max_abs):
         normalized_shape = _normalize_shape(shape, scalar_empty=False)
         storage_dtype = self._storage_dtype(dtype)
+        if (
+            _fast_input_gen_enabled()
+            and normalized_shape
+            and math.prod(normalized_shape) >= _SYMMETRIC_CHUNK_MIN_ELEMENTS
+        ):
+            # 对称区间 [-max_abs, max_abs) 等价于 uniform(-max_abs, max_abs)。
+            return self._fast_uniform_fill(
+                normalized_shape, storage_dtype, -max_abs, max_abs, ":symmetric"
+            )
         if normalized_shape and math.prod(normalized_shape) >= _SYMMETRIC_CHUNK_MIN_ELEMENTS:
             value = numpy.empty(normalized_shape, dtype=storage_dtype)
             flat_value = value.reshape(-1)
@@ -215,9 +235,66 @@ class NumPyInputBackend:
         )
 
     def uniform(self, low=0.0, high=1.0, shape=None, dtype=None):
-        value = self.input_random_state.uniform(low=low, high=high, shape=shape)
         storage_dtype = self._storage_dtype(dtype)
+        normalized_shape = _normalize_shape(shape, scalar_empty=False)
+        if (
+            storage_dtype is not None
+            and normalized_shape
+            and math.prod(normalized_shape) >= _SYMMETRIC_CHUNK_MIN_ELEMENTS
+        ):
+            if _fast_input_gen_enabled():
+                # 阶段 1：PCG64 + dtype 感知精度，改变具体随机值。
+                return self._fast_uniform_fill(
+                    normalized_shape, storage_dtype, low, high, ":uniform"
+                )
+            # 阶段 0：按块生成，消除整块 float64 中间峰值；逐位等价于原整块路径。
+            return self._chunked_uniform(normalized_shape, storage_dtype, low, high)
+        value = self.input_random_state.uniform(low=low, high=high, shape=shape)
         return numpy.asarray(value).astype(storage_dtype) if storage_dtype is not None else value
+
+    def _chunked_uniform(self, shape, storage_dtype, low, high):
+        """按块复刻 ``input_random_state.uniform(...).astype(storage_dtype)``。
+
+        legacy RandomState 的 uniform 顺序消费 random_sample 流，分块与整块消费顺序一致，
+        逐块 cast 与整块 astype 逐元素等价，因此结果与原路径逐位相同，仅去掉整块 float64 峰值。
+        """
+        value = numpy.empty(shape, dtype=storage_dtype)
+        flat_value = value.reshape(-1)
+        total_elements = int(flat_value.size)
+        for start in range(0, total_elements, _SYMMETRIC_CHUNK_ELEMENTS):
+            end = min(total_elements, start + _SYMMETRIC_CHUNK_ELEMENTS)
+            block = self.input_random_state.uniform(low=low, high=high, shape=(end - start,))
+            flat_value[start:end] = numpy.asarray(block)
+        return value
+
+    def _fast_uniform_fill(self, shape, storage_dtype, low, high, stream_suffix):
+        """PCG64 + dtype 感知精度的 uniform[low, high) 填充（仅快路径）。
+
+        生成精度不得低于目标精度：float64 storage 用 float64 生成，其余浮点用 float32 直生
+        （Generator.random 只支持 float32/float64；float32 对 fp32/fp16/bf16/fp8 均足够）。
+        """
+        np_storage = numpy.dtype(storage_dtype)
+        gen_dtype = numpy.float64 if np_storage == numpy.dtype(numpy.float64) else numpy.float32
+        fill_in_place = np_storage == numpy.dtype(gen_dtype)
+        generator = self.input_random_state.make_pcg64(stream_suffix)
+        span = gen_dtype(high - low)
+        offset = gen_dtype(low)
+        value = numpy.empty(shape, dtype=storage_dtype)
+        flat_value = value.reshape(-1)
+        total_elements = int(flat_value.size)
+        for start in range(0, total_elements, _SYMMETRIC_CHUNK_ELEMENTS):
+            end = min(total_elements, start + _SYMMETRIC_CHUNK_ELEMENTS)
+            if fill_in_place:
+                block = flat_value[start:end]
+                generator.random(end - start, dtype=gen_dtype, out=block)
+                block *= span
+                block += offset
+            else:
+                block = generator.random(end - start, dtype=gen_dtype)
+                block *= span
+                block += offset
+                flat_value[start:end] = block
+        return value
 
     def randint(self, low, high=None, shape=None, dtype=None):
         value = self.input_random_state.randint(low, high, shape=shape)

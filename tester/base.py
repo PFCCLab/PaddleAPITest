@@ -98,6 +98,16 @@ CUDA_OOM = frozenset(
 )
 
 
+def _is_cuda_oom_error(err):
+    """判断异常是否为 GPU 显存不足（用于机会性 GPU 比较的 CPU 兜底重试）。"""
+    oom_type = getattr(getattr(torch, "cuda", None), "OutOfMemoryError", None)
+    if oom_type is not None and isinstance(err, oom_type):
+        return True
+    message = str(err).lower()
+    markers = ("cuda out of memory", "outofmemoryerror", "cublas_status_alloc_failed")
+    return any(marker in message for marker in markers)
+
+
 GPU_MEMORY_PROBE_MIN_BYTES = 256 << 20
 COMPARISON_WORKSPACE_FAST_PATH_BYTES = 256 << 20
 DEFAULT_COMPARISON_WORKSPACE_BYTES = 1 << 30
@@ -108,6 +118,36 @@ DEFAULT_COMPARISON_WORKSPACE_BYTES = 1 << 30
 # billions of elements. A 256 MiB working set keeps the iteration count bounded.
 MIN_COMPARISON_CHUNK_BYTES = 256 << 20
 _GIB = 1024**3
+# Torch CPU 线程数的默认上限：超过后 isclose 等 elementwise 比较受内存带宽限制、收益递减，
+# 且避免大核机器上单 worker 占满全部核。可用 PADDLEAPITEST_TORCH_THREAD_CAP 覆盖。
+_TORCH_THREAD_CAP_DEFAULT = 16
+
+
+def _resolve_torch_thread_count():
+    """按机器核数在所有并发 worker 间分摊 Torch CPU 线程数。
+
+    旧逻辑 ``8 // workers_on_gpu`` 把每卡核数写死为 8，大核机器上严重欠用（例如 180 核
+    / 4 workers 只给 2 线程）。这里改为 ``cpu_count // total_workers``，其中 total_workers
+    是全机并发 worker 数（engineV4 通过 PADDLEAPITEST_TOTAL_WORKERS 下发）。显式设置
+    PADDLEAPITEST_TORCH_THREADS 时直接采用；无 total-workers 信息时退回按 workers_on_gpu
+    分摊（相当于单卡）。线程数只影响速度、不影响比较判定。
+    """
+    explicit = os.environ.get("PADDLEAPITEST_TORCH_THREADS")
+    if explicit:
+        try:
+            return max(1, int(explicit))
+        except ValueError:
+            pass
+    cpu_count = os.cpu_count() or 8
+    workers_on_gpu = max(1, int(os.environ.get("PADDLEAPITEST_WORKERS_ON_GPU", "1")))
+    total_workers = max(1, int(os.environ.get("PADDLEAPITEST_TOTAL_WORKERS", str(workers_on_gpu))))
+    try:
+        cap = max(
+            1, int(os.environ.get("PADDLEAPITEST_TORCH_THREAD_CAP", _TORCH_THREAD_CAP_DEFAULT))
+        )
+    except ValueError:
+        cap = _TORCH_THREAD_CAP_DEFAULT
+    return max(1, min(cap, cpu_count // total_workers))
 
 
 @contextlib.contextmanager
@@ -394,9 +434,8 @@ class APITestBase:
         # 同一 case 的结果树共享设备快照，避免每个叶子重复查询 CUDA allocator。
         self.comparison_workspace_cache = {}
         if use_torch:
-            # worker 数增大时按卡分摊 Torch 线程，单 worker 保持原有 8 线程默认值。
-            workers_on_gpu = max(1, int(os.environ.get("PADDLEAPITEST_WORKERS_ON_GPU", "1")))
-            torch.set_num_threads(max(1, 8 // workers_on_gpu))
+            # 按全机并发 worker 数分摊 Torch CPU 线程，充分利用大核机器又不超订。
+            torch.set_num_threads(_resolve_torch_thread_count())
             torch.set_printoptions(threshold=100, linewidth=120)
 
     def torch_operator_device(self):
@@ -463,6 +502,26 @@ class APITestBase:
             self.memory_governance_metrics = collections.Counter()
         self.memory_governance_metrics[name] += int(amount)
 
+    def describe_runtime_error(
+        self,
+        err,
+        default_log_type,
+        stage: Stage,
+    ):
+        """Classify one runtime error and dump its stage event without writing a terminal result.
+
+        accuracy 模式在 torch 失败后仍需执行 paddle，因此正确性判定和结果写盘必须解耦：
+        本方法只负责识别错误类型，由调用方决定是立即写终态还是延迟到合并判定。
+        """
+        err_msg = str(err)
+        # dump 事件保留阶段派生名，inorder 日志使用统一直接文本。
+        if stage:
+            self.dump_error(f"{stage.lower().replace(' ', '_')}_error", err)
+        log_type, fatal = classify_runtime_error(err_msg)
+        if log_type is None:
+            log_type = default_log_type
+        return log_type, fatal, err_msg
+
     def report_runtime_error(
         self,
         err,
@@ -478,15 +537,9 @@ class APITestBase:
         force_log_type changes the emitted log bucket only; fatal/nonfatal still comes
         from classify_runtime_error().
         """
-        err_msg = str(err)
-        # dump 事件保留阶段派生名，inorder 日志使用统一直接文本。
-        if stage:
-            self.dump_error(f"{stage.lower().replace(' ', '_')}_error", err)
-        log_type, fatal = classify_runtime_error(err_msg)
+        log_type, fatal, err_msg = self.describe_runtime_error(err, default_log_type, stage)
         if force_log_type is not None:
             log_type = force_log_type
-        if log_type is None:
-            log_type = default_log_type
         self.report_case_result(
             log_type,
             stage=stage,
@@ -1609,10 +1662,15 @@ class APITestBase:
     def _comparison_device(self, actual, expected, *, record_accuracy_tolerance, dual_gpu):
         """解析比较设备；该策略独立于两侧算子的执行设备。"""
         # record_accuracy_tolerance 只改变容差与日志，不得绕过 GPU mode 的比较设备协议。
-        # 非 GPU mode 使用 CPU compare，保持低显存路径。
+        # 非 GPU mode 默认 CPU compare 保持低显存；但当某侧结果已在 GPU 且显存充裕时，
+        # 机会性地在 GPU 上比较（省掉 D2H 搬运 + CPU 慢比较），显存不足或被强制时退回 CPU。
         # 单卡 GPU mode 允许 CPU kernel 结果显式搬到 GPU 0 后比较。
         # 双卡模式必须从结果设备解析比较卡，不允许 CPU tensor 隐式降级。
         if not self.gpu_mode_config.enabled:
+            if not getattr(self, "_prefer_cpu_compare", False):
+                gpu_device = self._opportunistic_gpu_compare_device(actual, expected)
+                if gpu_device is not None:
+                    return gpu_device
             return torch.device("cpu")
         if dual_gpu:
             device_id = self._comparison_cuda_device_id(actual)
@@ -1624,7 +1682,70 @@ class APITestBase:
         device_id = self.gpu_mode_config.comparison_device_id
         return torch.device("cuda", 0 if device_id is None else int(device_id))
 
-    def torch_assert_accuracy(
+    def _opportunistic_gpu_compare_device(self, actual, expected):
+        """非 GPU mode 下，若某侧结果已在 GPU 且空闲显存足够，返回该 GPU 作为比较设备。
+
+        门控保守：只在能把需搬运的一侧完整放上该卡、并留足临时量与安全余量时才选 GPU；
+        否则返回 None 退回 CPU。真实搬运/比较中若仍 OOM，由 torch_assert_accuracy 捕获后退 CPU。
+        默认关闭（PADDLEAPITEST_GPU_COMPARE=1 开启）：GPU 与 CPU 的 bf16 isclose 在容差边界
+        元素上判定可能有极小比例分歧，开启前需重建基线。
+        """
+        if os.environ.get("PADDLEAPITEST_GPU_COMPARE", "0") != "1":
+            return None
+        if not (
+            isinstance(actual, (torch.Tensor, paddle.Tensor))
+            and isinstance(expected, (torch.Tensor, paddle.Tensor))
+        ):
+            return None
+        device_id = self._comparison_cuda_device_id(actual)
+        if device_id is None:
+            device_id = self._comparison_cuda_device_id(expected)
+        if device_id is None:
+            # 两侧都在 CPU：搬上 GPU 无额外收益，保持 CPU。
+            return None
+        # 需要搬到该卡的字节数（已在该卡的一侧不计；其显存已被 free 排除）。
+        bytes_to_move = 0
+        for operand in (actual, expected):
+            if self._comparison_cuda_device_id(operand) != device_id:
+                bytes_to_move += int(operand.numel()) * _tensor_element_size(operand)
+        # 分块比较下临时量按块界定；此处只为搬运常驻 + 一块临时留固定余量。
+        temp_headroom = 2 * _GIB
+        safety_margin = 1 * _GIB
+        try:
+            free_bytes, _total_bytes = torch.cuda.mem_get_info(device_id)
+        except Exception:
+            return None
+        if int(free_bytes) - safety_margin >= bytes_to_move + temp_headroom:
+            return torch.device("cuda", device_id)
+        return None
+
+    def torch_assert_accuracy(self, *args, **kwargs):
+        """精度比较入口。非 GPU mode 下可能机会性地在 GPU 上比较；若该比较因显存竞争
+        （共享卡上其他进程占用）触发 CUDA OOM，释放缓存后强制在 CPU 上重试一次，保证
+        case 能比完、不因机会性 GPU 比较而失败。GPU mode / 已在 CPU 的比较不受影响。
+        """
+        try:
+            return self._torch_assert_accuracy_impl(*args, **kwargs)
+        except Exception as err:
+            if (
+                self.gpu_mode_config.enabled
+                or getattr(self, "_prefer_cpu_compare", False)
+                or not _is_cuda_oom_error(err)
+            ):
+                raise
+            # 机会性 GPU 比较撞上显存竞争 → 清缓存并强制 CPU 重试一次。
+            try:
+                torch.cuda.empty_cache()
+            except Exception:
+                pass
+            gc.collect()
+            self._prefer_cpu_compare = True
+            try:
+                return self._torch_assert_accuracy_impl(*args, **kwargs)
+            finally:
+                self._prefer_cpu_compare = False
+
+    def _torch_assert_accuracy_impl(
         self,
         actual,
         expected,

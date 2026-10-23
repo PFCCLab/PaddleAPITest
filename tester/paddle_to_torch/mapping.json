@@ -1408,6 +1408,9 @@
     "paddle.increment": {
         "Rule": "IncrementRule"
     },
+    "paddle.incubate.nn.functional.batched_gemm": {
+        "Rule": "BatchedGemmRule"
+    },
     "paddle.incubate.nn.functional.blha_get_max_len": {
         "Rule": "BlhaGetMaxLenRule"
     },
@@ -5137,6 +5140,14 @@
     "paddle._C_ops.add_": {
         "Rule": "CopsAddRule"
     },
+    "paddle._C_ops.add": {
+        "torch_api": "torch.add",
+        "paddle_torch_args_map": {
+            "x": "input",
+            "y": "other",
+            "alpha": "alpha"
+        }
+    },
     "paddle._C_ops.bitwise_not": {
         "Rule": "CopsBitwiseNotRule"
     },
@@ -5145,6 +5156,18 @@
     },
     "paddle._C_ops.concat": {
         "Rule": "CopsConcatRule"
+    },
+    "paddle._C_ops.conv2d": {
+        "Rule": "CopsConv2dRule",
+        "torch_api": "torch.nn.functional.conv2d",
+        "paddle_torch_args_map": {
+            "input": "input",
+            "filter": "weight",
+            "strides": "stride",
+            "paddings": "padding",
+            "dilations": "dilation",
+            "groups": "groups"
+        }
     },
     "paddle._C_ops.flatten_": {
         "Rule": "CopsFlattenRule"
@@ -5157,6 +5180,9 @@
     },
     "paddle._C_ops.gaussian": {
         "Rule": "CopsGaussianRule"
+    },
+    "paddle._C_ops.layer_norm": {
+        "Rule": "CopsLayerNormRule"
     },
     "paddle._C_ops.matmul": {
         "Rule": "CopsMatmulRule"
