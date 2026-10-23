@@ -57,8 +57,8 @@ LogType = Literal[
     "oom",
     "timeout",
     "torch_error",
-    # torch 失败后仍执行 paddle 才能判定的两个终态；torch_error 保留给 torch 反向失败
-    # 及 accuracy_stable 等未接入合并判定的路径。
+    # torch 输入、前向或反向失败后仍执行 paddle 才能判定的两个终态。
+    # torch_error 保留给 accuracy_stable 等未接入合并判定的路径。
     "torch_only_error",
     "both_error",
     "config_input",

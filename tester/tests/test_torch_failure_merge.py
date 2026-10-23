@@ -11,6 +11,7 @@ from __future__ import annotations
 import types
 
 import pytest
+import torch
 
 from tester.accuracy import APITestAccuracy
 
@@ -91,7 +92,39 @@ def test_terminal_written_blocks_second_merge():
     assert case._torch_failure is None
 
 
-def test_backward_sync_failure_uses_merge_handler():
+def test_torch_backward_failure_defers_to_paddle(monkeypatch):
+    case, recorder = _real_case(None)
+    case.need_check_grad = lambda: True
+    case.get_torch_input_list = lambda: [torch.zeros(1, requires_grad=True)]
+    case.gen_torch_output_and_output_grad = lambda _out: ([_out], [torch.ones_like(_out)])
+    case.torch_args = ()
+    case.torch_kwargs = {}
+    case.check_torch_operator_cuda_error = lambda: None
+    case.torch_operator_device = lambda: torch.device("cpu")
+    case.build_torch_input = lambda: True
+    case.converter = types.SimpleNamespace(execute=lambda *_a, **_k: torch.zeros(1))
+    case.paddle_api = lambda *_a, **_k: "out"
+
+    def _backward_fails(**_kwargs):
+        raise RuntimeError("backward is not implemented")
+
+    monkeypatch.setattr(torch.autograd, "grad", _backward_fails)
+    monkeypatch.setattr(
+        "tester.accuracy.bind_paddle_arguments", lambda *_a, **_k: types.SimpleNamespace()
+    )
+
+    success, _output, _grads, grad_success = case.get_torch_output(None)
+
+    # 反向失败先不写终态，只留下可合并的 torch 失败。
+    assert recorder.results == [], case._torch_failure
+    assert case._torch_failure[0] == "torch_error"
+    assert case._torch_failure[2] == APITestAccuracy.STAGE_TORCH_BACKWARD, case._torch_failure
+
+    case.need_check_grad = lambda: False
+    case._test_paddle_after_torch_failure(0)
+
+    assert [result["log_type"] for result in recorder.results] == ["torch_only_error"], recorder.results
+    assert recorder.results[0]["stage"] == APITestAccuracy.STAGE_TORCH_BACKWARD
     case, _ = _make_case(("torch_error", "boom", "Torch forward"))
     case.paddle_args = ()
     case.paddle_kwargs = {}

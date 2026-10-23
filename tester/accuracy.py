@@ -416,7 +416,7 @@ class APITestAccuracy(APITestBase):
         *,
         force_log_type=None,
     ):
-        """记录 Torch 输入/前向失败，返回 "raise"、"done" 或 "deferred"。
+        """记录 Torch 失败，返回 "raise"、"done" 或 "deferred"。
 
         fatal 维持既有立即上抛语义；skip 表示无法有效验证，写终态后直接结束；
         其余延迟到 Paddle 执行后由合并判定给出唯一终态。
@@ -520,7 +520,7 @@ class APITestAccuracy(APITestBase):
         try:
             self.check_torch_operator_cuda_error()
         except Exception as err:
-            # Torch 反向错误必须在梯度阶段终止当前 case。
+            # 前向同步失败与输入/前向失败共用延迟终态，fatal 仍立即上抛。
             outcome = self._record_torch_failure_or_raise(
                 err,
                 "torch_error",
@@ -567,30 +567,35 @@ class APITestAccuracy(APITestBase):
             del inputs_list, result_outputs, result_outputs_grads
         except Exception as err:
             if str(err).startswith("Too large tensor to get cached numpy: "):
-                self._report_runtime_error_and_finalize(
+                # 与输入/前向一致：先延迟，再由 Paddle 结果决定 config_input 还是 both_error。
+                outcome = self._record_torch_failure_or_raise(
                     err,
                     "config_input",
                     self.STAGE_TORCH_BACKWARD,
                     force_log_type="config_input",
                 )
+                if outcome == "raise":
+                    raise
                 return False, None, None, False
-            # Paddle 前向错误与 Torch 错误使用相同格式。
-            _, fatal = self._report_runtime_error_and_finalize(
+            # 反向失败不再立即终态，继续执行 Paddle 后合并出唯一分类。
+            outcome = self._record_torch_failure_or_raise(
                 err, "torch_error", self.STAGE_TORCH_BACKWARD
             )
-            if fatal:
+            if outcome == "raise":
                 raise
             return False, None, None, False
         try:
             self.check_torch_operator_cuda_error()
         except Exception as err:
-            self._report_runtime_error_and_finalize(
+            outcome = self._record_torch_failure_or_raise(
                 err,
                 "torch_error",
                 self.STAGE_TORCH_BACKWARD_SYNC,
                 force_log_type="torch_error",
             )
-            raise
+            if outcome == "raise":
+                raise
+            return False, None, None, False
         return True, torch_output, torch_out_grads, torch_grad_success
 
     def _prepare_torch_results_for_paddle(
