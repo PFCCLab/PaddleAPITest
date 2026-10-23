@@ -493,11 +493,17 @@ class AddNRule(BaseRule):
     PADDLE_APIS = ("paddle.add_n",)
 
     def apply(self, paddle_api: str) -> ConvertResult:
+        # 对齐 paddle.add_n（方案 A）：所有输入必须完全同 shape，不广播、不豁免 0D。
+        # 全 0D（同为 []）通过；0D 混 ND 或任意不同形都报错，与 paddle 一致。
         pre = """
 inputs = [inputs] if torch.is_tensor(inputs) else inputs
-expanded_inputs = torch.broadcast_tensors(*inputs)
+# 复刻删 0D 豁免后的 AddNInferMeta：所有输入 shape 必须一致，否则按 paddle 一样报错
+_ref = tuple(inputs[0].shape)
+for _t in inputs[1:]:
+    if tuple(_t.shape) != _ref:
+        raise ValueError(f"add_n inputs must have same shape: {_ref} vs {tuple(_t.shape)}")
 """
-        core = "result = torch.sum(torch.stack(expanded_inputs), dim=0)"
+        core = "result = torch.sum(torch.stack(inputs), dim=0)"
         return self.build_result(
             paddle_api,
             kind=ConversionKind.COMPOSITE,
