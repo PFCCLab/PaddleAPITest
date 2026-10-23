@@ -12,7 +12,6 @@ import types
 
 import pytest
 import torch
-
 from tester.accuracy import APITestAccuracy
 
 
@@ -123,7 +122,9 @@ def test_torch_backward_failure_defers_to_paddle(monkeypatch):
     case.need_check_grad = lambda: False
     case._test_paddle_after_torch_failure(0)
 
-    assert [result["log_type"] for result in recorder.results] == ["torch_only_error"], recorder.results
+    assert [result["log_type"] for result in recorder.results] == ["torch_only_error"], (
+        recorder.results
+    )
     assert recorder.results[0]["stage"] == APITestAccuracy.STAGE_TORCH_BACKWARD
     case, _ = _make_case(("torch_error", "boom", "Torch forward"))
     case.paddle_args = ()
