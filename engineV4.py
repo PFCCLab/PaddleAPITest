@@ -674,6 +674,9 @@ def _normalize_sanitizer_exitcode(output, *, returncode, sanitizer_error_exitcod
     """把 sanitizer 专用退出码还原为普通 worker 的 fatal 退出协议。"""
     if returncode != sanitizer_error_exitcode:
         return returncode
+    # 合并终态已经落盘时，正文里的 CUDA 文本不能再把它改判成另一种 fatal。
+    if _recorded_terminal_prefixes(output):
+        return returncode
     # 仅把 sanitizer 的协议码转换为统一 fatal 码，普通 child 退出码保持原语义。
     # Torch 已写出的终态会出现在 child 输出中；OOM 仍由共享文本规则优先识别。
     # 只认 torch_error：合并出的 torch_only_error/both_error 不是 fatal 终态，不参与退出码还原。
@@ -1044,6 +1047,7 @@ class BatchMessage:
             message.exitcode = msg[3] if len(msg) > 3 else None
             if len(msg) > 5 and msg[5] == "session":
                 message.crash_source = "session"
+                message.reason = msg[4] if len(msg) > 4 else ""
                 message.worker_pid = msg[6] if len(msg) > 6 else None
                 message.completed_offset = msg[7] if len(msg) > 7 else None
             else:
@@ -3421,6 +3425,30 @@ class BatchTerminalCoordinator:
         return self.batch_state.tested_case > before
 
 
+def _recorded_terminal_prefixes(output):
+    """返回输出里已经作为 case 终态落下的分类前缀。"""
+    recorded = set()
+    for line in str(output).splitlines():
+        stripped = line.strip().lower()
+        if stripped.startswith("[") and "]" in stripped:
+            recorded.add(stripped[1 : stripped.index("]")])
+    return recorded
+
+
+def _settle_crash(config, exitcode, crash_source, output=""):
+    """认领 crash 后决定是否补写 fatal 终态，返回进度状态和详情。"""
+    # 只有已认领的 crash 才写终态，避免 watchdog/终态竞争双计数。
+    log_type, progress_status, terminal_recorded = log_worker.classify_exit(exitcode)
+    if crash_source == "session":
+        # session 子进程与父进程日志分离；输出里的终态前缀才是子进程是否写过的证据。
+        recorded = _recorded_terminal_prefixes(output)
+        terminal_recorded = log_type in recorded
+    progress_detail = f"exit {exitcode}" if progress_status == "PADDLE_CRASH" else None
+    if not terminal_recorded:
+        log_worker.write_to_log(log_type, config)
+    return progress_status, progress_detail
+
+
 def _handle_batch_result(
     *,
     pool,
@@ -3532,14 +3560,12 @@ def _handle_batch_result(
         log_worker.write_to_log("timeout", config)
         progress_status = "TIMEOUT"
     elif msg_type == "crashed":
-        # 只有已认领的 crash 才写终态，避免 watchdog/终态竞争双计数。
-        log_type, progress_status, terminal_recorded = log_worker.classify_exit(exitcode)
-        if crash_source == "session":
-            terminal_recorded = False
-        if progress_status == "PADDLE_CRASH":
-            progress_detail = f"exit {exitcode}"
-        if not terminal_recorded:
-            log_worker.write_to_log(log_type, config)
+        progress_status, progress_detail = _settle_crash(
+            config,
+            exitcode,
+            crash_source,
+            message.reason or "",
+        )
     elif msg_type == "error":
         # worker 的 error 通道覆盖配置解析失败和未分类异常，不能一律记成 parse。
         log_type = "config_parse" if "APIConfig" in (reason or "") else "paddle_error"
