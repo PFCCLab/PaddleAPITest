@@ -428,7 +428,14 @@ def print_run_footer(total_case, tested_case, remaining_case, log_counts, elapse
         "paddle_cuda",
         "paddle_crash",
     )
-    test_types = ("torch_error", "config_input", "config_parse", "config_convert")
+    test_types = (
+        "torch_error",
+        "torch_only_error",
+        "both_error",
+        "config_input",
+        "config_parse",
+        "config_convert",
+    )
     paddle_issues = sum(counts.get(key, 0) for key in paddle_types)
     test_issues = sum(counts.get(key, 0) for key in test_types)
     retest = sum(counts.get(key, 0) for key in ("oom", "timeout"))

@@ -42,6 +42,12 @@ class APITestAccuracy(APITestBase):
             self.bitwise_alignment = True
         # known 结果延迟到整个 case 成功后写入，避免后续梯度失败造成重复终态。
         self._bitwise_knows_detected = False
+        # Torch 输入/前向失败的延迟终态；合并判定完成后才写盘，保证每个 case 只有一条终态。
+        self._torch_failure = None
+        # Paddle 侧在合并模式下的延迟失败；fatal 错误仍按既有机制立即上抛。
+        self._paddle_failure = None
+        # 合并路径中若某一步已写出终态（fatal/skip），后续不得再合并，否则产生重复分类。
+        self._merge_terminal_written = False
         if self.record_accuracy_tolerance:
             torch.set_printoptions(profile="short")
         self.converter = get_converter()
@@ -402,16 +408,48 @@ class APITestAccuracy(APITestBase):
             return False
         return True
 
+    def _record_torch_failure_or_raise(
+        self,
+        err,
+        default_log_type,
+        stage,
+        *,
+        force_log_type=None,
+    ):
+        """记录 Torch 失败，返回 "raise"、"done" 或 "deferred"。
+
+        fatal 维持既有立即上抛语义；skip 表示无法有效验证，写终态后直接结束；
+        其余延迟到 Paddle 执行后由合并判定给出唯一终态。
+        """
+        log_type, fatal, err_msg = self.describe_runtime_error(err, default_log_type, stage)
+        if force_log_type is not None:
+            log_type = force_log_type
+        if fatal:
+            # OOM 与 CUDA 错误必须保持立即终态：显存和 worker 状态在失败后不可信。
+            self.report_case_result(log_type, stage=stage, error=err_msg)
+            self.dump_finalize(log_type)
+            self.clear_output_grad_cache()
+            self._merge_terminal_written = True
+            return "raise"
+        if log_type == "skip":
+            # 未实现（(Unimplemented)）不是可比较的失败，继续跑 Paddle 也无法得出有效结论。
+            self.report_case_result("skip", stage=stage, error=err_msg)
+            self.dump_finalize("skip")
+            self.clear_output_grad_cache()
+            self._merge_terminal_written = True
+            return "done"
+        # 延迟到 paddle 执行后再写唯一终态，避免 torch_error 与合并分类同时落盘。
+        self._torch_failure = (log_type, err_msg, stage)
+        return "deferred"
+
     def get_torch_output(self, convert_result):
         try:
             device = self.torch_operator_device()
             torch.set_default_device(device)
             self.dump_event("torch_input_start")
             if not self.build_torch_input():
-                self.report_case_result(
-                    "torch_error", "build_torch_input failed", stage=self.STAGE_INPUT
-                )
-                self.dump_finalize("torch_error")
+                # 延迟终态：torch 失败后仍需执行 paddle 才能判定 torch_only_error。
+                self._torch_failure = ("torch_error", "build_torch_input failed", self.STAGE_INPUT)
                 return False, None, None, False
             self.dump_save(
                 "torch_inputs",
@@ -471,10 +509,10 @@ class APITestAccuracy(APITestBase):
 
         except Exception as err:
             # Torch 前向和同步分开记录，异步错误仍能保留方向。
-            _, fatal = self._report_runtime_error_and_finalize(
+            outcome = self._record_torch_failure_or_raise(
                 err, "torch_error", self.STAGE_TORCH_FORWARD
             )
-            if fatal:
+            if outcome == "raise":
                 raise
             return False, None, None, False
 
@@ -482,14 +520,14 @@ class APITestAccuracy(APITestBase):
         try:
             self.check_torch_operator_cuda_error()
         except Exception as err:
-            # Torch 反向错误必须在梯度阶段终止当前 case。
-            _, fatal = self._report_runtime_error_and_finalize(
+            # 前向同步失败与输入/前向失败共用延迟终态，fatal 仍立即上抛。
+            outcome = self._record_torch_failure_or_raise(
                 err,
                 "torch_error",
                 self.STAGE_TORCH_FORWARD_SYNC,
                 force_log_type="torch_error",
             )
-            if fatal:
+            if outcome == "raise":
                 raise
             return False, None, None, False
 
@@ -529,30 +567,35 @@ class APITestAccuracy(APITestBase):
             del inputs_list, result_outputs, result_outputs_grads
         except Exception as err:
             if str(err).startswith("Too large tensor to get cached numpy: "):
-                self._report_runtime_error_and_finalize(
+                # 与输入/前向一致：先延迟，再由 Paddle 结果决定 config_input 还是 both_error。
+                outcome = self._record_torch_failure_or_raise(
                     err,
                     "config_input",
                     self.STAGE_TORCH_BACKWARD,
                     force_log_type="config_input",
                 )
+                if outcome == "raise":
+                    raise
                 return False, None, None, False
-            # Paddle 前向错误与 Torch 错误使用相同格式。
-            _, fatal = self._report_runtime_error_and_finalize(
+            # 反向失败不再立即终态，继续执行 Paddle 后合并出唯一分类。
+            outcome = self._record_torch_failure_or_raise(
                 err, "torch_error", self.STAGE_TORCH_BACKWARD
             )
-            if fatal:
+            if outcome == "raise":
                 raise
             return False, None, None, False
         try:
             self.check_torch_operator_cuda_error()
         except Exception as err:
-            self._report_runtime_error_and_finalize(
+            outcome = self._record_torch_failure_or_raise(
                 err,
                 "torch_error",
                 self.STAGE_TORCH_BACKWARD_SYNC,
                 force_log_type="torch_error",
             )
-            raise
+            if outcome == "raise":
+                raise
+            return False, None, None, False
         return True, torch_output, torch_out_grads, torch_grad_success
 
     def _prepare_torch_results_for_paddle(
@@ -615,6 +658,14 @@ class APITestAccuracy(APITestBase):
         # Paddle 侧必须在 Torch 结果清理后开始，避免两套 runtime 同时持有峰值数据。
         try:
             if not self.build_paddle_input():
+                if self._torch_failure is not None:
+                    # 合并模式下先记录，由统一出口决定 both_error/torch_only_error。
+                    self._paddle_failure = (
+                        "paddle_error",
+                        "build_paddle_input failed",
+                        self.STAGE_INPUT,
+                    )
+                    return False, None
                 self.report_case_result(
                     "paddle_error", "build_paddle_input failed", stage=self.STAGE_INPUT
                 )
@@ -656,6 +707,13 @@ class APITestAccuracy(APITestBase):
                     else next(iter(self.paddle_kwargs.values()))
                 )
         except Exception as err:
+            if self._torch_failure is not None:
+                outcome = self._record_paddle_failure_or_raise(
+                    err, "paddle_error", self.STAGE_PADDLE_FORWARD
+                )
+                if outcome == "raise":
+                    raise
+                return False, None
             _, fatal = self._report_runtime_error_and_finalize(
                 err,
                 "paddle_error",
@@ -670,11 +728,47 @@ class APITestAccuracy(APITestBase):
             self.dump_event("paddle_forward_done")
             self.check_paddle_kernel_cuda_error()
         except Exception as err:
+            if self._torch_failure is not None:
+                # CUDA 同步错误属于 fatal，helper 内部会先写终态再要求上抛。
+                outcome = self._record_paddle_failure_or_raise(
+                    err, "paddle_cuda", self.STAGE_PADDLE_FORWARD_SYNC
+                )
+                if outcome == "raise":
+                    raise
+                return False, None
             self._report_runtime_error_and_finalize(
                 err, "paddle_cuda", self.STAGE_PADDLE_FORWARD_SYNC
             )
             raise
         return True, paddle_output
+
+    def _record_paddle_failure_or_raise(
+        self,
+        err,
+        default_log_type,
+        stage,
+        *,
+        force_log_type=None,
+    ):
+        """合并模式下记录 Paddle 失败，返回 "raise" 或 "deferred"。
+
+        OOM/CUDA 等 fatal 写唯一终态后上抛，交给既有 worker 协议；其余（含 Paddle
+        的 skip/未实现）一律延迟到统一出口参与合并判定，因此归入 both_error。
+        """
+        # 显存守卫不属于算子结果，必须走 test() 的既有 OOM 入口，不能吞进合并分类。
+        if isinstance(err, GpuMemoryGuardSkip):
+            raise err
+        log_type, fatal, err_msg = self.describe_runtime_error(err, default_log_type, stage)
+        if force_log_type is not None:
+            log_type = force_log_type
+        if fatal or log_type == "oom":
+            self.report_case_result(log_type, stage=stage, error=err_msg)
+            self.dump_finalize(log_type)
+            self.clear_output_grad_cache()
+            self._merge_terminal_written = True
+            return "raise"
+        self._paddle_failure = (log_type, err_msg, stage)
+        return "deferred"
 
     def get_paddle_grad(self, paddle_output):
         paddle_out_grads = None
@@ -698,6 +792,9 @@ class APITestAccuracy(APITestBase):
                 )
             del inputs_list, result_outputs, result_outputs_grads
         except GpuMemoryGuardSkip as err:
+            # 合并模式下不能在此写终态，否则会与随后合并出的终态重复；交给 test() 统一上报。
+            if self._torch_failure is not None:
+                raise
             self.report_case_result("oom", stage=self.STAGE_PADDLE_BACKWARD, message=str(err))
             self.clear_runtime_inputs("paddle")
             self.clear_output_grad_cache()
@@ -705,12 +802,31 @@ class APITestAccuracy(APITestBase):
             return False, None
         except Exception as err:
             if str(err).startswith("Too large tensor to get cached numpy: "):
+                if self._torch_failure is not None:
+                    outcome = self._record_paddle_failure_or_raise(
+                        err,
+                        "config_input",
+                        self.STAGE_PADDLE_BACKWARD,
+                        force_log_type="config_input",
+                    )
+                    if outcome == "raise":
+                        raise
+                    return False, None
                 self._report_runtime_error_and_finalize(
                     err,
                     "config_input",
                     self.STAGE_PADDLE_BACKWARD,
                     force_log_type="config_input",
                 )
+                return False, None
+            if self._torch_failure is not None:
+                outcome = self._record_paddle_failure_or_raise(
+                    err,
+                    "paddle_error",
+                    self.STAGE_PADDLE_BACKWARD,
+                )
+                if outcome == "raise":
+                    raise
                 return False, None
             _, fatal = self._report_runtime_error_and_finalize(
                 err,
@@ -724,6 +840,14 @@ class APITestAccuracy(APITestBase):
         try:
             self.check_paddle_kernel_cuda_error()
         except Exception as err:
+            if self._torch_failure is not None:
+                # 与前向同步保持一致：合并模式下统一走 handler，fatal 由它写终态并上抛。
+                outcome = self._record_paddle_failure_or_raise(
+                    err, "paddle_cuda", self.STAGE_PADDLE_BACKWARD_SYNC
+                )
+                if outcome == "raise":
+                    raise
+                return False, None
             self._report_runtime_error_and_finalize(
                 err, "paddle_cuda", self.STAGE_PADDLE_BACKWARD_SYNC
             )
@@ -741,6 +865,66 @@ class APITestAccuracy(APITestBase):
             # _test_accuracy 返回后局部结果引用已经销毁，此时才能可靠清理 allocator cache。
             if self.use_dual_gpu:
                 self._cleanup_accuracy_dual_gpu(force_cache_release=not dual_gpu_completed)
+
+    def _test_paddle_after_torch_failure(self, probe_bytes):
+        """Torch 输入/前向失败后继续执行 Paddle，并在最后合并出唯一终态。
+
+        Torch 未产出参考值，因此本路径不比较精度，只区分「Paddle 能否执行」：
+        失败侧若为 fatal（OOM/CUDA/崩溃/超时）由既有机制立即写终态并上抛，其余组合：
+        - Paddle 成功 → torch_only_error（Torch 独有分歧，Paddle 更宽松或 Torch 有 gap）
+        - 两侧均 config_input → config_input（两框架一致认定该配置非法）
+        - 其余两者都失败 → both_error
+        """
+        # Torch 失败后其输入缓存不再需要，先释放再物化 Paddle 输入，避免双份驻留。
+        self.clear_runtime_inputs("torch")
+        if self.use_gpu_mode:
+            # 与正常路径一致：进入 Paddle 前按当前压力决定是否回收 allocator cache。
+            gpu_mode_memory_decision(
+                self.gpu_mode_config,
+                probe_bytes=probe_bytes,
+            )
+        paddle_success, paddle_output = self.get_paddle_output()
+        if paddle_success and self.need_check_grad():
+            self.is_backward = True
+            paddle_success, _ = self.get_paddle_grad(paddle_output)
+
+        if self._merge_terminal_written:
+            # fatal/skip 已写唯一终态，不允许再合并出第二条分类。
+            self._torch_failure = None
+            self._paddle_failure = None
+            return
+        final_log_type = self._merge_torch_paddle_failure(paddle_success)
+        # 合并终态必须同时保留两侧原始错误，否则日志只剩分类名无法定位。
+        merge_error = self._format_merge_error()
+        # stage 取 torch 失败阶段：合并终态的归因主体是 torch 侧，paddle 细节保留在 error 文本里。
+        merge_stage = self._torch_failure[2]
+        self._torch_failure = None
+        self._paddle_failure = None
+        self.clear_output_grad_cache()
+        self.report_case_result(final_log_type, stage=merge_stage, error=merge_error)
+        self.dump_finalize(final_log_type)
+
+    def _format_merge_error(self):
+        """把两侧错误拼成一条可追溯的诊断文本，不改变分类本身。"""
+        torch_log_type, torch_msg, torch_stage = self._torch_failure
+        lines = [f"[torch] {torch_stage} {torch_log_type}: {torch_msg}"]
+        if self._paddle_failure is not None:
+            paddle_log_type, paddle_msg, paddle_stage = self._paddle_failure
+            lines.append(f"[paddle] {paddle_stage} {paddle_log_type}: {paddle_msg}")
+        else:
+            lines.append("[paddle] forward/backward succeeded")
+        return "\n".join(lines)
+
+    def _merge_torch_paddle_failure(self, paddle_success):
+        """按优先级合并两侧结果；fatal 已在各自阶段写终态，不会到达这里。"""
+        if paddle_success:
+            return "torch_only_error"
+        torch_log_type = self._torch_failure[0]
+        paddle_log_type = self._paddle_failure[0] if self._paddle_failure else "paddle_error"
+        # 只有两侧都被明确识别为配置非法时才归 config_input，保持既有信号语义。
+        if torch_log_type == "config_input" and paddle_log_type == "config_input":
+            return "config_input"
+        return "both_error"
 
     def _test_accuracy(self):
         self.dump_event("api_analyze_start", mode="accuracy")
@@ -772,6 +956,9 @@ class APITestAccuracy(APITestBase):
             torch_grad_success,
         ) = self.get_torch_output(convert_result)
         if not torch_success:
+            if self._torch_failure is not None:
+                # Torch 没有参考值，无法比较精度；继续执行 Paddle 只能判定其能否运行。
+                self._test_paddle_after_torch_failure(probe_bytes)
             return
         torch_output, torch_out_grads = self._prepare_torch_results_for_paddle(
             convert_result,

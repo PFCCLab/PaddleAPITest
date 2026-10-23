@@ -502,6 +502,26 @@ class APITestBase:
             self.memory_governance_metrics = collections.Counter()
         self.memory_governance_metrics[name] += int(amount)
 
+    def describe_runtime_error(
+        self,
+        err,
+        default_log_type,
+        stage: Stage,
+    ):
+        """Classify one runtime error and dump its stage event without writing a terminal result.
+
+        accuracy 模式在 torch 失败后仍需执行 paddle，因此正确性判定和结果写盘必须解耦：
+        本方法只负责识别错误类型，由调用方决定是立即写终态还是延迟到合并判定。
+        """
+        err_msg = str(err)
+        # dump 事件保留阶段派生名，inorder 日志使用统一直接文本。
+        if stage:
+            self.dump_error(f"{stage.lower().replace(' ', '_')}_error", err)
+        log_type, fatal = classify_runtime_error(err_msg)
+        if log_type is None:
+            log_type = default_log_type
+        return log_type, fatal, err_msg
+
     def report_runtime_error(
         self,
         err,
@@ -517,15 +537,9 @@ class APITestBase:
         force_log_type changes the emitted log bucket only; fatal/nonfatal still comes
         from classify_runtime_error().
         """
-        err_msg = str(err)
-        # dump 事件保留阶段派生名，inorder 日志使用统一直接文本。
-        if stage:
-            self.dump_error(f"{stage.lower().replace(' ', '_')}_error", err)
-        log_type, fatal = classify_runtime_error(err_msg)
+        log_type, fatal, err_msg = self.describe_runtime_error(err, default_log_type, stage)
         if force_log_type is not None:
             log_type = force_log_type
-        if log_type is None:
-            log_type = default_log_type
         self.report_case_result(
             log_type,
             stage=stage,
