@@ -676,6 +676,7 @@ def _normalize_sanitizer_exitcode(output, *, returncode, sanitizer_error_exitcod
         return returncode
     # 仅把 sanitizer 的协议码转换为统一 fatal 码，普通 child 退出码保持原语义。
     # Torch 已写出的终态会出现在 child 输出中；OOM 仍由共享文本规则优先识别。
+    # 只认 torch_error：合并出的 torch_only_error/both_error 不是 fatal 终态，不参与退出码还原。
     terminal_log_type = "torch_error" if "[torch_error]" in output.lower() else None
     fatal_log_type = _fatal_log_type_for_error(output, terminal_log_type)
     return log_worker.fatal_exit_code(fatal_log_type or "paddle_cuda", False)

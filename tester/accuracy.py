@@ -835,6 +835,14 @@ class APITestAccuracy(APITestBase):
         try:
             self.check_paddle_kernel_cuda_error()
         except Exception as err:
+            if self._torch_failure is not None:
+                # 与前向同步保持一致：合并模式下统一走 handler，fatal 由它写终态并上抛。
+                outcome = self._record_paddle_failure_or_raise(
+                    err, "paddle_cuda", self.STAGE_PADDLE_BACKWARD_SYNC
+                )
+                if outcome == "raise":
+                    raise
+                return False, None
             self._report_runtime_error_and_finalize(
                 err, "paddle_cuda", self.STAGE_PADDLE_BACKWARD_SYNC
             )
@@ -883,10 +891,12 @@ class APITestAccuracy(APITestBase):
         final_log_type = self._merge_torch_paddle_failure(paddle_success)
         # 合并终态必须同时保留两侧原始错误，否则日志只剩分类名无法定位。
         merge_error = self._format_merge_error()
+        # stage 取 torch 失败阶段：合并终态的归因主体是 torch 侧，paddle 细节保留在 error 文本里。
+        merge_stage = self._torch_failure[2]
         self._torch_failure = None
         self._paddle_failure = None
         self.clear_output_grad_cache()
-        self.report_case_result(final_log_type, error=merge_error)
+        self.report_case_result(final_log_type, stage=merge_stage, error=merge_error)
         self.dump_finalize(final_log_type)
 
     def _format_merge_error(self):
