@@ -493,17 +493,24 @@ class AddNRule(BaseRule):
     PADDLE_APIS = ("paddle.add_n",)
 
     def apply(self, paddle_api: str) -> ConvertResult:
-        # 对齐 paddle.add_n（方案 A）：所有输入必须完全同 shape，不广播、不豁免 0D。
-        # 全 0D（同为 []）通过；0D 混 ND 或任意不同形都报错，与 paddle 一致。
+        # 对齐 paddle.add_n（方案 B）：非 0D 输入必须同 shape；0D 可与"单元素"张量
+        # （numel==1，如 [1]/[1,1]）混用，但不能与多元素张量混用；全 0D 通过。
         pre = """
 inputs = [inputs] if torch.is_tensor(inputs) else inputs
-# 复刻删 0D 豁免后的 AddNInferMeta：所有输入 shape 必须一致，否则按 paddle 一样报错
-_ref = tuple(inputs[0].shape)
-for _t in inputs[1:]:
-    if tuple(_t.shape) != _ref:
-        raise ValueError(f"add_n inputs must have same shape: {_ref} vs {tuple(_t.shape)}")
+# 复刻方案B 的 AddNInferMeta：非 0D 必须同 shape；0D 仅能混 numel==1 的张量
+_nd = [t for t in inputs if t.dim() != 0]
+if _nd:
+    _ref = tuple(_nd[0].shape)
+    for _t in _nd[1:]:
+        if tuple(_t.shape) != _ref:
+            raise ValueError(f"add_n inputs must have same shape: {_ref} vs {tuple(_t.shape)}")
+    if len(_nd) != len(inputs) and _nd[0].numel() != 1:
+        raise ValueError(f"add_n: 0-D tensor can only mix with single-element tensors, got {_ref}")
+    _out_shape = _ref
+else:
+    _out_shape = ()
 """
-        core = "result = torch.sum(torch.stack(inputs), dim=0)"
+        core = "result = torch.sum(torch.stack([t.reshape(_out_shape) for t in inputs]), dim=0)"
         return self.build_result(
             paddle_api,
             kind=ConversionKind.COMPOSITE,
