@@ -2630,7 +2630,17 @@ class FusedActDequantRule(BaseRule):
         core = """
 _x = x
 _scale = x_scale
+# 对齐 paddle FusedActDequantInferMeta 的前置校验：非法输入让 torch 与 paddle 同样报错，
+# 避免 rows=0 等被 torch 参考静默放过而造成「torch 过 paddle 挂」的误报。
+if _x.dim() != 2:
+    raise ValueError(f"fused_act_dequant: X must be 2D, but got {_x.dim()}D")
 _rows, _cols = _x.shape
+if _rows <= 0:
+    raise ValueError(f"fused_act_dequant: rows of X should be positive, but received {_rows}")
+if _cols <= 0:
+    raise ValueError(f"fused_act_dequant: cols of X should be positive, but received {_cols}")
+if _scale is not None and _scale.dim() == 2 and _scale.shape[0] != _rows:
+    raise ValueError(f"fused_act_dequant: x_scale rows {_scale.shape[0]} must equal X rows {_rows}")
 _tile_size = 128
 _num_scale_blocks = (_cols + _tile_size - 1) // _tile_size
 _full_blocks = _cols // _tile_size
