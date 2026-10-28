@@ -718,6 +718,7 @@ class APITestAccuracy(APITestBase):
                 err,
                 "paddle_error",
                 self.STAGE_PADDLE_FORWARD,
+                force_log_type=self.paddle_refusal_log_type(err),
             )
             if fatal:
                 raise
@@ -832,6 +833,7 @@ class APITestAccuracy(APITestBase):
                 err,
                 "paddle_error",
                 self.STAGE_PADDLE_BACKWARD,
+                force_log_type=self.paddle_refusal_log_type(err),
             )
             if fatal:
                 raise
