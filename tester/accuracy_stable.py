@@ -1046,6 +1046,7 @@ class APITestAccuracyStable(APITestBase):
                 "paddle_error",
                 # Paddle 稳定性检查不再使用 dynamic/static 自由文本。
                 self.STAGE_PADDLE_FORWARD,
+                force_log_type=self.paddle_refusal_log_type(err),
                 affected_comps=self._PADDLE_AFFECTED_COMPS[iter_idx],
             )
             if fatal:
@@ -1113,6 +1114,7 @@ class APITestAccuracyStable(APITestBase):
                     err,
                     "paddle_error",
                     self.STAGE_PADDLE_BACKWARD,
+                    force_log_type=self.paddle_refusal_log_type(err),
                     affected_comps=self._PADDLE_AFFECTED_COMPS[iter_idx],
                 )
                 return None, None

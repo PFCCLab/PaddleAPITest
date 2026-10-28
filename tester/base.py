@@ -522,6 +522,20 @@ class APITestBase:
             log_type = default_log_type
         return log_type, fatal, err_msg
 
+    def paddle_refusal_log_type(self, err):
+        """Torch 已跑通时，Paddle 自报的「输入不合法」不该算语料问题。
+
+        classify_runtime_error 把 (InvalidArgument)/(PreconditionNotMet)/(OutOfRange)
+        判成 config_input 并覆盖调用方的 paddle_error 默认值。但这类 tag 只是 Paddle
+        单方面的判断：同一份配置 Torch 已经产出结果，两侧的分歧本身才是被测对象，
+        归入 config_input 会被当成脏语料过滤掉。
+
+        只供「Torch 先跑通、再执行 Paddle」的 tester 在 Paddle 侧调用点使用，
+        作为 report_runtime_error 的 force_log_type 入参；返回 None 表示不干预。
+        """
+        log_type, _ = classify_runtime_error(str(err))
+        return "paddle_error" if log_type == "config_input" else None
+
     def report_runtime_error(
         self,
         err,
