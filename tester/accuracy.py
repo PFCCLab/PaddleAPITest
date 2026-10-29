@@ -771,6 +771,21 @@ class APITestAccuracy(APITestBase):
         self._paddle_failure = (log_type, err_msg, stage)
         return "deferred"
 
+    def _check_paddle_backward_outputs(self, inputs_list, result_outputs):
+        """输入需要梯度却没有可求导输出时，拒绝把跳过反向当作反向成功。"""
+        if not inputs_list or result_outputs:
+            return
+        # grad 开关被关闭时所有输出都被标记为 stop_gradient，反向实际没有执行。
+        if not paddle.is_grad_enabled():
+            raise RuntimeError(
+                "Paddle grad mode is disabled, all outputs are stop_gradient and backward was skipped"
+            )
+        # Torch 已产出输入梯度时，Paddle 无可求导输出本身就是两侧分歧。
+        if self._torch_failure is None:
+            raise RuntimeError(
+                "Paddle produced no differentiable outputs while Torch produced input grads"
+            )
+
     def get_paddle_grad(self, paddle_output):
         paddle_out_grads = None
         try:
@@ -784,6 +799,7 @@ class APITestAccuracy(APITestBase):
                 result_outputs_grads,
             )
             del self.paddle_args, self.paddle_kwargs
+            self._check_paddle_backward_outputs(inputs_list, result_outputs)
             if inputs_list and result_outputs and result_outputs_grads:
                 paddle_out_grads = paddle.grad(
                     result_outputs,

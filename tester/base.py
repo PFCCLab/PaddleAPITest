@@ -431,6 +431,14 @@ class APITestBase:
         from .input_generation.backend_runtime import reset_output_grad_streams
 
         reset_output_grad_streams()
+        # Paddle 组合反向抛异常时不会恢复全局 grad 开关，常驻 worker 必须逐 case 恢复，
+        # 否则后续 case 的输出全部变成 stop_gradient，反向被静默跳过。
+        if not paddle.is_grad_enabled():
+            print(
+                f"[warning] Paddle grad mode was disabled before case, re-enabled: {api_config.config}",
+                flush=True,
+            )
+            paddle.set_grad_enabled(True)
         # 同一 case 的结果树共享设备快照，避免每个叶子重复查询 CUDA allocator。
         self.comparison_workspace_cache = {}
         if use_torch:
