@@ -2078,6 +2078,10 @@ def generate_put_along_axis_inputs(rule: InputRuleContext):
         if 0 <= axis < x_dims:
             dim_size = x_shape[axis]
             width = current_shape[-1]
+            # 被索引轴为空(dim_size==0)时无合法 index：choice(0,...) 会在输入生成阶段崩。保持全 0
+            # (indices 已 zeros)，让 case 走到前向，由 torch/paddle 一致按越界报错。
+            if dim_size <= 0:
+                return indices
             if width <= dim_size:
                 return generate_unique_indices(dim_size, width, current_shape[:-1])
             for idx in rule.ops.ndindex(tuple(current_shape[:-1])):
@@ -2528,6 +2532,10 @@ def generate_tensor_getitem_inputs(rule: InputRuleContext):
         numel = shape_numel(input_binding.shape)
         if input_binding.dtype == "bool":
             indices = rule.ops.choice([0, 1], shape=numel)
+        elif min_dim <= 0:
+            # 源 Tensor 含 0-size 维时 min_dim==0，randint(0,0) 会在输入生成阶段崩。退化为全 0
+            # 索引，让 case 走到前向，由 torch/paddle 一致按越界报错而非卡在输入生成。
+            indices = rule.ops.zeros(numel, dtype="int64")
         else:
             indices = rule.ops.randint(0, min_dim, shape=numel)
         return rule.ops.cast(
@@ -2560,6 +2568,9 @@ def generate_tensor_setitem_inputs(rule: InputRuleContext):
                 indices[true_indices] = 1
             else:
                 indices = rule.ops.choice([0, 1], shape=numel)
+        elif min_dim <= 0:
+            # 源含 0-size 维 → min_dim==0，randint(0,0) 会崩；退化全 0 索引，交前向一致按越界报错。
+            indices = rule.ops.zeros(numel, dtype="int64")
         else:
             indices = rule.ops.randint(0, min_dim, shape=numel)
         return rule.ops.cast(
@@ -2605,6 +2616,10 @@ def generate_take_inputs(rule: InputRuleContext):
     def generate_index_input_value(input_binding):
         x = rule.arg("x")
         dim_size = shape_numel(x.shape)
+        # x 没有任何元素时 take 无合法下标，randint(0, 0) 会在输入生成阶段崩。退化为全 0 索引：
+        # 空 index 仍是合法空 take，非空 index 则交前向按越界处理，让 torch/paddle 都走到前向。
+        if dim_size <= 0:
+            return rule.ops.zeros(input_binding.shape, dtype=input_binding.dtype)
         return rule.ops.cast(
             rule.ops.randint(0, dim_size, shape=input_binding.shape),
             input_binding.dtype,
@@ -2625,6 +2640,12 @@ def generate_gather_inputs(rule: InputRuleContext):
                 axis = axis.shape[0]
         else:
             axis = 0
+        # 被索引轴为 0-size 时无合法索引：randint(0,0) 会在输入生成阶段直接崩。退化为全 0 索引——
+        # 空 index 即合法空 gather，非空 index 则交前向按越界报错，torch/paddle 前向一致落 config_input。
+        if x.shape[axis] <= 0:
+            return rule.ops.cast(
+                rule.ops.zeros(input_binding.shape), input_binding.dtype
+            )
         return rule.ops.cast(
             rule.ops.randint(0, x.shape[axis], shape=input_binding.shape),
             input_binding.dtype,
@@ -2653,6 +2674,9 @@ def generate_gather_nd_inputs(rule: InputRuleContext):
         index_shape = rule.arg("index").shape
         result = rule.ops.zeros(index_shape, dtype=input_binding.dtype)
         for index in range(index_shape[-1]):
+            # 对应维为 0-size 时保持 0（result 已 zeros），避免 randint(0,0) 崩，交前向按越界报错。
+            if x_shape[index] <= 0:
+                continue
             result[..., index] = rule.ops.randint(0, x_shape[index], shape=result[..., index].shape)
         return result
 
@@ -2692,6 +2716,9 @@ def generate_take_along_axis_inputs(rule: InputRuleContext):
         num_elements = shape_numel(input_binding.shape)
         if num_elements == 0:
             indices = rule.ops.asarray([], dtype=dtype)
+        elif dim_size <= 0:
+            # 目标轴为 0-size 时无合法索引，退化为全 0，交前向按越界报错而非输入生成崩溃。
+            indices = rule.ops.zeros(num_elements, dtype=dtype)
         elif dim_size == 1:
             indices = rule.ops.zeros(num_elements, dtype=dtype)
         elif num_elements == 1:
@@ -3117,6 +3144,10 @@ def generate_scatter_inputs(rule: InputRuleContext):
     def generate_index_input_value(input_binding):
         x = rule.arg("x")
         first_dim = x.shape[0]
+        # x 首维为 0 时 scatter 无合法下标（choice/randint 的上界都是 0 会崩）。退化为全 0 索引，
+        # 交前向按越界处理，让 torch/paddle 都走到前向而不是死在输入生成阶段。
+        if first_dim <= 0:
+            return rule.ops.zeros(input_binding.shape, dtype=input_binding.dtype)
         overwrite = rule.arg("overwrite")
         if (overwrite is None or overwrite is True) and (
             input_binding.shape == () or input_binding.shape[0]
@@ -3635,9 +3666,9 @@ def generate_cholesky_inputs(rule: InputRuleContext):
 
     def generate_x_input_value(input_binding):
         if len(input_binding.shape) < 2 or input_binding.shape[-1] != input_binding.shape[-2]:
-            raise ValueError(
-                "Shape must have at least 2 dimensions and last two dimensions must be equal"
-            )
+            # 非方阵/不足 2 维是非法 cholesky 输入。改为生成同 shape 的普通张量而非在输入生成阶段
+            # 抛错，让 case 走到前向由 torch/paddle 一致地拒绝（否则卡在输入阶段测不到前向处理）。
+            return rule.default(input_binding)
         batch_dims = input_binding.shape[:-2]
         matrix_dim = input_binding.shape[-1]
         if input_binding.dtype.startswith("complex"):
@@ -3712,9 +3743,10 @@ def generate_eigen_symmetric_inputs(rule: InputRuleContext):
 
     def generate_x_input_value(input_binding):
         if len(input_binding.shape) < 2 or input_binding.shape[-1] != input_binding.shape[-2]:
-            raise ValueError(
-                "Shape must have at least 2 dimensions and last two dimensions must be equal"
-            )
+            # 非方阵/不足 2 维是非法 eigh/eigvalsh 输入。此前直接在输入生成阶段抛错，case 走不到
+            # 前向，无法检验 paddle 对该错误的处理。改为生成一个同 shape 的普通张量，让前向去
+            # 一致地报错（两框架都应拒绝非方阵）。
+            return rule.default(input_binding)
         batch_dims = input_binding.shape[:-2]
         matrix_dim = input_binding.shape[-1]
         if input_binding.dtype.startswith("complex"):
