@@ -9579,6 +9579,8 @@ class CopsRunCustomOpRule(BaseRule):
     Dispatches to per-op torch implementations based on op_name (first arg).
     Currently supported:
       - "fused_swiglu_bwd": dy, x → compute grad of swiglu
+      - "fused_swiglu_scale": x, scale → scaled swiglu fwd
+      - "fused_swiglu_scale_bwd": x, scale, dy → scaled swiglu bwd
       - "fused_swiglu_scale_clamp": x, scale, max_val → scaled+clamped swiglu fwd
       - "fused_swiglu_scale_clamp_bwd": x, scale, dy, max_val → scaled+clamped swiglu bwd
       - "fused_swiglu_probs_bwd": o1, do2_s, unzipped_probs, inplace → weighted swiglu bwd
@@ -9808,6 +9810,121 @@ elif op_name == "fused_swiglu_scale_clamp_bwd":
         .to(_scale_dtype)
     )
     result = [dx, d_scale]
+
+elif op_name in ("fused_swiglu_scale", "fused_swiglu_scale_bwd"):
+    # _run_custom_op("fused_swiglu_scale", x, scale)
+    # _run_custom_op("fused_swiglu_scale_bwd", x, scale, dy)
+    # 对齐 paddlefleet_ops/_extensions/fuse_swiglu_scale.cu 的 kHasClamp=false 分支:
+    #   sig = sigmoid(g); silu = g * sig; swiglu = silu * v   # 全程 fp32
+    #   fwd: out = (T)(swiglu * s)
+    #   bwd: d_u = dout * s
+    #        d_v = (T)(d_u * silu)
+    #        d_g = (T)(d_u * v * sig * (1 + g*(1-sig)))   # 乘法顺序与 clamp 分支不同
+    #        d_scale = (ScaleT)sum_fp32(dout * swiglu)    # 不像 clamp 分支先压回 x.dtype
+    # d_scale 形状与 Scale 相同（FusedGradInferShape），不是固定的 [rows, 1]。
+    _is_bwd = op_name == "fused_swiglu_scale_bwd"
+    x = arg1
+    scale = arg2
+    d_out = arg3 if _is_bwd else None
+    if x.ndim != 2 or x.shape[-1] % 2 != 0:
+        raise ValueError(
+            f"(InvalidArgument) {op_name} expects X shape [rows, 2 * hidden_size], "
+            f"but got {tuple(x.shape)}"
+        )
+    _rows = x.shape[0]
+    _hidden = x.shape[1] // 2
+    if scale.numel() != _rows or tuple(scale.shape) not in ((_rows,), (_rows, 1)):
+        raise ValueError(
+            f"(InvalidArgument) {op_name} expects Scale shape [{_rows}] or "
+            f"[{_rows}, 1], but got {tuple(scale.shape)}"
+        )
+    # kernel 只实例化 (bf16, fp32)、(bf16, bf16)、(fp32, fp32) 三种组合。
+    if (x.dtype, scale.dtype) not in (
+        (torch.bfloat16, torch.float32),
+        (torch.bfloat16, torch.bfloat16),
+        (torch.float32, torch.float32),
+    ):
+        raise TypeError(
+            f"{op_name} only supports (X, Scale) dtypes (bfloat16, float32) / "
+            f"(bfloat16, bfloat16) / (float32, float32), but got "
+            f"({x.dtype}, {scale.dtype})"
+        )
+    if _is_bwd:
+        if tuple(d_out.shape) != (_rows, _hidden):
+            raise ValueError(
+                f"(InvalidArgument) {op_name} expects DOut shape [{_rows}, "
+                f"{_hidden}], but got {tuple(d_out.shape)}"
+            )
+        if d_out.dtype != x.dtype:
+            raise TypeError(
+                f"{op_name} expects DOut to share X's dtype, but got "
+                f"{d_out.dtype} and {x.dtype}"
+            )
+    _vec_size = 8 if x.dtype == torch.bfloat16 else 4
+    if _rows > 0 and _hidden % _vec_size != 0:
+        raise ValueError(
+            f"(InvalidArgument) {op_name} expects hidden_size divisible by "
+            f"{_vec_size}, but got {_hidden}"
+        )
+
+    _scale_flat = scale.reshape(-1)
+    if _is_bwd:
+        _dx_out = torch.empty_like(x)
+        # 空 batch 时 host wrapper 返回 zeros 的 d_scale，不读未初始化内存。
+        _dscale_out = torch.zeros(_rows, dtype=scale.dtype, device=x.device)
+        # 每行约 8 个 fp32 [chunk, hidden] 中间量，另有 x/dout 读入和 2 份 x.dtype 写出。
+        _bytes_per_row = max(1, _hidden * (4 * 8 + x.element_size() * 4))
+    else:
+        _out = torch.empty([_rows, _hidden], dtype=x.dtype, device=x.device)
+        _bytes_per_row = max(1, _hidden * (4 * 4 + x.element_size() * 3))
+    if _rows > 0 and _hidden > 0:
+        _workspace_bytes = _adaptive_workspace_bytes(torch, locals())
+        _row_chunk = max(1, min(_rows, _workspace_bytes // _bytes_per_row))
+        _one = torch.ones((), dtype=torch.float32, device=x.device)
+        with torch.no_grad():
+            for _row_start in range(0, _rows, _row_chunk):
+                _row_end = min(_rows, _row_start + _row_chunk)
+                _gate = x[_row_start:_row_end, :_hidden].to(torch.float32)
+                _val = x[_row_start:_row_end, _hidden:].to(torch.float32)
+                _s = _scale_flat[_row_start:_row_end].to(torch.float32).unsqueeze(-1)
+                _sig = torch.sigmoid(_gate)
+                _silu = _gate * _sig
+                if not _is_bwd:
+                    _out[_row_start:_row_end] = (_silu * _val * _s).to(x.dtype)
+                    continue
+                _dout_c = d_out[_row_start:_row_end].to(torch.float32)
+                _swiglu = _silu * _val
+                # d_scale 逐位复刻 kernel 归约顺序：线程 tid 依次处理
+                # col = k*256*VEC + tid*VEC + i，局部和 += dout*swiglu 收缩为 FMA，
+                # 再对 256 个线程做共享内存树形归约；torch.sum 的顺序会改变低位。
+                _acc = torch.zeros(
+                    (_row_end - _row_start, 256), dtype=torch.float32, device=x.device
+                )
+                for _col_start in range(0, _hidden, 256 * _vec_size):
+                    _col_end = min(_hidden, _col_start + 256 * _vec_size)
+                    _threads = (_col_end - _col_start) // _vec_size
+                    _dout_k = _dout_c[:, _col_start:_col_end].reshape(-1, _threads, _vec_size)
+                    _sw_k = _swiglu[:, _col_start:_col_end].reshape(-1, _threads, _vec_size)
+                    for _i in range(_vec_size):
+                        _acc[:, :_threads] = torch.addcmul(
+                            _acc[:, :_threads], _dout_k[..., _i], _sw_k[..., _i]
+                        )
+                _stride = 128
+                while _stride > 0:
+                    _acc[:, :_stride] = _acc[:, :_stride] + _acc[:, _stride : 2 * _stride]
+                    _stride //= 2
+                _dscale_out[_row_start:_row_end] = _acc[:, 0].to(scale.dtype)
+                del _swiglu, _acc
+                _d_u = _dout_c * _s
+                _dx_out[_row_start:_row_end, _hidden:] = (_d_u * _silu).to(x.dtype)
+                # 1.0f + g*(1.0f-sig) 在 kernel 中会收缩成单条 FMA，用 addcmul 对齐舍入。
+                _dx_out[_row_start:_row_end, :_hidden] = (
+                    _d_u * _val * _sig * torch.addcmul(_one, _gate, 1.0 - _sig)
+                ).to(x.dtype)
+    if _is_bwd:
+        result = [_dx_out, _dscale_out.reshape(scale.shape)]
+    else:
+        result = [_out]
 
 elif op_name in ("fused_swiglu_probs_bwd", "paddlefleet_fused_swiglu_probs_bwd"):
     # _run_custom_op("fused_swiglu_probs_bwd", o1, do2_s, unzipped_probs, inplace)
