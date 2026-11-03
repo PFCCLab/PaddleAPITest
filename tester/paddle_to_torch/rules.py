@@ -3469,6 +3469,15 @@ axis = axis
 if isinstance(axis,torch.Tensor):
     axis = axis.item()
 axis = int(axis)
+# 对齐 paddle GatherInferMeta：被索引轴为 0-size 而 index 非空时没有任何合法下标，paddle 在 host 侧
+# 直接抛越界。torch 参考若继续执行会在 CUDA 上触发 device-side assert 并污染上下文，故在此前置抛错，
+# 使两侧都是干净的越界报错。
+_axis_v = axis + x.dim() if axis < 0 else axis
+if x.dim() > 0 and 0 <= _axis_v < x.dim() and x.shape[_axis_v] == 0 and index.numel() > 0:
+    raise ValueError(
+        f"gather: index is out of bounds, dimension {_axis_v} of x has size 0 "
+        f"but index has {index.numel()} elements"
+    )
 if len(index.shape) == 0:
     result = torch.squeeze(torch.narrow(x, axis, index, 1),axis)
 elif index.numel()==0:
