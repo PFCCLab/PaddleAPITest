@@ -465,6 +465,12 @@ class TensorConfig:
             if requires_grad:
                 tensor = tensor.detach().requires_grad_(True)
             return tensor
+        if getattr(value, "size", None) == 0 and hasattr(value, "shape"):
+            # torch.tensor 由 0 元素 ndarray 构造时 stride 全为 0，会让 view(dtype) 等
+            # stride 敏感的 API 误报；空张量没有数据可拷，按 shape 建标准连续 layout。
+            return torch.empty(
+                tuple(value.shape), dtype=dtype, device=device, requires_grad=requires_grad
+            )
         return torch.tensor(value, dtype=dtype, device=device, requires_grad=requires_grad)
 
     def clear_tensor(self, api_config=None):
