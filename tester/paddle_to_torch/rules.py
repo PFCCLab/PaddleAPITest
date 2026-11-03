@@ -6843,6 +6843,10 @@ if not overwrite:
 else:
     for i in range(index.shape[0]):
         x[index[i]] = updates[i]
+if index.shape[0] == 0:
+    # 空 index 时上面的循环不读 updates，torch 会给出 None 梯度；
+    # 用空切片的 index_copy 把 updates 接入计算图，前向不变，updates 梯度为全 0（与 paddle 语义一致）
+    x = torch.index_copy(x, 0, index.view(-1), updates[:0])
 result = x
 """
         return self.build_result(
