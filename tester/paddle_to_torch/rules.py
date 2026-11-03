@@ -6843,10 +6843,6 @@ if not overwrite:
 else:
     for i in range(index.shape[0]):
         x[index[i]] = updates[i]
-if index.shape[0] == 0:
-    # 空 index 时上面的循环不读 updates，torch 会给出 None 梯度；
-    # 用空切片的 index_copy 把 updates 接入计算图，前向不变，updates 梯度为全 0（与 paddle 语义一致）
-    x = torch.index_copy(x, 0, index.view(-1), updates[:0])
 result = x
 """
         return self.build_result(
@@ -9396,15 +9392,7 @@ y    = y
 
 dout = dout
 
-# torch 没有原生 swiglu_grad，逐元素拼接会隐式广播 dout；
-# 这里先按 Paddle 定义严格校验 dout 形状，避免把 [1, C] / [C] 之类的非法 dout 当成合法输入
 if y is None:
-    expected = tuple(x.shape[:-1]) + (x.shape[-1] // 2,)
-    if x.shape[-1] % 2 != 0 or tuple(dout.shape) != expected:
-        raise ValueError(
-            f"swiglu_grad: dout shape {tuple(dout.shape)} must equal {expected} "
-            f"for x shape {tuple(x.shape)} when y is None"
-        )
     C = x.shape[-1] // 2
     a = x[..., :C]
     b = x[..., C:]
@@ -9415,28 +9403,10 @@ if y is None:
     dx = torch.cat([da, db], dim=-1)
     dy = None
 else:
-    # 与 Paddle SwiGLUInferMeta 一致：x / y 任一为 0-size 时允许形状不同，
-    # 此时前向 out（即 dout）仅在 x 非空、y 为空时取 y 的形状，否则取 x 的形状
-    x_empty = x.numel() == 0
-    y_empty = y.numel() == 0
-    if not x_empty and not y_empty and x.shape != y.shape:
-        raise ValueError(
-            f"swiglu_grad: y shape {tuple(y.shape)} must equal x shape {tuple(x.shape)}"
-        )
-    out_shape = y.shape if (not x_empty and y_empty) else x.shape
-    if dout.shape != out_shape:
-        raise ValueError(
-            f"swiglu_grad: dout shape {tuple(dout.shape)} must equal out shape {tuple(out_shape)}"
-        )
-    if x_empty or y_empty:
-        # 前向输出为空，Paddle 返回与各自输入同形状的全 0 梯度
-        dx = torch.zeros_like(x)
-        dy = torch.zeros_like(y)
-    else:
-        sig_x = torch.sigmoid(x)
-        silu_x = torch.nn.functional.silu(x)
-        dy = dout * silu_x
-        dx = (dout * y) * sig_x * (1.0 + x * (1.0 - sig_x))
+    sig_x = torch.sigmoid(x)
+    silu_x = torch.nn.functional.silu(x)
+    dy = dout * silu_x
+    dx = (dout * y) * sig_x * (1.0 + x * (1.0 - sig_x))
 
 result = [dx, dy]
 """
