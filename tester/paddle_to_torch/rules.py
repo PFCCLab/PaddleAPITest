@@ -7398,8 +7398,57 @@ y = y
 
 if y == None:
     x, y = torch.chunk(x, 2, dim=-1)
+# 对齐 SwiGLUFunctor：半精度升到 fp32 算完整个表达式，只在写出时舍入一次。
+# 表达式顺序必须与 kernel 的 mp_y * mp_x / (1 + exp(-mp_x)) 一致，
+# 换成 silu(x) * y 即使在 fp32 下也会改变舍入，仍有少量元素差 1 个 ULP。
+_mp = torch.float32 if x.dtype in (torch.bfloat16, torch.float16) else x.dtype
+
+
+class _SwigluMPFunc(torch.autograd.Function):
+    \"\"\"按行分块的 fp32 参考实现，反向沿用 SwiGLUGradFunctor 的表达式。\"\"\"
+
+    @staticmethod
+    def _plan(ref, bytes_per_element):
+        # fp32 中间量在 1M 级 shape 下可达数百 GB，必须按行切块而不是整块物化。
+        rows = ref.shape[0] if ref.dim() > 0 else 0
+        if rows == 0:
+            return 0, 1
+        row_numel = max(1, ref.numel() // rows)
+        budget = _adaptive_workspace_bytes(torch, {"ref": ref})
+        return rows, max(1, min(rows, budget // max(1, row_numel * bytes_per_element)))
+
+    @staticmethod
+    def forward(ctx, xt, yt):
+        ctx.save_for_backward(xt, yt)
+        out = torch.empty_like(xt)
+        rows, chunk = _SwigluMPFunc._plan(xt, _mp.itemsize * 4 + xt.element_size() * 3)
+        for start in range(0, rows, chunk):
+            stop = min(rows, start + chunk)
+            xm = xt[start:stop].to(_mp)
+            ym = yt[start:stop].to(_mp)
+            out[start:stop] = (ym * xm / (1.0 + torch.exp(-xm))).to(xt.dtype)
+        return out
+
+    @staticmethod
+    def backward(ctx, gout):
+        xt, yt = ctx.saved_tensors
+        gx = torch.empty_like(xt) if ctx.needs_input_grad[0] else None
+        gy = torch.empty_like(yt) if ctx.needs_input_grad[1] else None
+        rows, chunk = _SwigluMPFunc._plan(xt, _mp.itemsize * 5 + xt.element_size() * 4)
+        for start in range(0, rows, chunk):
+            stop = min(rows, start + chunk)
+            xm = xt[start:stop].to(_mp)
+            dz = gout[start:stop].to(_mp)
+            sig = 1.0 / (1.0 + torch.exp(-xm))
+            tmp = xm * sig
+            if gx is not None:
+                ym = yt[start:stop].to(_mp)
+                gx[start:stop] = (dz * ym * sig * (1.0 + xm - tmp)).to(xt.dtype)
+            if gy is not None:
+                gy[start:stop] = (dz * tmp).to(yt.dtype)
+        return gx, gy
 """
-        core = "result = torch.nn.functional.silu(x) * y"
+        core = "result = _SwigluMPFunc.apply(x, y)"
         return self.build_result(
             paddle_api,
             kind=ConversionKind.COMPOSITE,
@@ -9374,19 +9423,19 @@ class CopsSwigluGradRule(BaseRule):
 
     Backward derivatives (y given):
         dy = dout * silu(x)
-        dx = dout * y * sigmoid(x) * (1 + x * (1 - sigmoid(x)))
+        dx = dout * y * sigmoid(x) * (1 + x - x * sigmoid(x))
 
     Backward derivatives (y is None — split last dim):
         let a = x[..., :C], b = x[..., C:]
-        da = silu_backward(dout * b, a)
-        db = dout * silu(a)
+        da = dout * b * sigmoid(a) * (1 + a - a * sigmoid(a))
+        db = dout * a * sigmoid(a)
         dx = concat([da, db], dim=-1); dy is returned as None to match
         Paddle's uninitialized second output (the framework comparator
         accepts `paddle uninitialized + torch None` as a pass).
 
-    Use Torch's native silu implementation for the corresponding SiLU value.
-    The SiLU derivative is kept analytical because Torch does not expose a full
-    swiglu_grad op and aten::silu_backward is not bitwise aligned here.
+    The whole expression is evaluated in the Paddle MPType (fp32 for bf16/fp16)
+    and rounded once on store, mirroring SwiGLUGradFunctor. Torch's silu is not
+    used because it rounds the intermediate value in half precision.
     """
 
     def apply(self, paddle_api: str) -> ConvertResult:
@@ -9396,21 +9445,36 @@ y    = y
 
 dout = dout
 
-if y is None:
-    C = x.shape[-1] // 2
-    a = x[..., :C]
-    b = x[..., C:]
-    sig_a = torch.sigmoid(a)
-    silu_a = torch.nn.functional.silu(a)
-    da = (dout * b) * sig_a * (1.0 + a * (1.0 - sig_a))
-    db = dout * silu_a
-    dx = torch.cat([da, db], dim=-1)
-    dy = None
-else:
-    sig_x = torch.sigmoid(x)
-    silu_x = torch.nn.functional.silu(x)
-    dy = dout * silu_x
-    dx = (dout * y) * sig_x * (1.0 + x * (1.0 - sig_x))
+# 对齐 SwiGLUGradFunctor：半精度升到 fp32 算完整个表达式，只在写出时转回原 dtype。
+# 乘法顺序与 (one + mp_x - tmp) 的写法都不能改：换成 1 + x * (1 - sig) 在 fp32 下
+# 仍会让少量元素差 1 个 ULP。
+_mp = torch.float32 if x.dtype in (torch.bfloat16, torch.float16) else x.dtype
+_combine = y is None
+_C = x.shape[-1] // 2
+dx = torch.empty_like(x)
+dy = None if _combine else torch.empty_like(y)
+# y 为 None 时 kernel 把 dx、dy 写进同一块缓冲的前后两半；先取出视图再分块，
+# 这样 1 维输入按首维切块也不会把 a / b 切错。
+_xa = x[..., :_C] if _combine else x
+_xb = x[..., _C:] if _combine else y
+_dxa = dx[..., :_C] if _combine else dx
+_dxb = dx[..., _C:] if _combine else dy
+# fp32 中间量在 1M 级 shape 下可达数百 GB，按行分块后峰值只有一块的大小。
+_rows = _xa.shape[0] if _xa.dim() > 0 else 0
+_row_numel = max(1, _xa.numel() // _rows) if _rows else 1
+_bytes_per_element = _mp.itemsize * 5 + x.element_size() * 4
+_workspace_bytes = _adaptive_workspace_bytes(torch, locals())
+_row_chunk = max(1, min(_rows, _workspace_bytes // max(1, _row_numel * _bytes_per_element)))
+with torch.no_grad():
+    for _start in range(0, _rows, _row_chunk):
+        _stop = min(_rows, _start + _row_chunk)
+        _a = _xa[_start:_stop].to(_mp)
+        _b = _xb[_start:_stop].to(_mp)
+        _dz = dout[_start:_stop].to(_mp)
+        _sig = 1.0 / (1.0 + torch.exp(-_a))
+        _tmp = _a * _sig
+        _dxa[_start:_stop] = (_dz * _b * _sig * (1.0 + _a - _tmp)).to(x.dtype)
+        _dxb[_start:_stop] = (_dz * _tmp).to(x.dtype)
 
 result = [dx, dy]
 """
