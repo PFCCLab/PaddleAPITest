@@ -3110,7 +3110,7 @@ def generate_slice_inputs(rule: InputRuleContext):
 
 
 # scatter 规则依据目标维度生成坐标并保持 updates 的广播关系。
-@input_rules.register("paddle.scatter")
+@input_rules.register("paddle.scatter", aliases=("paddle.scatter_", "paddle.Tensor.scatter_"))
 def generate_scatter_inputs(rule: InputRuleContext):
     """输入规则：按源 Tensor 首维生成 scatter 索引。"""
 

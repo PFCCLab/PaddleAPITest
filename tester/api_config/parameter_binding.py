@@ -55,6 +55,10 @@ INPUT_MANUAL_PARAMETER_NAMES = {
     "paddle.Tensor.detach": ("self",),
     "paddle.Tensor.__getitem__": ("self", "item"),
     "paddle.Tensor.__setitem__": ("self", "item", "value"),
+    # scatter_ 是按首个位置参数分发的重载入口，inspect 只能看到 (*args, **kwargs)；
+    # 这里固定为 (x, index, updates, overwrite) 形态，int 形态由 put_along_axis_ 规则承接。
+    "paddle.scatter_": ("x", "index", "updates", "overwrite"),
+    "paddle.Tensor.scatter_": ("self", "index", "updates", "overwrite"),
     "paddle._C_ops.adam_": (
         "param",
         "grad",
@@ -160,6 +164,8 @@ INPUT_MANUAL_PARAMETER_NAMES = {
 INPUT_MANUAL_PARAMETER_DEFAULTS = {
     # 默认值仅在 apply_defaults=True 的执行调用中展开。
     "paddle.Tensor.copy_": {"blocking": True},
+    "paddle.scatter_": {"overwrite": True},
+    "paddle.Tensor.scatter_": {"overwrite": True},
     "paddle._C_ops._run_custom_op": {f"arg{index}": None for index in range(1, 10)},
     "paddle._C_ops.full_": {"place": None},
     "paddle._C_ops.gaussian": {"place": None},

@@ -6852,6 +6852,47 @@ result = x
         )
 
 
+class ScatterInplaceRule(BaseRule):
+    PADDLE_APIS = ("paddle.scatter_", "paddle.Tensor.scatter_")
+
+    """paddle.scatter_(x, index, updates, overwrite=True) -> 原地版 paddle.scatter。
+
+    Paddle 在 x 上就地写回并返回 x，torch 没有同语义的原地 API，因此沿用 ScatterRule
+    的组合语义，只把结果写回 x 本身。只覆盖 (x, index, updates, overwrite) 这一种调用形态；
+    Paddle 的 scatter_ 在第二个参数为 int 时会转去 put_along_axis_，那条路径由
+    CopsPutAlongAxisRule 负责，这里不处理。
+    """
+
+    def apply(self, paddle_api: str) -> ConvertResult:
+        impl = """
+overwrite = overwrite
+# 在 no_grad 下就地改写：需要梯度的叶子 Tensor 不允许原地修改，与其他 Cops 原地规则一致。
+with torch.no_grad():
+    out = x.clone()
+    index = index.reshape(-1, 1)
+    try:
+        updates = updates.expand_as(x)
+    except Exception:
+        pass
+    # overwrite=False 时先把被选中的行清零，再对重复下标做累加。
+    if not overwrite:
+        for i in range(index.shape[0]):
+            out[index[i]] = torch.zeros_like(out[index[i]])
+        for i in range(index.shape[0]):
+            out[index[i]] += updates[i]
+    else:
+        for i in range(index.shape[0]):
+            out[index[i]] = updates[i]
+    x.copy_(out)
+result = x
+"""
+        return self.build_result(
+            paddle_api,
+            kind=ConversionKind.COMPOSITE,
+            core=impl.splitlines(),
+        )
+
+
 class ScatterndRule(BaseRule):
     PADDLE_APIS = ("paddle.scatter_nd",)
 
