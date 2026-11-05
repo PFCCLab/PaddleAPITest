@@ -527,7 +527,11 @@ class TorchInputBackend:
 
     def symmetric(self, shape, dtype, max_abs):
         # Torch 保持原生 Tensor 整块生成，避免 Python 分块增加 kernel launch。
-        return self.cast((self.random(shape) - 0.5) * (2 * max_abs), dtype)
+        # 原地 sub_/mul_ 取代 (x-0.5)*scale 的两次 out-of-place 运算,省掉一份同尺寸 float32
+        # 临时量(峰值由 ~8N 降到 ~6N);运算与舍入不变,数值与 out-of-place 逐位一致(已验证)。
+        value = self.random(shape)
+        value.sub_(0.5).mul_(2 * max_abs)
+        return self.cast(value, dtype)
 
     def randint(self, low, high=None, shape=None, dtype=None):
         torch = self._torch()
@@ -889,7 +893,12 @@ class PaddleInputBackend:
 
     def symmetric(self, shape, dtype, max_abs):
         # Paddle 保持原生 Tensor 整块生成，随机值不会回落到 NumPy 主存。
-        return self.cast((self.random(shape) - 0.5) * (2 * max_abs), dtype)
+        # 原地 subtract_/scale_ 取代 (x-0.5)*scale,省掉一份同尺寸临时量;数值逐位一致(已验证)。
+        paddle = self._paddle()
+        value = self.random(shape)
+        value.subtract_(paddle.to_tensor(0.5, dtype=value.dtype))
+        value.scale_(2 * max_abs)
+        return self.cast(value, dtype)
 
     def randint(self, low, high=None, shape=None, dtype=None):
         if high is None:

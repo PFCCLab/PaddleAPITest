@@ -1672,11 +1672,8 @@ class APITestBase:
             cache[cache_key] = working_bytes
             return working_bytes
 
-        if dual_gpu and working_bytes < min_working_bytes:
-            # 双卡结果已经搬运到 comparison 卡，无法退回 CPU 或切换设备继续比较。
-            raise GpuMemoryGuardSkip(
-                "comparison GPU capacity guard: no reserved headroom for bounded compare"
-            )
+        # 原先 dual_gpu 下 headroom 不足即预判跳过(记 oom),实测对可跑通用例系统性误判;
+        # 改为以 min_working_bytes 继续分块比较,真放不下再由上层 OOM 捕获归类。
         working_bytes = max(min_working_bytes, working_bytes)
         cache[cache_key] = working_bytes
         return working_bytes
