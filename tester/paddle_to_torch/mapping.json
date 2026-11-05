@@ -4064,6 +4064,9 @@
     "paddle.scatter": {
         "Rule": "ScatterRule"
     },
+    "paddle.scatter_": {
+        "Rule": "ScatterInplaceRule"
+    },
     "paddle.scatter_nd": {
         "Rule": "ScatterndRule"
     },
@@ -5248,6 +5251,9 @@
     },
     "paddle.Tensor.scale_": {
         "Rule": "CopsScaleRule"
+    },
+    "paddle.Tensor.scatter_": {
+        "Rule": "ScatterInplaceRule"
     },
     "paddle.Tensor.subtract_": {
         "Rule": "CopsSubtractRule"
