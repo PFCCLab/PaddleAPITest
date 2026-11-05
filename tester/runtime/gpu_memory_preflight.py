@@ -13,6 +13,7 @@ from ..input_generation.materialization import (
 )
 from ..input_generation.tensor_config import (
     AUTOGRAD_DTYPES,
+    CAST_THROUGH_INTERMEDIATE_DTYPES,
     FLOAT8_DTYPES,
     FORWARD_ONLY_APIS,
     dtype_element_size,
@@ -145,12 +146,17 @@ def _input_generation_peak(configs):
                 if name == "float16" and numel >= DIRECT_DTYPE_NUMEL_THRESHOLD
                 else numel * 4
             )
-            # bfloat16 当前仍使用 float32 storage，不能套用 float16 的估算。
-            temporary_peak = max(
-                2 * source_bytes,
-                source_bytes + generated_bytes,
-                2 * generated_bytes,
-            )
+            if name in CAST_THROUGH_INTERMEDIATE_DTYPES:
+                # bf16/fp8 生成已改为原地(backend.symmetric),float32 源不再出现两份;
+                # 峰值 = float32 源 + cast 目标 dtype(logical),不再按 2×源估算。
+                temporary_peak = source_bytes + logical_bytes
+            else:
+                # 非 cast 浮点(float32/float64 等)保持原估算,避免 float64 源被低估。
+                temporary_peak = max(
+                    2 * source_bytes,
+                    source_bytes + generated_bytes,
+                    2 * generated_bytes,
+                )
         peak_bytes = max(peak_bytes, resident_bytes + temporary_peak)
         resident_bytes += generated_bytes
     return max(peak_bytes, resident_bytes)
