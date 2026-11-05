@@ -92,6 +92,10 @@ def build_materialization_plan(config, input_backend, framework, *, input_source
         reuses_source = input_source_on_gpu and not cast_required
         persistent_bytes = 0 if reuses_source else target_bytes
         temporary_bytes = 0 if reuses_source else target_bytes
+        if cast_required and not input_source_on_gpu:
+            # CPU 源先搬中间 dtype 到 GPU，再 cast；两份 storage 在转换时同时存活。
+            # GPU 原生源由阶段公共组件统计，不能在此重复累计。
+            temporary_bytes += generated_value_nbytes(config)
         return MaterializationPlan(persistent_bytes, temporary_bytes, source_bytes, temporary_bytes)
 
     flat_bytes = _materialization_intermediate_bytes(config)

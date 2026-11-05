@@ -347,25 +347,14 @@ def estimate_gpu_memory(
             if torch_operator_on_gpu
             else 0
         )
-        # 两侧从同一 CPU snapshot 顺序重建，分别统计才能表达 Paddle CPU + Torch GPU。
-        stable_torch_framework_peak = 0
-        if torch_operator_on_gpu:
-            stable_torch_framework_peak, _ = _framework_materialization(
-                configs,
-                "numpy",
-                "torch",
-                input_source_on_gpu=False,
-                force_clone=force_input_copy,
-            )
-        stable_paddle_framework_peak = 0
-        if paddle_kernel_on_gpu:
-            stable_paddle_framework_peak, _ = _framework_materialization(
-                configs,
-                "numpy",
-                "paddle",
-                input_source_on_gpu=False,
-                force_clone=force_input_copy,
-            )
+        # snapshot 已保存最终 dtype 和布局；重建直接 copy，不再经过生成值的 cast。
+        # 原地 API 的隔离副本仍与重建输入同时存活，不能漏掉 clone 峰值。
+        stable_framework_peak = sum(_framework_live_input_bytes(config) for config in configs)
+        if force_input_copy:
+            stable_framework_peak *= 2
+        # 两侧从同一 CPU snapshot 顺序重建，分别统计表达 Paddle CPU + Torch GPU。
+        stable_torch_framework_peak = stable_framework_peak if torch_operator_on_gpu else 0
+        stable_paddle_framework_peak = stable_framework_peak if paddle_kernel_on_gpu else 0
         stages.append(
             MemoryStageEstimate(
                 "stable_input_snapshot",
