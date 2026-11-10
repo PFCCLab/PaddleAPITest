@@ -9,10 +9,19 @@ import yaml
 
 from .accuracy_common import process_grad_output, process_output
 from .base import CUDA_OOM, APITestBase, GpuMemoryGuardSkip, gpu_mode_memory_decision
+from .input_generation.materialization import iter_unique_tensor_configs
 from .paddle_to_torch import ConversionKind, get_converter
 from .paddle_to_torch.arguments import bind_paddle_arguments
 
 _ACCURACY_COMPARISON_WORKSPACE_BYTES = 256 * 1024**2
+
+# torch 的 rms_norm/layer_norm CUDA kernel 共用 layer_norm_kernel.cu,向量化路径按 32-bit 行偏移
+# (blockIdx.x * N)寻址,输入元素数 >2^32 时整型回绕、该行起全部失真。此类参考值不可信且不是
+# Paddle 精度问题,直接跳过精度比较(不与 torch 对比)。
+_TORCH_INDEX_OVERFLOW_APIS = frozenset(
+    {"paddle.nn.functional.rms_norm", "paddle.nn.functional.layer_norm"}
+)
+_TORCH_INDEX_OVERFLOW_NUMEL_LIMIT = 1 << 32
 
 
 class APITestAccuracy(APITestBase):
@@ -167,6 +176,15 @@ class APITestAccuracy(APITestBase):
         if self.api_config.api_name == "paddle._C_ops._run_custom_op":
             return self.paddle_args[0]
         return self.api_config.api_name
+
+    def _skip_due_to_torch_index_overflow(self):
+        """norm 类且任一输入 numel >2^32 时返回 True:torch kernel 32-bit 索引回绕,参考不可信。"""
+        if self.api_config.api_name not in _TORCH_INDEX_OVERFLOW_APIS:
+            return False
+        return any(
+            config.numel() > _TORCH_INDEX_OVERFLOW_NUMEL_LIMIT
+            for config in iter_unique_tensor_configs(self.api_config.args, self.api_config.kwargs)
+        )
 
     def _assert_with_bitwise_knows(self, assertion, *, atol, rtol):
         """严格比较失败后，仅对 YAML 命中的 API 使用已知容差复核。"""
@@ -947,6 +965,15 @@ class APITestAccuracy(APITestBase):
         self.dump_event("api_analyze_start", mode="accuracy")
         if self.need_skip():
             self.report_case_result("skip")
+            self.dump_finalize("skip")
+            return
+        if self._skip_due_to_torch_index_overflow():
+            # >2^32 的 norm:torch 参考因 32-bit 索引回绕失真,无有效参考,跳过精度比较。
+            self.report_case_result(
+                "skip",
+                "input numel exceeds 2^32; torch norm reference unreliable (32-bit index overflow)",
+                stage=self.STAGE_INPUT,
+            )
             self.dump_finalize("skip")
             return
 
