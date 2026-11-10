@@ -81,10 +81,9 @@ class APITestAccuracy(APITestBase):
         if memory_state.free_bytes < target_free_bytes:
             self._release_accuracy_gpu_cache(self.comparison_device_id)
             memory_state = self._accuracy_comparison_memory_state()
-        if memory_state.free_bytes <= memory_state.reserve_bytes + value_bytes:
-            raise GpuMemoryGuardSkip(
-                "accuracy comparison GPU capacity guard: result copy would consume the safe reserve"
-            )
+        # 不再按安全预留“预判跳过”:实测该预判在 1M dual_gpu 用例上误判率 909/913(99.6%),
+        # 结果拷到比较卡其实大多放得下。此处只做尽力的缓存释放,真放不下交由
+        # _move_accuracy_result_to_comparison_gpu 的实际拷贝 + try/except 捕获真 CUDA OOM 再归 oom。
         return value_bytes
 
     def _move_accuracy_result_to_comparison_gpu(self, value):
