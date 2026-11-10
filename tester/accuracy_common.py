@@ -77,7 +77,61 @@ def process_output(api_config, paddle_output, torch_output):
                 paddle_output = paddle_output[:1]
             if isinstance(torch_output, (list, tuple)) and len(torch_output) > 1:
                 torch_output = torch_output[:1]
+    elif (
+        api_config.api_name == "paddle._C_ops._run_custom_op"
+        and api_config.args
+        and api_config.args[0]
+        in {
+            "fuse_weighted_swiglu_fp8_quant",
+            "fuse_weighted_swiglu_fp8_quant_clamp",
+        }
+    ):
+        # fp8 量化算子输出是 [fp8码, scale]，真实值 = 码×scale。scale 是 pow2，边界处
+        # kernel 与参考可能选相邻档位，raw 码会差约 2×（fp8 仅 3 位尾数，放大成夸张差异）。
+        # 这里改比"反量化值 码×scale"：档位差被抵消，只留下真实的量化误差（≤1 fp8 ULP）。
+        # use_ue8m0 时 scale 是打包 int32 指数位，需先解包成 2^(e-127) 再反量化。
+        use_ue8m0 = len(api_config.args) > 4 and bool(api_config.args[4])
+        if (
+            isinstance(paddle_output, (list, tuple))
+            and len(paddle_output) >= 2
+            and isinstance(torch_output, (list, tuple))
+            and len(torch_output) >= 2
+        ):
+            paddle_output = [
+                _dequant_fp8_block(paddle_output[0], paddle_output[1], "paddle", use_ue8m0)
+            ]
+            torch_output = [
+                _dequant_fp8_block(torch_output[0], torch_output[1], "torch", use_ue8m0)
+            ]
     return paddle_output, torch_output
+
+
+def _unpack_ue8m0_scale(packed, nblocks):
+    # 打包规则（见 rules.py）：每个 int32 的低到高 4 字节 = 连续 4 个 block 的 inv_scale 指数位。
+    # 这里反向拆回 [rows, nblocks] 的指数，再还原成 2^(e-127)（inv_scale 为 pow2，尾数恒 0）。
+    p = packed.to(torch.int64) & 0xFFFFFFFF
+    bytes4 = torch.stack([(p >> (8 * k)) & 0xFF for k in range(4)], dim=-1)
+    exp = bytes4.reshape(*packed.shape[:-1], -1)[..., :nblocks].to(torch.float32)
+    return torch.exp2(exp - 127.0)
+
+
+def _dequant_fp8_block(code, scale, framework, use_ue8m0=False, tile=128):
+    # 把每 128 列一个的 block scale 沿列展开到与 fp8 码同宽，再逐元素相乘还原真实值。
+    if use_ue8m0:
+        # ue8m0 需按位解包，统一转到 torch 处理（paddle 位运算在此路径更易错）。
+        if framework == "paddle":
+            code = paddle_tensor_to_torch(code)
+            scale = paddle_tensor_to_torch(scale)
+        width = code.shape[-1]
+        nblocks = (width + tile - 1) // tile
+        scale_exp = _unpack_ue8m0_scale(scale, nblocks).repeat_interleave(tile, dim=-1)
+        return code.float() * scale_exp[..., :width]
+    width = code.shape[-1]
+    if framework == "paddle":
+        scale_exp = paddle.repeat_interleave(scale.astype("float32"), tile, axis=-1)
+        return code.astype("float32") * scale_exp[..., :width]
+    scale_exp = scale.float().repeat_interleave(tile, dim=-1)
+    return code.float() * scale_exp[..., :width]
 
 
 def process_grad_output(api_config, paddle_out_grads, torch_out_grads):
