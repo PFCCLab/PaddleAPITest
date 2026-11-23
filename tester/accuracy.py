@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import gc
+import math
 
 import numpy
 import paddle
@@ -8,6 +9,7 @@ import torch
 import yaml
 
 from .accuracy_common import process_grad_output, process_output
+from .api_config.parameter_binding import bind_input_parameters
 from .base import CUDA_OOM, APITestBase, GpuMemoryGuardSkip, gpu_mode_memory_decision
 from .input_generation.materialization import iter_unique_tensor_configs
 from .paddle_to_torch import ConversionKind, get_converter
@@ -22,6 +24,13 @@ _TORCH_INDEX_OVERFLOW_APIS = frozenset(
     {"paddle.nn.functional.rms_norm", "paddle.nn.functional.layer_norm"}
 )
 _TORCH_INDEX_OVERFLOW_NUMEL_LIMIT = 1 << 32
+
+# torch.quantile 要求被归约维(多 axis 合并后)长度 <=2^24,否则直接报
+# "quantile() input tensor is too large"(aten/src/ATen/native/Sorting.cpp),无参考可比,跳过。
+_TORCH_QUANTILE_APIS = frozenset(
+    {"paddle.quantile", "paddle.nanquantile", "paddle.Tensor.quantile"}
+)
+_TORCH_QUANTILE_REDUCE_LIMIT = 1 << 24
 
 
 class APITestAccuracy(APITestBase):
@@ -185,6 +194,21 @@ class APITestAccuracy(APITestBase):
             config.numel() > _TORCH_INDEX_OVERFLOW_NUMEL_LIMIT
             for config in iter_unique_tensor_configs(self.api_config.args, self.api_config.kwargs)
         )
+
+    def _skip_due_to_torch_quantile_limit(self):
+        """quantile 类且归约长度 >2^24 时返回 True:torch.quantile 不支持该规模。"""
+        if self.api_config.api_name not in _TORCH_QUANTILE_APIS:
+            return False
+        arguments = bind_input_parameters(
+            self.api_config.api_name, self.api_config.args, self.api_config.kwargs
+        ).arguments
+        shape = arguments["x"].shape
+        axis = arguments.get("axis")
+        if axis is None:
+            axis = range(len(shape))
+        elif isinstance(axis, int):
+            axis = [axis]
+        return math.prod(shape[a] for a in axis) > _TORCH_QUANTILE_REDUCE_LIMIT
 
     def _assert_with_bitwise_knows(self, assertion, *, atol, rtol):
         """严格比较失败后，仅对 YAML 命中的 API 使用已知容差复核。"""
@@ -972,6 +996,14 @@ class APITestAccuracy(APITestBase):
             self.report_case_result(
                 "skip",
                 "input numel exceeds 2^32; torch norm reference unreliable (32-bit index overflow)",
+                stage=self.STAGE_INPUT,
+            )
+            self.dump_finalize("skip")
+            return
+        if self._skip_due_to_torch_quantile_limit():
+            self.report_case_result(
+                "skip",
+                "quantile reduce size exceeds 2^24; torch.quantile unsupported",
                 stage=self.STAGE_INPUT,
             )
             self.dump_finalize("skip")
