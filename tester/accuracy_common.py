@@ -150,6 +150,8 @@ def process_grad_output(api_config, paddle_out_grads, torch_out_grads):
     elif api_config.api_name in {
         "paddle.Tensor.__setitem__",
         "paddle.Tensor.fill_diagonal_tensor",
+        # 原地 API 的输入被复制后，paddle.grad 取不到 value 的梯度，只比较第一个梯度。
+        "paddle.Tensor.masked_fill_",
         "paddle.diagonal_scatter",
         "paddle.incubate.softmax_mask_fuse",
         "paddle.nn.functional.binary_cross_entropy",
