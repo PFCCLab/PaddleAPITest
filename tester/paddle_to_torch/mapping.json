@@ -2146,6 +2146,13 @@
             "value": "value"
         }
     },
+    "paddle.Tensor.masked_fill_": {
+        "torch_api": "torch.Tensor.masked_fill_",
+        "paddle_torch_args_map": {
+            "mask": "mask",
+            "value": "value"
+        }
+    },
     "paddle.masked_scatter": {
         "Rule": "MaskedScatterRule",
         "torch_api": "torch.Tensor.masked_scatter",
@@ -5207,6 +5214,13 @@
     },
     "paddle._C_ops.scale_": {
         "Rule": "CopsScaleRule"
+    },
+    "paddle._C_ops.softmax": {
+        "torch_api": "torch.nn.functional.softmax",
+        "paddle_torch_args_map": {
+            "x": "input",
+            "axis": "dim"
+        }
     },
     "paddle._C_ops.squared_l2_norm": {
         "Rule": "CopsSquaredL2NormRule"
